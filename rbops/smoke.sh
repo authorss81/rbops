@@ -66,7 +66,7 @@ build_fixture() {
 }
 
 # ---------------------------------------------------------------- stub toolchain
-build_stubs() {
+_stubs_raw() {
   # opencode: writes a conforming REPORT.md plus real tests into its own cwd,
   # exactly as a successful agent would. --dir is honoured so we can assert the
   # agent was pointed at the project.
@@ -146,6 +146,24 @@ EOS
   cp "$STUB/rb" "$PROJ/target/debug/rb"; chmod +x "$PROJ/target/debug/rb"
 }
 
+# Rebuild the stubs AND prove the suite is hermetic: every tool the pipeline can
+# invoke must resolve to $STUB, not to whatever happens to exist on the host.
+# Without this, a host opencode masks a missing stub locally and the suite passes
+# here while failing on a runner that has no opencode installed — which is
+# exactly how a CI-only failure once survived review.
+use_stubs() {
+  _stubs_raw
+  local t got bad=0
+  for t in opencode cargo rb; do
+    got="$(PATH="$STUB:$PATH" command -v "$t")"
+    if [ "$got" != "$STUB/$t" ]; then
+      no "HERMETICITY BREAK: $t resolves to $got, not $STUB/$t"
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+
 # run <args...>  — invoke dispatch.sh against the fixture.
 # RBOPS_MIN_OUTPUT is the threshold below which a model's output is treated as a
 # silent no-op. It is lowered here so the terse stub agent counts as success,
@@ -164,7 +182,7 @@ strip() { sed 's/\x1b\[[0-9;]*m//g'; }
 # Build the fixture once up front. Forgetting this is exactly how the first
 # version of this script reported eighteen failures that were all "no such
 # directory".
-build_fixture >/dev/null; build_stubs
+build_fixture >/dev/null; use_stubs
 
 # =========================================================== 1. cold start
 head_ "1. cold start under set -u (the use-before-assignment class)"
@@ -274,7 +292,7 @@ esac
 
 # =========================================================== 7. dead model chain
 head_ "7. a dead model chain defers WITHOUT consuming an attempt"
-build_fixture >/dev/null; build_stubs
+build_fixture >/dev/null; use_stubs
 cat > "$STUB/opencode" <<'EOS'
 #!/usr/bin/env bash
 echo "Error: OpenCode 1.18.0 or newer is required to use the free tier"
@@ -293,11 +311,14 @@ marker phase-001 .blocked  && no "blocked on first infra failure" || ok "not blo
 for _ in 1 2 3 4 5; do RBOPS_MIN_OUTPUT=500 D run phase-001 >/dev/null; done
 marker phase-001 .blocked && ok "blocks after MAX_DEFERRALS" || no "never blocked"
 marker phase-001 .attempts && no "attempts consumed while deferring" || ok "still zero attempts"
-build_stubs >/dev/null
-
+use_stubs
 # =========================================================== 8. missing key
 head_ "8. a missing API key blocks instead of burning the queue"
-build_fixture >/dev/null
+# build_fixture removes $STUB, so the toolchain must be rebuilt or this section
+# depends on whatever opencode happens to exist on the host. That is how the
+# first CI run failed with 'FATAL opencode CLI not on PATH' while passing
+# locally: the runner has no opencode, my machine does.
+build_fixture >/dev/null; use_stubs
 out="$( cd "$PIPE" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
         JQ="$JQ" RBOPS_LOCK="$T/lock" \
         env -u OPENCODE_API_KEY timeout 60 bash "$PIPE/rbops/dispatch.sh" run phase-001 2>&1 | strip )"
@@ -309,7 +330,7 @@ case "$out" in *"OPENCODE_API_KEY is not set"*) ok "the reason is stated" ;; *) 
 
 # =========================================================== 9. review + done
 head_ "9. review signs off and only then is .done written"
-build_fixture >/dev/null; build_stubs
+build_fixture >/dev/null; use_stubs
 D run phase-001 >/dev/null
 rm -f "$PIPE/phases/phase-001"/.failed 2>/dev/null
 D review phase-001 >/dev/null
@@ -385,8 +406,7 @@ case "$out" in
   *"another rbops run holds"*) ok "a live owner's lock is respected (exit $rc)" ;;
   *) no "the lock did not stop a concurrent run" ;;
 esac
-build_stubs >/dev/null
-
+use_stubs
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

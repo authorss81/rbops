@@ -97,25 +97,33 @@ acquire_lock() {
 }
 
 need_jq() { command -v "$JQ" >/dev/null 2>&1 || die "jq is required (set JQ=/path/to/jq)"; }
-need_rbx(){ command -v opencode >/dev/null 2>&1 || die "opencode CLI not on PATH"; }
+# Preflight, shared by every mutating command.
+#
+# toolchain_ok prints the reason on stdout and returns 3 when the machine cannot
+# invoke a model. It NEVER dies: a missing CLI or key is an operator problem,
+# not a phase problem, and `die` (exit 2, no marker) made a runner without
+# opencode look like a crash instead of a blocked phase.
+toolchain_ok() {
+  command -v opencode >/dev/null 2>&1 || { printf 'opencode CLI not on PATH'; return 3; }
+  [ -n "${OPENCODE_API_KEY:-}" ]        || { printf 'OPENCODE_API_KEY is not set'; return 3; }
+  return 0
+}
 
-# Preflight. A missing binary or a bad key is an OPERATOR problem, not a phase
-# problem: mark the phase .blocked immediately and exit 3 rather than burning
-# MAX_ATTEMPTS on a failure that will never succeed.
+# env_check is the phase-aware wrapper: same verdict, plus a marker and a log
+# line naming the phase, so the dispatcher, the workflow and the auditor can
+# all see why it stopped.
 env_check() {
-  local phase="$1"
-  command -v opencode >/dev/null 2>&1 || {
+  local phase="$1" reason
+  if ! reason="$(toolchain_ok)"; then
     touch "$(marker "$phase" .blocked)"
-    log "$phase BLOCKED — opencode CLI not installed"
-    return 3
-  }
-  if [ -z "${OPENCODE_API_KEY:-}" ]; then
-    touch "$(marker "$phase" .blocked)"
-    local repo_hint
-    repo_hint="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
-    [ -n "$repo_hint" ] || repo_hint="<owner>/rbops"
-    log "$phase BLOCKED — OPENCODE_API_KEY is not set"
-    log "  fix: gh secret set OPENCODE_API_KEY --repo $repo_hint"
+    log "$phase BLOCKED — $reason"
+    case "$reason" in
+      "OPENCODE_API_KEY is not set")
+        local hint
+        hint="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+        [ -n "$hint" ] || hint="<owner>/rbops"
+        log "  fix: gh secret set OPENCODE_API_KEY --repo $hint" ;;
+    esac
     return 3
   fi
   # Cheap auth probe. Do not waste a phase on a bad key.
@@ -369,7 +377,9 @@ TPL
   } > "$LOG_DIR/$phase.ctx"
   cat "$LOG_DIR/$phase.ctx" > "$LOG_DIR/$phase.prompt"   # audit record
 
-  need_rbx
+  # env_check FIRST: it returns 3 with a marker and a reason for both a missing
+  # CLI and a missing key. A hard die here (exit 2, no marker) is how a runner
+  # without opencode once looked like a crash rather than a blocked phase.
   env_check "$phase" || return 3
   [ -d "$PROJECT_DIR" ] || { log "FATAL: project dir '$PROJECT_DIR' does not exist"; return 2; }
   CHECK_PID=""
@@ -538,11 +548,12 @@ cmd_review() {
 # ----------------------------------------------------------------------- audit
 # The phase-generating loop. The auditor is the only writer of phases.json.
 cmd_audit() {
-  need_rbx
-  mkdir -p "$LOG_DIR"
-  if [ -z "${OPENCODE_API_KEY:-}" ]; then
-    log "audit SKIPPED — OPENCODE_API_KEY is not set"; return 3
+  local reason
+  if ! reason="$(toolchain_ok)"; then
+    log "audit SKIPPED — $reason"
+    return 3
   fi
+  mkdir -p "$LOG_DIR"
   log "audit pass — generating new phases from measured evidence"
   # The auditor needs to read the tree, so point it at the repo root rather than
   # rbops/, and hand it the contract rather than assuming it remembers.
