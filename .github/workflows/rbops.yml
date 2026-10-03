@@ -162,47 +162,54 @@ jobs:
           key: rbops-${{ runner.os }}-${{ hashFiles('rbops/phases.json') }}
           restore-keys: rbops-${{ runner.os }}-
 
-      - name: Clone redblue and give it push credentials
+      - name: Clone redblue with push access
         env:
           # GITHUB_TOKEN is scoped to the repository the workflow runs in, so it
-          # CANNOT push to redblue no matter what `permissions:` says. A
-          # cross-repo push needs a token with access to redblue: a fine-grained
-          # PAT with Contents: Read and write on authorss81/redblue only.
-          #   echo "$PAT" | gh secret set REDBLUE_TOKEN -R authorss81/rbops
+          # CANNOT push to redblue no matter what `permissions:` says.
+          # Two supported credentials, in order:
+          #   1. REDBLUE_DEPLOY_KEY — private half of an SSH deploy key with
+          #      write access on redblue. Least privilege, nothing to rotate by
+          #      hand. Created once, scripted: rbops/setup-deploy-key.ps1.
+          #      Re-running that script rotates the key.
+          #   2. REDBLUE_TOKEN — fine-grained PAT, Contents R/W on redblue.
+          REDBLUE_DEPLOY_KEY: ${{ secrets.REDBLUE_DEPLOY_KEY }}
           REDBLUE_TOKEN: ${{ secrets.REDBLUE_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -uo pipefail
           OWNER="${{ github.repository_owner }}"
-          git clone --depth 50 "https://github.com/${OWNER}/redblue.git" redblue
+          SSHKEY="$HOME/.ssh/rbops_redblue"
+
+          if [ -n "${REDBLUE_DEPLOY_KEY:-}" ]; then
+            mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
+            printf '%s' "$REDBLUE_DEPLOY_KEY" > "$SSHKEY"; chmod 600 "$SSHKEY"
+            ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts_rbops" 2>/dev/null
+            if ! grep -q 'github.com ssh-ed25519' "$HOME/.ssh/known_hosts_rbops"; then
+              echo "::error::ssh-keyscan returned no host key — cannot trust github.com"
+              exit 1
+            fi
+            SSHOPTS="ssh -i $SSHKEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_rbops -o StrictHostKeyChecking=yes"
+            echo "GIT_SSH_COMMAND=$SSHOPTS" >> "$GITHUB_ENV"
+            export GIT_SSH_COMMAND="$SSHOPTS"
+            git clone --depth 50 "git@github.com:${OWNER}/redblue.git" redblue
+            echo "::notice::cloned over SSH (deploy key)"
+          elif [ -n "${REDBLUE_TOKEN:-}" ]; then
+            git clone --depth 50 "https://github.com/${OWNER}/redblue.git" redblue
+            git -C redblue remote set-url origin \
+              "https://x-access-token:${REDBLUE_TOKEN}@github.com/${OWNER}/redblue.git"
+            echo "::notice::cloned over HTTPS (PAT)"
+          else
+            git clone --depth 50 "https://github.com/${OWNER}/redblue.git" redblue
+            echo "::warning::no REDBLUE_DEPLOY_KEY or REDBLUE_TOKEN — the clone can read but NOT push."
+            echo "::warning::phase work will be captured as work-<phase>.patch but not pushed."
+          fi
+          git -C redblue config user.name  "rbops-bot"
+          git -C redblue config user.email "rbops-bot@users.noreply.github.com"
 
           # THE CRITICAL PATH SETTING. dispatch.sh keeps its state in the rbops
           # repo but the agent must edit redblue. Without this the agent runs in
           # the rbops checkout, cannot find src/testing/harness.rs, burns its
           # whole budget searching, and its output is discarded.
           echo "RBOPS_PROJECT_DIR=$PWD/redblue" >> "$GITHUB_ENV"
-
-          git -C redblue config user.name  "rbops-bot"
-          git -C redblue config user.email "rbops-bot@users.noreply.github.com"
-
-          # `actions/checkout` configures a credential helper for ITS OWN repo
-          # only, and a plain clone of another repo is anonymous. Attach an
-          # explicit token, preferring a PAT scoped to redblue.
-          if [ -n "${REDBLUE_TOKEN:-}" ]; then
-            URL="https://x-access-token:${REDBLUE_TOKEN}@github.com/${OWNER}/redblue.git"
-            echo "::notice::using REDBLUE_TOKEN (PAT)"
-          elif [ "${ALLOW_CROSS_REPO:-0}" = "1" ]; then
-            URL="https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/redblue.git"
-            echo "::notice::using GITHUB_TOKEN"
-          else
-            echo "::warning::no REDBLUE_TOKEN configured — the clone can read but NOT push."
-            echo "::warning::phase work will be captured as work-<phase>.patch but not pushed."
-            echo "::warning::to fix: create a fine-grained PAT (Contents: R/W on"
-            echo "::warning::authorss81/redblue) and run:"
-            echo "::warning::  echo \$PAT | gh secret set REDBLUE_TOKEN -R authorss81/rbops"
-            URL="https://github.com/${OWNER}/redblue.git"
-          fi
-          git -C redblue remote set-url origin "$URL"
 
           # Prove write access now, and SHOW git's actual stderr.
           #

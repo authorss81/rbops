@@ -79,11 +79,24 @@ State is **git**, in marker files committed under `phases/phase-NNN/`:
 ## Enabling
 
 ```bash
-# 1. the API key. This is the only secret the pipeline needs.
+# 1. the API key for the models. This is the only secret the pipeline needs
+#    to THINK.
 gh secret set OPENCODE_API_KEY --repo authorss81/rbops
 
-# 2. check the pipeline can prove itself before spending model tokens
+# 2. push access to redblue, so finished work can SHIP. GITHUB_TOKEN cannot do
+#    this: it is scoped to rbops no matter what `permissions:` says. Instead a
+#    WRITE SSH deploy key is registered on redblue and its private half is
+#    stored as REDBLUE_DEPLOY_KEY on rbops. Fully scripted, no UI, least
+#    privilege (that key opens exactly one repo):
+#
+#      powershell -File rbops/setup-deploy-key.ps1
+#
+#    Re-running rotates the key. Without either credential the pipeline still
+#    runs, but work lands as a work-<phase>.patch artifact instead of a commit.
+
+# 3. check the pipeline can prove itself before spending model tokens
 gh workflow run validate.yml
+gh workflow run smoke.yml
 
 # 3. see what would run next, without running it
 ./rbops/dispatch.sh status
