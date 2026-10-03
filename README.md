@@ -130,27 +130,52 @@ halt survives a runner being replaced.
 
 ### Models
 
-One key is enough. `OPENCODE_API_KEY` serves every `opencode/*` model, and the
-default chains use only those. A dead or rate-limited model advances the chain
-**without consuming a phase attempt**, so the lists are deliberately generous and
-need no babysitting.
+Order is deliberate: `opencode/space-bunny-free` leads, then
+`muse-spark-1.3-contributor-free`. The strongest coder on the free tier goes
+first because a dead model advances the chain **without consuming a phase
+attempt**, so an unavailable or revoked entry costs about two seconds rather
+than a retry from `MAX_ATTEMPTS`. That makes a long chain cheap insurance
+rather than a liability.
 
-To add `openrouter/*` models (a different provider, better benchmarks):
+To see what your key can actually reach:
+
+```bash
+OPENCODE_API_KEY=... opencode models
+```
+
+If `space-bunny-free` is not listed for your key it will simply be skipped and
+the chain moves to muse-spark. To change the order, edit `RBOPS_IMPL_MODELS`
+(and the reviewer/audit chains) in `.github/workflows/rbops.yml`, plus
+`.models` in `rbops/phases.json` and the agent models in `opencode.json`.
+
+To add `openrouter/*` models (a different provider, different benchmarks):
 
 ```bash
 gh secret set OPENROUTER_API_KEY --repo authorss81/rbops
 ```
 
-then extend `RBOPS_IMPL_MODELS` etc. in `.github/workflows/rbops.yml`. Without
-that second key, every `openrouter/*` entry is dead weight in the chain.
-
 Free-tier models disappear without warning. When a phase starts deferring
-repeatedly with `every model in the chain was unusable`, list what is actually
-served and update the chains:
+repeatedly with `every model in the chain was unusable`, that is the signal to
+re-list and re-order.
+
+### Pushing while a run is in flight
+
+**Don't, unless you mean to.** The `work` job ends by rebasing onto `origin/main`
+before pushing its state, so a commit arriving mid-run can collide with that
+rebase. It retries five times and then falls back to a recovery branch, which
+loses the marker state.
+
+The phase's *code* lands in redblue and is not at risk from an rbops push. To
+iterate on the pipeline itself while a phase is running:
 
 ```bash
-OPENCODE_API_KEY=... opencode models
+./rbops/dispatch.sh stop      # committed halt; select becomes a no-op
+# ... push freely, the queue will not move ...
+./rbops/dispatch.sh resume
 ```
+
+`phases/.stop` survives a runner being replaced, which is why it is a committed
+file rather than a runner-local flag.
 
 ## The gate
 
