@@ -133,7 +133,27 @@ cmd_select() {
         done
         [ "$unmet" -eq 0 ] && { echo "$id"; break; }
       done)"
-  if [ -n "$p" ]; then log "selected: $p"; printf '%s\n' "$p"; return; fi
+  if [ -n "$p" ]; then
+    # Skipping a blocked phase keeps throughput, but it must never be SILENT.
+    # A lower-id phase that is blocked or repeatedly deferred is a hole in the
+    # plan; anyone reading "selected: phase-004" must not assume 001 is fine.
+    local skipped
+    skipped="$("$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | sort -t- -k2 -n \
+      | while read -r id; do
+          if [ "$id" = "$p" ]; then break; fi
+          has "$id" .blocked  && { echo "$id:blocked"; continue; }
+          d="$(read_n "$id" .deferred_attempts)"
+          [ "$d" -gt 0 ] && echo "$id:deferred($d)"
+        done)"
+    if [ -n "$skipped" ]; then
+      log "WARNING: $p selected while earlier phases are not done:"
+      printf '%s\n' "$skipped" | sed 's/^/          - /'
+      log "  these are stalled. Dispatching stop will halt the pipeline."
+    fi
+    log "selected: $p"
+    printf '%s\n' "$p"
+    return
+  fi
 
   # 3. queue drained
   local blocked
