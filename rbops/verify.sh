@@ -13,16 +13,36 @@
 set -uo pipefail
 
 PHASE="${1:?usage: verify.sh <phase-id>}"
-PHASES="${RBOPS_PHASES:-rbops/phases.json}"
+
+# Resolve every path BEFORE changing directory, and normalise away any `..`.
+# The gate runs against the project checkout (redblue/) while the manifest,
+# baseline and report live in the pipeline repo. A relative path resolved after
+# `cd` silently points at a file that does not exist there, and the gate then
+# fails on its very first check having verified nothing.
+abspath() {
+  local p="$1"
+  if [ -e "$p" ]; then (cd "$(dirname "$p")" && printf '%s/%s\n' "$(pwd)" "$(basename "$p")")
+  else printf '%s\n' "$p"; fi
+}
+
+# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the gate can
+# be exercised against a fixture pipeline root, not only this checkout.
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PHASES="$(abspath "${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}")"
+BASELINE="$(abspath "${RBOPS_BASELINE:-$RBOPS_ROOT/rbops/baseline.json}")"
+PROJECT_DIR="$(abspath "${RBOPS_PROJECT_DIR:-.}")"
+REPORT="$RBOPS_ROOT/phases/$PHASE/REPORT.md"
+
+# Preconditions, checked before we touch the project.
+[ -f "$PHASES" ]                                    || { echo "FATAL: no manifest at $PHASES" >&2; exit 1; }
+[ -f "$BASELINE" ]                                  || { echo "FATAL: no baseline at $BASELINE" >&2; exit 1; }
+[ -d "$RBOPS_ROOT/phases/$PHASE" ]                  || { echo "FATAL: $RBOPS_ROOT/phases/$PHASE does not exist" >&2; exit 1; }
+cd "$PROJECT_DIR" || { echo "FATAL: cannot enter project dir $PROJECT_DIR" >&2; exit 1; }
+[ -f Cargo.toml ] || { echo "FATAL: no Cargo.toml in $PROJECT_DIR — is RBOPS_PROJECT_DIR correct?" >&2; exit 1; }
+
 # Honour $JQ so a native Linux jq can be substituted when testing outside CI.
 # A Windows jq.exe under WSL emits CRLF and breaks every id and count.
 JQ="${JQ:-jq}"
-REPO="${RBOPS_REPO:-.}"
-
-cd "$REPO" || exit 1
-
-PHASE_DIR="phases/${PHASE}"
-REPORT="${PHASE_DIR}/REPORT.md"
 BASE_REF="${RBOPS_BASE_REF:-HEAD}"
 
 FAIL=0
@@ -141,7 +161,6 @@ if ! cargo build >/tmp/build.log 2>&1; then
   bad "cargo build"; tail -20 /tmp/build.log
 fi
 RB="./target/debug/rb"
-BASELINE="${RBOPS_BASELINE:-rbops/baseline.json}"
 if [ -x "$RB" ]; then
   for ex in examples/*.rb modules/*.rb; do
     [ -f "$ex" ] || continue

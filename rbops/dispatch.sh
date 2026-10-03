@@ -14,10 +14,19 @@
 # =============================================================================
 set -uo pipefail
 
-PHASES="${RBOPS_PHASES:-rbops/phases.json}"
-PHASE_ROOT="phases"
-LOG_DIR="${RBOPS_LOG_DIR:-logs}"
-VERIFY="./rbops/verify.sh"
+VERIFY="${BASH_SOURCE[0]}"
+# The pipeline repo (this one) holds phases/, the manifest and the log; the
+# PROJECT is the thing being changed. They are different checkouts and confusing
+# them is the single most expensive bug available here: the agent edits whatever
+# directory it happens to be in, and its work is then thrown away.
+# `cd && pwd` normalises away any `..` in the path.
+# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the
+# dispatcher can be exercised against a fixture pipeline root.
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "$VERIFY")/.." && pwd)}"
+PHASES="${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}"
+PHASE_ROOT="$RBOPS_ROOT/phases"
+LOG_DIR="${RBOPS_LOG_DIR:-$RBOPS_ROOT/logs}"
+PROJECT_DIR="${RBOPS_PROJECT_DIR:-.}"
 # Honour $JQ so a native Linux jq can be substituted when testing outside CI.
 # A Windows jq.exe under WSL emits CRLF and its nested invocations slurp the
 # parent pipe, which silently truncates the phase loop to one iteration.
@@ -94,8 +103,12 @@ env_check() {
 }
 
 # ---------------------------------------------------------------- phase state
-marker() { printf 'phases/%s/%s' "$1" "$2"; }
+# Paths are anchored to the pipeline repo, and git operations are anchored to the
+# project, so the script behaves identically no matter where it is invoked from.
+marker() { printf '%s/phases/%s/%s' "$RBOPS_ROOT" "$1" "$2"; }
 has()    { [ -f "$(marker "$1" "$2")" ]; }
+# Run a command inside the project checkout.
+in_project() { ( cd "$PROJECT_DIR" && "$@" ); }
 bump()   { # bump <phase> <file>
   local f; f="$(marker "$1" "$2")"
   local n=0; [ -f "$f" ] && n="$(tr -cd '0-9' < "$f")"
@@ -111,7 +124,7 @@ read_n() { local f; f="$(marker "$1" "$2")"; [ -f "$f" ] && tr -cd '0-9' < "$f" 
 #            3) empty  => the queue is drained
 cmd_select() {
   need_jq
-  if [ -f phases/.stop ]; then log "phases/.stop present — pipeline halted"; printf '\n'; return; fi
+  if [ -f "$RBOPS_ROOT/phases/.stop" ]; then log "phases/.stop present — pipeline halted"; printf '\n'; return; fi
 
   # Portability: `tr -d '\r'` guards against a Windows jq.exe under WSL, whose
   # CRLF output would otherwise produce a phase id of "phase-001\r" and create a
@@ -242,11 +255,14 @@ infra_failure() {
 checkpoint_loop() {
   local phase="$1"
   while sleep "$CHECKPOINT_SECS"; do
-    local tree commit
-    tree="$(git add -A >/dev/null 2>&1; git write-tree 2>/dev/null)" || continue
-    commit="$(git commit-tree "$tree" -p HEAD -m "rbops: ${phase} checkpoint $(date -u +%s)" 2>/dev/null)" || continue
-    git push -f origin "$commit:refs/heads/rbops-wip/${phase}" >/dev/null 2>&1 || true
-    git reset --mixed HEAD >/dev/null 2>&1 || true
+    # Everything here is git inside the PROJECT, so the checkpoint captures the
+    # agent's work rather than the untouched pipeline repo.
+    in_project bash -c '
+      tree=$(git add -A >/dev/null 2>&1; git write-tree 2>/dev/null) || exit 0
+      commit=$(git commit-tree "$tree" -p HEAD -m "rbops: '"$phase"' checkpoint $(date -u +%s)" 2>/dev/null) || exit 0
+      git push -f origin "$commit:refs/heads/rbops-wip/'"$phase"'" >/dev/null 2>&1 || true
+      git reset --mixed HEAD >/dev/null 2>&1 || true
+    ' || true
   done
 }
 
@@ -271,18 +287,18 @@ cmd_run() {
   [ -f "$prompt" ] || die "no PROMPT.md for $phase — an undeclared prompt is not a phase"
 
   if has "$phase" .done; then log "$phase already .done"; return 0; fi
-  if [ -f phases/.stop ]; then log "halted by phases/.stop"; return 0; fi
+  if [ -f "$RBOPS_ROOT/phases/.stop" ]; then log "halted by phases/.stop"; return 0; fi
 
   # resume any WIP checkpoint from a previous timeout
-  if git rev-parse --verify -q "origin/rbops-wip/$phase" >/dev/null 2>&1; then
+  if in_project git rev-parse --verify -q "origin/rbops-wip/$phase" >/dev/null 2>&1; then
     log "merging WIP checkpoint for $phase"
-    git merge --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1 || true
+    in_project git merge --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1 || true
     touch "$(marker "$phase" .checkpoint)"
   fi
 
-  local base; base="$(git rev-parse HEAD)"
+  local base; base="$(in_project git rev-parse HEAD)"
   {
-    cat AGENTS.md
+    cat "$RBOPS_ROOT/AGENTS.md"
     printf '\n\n---\n\n# YOUR PHASE: %s\n\n' "$phase"
     cat "$prompt"
     [ -f "$(marker "$phase" .checkpoint)" ] && cat <<'TPL'
@@ -297,11 +313,15 @@ TPL
 
   need_rbx
   env_check "$phase" || return 3
+  [ -d "$PROJECT_DIR" ] || { log "FATAL: project dir '$PROJECT_DIR' does not exist"; return 2; }
   CHECK_PID=""
   start_checkpoint_loop "$phase"
   local code
+  # --dir points the agent at the PROJECT checkout. Without it the agent runs in
+  # the rbops repo, spends its whole budget looking for src/testing/harness.rs,
+  # edits nothing, and its output is discarded.
   run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" "$LOG_DIR/$phase.ctx" \
-      --agent build --title "rbops-${phase}"
+      --dir "$PROJECT_DIR" --agent build --title "rbops-${phase}"
   code=$?
   stop_checkpoint_loop
 
@@ -326,7 +346,7 @@ TPL
 
   # --- THE GATE -------------------------------------------------------------
   log "running verify gate for $phase"
-  RBOPS_BASE_REF="$base" "$VERIFY" "$phase"
+  RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" RBOPS_BASE_REF="$base" "$VERIFY" "$phase"
   code=$?
   if [ "$code" -ne 0 ]; then
     rm -f "$(marker "$phase" .done)" "$(marker "$phase" .checkpoint)"
@@ -352,7 +372,7 @@ TPL
 cmd_review() {
   local phase="${1:?phase required}"
   mkdir -p "$LOG_DIR"
-  local base; base="$(git rev-parse HEAD)"
+  local base; base="$(in_project git rev-parse HEAD)"
   local round=0
 
   while [ "$round" -lt "${RBOPS_MAX_REVIEW_ROUNDS:-3}" ]; do
@@ -370,21 +390,21 @@ cmd_review() {
       printf 'Rules: .opencode/agent/reviewer.md and AGENTS.md section 5.\n'
       printf 'The gate is green. Your job is to find what is still wrong.\n\n'
       printf '## 1. Committed changes (%s..HEAD)\n\n```diff\n' "$base"
-      git diff --no-color "$base"..HEAD 2>/dev/null || printf '(none)\n'
+      in_project git diff --no-color "$base"..HEAD 2>/dev/null || printf '(none)\n'
       printf '```\n\n## 2. Uncommitted tracked changes\n\n```diff\n'
-      git diff --no-color 2>/dev/null || printf '(none)\n'
+      in_project git diff --no-color 2>/dev/null || printf '(none)\n'
       printf '```\n\n## 3. Untracked files (full contents)\n\n'
-      git status --porcelain 2>/dev/null | grep '^??' | sed 's/^?? //' | while read -r f; do
+      in_project git status --porcelain 2>/dev/null | grep '^??' | sed 's/^?? //' | while read -r f; do
         printf -- '--- %s\n```\n' "$f"
-        cat "$f" 2>/dev/null || printf '(unreadable)\n'
+        cat "$PROJECT_DIR/$f" 2>/dev/null || printf '(unreadable)\n'
         printf '```\n'
       done
       printf '\n## 4. The phase REPORT.md\n\n'
-      cat "phases/$phase/REPORT.md" 2>/dev/null || printf '(missing)\n'
+      cat "$RBOPS_ROOT/phases/$phase/REPORT.md" 2>/dev/null || printf '(missing)\n'
     } > "$rctx"
 
     run_agent "$REVIEW_MODELS" "$LOG_DIR/$phase.review.$round.log" "$rctx" \
-        --agent reviewer --title "rbops-review-${phase}-${round}"
+        --dir "$PROJECT_DIR" --agent reviewer --title "rbops-review-${phase}-${round}"
 
     local rc_round=$?
     if [ "$rc_round" = "75" ]; then
@@ -416,7 +436,7 @@ cmd_review() {
       cat "$LOG_DIR/$phase.review.$round.log"
     } > "$fctx"
     run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.fix.$round.log" "$fctx" \
-        --agent build --title "rbops-fix-${phase}-${round}"
+        --dir "$PROJECT_DIR" --agent build --title "rbops-fix-${phase}-${round}"
     if [ "$?" = "75" ]; then
       log "fix round $round: model chain unusable — deferring"
       return 42
@@ -424,7 +444,7 @@ cmd_review() {
 
     # --- re-gate after fixes. Mandatory. -----------------------------------
     log "re-running verify gate after review fixes"
-    if RBOPS_BASE_REF="$base" "$VERIFY" "$phase"; then
+    if RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" RBOPS_BASE_REF="$base" "$VERIFY" "$phase"; then
       log "gate still green after fixes"
     else
       log "gate red after fixes — review loop continues"
@@ -438,8 +458,8 @@ cmd_review() {
   fi
 
   touch "$(marker "$phase" .done)"
-  git push -q origin "HEAD:refs/heads/rbops-wip/DELETE_${phase}" 2>/dev/null || true
-  git push -q origin ":refs/heads/rbops-wip/$phase" 2>/dev/null || true
+  in_project git push -q origin "HEAD:refs/heads/rbops-wip/DELETE_${phase}" 2>/dev/null || true
+  in_project git push -q origin ":refs/heads/rbops-wip/$phase" 2>/dev/null || true
   log "$phase DONE"
   return 0
 }
@@ -455,7 +475,7 @@ cmd_audit() {
   log "audit pass — generating new phases from measured evidence"
   # The auditor needs to read the tree, so point it at the repo root rather than
   # rbops/, and hand it the contract rather than assuming it remembers.
-  cat AGENTS.md > "$LOG_DIR/audit.ctx"
+  cat "$RBOPS_ROOT/AGENTS.md" > "$LOG_DIR/audit.ctx"
   {
     printf '\n\n---\n\n# AUDIT REQUEST\n\n'
     printf 'Follow .opencode/agent/auditor.md and AGENTS.md section 6.\n'
@@ -465,7 +485,7 @@ cmd_audit() {
     printf 'Every phase needs a real file:line. Do not invent work.\n'
   } >> "$LOG_DIR/audit.ctx"
   run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" "$LOG_DIR/audit.ctx" \
-      --agent auditor --title "rbops-audit"
+      --dir "$PROJECT_DIR" --agent auditor --title "rbops-audit"
   local code=$?
   if [ "$code" = "75" ]; then
     log "audit DEFERRED — model chain unusable"
@@ -475,7 +495,9 @@ cmd_audit() {
     log "phases.json still valid JSON after audit"
   else
     log "FATAL: audit corrupted phases.json — reverting"
-    git checkout -- "$PHASES"; return 1
+    # Restore the manifest in the PIPELINE repo, which is where it lives.
+    ( cd "$RBOPS_ROOT" && git checkout -- "$PHASES" ) 2>/dev/null || true
+    return 1
   fi
   # an audit that invents phases with no evidence is a failed audit
   if [ "$code" -ne 0 ]; then log "audit agent exited $code"; return "$code"; fi
@@ -525,8 +547,8 @@ case "${1:-}" in
   review) shift; acquire_lock; cmd_review "$@" ;;
   audit)  acquire_lock; cmd_audit ;;
   tick)   acquire_lock; cmd_tick ;;
-  stop)   mkdir -p phases; touch phases/.stop; log "HALTED — remove phases/.stop to resume" ;;
-  resume) rm -f phases/.stop; log "RESUMED" ;;
+  stop)   mkdir -p "$RBOPS_ROOT/phases"; touch "$RBOPS_ROOT/phases/.stop"; log "HALTED — remove phases/.stop to resume" ;;
+  resume) rm -f "$RBOPS_ROOT/phases/.stop"; log "RESUMED" ;;
   status) need_jq
           # Sort numerically: manifest order is a convenience for humans, and the
   # dispatcher must not jump the queue when a phase is appended.

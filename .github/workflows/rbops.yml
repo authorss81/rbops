@@ -119,6 +119,9 @@ jobs:
     needs: select
     if: needs.select.outputs.exists == 'true' && needs.select.outputs.action != 'status'
     runs-on: ubuntu-latest
+    # A phase gets a real budget, but not an unlimited one. The previous default
+    # was 360 minutes; a lost agent should not occupy a runner for six hours.
+    timeout-minutes: 150
     permissions:
       contents: write          # push phase work. NO `workflows` scope.
     outputs:
@@ -162,7 +165,11 @@ jobs:
       - name: Clone redblue
         run: |
           git clone --depth 50 https://github.com/authorss81/redblue.git redblue
-          echo "RBOPS_REPO=$PWD/redblue" >> "$GITHUB_ENV"
+          # THE CRITICAL PATH SETTING. dispatch.sh keeps its state in the rbops
+          # repo but the agent must edit redblue. Without this the agent runs in
+          # the rbops checkout, cannot find src/testing/harness.rs, burns its
+          # whole budget searching, and its output is discarded.
+          echo "RBOPS_PROJECT_DIR=$PWD/redblue" >> "$GITHUB_ENV"
 
       - name: Fetch WIP checkpoint
         continue-on-error: true
@@ -203,6 +210,13 @@ jobs:
           # reference RBOPS_PHASE, and under `set -u` an unset variable aborts
           # the step. It was step-scoped to this one and killed Report status.
           echo "RBOPS_PHASE=$PHASE" >> "$GITHUB_ENV"
+          # Refuse to run rather than silently point the agent at the wrong tree.
+          if [ ! -d "${RBOPS_PROJECT_DIR:-.}/.git" ] && [ ! -f "${RBOPS_PROJECT_DIR:-.}/Cargo.toml" ]; then
+            echo "::error::RBOPS_PROJECT_DIR='${RBOPS_PROJECT_DIR:-unset}' is not the redblue checkout"
+            echo "progress=false" >> "$GITHUB_OUTPUT"
+            echo "rc=2" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "${{ needs.select.outputs.action }}" = "audit" ]; then
             bash rbops/dispatch.sh audit; rc=$?
           else
