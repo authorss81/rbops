@@ -121,11 +121,36 @@ implementer can edit is not a gate.
 | Infra deferrals before blocking | `RBOPS_MAX_DEFERRALS` | 5 |
 | Review rounds before blocking | `RBOPS_MAX_REVIEW_ROUNDS` | 3 |
 | Per-model wall clock | `RBOPS_MODEL_TIMEOUT` | 3000 s |
+| Minimum agent output to trust a model | `RBOPS_MIN_OUTPUT` | 500 bytes |
 | Chain to next tick | `RBOPS_RETRIGGER` | 1 |
 | Audit every N completed phases | `.audit.every_n_phases` | 8 |
 
 `./rbops/dispatch.sh stop` is the kill switch. It is a committed file, so the
 halt survives a runner being replaced.
+
+### Models
+
+One key is enough. `OPENCODE_API_KEY` serves every `opencode/*` model, and the
+default chains use only those. A dead or rate-limited model advances the chain
+**without consuming a phase attempt**, so the lists are deliberately generous and
+need no babysitting.
+
+To add `openrouter/*` models (a different provider, better benchmarks):
+
+```bash
+gh secret set OPENROUTER_API_KEY --repo authorss81/rbops
+```
+
+then extend `RBOPS_IMPL_MODELS` etc. in `.github/workflows/rbops.yml`. Without
+that second key, every `openrouter/*` entry is dead weight in the chain.
+
+Free-tier models disappear without warning. When a phase starts deferring
+repeatedly with `every model in the chain was unusable`, list what is actually
+served and update the chains:
+
+```bash
+OPENCODE_API_KEY=... opencode models
+```
 
 ## The gate
 
