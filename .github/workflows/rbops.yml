@@ -162,7 +162,9 @@ jobs:
           key: rbops-${{ runner.os }}-${{ hashFiles('rbops/phases.json') }}
           restore-keys: rbops-${{ runner.os }}-
 
-      - name: Clone redblue
+      - name: Clone redblue and give it push credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git clone --depth 50 https://github.com/authorss81/redblue.git redblue
           # THE CRITICAL PATH SETTING. dispatch.sh keeps its state in the rbops
@@ -171,11 +173,30 @@ jobs:
           # whole budget searching, and its output is discarded.
           echo "RBOPS_PROJECT_DIR=$PWD/redblue" >> "$GITHUB_ENV"
 
+          # CREDENTIALS. `actions/checkout` configures a credential helper for
+          # ITS OWN repository only. A plain `git clone https://...` of another
+          # repo is anonymous, so every `git push` from redblue/ fails auth:
+          # phase work was unshippable, WIP checkpoints never appeared, and the
+          # WIP fetch failed silently behind `|| true`. Embed the token in the
+          # remote instead of relying on a helper.
+          git -C redblue remote set-url origin \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/redblue.git"
+          git -C redblue config user.name  "rbops-bot"
+          git -C redblue config user.email "rbops-bot@users.noreply.github.com"
+
+          # Prove it now, loudly, rather than discovering it 20 minutes later
+          # when a finished phase silently fails to ship.
+          if git -C redblue push --dry-run origin HEAD:main 2>&1 | grep -qiE 'could not read|denied|authentication|403'; then
+            echo "::error::redblue clone cannot push — phase work would be lost"
+            exit 1
+          fi
+          echo "::notice::redblue push access verified"
+
       - name: Fetch WIP checkpoint
         continue-on-error: true
         run: |
-          cd redblue
-          git fetch origin "+refs/heads/rbops-wip/*:refs/remotes/origin/rbops-wip/*" || true
+          git -C redblue fetch origin "+refs/heads/rbops-wip/*:refs/remotes/origin/rbops-wip/*" \
+            || echo "::warning::no WIP checkpoints to resume"
 
       # Warm the build so the phase's own gate is fast.
       - name: Warm cargo cache
