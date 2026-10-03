@@ -314,6 +314,7 @@ jobs:
           GIT_NAME: rbops-bot
           GIT_EMAIL: rbops-bot@users.noreply.github.com
           RBOPS_PHASE: ${{ env.RBOPS_PHASE }}
+          PROGRESS: ${{ steps.d.outputs.progress }}
         run: |
           set -uo pipefail
           PHASE="${RBOPS_PHASE:-none}"
@@ -321,7 +322,7 @@ jobs:
           git config user.name "$GIT_NAME"
           git config user.email "$GIT_EMAIL"
 
-          # DIAGNOSE FIRST. A phase produced 788 changed lines and the previous
+          # DIAGNOSE FIRST. A phase once produced 788 changed lines and the old
           # version of this step cheerfully reported "clean tree — nothing to
           # push". Nothing is lost now that this runs first and is unconditional.
           echo "::group::work inventory for ${PHASE}"
@@ -343,7 +344,7 @@ jobs:
           has_staged()        { ! git diff --cached --quiet; }
 
           # The agent may have committed its own work. `git status --porcelain`
-          # is EMPTY in that case, which is how a whole phase was discarded.
+          # is EMPTY in that case, which is how a whole phase was once discarded.
           if ! has_staged && ! has_local_commits; then
             echo "::notice::genuinely nothing to push for ${PHASE}"
             exit 0
@@ -351,6 +352,19 @@ jobs:
 
           if has_staged; then
             git commit -m "rbops: ${PHASE} ($(date -u +%Y-%m-%dT%H:%M:%SZ))" || true
+          fi
+
+          # POLICY: only gate-green, reviewed work lands on main. A failed gate
+          # means the code is unproven — possibly correct, possibly not — and
+          # unproven code does not belong on the language's main branch. It goes
+          # to a recovery branch instead, where the next attempt (or a human)
+          # can inspect it, and to the patch artifact either way.
+          if [ "${PROGRESS:-false}" != "true" ]; then
+            echo "::warning::gate did not pass for ${PHASE} — keeping main clean, parking work on rbops-recovery/${PHASE}"
+            git branch -f "rbops-recovery/${PHASE}" HEAD 2>/dev/null || true
+            git push -f origin "HEAD:refs/heads/rbops-recovery/${PHASE}" 2>/dev/null \
+              || echo "::warning::recovery-branch push also failed; work-${PHASE}.patch artifact still holds the work"
+            exit 0
           fi
 
           for i in 1 2 3 4 5; do
