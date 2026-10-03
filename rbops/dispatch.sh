@@ -362,8 +362,21 @@ TPL
   # edits nothing, and its output is discarded.
   run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" "$LOG_DIR/$phase.ctx" \
       --dir "$PROJECT_DIR" --agent build --title "rbops-${phase}"
-  code=$?
-  stop_checkpoint_loop
+code=$?
+stop_checkpoint_loop
+
+# Harvest what the agent wrote. The agent's working directory is the PROJECT
+# checkout, so anything it wrote to a relative path - REPORT.md, FINDINGS.md -
+# lands in the project, not in the pipeline repo where the gate looks. Run 5
+# produced a correct REPORT.md in redblue/phases/phase-001/ and the gate reported
+# "a phase without a report cannot pass".
+for artefact in REPORT.md FINDINGS.md; do
+  if [ -f "$PROJECT_DIR/phases/$phase/$artefact" ]; then
+    mkdir -p "$RBOPS_ROOT/phases/$phase"
+    cp "$PROJECT_DIR/phases/$phase/$artefact" "$RBOPS_ROOT/phases/$phase/$artefact"
+    log "harvested $artefact from the project"
+  fi
+done
 
   # --- classify -------------------------------------------------------------
   # A dead model chain (75) or an infra-shaped log is a RETRYABLE infra fault.
