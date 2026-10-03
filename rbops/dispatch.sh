@@ -15,19 +15,21 @@
 set -uo pipefail
 
 SELF="${BASH_SOURCE[0]}"
-# BASH_SOURCE[0] here is dispatch.sh ITSELF. Using it as the gate path made
-# verify.sh re-run the dispatcher, print its help banner and exit 2 — which the
-# dispatcher read as "gate failed", so every phase failed in milliseconds for a
-# reason that had nothing to do with the code.
-VERIFY="$RBOPS_ROOT/rbops/verify.sh"
 # The pipeline repo (this one) holds phases/, the manifest and the log; the
 # PROJECT is the thing being changed. They are different checkouts and confusing
 # them is the single most expensive bug available here: the agent edits whatever
 # directory it happens to be in, and its work is then thrown away.
-# `cd && pwd` normalises away any `..` in the path.
-# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the
-# dispatcher can be exercised against a fixture pipeline root.
+#
+# ORDER MATTERS. RBOPS_ROOT must be assigned before anything that reads it;
+# under `set -u` a forward reference aborts the script on line one of use.
+# `cd && pwd` normalises away any `..`. It is overridable so the dispatcher can
+# be exercised against a fixture pipeline root.
 RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "$SELF")/.." && pwd)}"
+# BASH_SOURCE[0] here is dispatch.sh ITSELF. Using it as the gate path made the
+# "run the gate" call re-run the dispatcher, print its help banner and exit 2,
+# which the dispatcher read as GATE FAILED — every phase failed in milliseconds
+# for a reason that had nothing to do with the code.
+VERIFY="$RBOPS_ROOT/rbops/verify.sh"
 PHASES="${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}"
 PHASE_ROOT="$RBOPS_ROOT/phases"
 LOG_DIR="${RBOPS_LOG_DIR:-$RBOPS_ROOT/logs}"

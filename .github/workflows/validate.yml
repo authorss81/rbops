@@ -133,6 +133,34 @@ jobs:
           if [ "$rc" -eq 0 ]; then echo "OK: baseline is governed"; fi
           exit "$rc"
 
+      - name: scripts survive a cold start under `set -u`
+        run: |
+          set -uo pipefail
+          rc=0
+          # `bash -n` only checks syntax. Running the entry points cold catches
+          # forward references and unbound-variable aborts, which is how
+          # dispatch.sh died on "line 22: RBOPS_ROOT: unbound variable" and every
+          # phase failed in under a minute with no useful output.
+          for cmd in status select; do
+            if out=$(RBOPS_ROOT="$PWD" RBOPS_PROJECT_DIR="$PWD" bash rbops/dispatch.sh "$cmd" 2>&1); then
+              echo "OK  dispatch.sh $cmd"
+            else
+              echo "::error::dispatch.sh $cmd failed:"; printf '%s\n' "$out" | tail -5; rc=1
+            fi
+          done
+          # The gate must also survive being pointed at a phase that does not
+          # exist. Capture first, then grep: under `pipefail` a pipeline inherits
+          # the non-zero exit of verify.sh, so `verify.sh ... | grep -q FATAL`
+          # reports "no match" precisely when it matched.
+          out=$(RBOPS_ROOT="$PWD" RBOPS_PROJECT_DIR="$PWD" bash rbops/verify.sh phase-999 2>&1) || true
+          if printf '%s\n' "$out" | grep -q 'FATAL'; then
+            echo "OK  verify.sh rejects an unknown phase with a named FATAL:"
+            printf '%s\n' "$out" | grep FATAL | sed 's/^/      /'
+          else
+            echo "::error::verify.sh did not fail cleanly on phase-999"; printf '%s\n' "$out" | tail -5; rc=1
+          fi
+          exit "$rc"
+
       - name: shell scripts are syntactically valid and executable
         run: |
           set -uo pipefail
