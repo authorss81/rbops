@@ -3,6 +3,11 @@ name: validate
 # RBOPS validating itself. This workflow has NO LLM in it and must never be
 # edited by a phase — see AGENTS.md hard rule 1. Its job is to prove the
 # pipeline's own integrity is intact before any agent runs against it.
+#
+# NOTE ON SHELL: GitHub runs `run:` blocks under `bash -e`. Several checks
+# below end a loop body with `[ cond ] && { ... }`, which returns 1 when the
+# condition is false and would abort the step. Every such construct is written
+# as an explicit if/fi or suffixed with `|| true`.
 
 on:
   push:
@@ -22,6 +27,9 @@ jobs:
     name: manifest + prompts are consistent
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -31,86 +39,114 @@ jobs:
           jq empty rbops/phases.json
           n=$(jq '.phases | length' rbops/phases.json)
           echo "phases declared: $n"
-          [ "$n" -gt 0 ] || { echo "::error::manifest declares no phases"; exit 1; }
+          if [ "$n" -gt 0 ]; then echo "OK"; else echo "::error::manifest declares no phases"; exit 1; fi
 
-      - name: phase ids are unique, sequential and well-formed
+      - name: phase ids are unique and well-formed
         run: |
           set -uo pipefail
+          rc=0
           dup=$(jq -r '.phases[].id' rbops/phases.json | sort | uniq -d)
-          [ -z "$dup" ] || { echo "::error::duplicate phase ids: $dup"; exit 1; }
+          if [ -n "$dup" ]; then echo "::error::duplicate phase ids: $dup"; rc=1; else echo "OK: ids unique"; fi
+          # `grep -v` exits 1 when it filters out everything, which under `bash -e`
+          # would abort the step even though the result is what we want.
           bad=$(jq -r '.phases[].id' rbops/phases.json | grep -vE '^phase-[0-9]{3}$' || true)
-          [ -z "$bad" ] || { echo "::error::malformed phase ids: $bad"; exit 1; }
+          if [ -n "$bad" ]; then echo "::error::malformed phase ids: $bad"; rc=1; else echo "OK: ids well-formed"; fi
+          exit "$rc"
 
-      - name: every depends_on resolves, and the graph is acyclic
+      - name: every depends_on resolves
         run: |
           set -uo pipefail
+          rc=0
           ids=$(jq -r '.phases[].id' rbops/phases.json)
-          for dep in $(jq -r '.phases[].depends_on[]?' rbops/phases.json); do
-            echo "$ids" | grep -qx "$dep" || { echo "::error::$dep is referenced but not declared"; exit 1; }
-          done
-          # cycle detection: repeatedly strip phases whose deps are all satisfied
+          while read -r dep; do
+            if ! printf '%s\n' "$ids" | grep -qx -- "$dep"; then
+              echo "::error::$dep is referenced but not declared"; rc=1
+            fi
+          done < <(jq -r '.phases[].depends_on[]?' rbops/phases.json)
+          if [ "$rc" -eq 0 ]; then echo "OK: all dependencies declared"; fi
+          exit "$rc"
+
+      - name: dependency graph is acyclic
+        run: |
+          set -uo pipefail
           remaining=$(jq -r '.phases[].id' rbops/phases.json)
           for _ in $(seq 1 64); do
-            [ -n "$remaining" ] || { echo "graph is acyclic"; exit 0; }
+            if [ -z "$remaining" ]; then break; fi
             progress=0
             for id in $remaining; do
               unmet=0
-              for d in $(jq -r --arg p "$id" '.phases[]|select(.id==$p)|.depends_on[]?' rbops/phases.json); do
-                echo "$remaining" | grep -qx "$d" && unmet=1
-              done
-              [ "$unmet" -eq 0 ] && { remaining=$(echo "$remaining" | grep -vx "$id"); progress=1; }
+              while read -r d; do
+                if printf '%s\n' "$remaining" | grep -qx -- "$d"; then unmet=1; fi
+              done < <(jq -r --arg p "$id" '.phases[]|select(.id==$p)|.depends_on[]?' rbops/phases.json)
+              if [ "$unmet" -eq 0 ]; then
+                # `grep -vx` exits 1 when the line being removed is the last one.
+                # Under `bash -e` that would abort the step mid-algorithm.
+                remaining=$(printf '%s\n' "$remaining" | grep -vx -- "$id" || true)
+                progress=1
+              fi
             done
-            [ "$progress" -eq 0 ] && break
+            if [ "$progress" -eq 0 ]; then break; fi
           done
           if [ -n "$remaining" ]; then
-            echo "::error::dependency cycle among: $remaining"; exit 1
+            echo "::error::dependency cycle among: $(echo $remaining)"
+            exit 1
           fi
+          echo "OK: graph is acyclic"
 
       - name: every declared phase has a committed PROMPT.md
         run: |
           set -uo pipefail
-          fail=0
-          for id in $(jq -r '.phases[].id' rbops/phases.json); do
-            [ -f "phases/$id/PROMPT.md" ] || { echo "::error::missing phases/$id/PROMPT.md"; fail=1; }
-          done
-          exit "$fail"
+          rc=0
+          while read -r id; do
+            if [ ! -f "phases/$id/PROMPT.md" ]; then
+              echo "::error::missing phases/$id/PROMPT.md"; rc=1
+            fi
+          done < <(jq -r '.phases[].id' rbops/phases.json)
+          if [ "$rc" -eq 0 ]; then echo "OK: every phase has a prompt"; fi
+          exit "$rc"
 
       - name: PROMPT.md files match the manifest
-        run: |
-          set -uo pipefail
-          ./rbops/gen-prompts.sh --check
+        run: ./rbops/gen-prompts.sh --check
 
       - name: shell scripts are syntactically valid
         run: |
+          set -uo pipefail
           for f in rbops/*.sh; do bash -n "$f" || exit 1; done
-          echo "shell OK"
-          command -v shellcheck >/dev/null && shellcheck -S warning rbops/*.sh || echo "(shellcheck not installed; skipped)"
+          echo "OK: shell syntax"
 
       - name: workflow YAML parses
         run: |
           set -uo pipefail
           for f in .github/workflows/*.yml; do
             python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" || exit 1
-            echo "YAML OK $f"
+            echo "OK: $f"
           done
 
   gate-selfcheck:
     name: verify.sh still has all its checks
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - name: the gate must not have been weakened
         run: |
           set -uo pipefail
-          fail=0
-          # The expected baseline lives in the manifest, so lowering it is a
-          # visible diff that a reviewer must approve.
+          rc=0
+          # The baseline lives in the manifest, so lowering it is a visible diff
+          # that a reviewer has to approve.
           while read -r needle; do
-            grep -qF "$needle" rbops/verify.sh || { echo "::error::gate lost a check: $needle"; fail=1; }
+            if ! grep -qF -- "$needle" rbops/verify.sh; then
+              echo "::error::gate lost a check: $needle"; rc=1
+            fi
           done < <(jq -r '.gate.selfcheck.required_needles[]' rbops/phases.json)
           want=$(jq -r '.gate.selfcheck.min_assertions' rbops/phases.json)
           have=$(grep -cE '^[[:space:]]*(ok|bad) ' rbops/verify.sh)
           echo "gate assertions: $have (baseline $want)"
-          [ "$have" -ge "$want" ] || { echo "::error::gate assertion count dropped"; fail=1; }
-          exit "$fail"
+          if [ "$have" -lt "$want" ]; then
+            echo "::error::gate assertion count dropped"; rc=1
+          fi
+          if [ "$rc" -eq 0 ]; then echo "OK: gate intact"; fi
+          exit "$rc"

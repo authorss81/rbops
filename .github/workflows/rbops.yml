@@ -41,7 +41,10 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # select: no checkout, one trees API call. Idle ticks cost ~nothing.
+  # select: checkout + `dispatch.sh select`. The workflow does NOT reimplement
+  # phase selection in YAML — that duplication is how the previous version came
+  # to believe the queue was drained while 23 phases were pending. One source of
+  # truth: rbops/dispatch.sh.
   # ---------------------------------------------------------------------------
   select:
     runs-on: ubuntu-latest
@@ -53,11 +56,11 @@ jobs:
       exists:  ${{ steps.s.outputs.exists }}
       action:  ${{ steps.s.outputs.action }}
     steps:
-      - name: Check for halt
+      - uses: actions/checkout@v4
+
+      - name: Select phase
         id: s
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
           INPUT_PHASE: ${{ inputs.phase }}
           INPUT_ACTION: ${{ inputs.action }}
         run: |
@@ -65,10 +68,10 @@ jobs:
           ACTION="${INPUT_ACTION:-tick}"
           PHASE="${INPUT_PHASE}"
 
-          if gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
-             | grep -qx 'phases/.stop'; then
+          if [ -f phases/.stop ]; then
             echo "::notice::phases/.stop present — pipeline halted."
-            echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           if [ "$ACTION" = "audit" ] || [ "$ACTION" = "status" ]; then
@@ -78,49 +81,21 @@ jobs:
             exit 0
           fi
 
+          if [ -z "$PHASE" ]; then
+            PHASE=$(./rbops/dispatch.sh select 2>/dev/null | tail -1)
+          fi
+
           if [ -n "$PHASE" ]; then
-            echo "phase=$PHASE" >> "$GITHUB_OUTPUT"
-            echo "exists=true"  >> "$GITHUB_OUTPUT"
-            echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::notice::selected $PHASE"
+            echo "phase=$PHASE"   >> "$GITHUB_OUTPUT"
+            echo "exists=true"    >> "$GITHUB_OUTPUT"
+            echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          else
+            ./rbops/dispatch.sh status || true
+            echo "::notice::queue drained."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "phase="       >> "$GITHUB_OUTPUT"
           fi
-
-          # resume a deferred phase first — cheapest continuity
-          D=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
-              | grep -E '^phases/phase-[0-9]+/\.deferred$' \
-              | cut -d/ -f2 | sort -V | head -1 || true)
-          if [ -n "$D" ]; then
-            echo "::notice::resuming deferred $D"
-            echo "phase=$D" >> "$GITHUB_OUTPUT"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "action=run"  >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # otherwise the first manifest phase with no .done and no .blocked
-          CAND=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
-              | grep -E '^phases/phase-[0-9]+/$' | cut -d/ -f2 | sort -V | head -1 || true)
-          if [ -n "$CAND" ]; then
-            DONE=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
-                   | grep -qx "phases/$CAND/.done" && echo yes || echo no)
-            BLK=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
-                  | grep -qx "phases/$CAND/.blocked" && echo yes || echo no)
-            if [ "$DONE" = "no" ] && [ "$BLK" = "no" ]; then
-              echo "phase=$CAND" >> "$GITHUB_OUTPUT"
-              echo "exists=true" >> "$GITHUB_OUTPUT"
-              echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          fi
-
-          BLOCKED=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
-                    | grep -cE '^phases/phase-[0-9]+/\.blocked$' || true)
-          [ "${BLOCKED:-0}" -gt 0 ] && \
-            echo "::warning::${BLOCKED} blocked phase(s) await human intervention"
-
-          echo "::notice::queue drained."
-          echo "exists=false" >> "$GITHUB_OUTPUT"
-          echo "phase="       >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # work: clone redblue, run the dispatcher. contents:write is required to
