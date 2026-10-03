@@ -1,7 +1,378 @@
 [0m
 > build · big-pickle
 [0m
-[91m[1mError: [0mOpenCode 1.18.0 or newer is required to use the free tier
-[91m[1mError: [0mYou must provide a message or a command
-[91m[1mError: [0mYou must provide a message or a command
-[91m[1mError: [0mYou must provide a message or a command
+[0m$ [0mcd /home/runner/work/rbops/rbops && cat src/testing/harness.rs | head -80
+cat: src/testing/harness.rs: No such file or directory
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops && find . -name "*.rs" | grep test
+./redblue/tests/redblue_test.rs
+./redblue/src/testing/runner.rs
+./redblue/src/testing/harness.rs
+./redblue/src/testing/reporter.rs
+./redblue/src/testing/assertions.rs
+./redblue/src/testing/mod.rs
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops && cat redblue/src/testing/harness.rs | head -160
+use crate::analyzer;
+use crate::error::{Error, Result};
+use crate::lexer::Lexer;
+use crate::parser::Parser;
+use crate::testing::{TestError, TestResults};
+use crate::vm::Vm;
+use std::collections::HashMap;
+
+pub struct TestHarness {
+    results: TestResults,
+    _globals: HashMap<String, crate::value::Value>,
+    _test_context: HashMap<String, crate::value::Value>,
+}
+
+impl TestHarness {
+    pub fn new() -> Self {
+        Self {
+            results: TestResults::new(),
+            _globals: crate::stdlib::builtins(),
+            _test_context: HashMap::new(),
+        }
+    }
+
+    pub fn run_source(&mut self, source: &str) -> Result<()> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut i = 0;
+
+        while i < lines.len() {
+            let line = lines[i].trim();
+
+            if line.starts_with("// test ") || line.starts_with("# test ") {
+                let test_name = line
+                    .trim_start_matches("// test ")
+                    .trim_start_matches("# test ");
+                self.run_single_test(&lines, &mut i, test_name)?;
+            } else if line.starts_with("// bench ") || line.starts_with("# bench ") {
+                let bench_name = line
+                    .trim_start_matches("// bench ")
+                    .trim_start_matches("# bench ");
+                self.run_benchmark(&lines, &mut i, bench_name)?;
+            } else if line.starts_with("// skip") || line.starts_with("# skip") {
+                let reason = if i + 1 < lines.len() {
+                    lines[i + 1].trim().to_string()
+                } else {
+                    "No reason provided".to_string()
+                };
+                self.results.add_skip();
+                println!("SKIP: {} - {}", lines.get(i).unwrap_or(&""), reason);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn run_file(&mut self, path: &str) -> Result<()> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| Error::Io(format!("Failed to read {}: {}", path, e)))?;
+
+        self.run_source(&source)
+    }
+
+    fn run_single_test(&mut self, lines: &[&str], i: &mut usize, test_name: &str) -> Result<()> {
+        let mut test_lines = Vec::new();
+        *i += 1;
+
+        while *i < lines.len() {
+            let line = lines[*i];
+            if line.trim().starts_with("// end") || line.trim() == "end" {
+                break;
+            }
+            test_lines.push(line);
+            *i += 1;
+        }
+
+        let test_code = test_lines.join("\n");
+
+        match self.execute_test_code(&test_code) {
+            Ok(()) => {
+                self.results.add_pass();
+                print!(".");
+            }
+            Err(e) => {
+                self.results.add_fail(TestError {
+                    test_name: test_name.to_string(),
+                    file: "inline".to_string(),
+                    line: Some(*i),
+                    message: e.to_string(),
+                    expected: None,
+                    actual: None,
+                });
+                print!("F");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run_benchmark(&mut self, lines: &[&str], i: &mut usize, bench_name: &str) -> Result<()> {
+        let mut bench_lines = Vec::new();
+        *i += 1;
+
+        while *i < lines.len() {
+            let line = lines[*i];
+            if line.trim().starts_with("// end") || line.trim() == "end" {
+                break;
+            }
+            bench_lines.push(line);
+            *i += 1;
+        }
+
+        println!("BENCHMARK: {} - Running...", bench_name);
+
+        let bench_code = bench_lines.join("\n");
+        let iterations = 1000;
+
+        let start = std::time::Instant::now();
+
+        for _ in 0..iterations {
+            let _ = self.execute_test_code(&bench_code);
+        }
+
+        let elapsed = start.elapsed();
+        let avg_ns = elapsed.as_nanos() / iterations as u128;
+
+        println!(
+            "  {}: {} ns/iter ({} iterations)",
+            bench_name, avg_ns, iterations
+        );
+
+        Ok(())
+    }
+
+    fn execute_test_code(&self, code: &str) -> Result<()> {
+        let tokens = Lexer::tokenize(code)?;
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse()?;
+        analyzer::analyze(&program)?;
+
+        let mut vm = Vm::new();
+        vm.run(&program)?;
+
+        Ok(())
+    }
+
+    pub fn add_error(&mut self, error: String) {
+        self.results.add_fail(TestError {
+            test_name: "File execution".to_string(),
+            file: "unknown".to_string(),
+            line: None,
+            message: error,
+            expected: None,
+            actual: None,
+        });
+    }
+
+    pub fn results(&self) -> TestResults {
+        self.results.clone()
+[0m
+[0m$ [0mcat redblue/src/testing/assertions.rs | head -200
+use crate::value::Value;
+
+pub trait Assertion<T> {
+    fn assert(self, actual: T) -> Result<(), TestAssertionError>;
+}
+
+pub struct Expected<T>(pub T);
+
+pub struct TestAssertionError {
+    pub message: String,
+    pub expected: Option<String>,
+    pub actual: Option<String>,
+}
+
+impl std::fmt::Debug for TestAssertionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        if let Some(expected) = &self.expected {
+            writeln!(f, "Expected: {}", expected)?;
+        }
+        if let Some(actual) = &self.actual {
+            writeln!(f, "Actual: {}", actual)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for TestAssertionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+pub fn assert_that<T: std::fmt::Debug + PartialEq + Clone>(actual: T) -> AssertThat<T> {
+    AssertThat { actual }
+}
+
+pub struct AssertThat<T> {
+    actual: T,
+}
+
+impl<T: std::fmt::Debug + PartialEq + Clone> AssertThat<T> {
+    pub fn is_equal_to(&self, expected: T) -> Result<(), TestAssertionError> {
+        if self.actual == expected {
+            Ok(())
+        } else {
+            Err(TestAssertionError {
+                message: format!("{:?} should equal {:?}", self.actual, expected),
+                expected: Some(format!("{:?}", expected)),
+                actual: Some(format!("{:?}", self.actual)),
+            })
+        }
+    }
+
+    pub fn is_not_equal_to(&self, not_expected: T) -> Result<(), TestAssertionError> {
+        if self.actual != not_expected {
+            Ok(())
+        } else {
+            Err(TestAssertionError {
+                message: format!("{:?} should NOT equal {:?}", self.actual, not_expected),
+                expected: Some(format!("NOT {:?}", not_expected)),
+                actual: Some(format!("{:?}", self.actual)),
+            })
+        }
+    }
+
+    pub fn is_same_as(&self, expected: &T) -> Result<(), TestAssertionError>
+    where
+        T: PartialEq,
+    {
+        if self.actual == *expected {
+            Ok(())
+        } else {
+            Err(TestAssertionError {
+                message: "Objects should be the same".to_string(),
+                expected: None,
+                actual: None,
+            })
+        }
+    }
+
+    pub fn is_none(&self) -> Result<(), TestAssertionError> {
+        Err(TestAssertionError {
+            message: "is_none not supported for this type".to_string(),
+            expected: None,
+            actual: None,
+        })
+    }
+
+    pub fn is_some(&self) -> Result<(), TestAssertionError>
+    where
+        T: std::fmt::Debug,
+    {
+        Err(TestAssertionError {
+            message: "is_some not supported for this type".to_string(),
+            expected: None,
+            actual: None,
+        })
+    }
+
+    pub fn contains(&self, item: &T) -> Result<(), TestAssertionError>
+    where
+        T: PartialEq + std::fmt::Debug,
+    {
+        if self.actual == *item {
+            Err(TestAssertionError {
+                message: format!("{:?} should contain {:?}", self.actual, item),
+                expected: Some(format!("Contains {:?}", item)),
+                actual: Some(format!("{:?}", self.actual)),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn assert_values_equal(expected: &Value, actual: &Value) -> Result<(), TestAssertionError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(TestAssertionError {
+            message: format!("Values not equal: {:?} vs {:?}", expected, actual),
+            expected: Some(format!("{:?}", expected)),
+            actual: Some(format!("{:?}", actual)),
+        })
+    }
+}
+
+pub fn assert_value_is_number(value: &Value) -> Result<(), TestAssertionError> {
+    match value {
+        Value::Number(_) => Ok(()),
+        _ => Err(TestAssertionError {
+            message: format!("Expected number but got {:?}", value),
+            expected: Some("number".to_string()),
+            actual: Some(format!("{:?}", value)),
+        }),
+    }
+}
+
+pub fn assert_value_is_text(value: &Value) -> Result<(), TestAssertionError> {
+    match value {
+        Value::Text(_) => Ok(()),
+        _ => Err(TestAssertionError {
+            message: format!("Expected text but got {:?}", value),
+            expected: Some("text".to_string()),
+            actual: Some(format!("{:?}", value)),
+        }),
+    }
+}
+
+pub fn assert_value_is_list(value: &Value) -> Result<(), TestAssertionError> {
+    match value {
+        Value::List(_) => Ok(()),
+        _ => Err(TestAssertionError {
+            message: format!("Expected list but got {:?}", value),
+            expected: Some("list".to_string()),
+            actual: Some(format!("{:?}", value)),
+        }),
+    }
+}
+
+pub fn assert_value_is_yes_no(value: &Value) -> Result<(), TestAssertionError> {
+    match value {
+        Value::YesNo(_) => Ok(()),
+        _ => Err(TestAssertionError {
+            message: format!("Expected yes/no but got {:?}", value),
+            expected: Some("yes/no".to_string()),
+            actual: Some(format!("{:?}", value)),
+        }),
+    }
+}
+
+pub fn assert_value_is_record(value: &Value) -> Result<(), TestAssertionError> {
+    match value {
+        Value::Record(_) => Ok(()),
+        _ => Err(TestAssertionError {
+            message: format!("Expected record but got {:?}", value),
+            expected: Some("record".to_string()),
+            actual: Some(format!("{:?}", value)),
+        }),
+    }
+}
+
+pub fn assert_list_length(list: &Value, expected: usize) -> Result<(), TestAssertionError> {
+    match list {
+        Value::List(items) => {
+            if items.len() == expected {
+                Ok(())
+            } else {
+                Err(TestAssertionError {
+                    message: format!("Expected list length {} but got {}", expected, items.len()),
+                    expected: Some(expected.to_string()),
+                    actual: Some(items.len().to_string()),
+                })
+            }
+        }
+        _ => Err(TestAssertionError {
+            message: format!("Expected list but got {:?}", list),
+            expected: Some("list".to_string()),
+            actual: Some(format!("{:?}", list)),
+[0m
