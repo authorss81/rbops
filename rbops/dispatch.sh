@@ -149,39 +149,61 @@ cmd_select() {
 # ------------------------------------------------------------------- execution
 # Runs the implementer agent against a chain of models, advancing on
 # infrastructure failure only. A real work error is kept, never swallowed.
+# RBOPS_PROMPT_FILE: the phase context (AGENTS.md + PROMPT.md) is passed as the
+# POSITIONAL message, never on stdin. `opencode run [message..]` does not read
+# stdin, so the `< ctx` idiom used by llops-android silently produces
+# "You must provide a message or a command" and a zero-byte no-op.
 run_agent() {
   local models="$1"; shift
   local logfile="$1"; shift
+  local prompt_file="${1:-}"; shift || true
   : > "$logfile"
-  local m code pre post growth IFS=,
+  local m code pre post growth msg IFS=,
+  # ARG_MAX on Linux is ~2MB; AGENTS.md + PROMPT.md is ~25KB, so a positional
+  # message is safe. Guard anyway so a runaway ctx fails loudly, not obscurely.
+  msg=""
+  if [ -n "$prompt_file" ] && [ -f "$prompt_file" ]; then
+    local bytes; bytes="$(wc -c < "$prompt_file")"
+    if [ "$bytes" -gt 500000 ]; then
+      log "prompt file is ${bytes} bytes — refusing to pass it as argv"
+      return 2
+    fi
+    msg="$(cat "$prompt_file")"
+  fi
   for m in $models; do
     m="$(printf '%s' "$m" | tr -d ' \r')"
     [ -n "$m" ] || continue
     log "model → $m"
     pre="$(wc -c < "$logfile")"
-    timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" >>"$logfile" 2>&1
+    if [ -n "$msg" ]; then
+      timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" "$msg" >>"$logfile" 2>&1
+    else
+      timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" >>"$logfile" 2>&1
+    fi
     code=$?
     post="$(wc -c < "$logfile")"; growth=$((post-pre))
-    # A model can exit 0 having produced nothing at all — an unknown model id,
-    # a bad request, or a CLI that gives up quietly. Accepting exit 0 as
-    # success is how a phase "passes" with zero work done, so require BOTH a
-    # zero exit AND real output before believing it.
+    # A model can exit 0 having produced nothing — an unknown model id, a free
+    # tier that has been revoked, or a CLI that gives up quietly. Accepting exit
+    # 0 as success is how a phase "passes" with zero work done, so require BOTH
+    # a zero exit AND real output before believing it.
     if [ "$code" -eq 0 ] && [ "$growth" -ge "${RBOPS_MIN_OUTPUT:-500}" ]; then
       log "model ok: $m (${growth} bytes)"; return 0
     fi
-    if [ "$code" -eq 0 ] && [ "$growth" -lt "${RBOPS_MIN_OUTPUT:-500}" ]; then
+    if [ "$code" -eq 0 ]; then
       log "model $m exited 0 but produced only ${growth} bytes — advancing chain"
-      tail -5 "$logfile" | sed 's/^/    | /'
+      tail -4 "$logfile" | sed 's/^/    | /'
       continue
     fi
     if infra_failure "$logfile" || [ "$growth" -lt 200 ]; then
-      log "model unusable ($m, exit $code) — advancing chain"; continue
+      log "model unusable ($m, exit $code) — advancing chain"
+      tail -4 "$logfile" | sed 's/^/    | /'
+      continue
     fi
     log "model failed with a real work error ($m, exit $code) — keeping result"
     return "$code"
   done
-  log "every model in the chain was unusable — this is an infra problem, not a phase problem"
-  return 1
+  log "every model in the chain was unusable — infra problem, not a phase problem"
+  return 75          # EX_TEMPFAIL: retry later, do NOT count a phase attempt
 }
 
 # Strict classifiers. The bare word "retry" must NOT match, or normal agent
@@ -192,15 +214,33 @@ infra_failure() {
 
 # Push work-in-progress every CHECKPOINT_SECS so a timeout or cancellation
 # never loses a partial phase.
+#
+# stdout/stderr MUST be redirected away from the caller. A background job that
+# inherits the pipe keeps it open for as long as it sleeps, so `$(dispatch.sh
+# ...)` and `dispatch.sh ... | tee` block until the 300s sleep expires — the
+# phase appears to hang even though the work finished in seconds.
 checkpoint_loop() {
   local phase="$1"
   while sleep "$CHECKPOINT_SECS"; do
     local tree commit
     tree="$(git add -A >/dev/null 2>&1; git write-tree 2>/dev/null)" || continue
     commit="$(git commit-tree "$tree" -p HEAD -m "rbops: ${phase} checkpoint $(date -u +%s)" 2>/dev/null)" || continue
-    git push -f "origin" "$commit:refs/heads/rbops-wip/${phase}" >/dev/null 2>&1 || true
+    git push -f origin "$commit:refs/heads/rbops-wip/${phase}" >/dev/null 2>&1 || true
     git reset --mixed HEAD >/dev/null 2>&1 || true
   done
+}
+
+start_checkpoint_loop() {
+  local phase="$1"
+  checkpoint_loop "$phase" >>"${LOG_DIR}/${phase}.checkpoint.log" 2>&1 &
+  CHECK_PID=$!
+}
+
+stop_checkpoint_loop() {
+  [ -n "${CHECK_PID:-}" ] || return 0
+  kill "$CHECK_PID" 2>/dev/null || true
+  wait "$CHECK_PID" 2>/dev/null || true
+  CHECK_PID=""
 }
 
 cmd_run() {
@@ -237,22 +277,30 @@ TPL
 
   need_rbx
   env_check "$phase" || return 3
-  checkpoint_loop "$phase" & local cp=$!
+  CHECK_PID=""
+  start_checkpoint_loop "$phase"
   local code
-  run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" \
-      --agent build --title "rbops-${phase}" < "$LOG_DIR/$phase.ctx"
+  run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" "$LOG_DIR/$phase.ctx" \
+      --agent build --title "rbops-${phase}"
   code=$?
-  kill "$cp" 2>/dev/null; wait "$cp" 2>/dev/null
+  stop_checkpoint_loop
 
   # --- classify -------------------------------------------------------------
-  if infra_failure "$LOG_DIR/$phase.log"; then
+  # A dead model chain (75) or an infra-shaped log is a RETRYABLE infra fault.
+  # It must never be counted as a phase attempt: nothing was attempted, so
+  # burning MAX_ATTEMPTS on it would block a phase that never even ran.
+  if [ "$code" = "75" ] || infra_failure "$LOG_DIR/$phase.log"; then
+    rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .done)"
     bump "$phase" .deferred_attempts
     local d; d="$(read_n "$phase" .deferred_attempts)"
     if [ "$d" -ge "$MAX_DEFERRALS" ]; then
-      touch "$(marker "$phase" .blocked)"; log "$phase BLOCKED after $d deferrals (infra)"
+      touch "$(marker "$phase" .blocked)"
+      log "$phase BLOCKED after $d deferrals — the model chain is unusable, this needs a human"
       return 3
     fi
-    touch "$(marker "$phase" .deferred)"; log "$phase DEFERRED ($d/$MAX_DEFERRALS) — infra, retry next tick"
+    touch "$(marker "$phase" .deferred)"
+    log "$phase DEFERRED ($d/$MAX_DEFERRALS) — infra, no attempt consumed, retry next tick"
+    tail -6 "$LOG_DIR/$phase.log" | sed 's/^/    | /'
     return 42
   fi
 
@@ -291,28 +339,76 @@ cmd_review() {
     round=$((round+1))
     log "review round $round for $phase"
 
-    run_agent "$REVIEW_MODELS" "$LOG_DIR/$phase.review.$round.log" \
-        --agent reviewer "Review phase ${phase} (round ${round}). Diff base: ${base}. Emit numbered FINDINGS with severity. Blockers: fake completion, panics, unbounded resources, nondeterminism, weakened gates, spec drift, missing edge-case tests."
+    # The reviewer agent is read-only AND has no shell, so it cannot run
+    # `git diff`. The change set has to be handed to it, and it must be the
+    # COMPLETE change set: committed, unstaged and untracked. Reading only
+    # `base..HEAD` hides any work the phase left uncommitted, which is exactly
+    # the work most worth reviewing.
+    local rctx="$LOG_DIR/$phase.review.$round.ctx"
+    {
+      printf '# Review request — round %s of phase %s\n\n' "$round" "$phase"
+      printf 'Rules: .opencode/agent/reviewer.md and AGENTS.md section 5.\n'
+      printf 'The gate is green. Your job is to find what is still wrong.\n\n'
+      printf '## 1. Committed changes (%s..HEAD)\n\n```diff\n' "$base"
+      git diff --no-color "$base"..HEAD 2>/dev/null || printf '(none)\n'
+      printf '```\n\n## 2. Uncommitted tracked changes\n\n```diff\n'
+      git diff --no-color 2>/dev/null || printf '(none)\n'
+      printf '```\n\n## 3. Untracked files (full contents)\n\n'
+      git status --porcelain 2>/dev/null | grep '^??' | sed 's/^?? //' | while read -r f; do
+        printf -- '--- %s\n```\n' "$f"
+        cat "$f" 2>/dev/null || printf '(unreadable)\n'
+        printf '```\n'
+      done
+      printf '\n## 4. The phase REPORT.md\n\n'
+      cat "phases/$phase/REPORT.md" 2>/dev/null || printf '(missing)\n'
+    } > "$rctx"
 
-    if ! grep -qiE 'FINDINGS:[[:space:]]*(none|0)|FINDINGS:[[:space:]]*$' "$LOG_DIR/$phase.review.$round.log" \
-       || grep -qE 'FINDINGS:' "$LOG_DIR/$phase.review.$round.log"; then
-      if ! grep -qE '\[(BLOCKER|CRITICAL)\]' "$LOG_DIR/$phase.review.$round.log"; then
-        log "no blocking findings — review clean"
-        break
-      fi
+    run_agent "$REVIEW_MODELS" "$LOG_DIR/$phase.review.$round.log" "$rctx" \
+        --agent reviewer --title "rbops-review-${phase}-${round}"
+
+    local rc_round=$?
+    if [ "$rc_round" = "75" ]; then
+      log "review round $round: model chain unusable — deferring, no attempt consumed"
+      return 42
+    fi
+
+    # Blocking findings present? The second clause is redundant-looking on
+    # purpose: it catches a reviewer that emitted FINDINGS but no severity tags.
+    if grep -qE '\[(BLOCKER|CRITICAL)\]' "$LOG_DIR/$phase.review.$round.log"; then
+      log "review round $round found blocking findings — fixing"
+    elif ! grep -qE '^\s*[0-9]+\.?\s*\[' "$LOG_DIR/$phase.review.$round.log"; then
+      log "review round $round produced no structured findings — treating as clean"
+      break
     else
-      log "no blocking findings — review clean"
+      log "review round $round found non-blocking findings only"
       break
     fi
 
     log "applying review fixes"
-    run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.fix.$round.log" \
-        --agent build --continue \
-        "Apply the review FINDINGS for phase ${phase} from the preceding review output. Fix every BLOCKER and CRITICAL. Do not weaken any gate, do not skip or ignore a test. Then re-run the four gates yourself."
+    local fctx="$LOG_DIR/$phase.fix.$round.ctx"
+    {
+      printf '# Fix the review findings for phase %s (round %s)\n\n' "$phase" "$round"
+      printf 'Read the reviewer output below and fix every BLOCKER and CRITICAL.\n'
+      printf 'Do not weaken any gate. Do not add #[ignore], `// skip`, or an'
+      printf ' allow(clippy:: suppression. Do not delete a test.\n'
+      printf 'Then re-run the four gates yourself.\n\n'
+      printf '## Reviewer output\n\n'
+      cat "$LOG_DIR/$phase.review.$round.log"
+    } > "$fctx"
+    run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.fix.$round.log" "$fctx" \
+        --agent build --title "rbops-fix-${phase}-${round}"
+    if [ "$?" = "75" ]; then
+      log "fix round $round: model chain unusable — deferring"
+      return 42
+    fi
 
     # --- re-gate after fixes. Mandatory. -----------------------------------
     log "re-running verify gate after review fixes"
-    RBOPS_BASE_REF="$base" "$VERIFY" "$phase" || { log "gate red after fixes — review loop continues"; continue; }
+    if RBOPS_BASE_REF="$base" "$VERIFY" "$phase"; then
+      log "gate still green after fixes"
+    else
+      log "gate red after fixes — review loop continues"
+    fi
   done
 
   if grep -qE '\[(BLOCKER|CRITICAL)\]' "$LOG_DIR/$phase.review.$round.log" 2>/dev/null; then
@@ -337,10 +433,24 @@ cmd_audit() {
     log "audit SKIPPED — OPENCODE_API_KEY is not set"; return 3
   fi
   log "audit pass — generating new phases from measured evidence"
-  run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" \
-      --agent auditor \
-      "Audit the redblue repository per .opencode/agent/auditor.md and AGENTS.md section 6. Measure, diff against SPEC.md and ROADMAP.md, and APPEND new phases to rbops/phases.json. Every phase needs file:line evidence. Do not invent work."
+  # The auditor needs to read the tree, so point it at the repo root rather than
+  # rbops/, and hand it the contract rather than assuming it remembers.
+  cat AGENTS.md > "$LOG_DIR/audit.ctx"
+  {
+    printf '\n\n---\n\n# AUDIT REQUEST\n\n'
+    printf 'Follow .opencode/agent/auditor.md and AGENTS.md section 6.\n'
+    printf 'The project under audit is the redblue checkout in this working directory.\n'
+    printf 'MEASURE it, DIFF reality against SPEC.md / ROADMAP.md / README.md,\n'
+    printf 'SAFETY-AUDIT this pipeline, then APPEND new phases to rbops/phases.json.\n'
+    printf 'Every phase needs a real file:line. Do not invent work.\n'
+  } >> "$LOG_DIR/audit.ctx"
+  run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" "$LOG_DIR/audit.ctx" \
+      --agent auditor --title "rbops-audit"
   local code=$?
+  if [ "$code" = "75" ]; then
+    log "audit DEFERRED — model chain unusable"
+    return 42
+  fi
   if "$JQ" empty "$PHASES" 2>/dev/null; then
     log "phases.json still valid JSON after audit"
   else
