@@ -72,11 +72,17 @@ try {
   Write-Output ("   id={0} read_only={1}" -f $created.id, $created.read_only)
   if ($created.read_only) { throw 'GitHub created the key read-only; expected write' }
 
-  Write-Output '-- saving private half as secret REDBLUE_DEPLOY_KEY'
-  Get-Content $key -Raw | gh secret set REDBLUE_DEPLOY_KEY --repo $Pipe 2>&1 | Out-Null
+  Write-Output '-- saving private half (base64, newline-immune) as REDBLUE_DEPLOY_KEY'
+  # Base64 on a single line: PEM newlines are what got mangled somewhere between
+  # the local file, the secret store and the runner, so they leave the transport
+  # entirely. The workflow decodes, auto-detecting the old raw format.
+  $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($key))
+  $b64 | gh secret set REDBLUE_DEPLOY_KEY --repo $Pipe 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'gh secret set failed' }
   $hit = Invoke-Native gh secret list --repo $Pipe | Select-String 'REDBLUE_DEPLOY_KEY'
   Write-Output ("   secret present: {0}" -f $hit.Line.Trim())
+  $fpLocal = (Invoke-Native ssh-keygen -lf "$key.pub" | Select-Object -First 1).Trim()
+  Write-Output ("   public fingerprint (must match the workflow log): {0}" -f $fpLocal)
 
   # End-to-end proof: clone over SSH with ONLY this key, then dry-run a push.
   # A dry-run changes nothing but fails exactly like a real push would.

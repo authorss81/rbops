@@ -181,7 +181,21 @@ jobs:
 
           if [ -n "${REDBLUE_DEPLOY_KEY:-}" ]; then
             mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
-            printf '%s' "$REDBLUE_DEPLOY_KEY" > "$SSHKEY"; chmod 600 "$SSHKEY"
+            # The secret holds base64 (single line, newline-immune); older
+            # rotations stored raw PEM, which is still accepted.
+            if printf '%s' "$REDBLUE_DEPLOY_KEY" | grep -q 'BEGIN OPENSSH PRIVATE KEY'; then
+              printf '%s' "$REDBLUE_DEPLOY_KEY" > "$SSHKEY"
+            else
+              printf '%s' "$REDBLUE_DEPLOY_KEY" | base64 -d > "$SSHKEY" \
+                || { echo "::error::REDBLUE_DEPLOY_KEY is neither PEM nor base64"; exit 1; }
+            fi
+            chmod 600 "$SSHKEY"
+            # Safe diagnostics, always printed: byte count and the PUBLIC
+            # fingerprint. Neither leaks the key, and together they settle any
+            # "server rejected the key" question in one glance — compare with
+            # the fingerprint printed by rbops/setup-deploy-key.ps1.
+            echo "key bytes: $(wc -c < "$SSHKEY")"
+            ssh-keygen -lf "$SSHKEY" 2>&1 || echo "::error::key file is not a valid private key"
             ssh-keyscan -t ed25519 github.com > "$HOME/.ssh/known_hosts_rbops" 2>/dev/null
             if ! grep -q 'github.com ssh-ed25519' "$HOME/.ssh/known_hosts_rbops"; then
               echo "::error::ssh-keyscan returned no host key — cannot trust github.com"
