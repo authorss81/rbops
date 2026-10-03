@@ -1,0 +1,478 @@
+{
+  "$schema": "./phases.schema.json",
+  "version": 1,
+  "project": {
+    "name": "redblue",
+    "repo": "authorss81/redblue",
+    "language": "rust",
+    "src_glob": "src/**/*.rs",
+    "test_globs": ["tests/**/*.rs", "tests/**/*.rb"],
+    "examples_glob": "examples/*.rb",
+    "invariants_file": "phases/INVARIANTS.md"
+  },
+  "gate": {
+    "command": "./rbops/verify.sh",
+    "steps": [
+      "cargo fmt --all -- --check",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo test --all-targets",
+      "cargo test --doc",
+      "./rbops/verify.sh"
+    ],
+    "min_changed_lines": 5,
+    "require_report": true,
+    "selfcheck": {
+      "min_assertions": 21,
+      "required_needles": [
+        "forbidden path touched",
+        "gate-weakening construct added",
+        "diff too small",
+        "cargo fmt --check",
+        "cargo clippy",
+        "cannot fail is not a suite",
+        "example fails",
+        "test quota not met",
+        "no test named edge_",
+        "no test asserts a failure",
+        "newly skipped/ignored tests",
+        "reported test count",
+        "is NOT declared"
+      ]
+    },
+    "reject_paths": [
+      ".github/workflows/",
+      "rbops/",
+      ".opencode/agent/",
+      "rbops/phases.json"
+    ],
+    "forbid_diff_patterns": [
+      "#\\[ignore\\]",
+      "// skip",
+      "allow\\(clippy",
+      "allow\\(dead_code",
+      "expect\\(.*\\)\\s*;\\s*//.*ignore",
+      "\\.unwrap\\(\\)\\s*//\\s*(ok|fine|ignore)"
+    ]
+  },
+  "test_policy": {
+    "min_rust_tests": 6,
+    "min_redblue_tests": 4,
+    "min_edge_named_tests": 1,
+    "min_failure_asserting_tests": 1,
+    "max_allowed_skipped_delta": 0,
+    "edge_matrix": [
+      "empty", "singleton", "boundary", "out_of_bounds", "type_mismatch",
+      "numeric_boundary", "unicode", "nesting_recursion",
+      "duplicate_missing_keys", "malformed_input", "resource_limit"
+    ]
+  },
+  "review": {
+    "required_for_severity": ["blocker", "critical", "major", "minor"],
+    "max_rounds": 3,
+    "blocking_severities": ["blocker", "critical"],
+    "rerun_gate_after_fixes": true
+  },
+  "budget": {
+    "max_attempts": 3,
+    "max_deferrals": 5,
+    "default_timeout_min": 90,
+    "checkpoint_interval_sec": 300,
+    "starve_after_idle_runs": 3
+  },
+  "audit": {
+    "every_n_phases": 8,
+    "agent": "auditor",
+    "may_append_phases": true,
+    "requires_file_line_evidence": true
+  },
+  "models": {
+    "implementer": [
+      "opencode/big-pickle",
+      "openrouter/thinkingmachines/inkling:free",
+      "opencode/nemotron-3-ultra-free",
+      "openrouter/poolside/laguna-s-2.1:free"
+    ],
+    "reviewer": [
+      "openrouter/thinkingmachines/inkling:free",
+      "opencode/nemotron-3-ultra-free"
+    ],
+    "auditor": [
+      "opencode/big-pickle",
+      "opencode/muse-spark-1.3-contributor-free"
+    ]
+  },
+  "phases": [
+    {
+      "id": "phase-001",
+      "title": "Make the test harness capable of failing",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "src/testing/harness.rs:execute_test_code() only returns Err on a parse/runtime error. No assertion is ever evaluated, so a Redblue test can only fail by crashing. src/testing/assertions.rs (19 assertion fns) is dead code: only referenced by `pub use assertions::*` in testing/mod.rs.",
+      "goal": "Wire real assertions into the harness so `expect x to be 5` inside a `test` block fails the test.",
+      "accept": [
+        "harness.rs evaluates Expr::Expect and returns TestAssertionError on mismatch",
+        "assertions.rs is called, not dead code",
+        "a deliberately WRONG test (expect 1 to be 2) is observed to FAIL",
+        "cargo test proves a failing test fails"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-002",
+      "title": "Fix test discovery: stop feeding Rust source to the Redblue harness",
+      "severity": "blocker",
+      "depends_on": ["phase-001"],
+      "risk": "low",
+      "finding": "src/testing/mod.rs:run_all_tests() scans tests/ for BOTH `.rs` and `.rb`, so tests/redblue_test.rs (Rust source) is parsed as Redblue code and reported as a failure. Discovery also requires lines starting with `// test `.",
+      "goal": "Separate the two suites. Rust tests run under cargo test; only `.rb` files go through the Redblue harness.",
+      "accept": [
+        "run_all_tests() only collects .rb",
+        "rb test reports 0 errors for the Rust suite",
+        "no .rs path is ever read by the Redblue harness"
+      ],
+      "timeout_min": 60
+    },
+    {
+      "id": "phase-003",
+      "title": "Write a real Redblue test suite",
+      "severity": "blocker",
+      "depends_on": ["phase-001", "phase-002"],
+      "risk": "medium",
+      "finding": "tests/suite.rb, tests/integration_test.rb, tests/test_arithmetic.rb are 100% commented out. The repo's entire Redblue-language test suite is zero tests.",
+      "goal": "Replace the commented placeholders with real, assertion-bearing `test` blocks covering arithmetic, text, lists, records, control flow, functions, objects, modules.",
+      "accept": [
+        ">= 40 Redblue test blocks, all with assertions",
+        ">= 8 named edge_*",
+        ">= 5 tests that assert a failure is produced",
+        "cargo test and rb test both green, non-zero counts"
+      ],
+      "timeout_min": 180
+    },
+    {
+      "id": "phase-004",
+      "title": "Deterministic Record ordering",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "src/value.rs:11 Record(HashMap<String, Value>) and Value::Display (value.rs:34-40) iterate the map, so `say` and `json.stringify` on a record emit keys in random order per process.",
+      "goal": "Preserve insertion order for records and objects.",
+      "accept": [
+        "record display order is stable across processes",
+        "json.stringify round-trips and is stable",
+        "edge test: 20-key record prints in insertion order, run 50x, identical",
+        "duplicate-key last-wins semantics tested"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-005",
+      "title": "Source spans on every error",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "src/error.rs carries only String. Parser errors like `Error::Parser(\"Unexpected token ...\")` give no file, line or column, unlike the lexer which already tracks line/column.",
+      "goal": "Attach file:line:col to Parser, Analyzer and Runtime errors and render a caret diagnostic.",
+      "accept": [
+        "every Parser/Analyzer/Runtime error carries line and column",
+        "diagnostic renders source line + caret",
+        "edge tests: error on line 1, error on last line, empty file, multi-byte UTF-8 column offsets",
+        "no error path constructs a variant without a span"
+      ],
+      "timeout_min": 180
+    },
+    {
+      "id": "phase-006",
+      "title": "Bounded call depth in the VM",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "high",
+      "finding": "src/vm.rs has no frame or recursion counter (grep for depth|stack|limit in vm.rs returns only a string-splitting depth at line 990). Infinite or deep recursion aborts the process with a Rust stack overflow instead of a clean Runtime error.",
+      "goal": "Add a configurable call-depth limit producing a catchable Runtime error.",
+      "accept": [
+        "MAX_CALL_DEPTH constant, default 1000, overridable by env/flag",
+        "infinite recursion -> RuntimeError, process exit code 1, no abort",
+        "deep-but-legal recursion at depth 999 still succeeds",
+        "mutual recursion across two functions also bounded",
+        "error message names the function and the depth"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-007",
+      "title": "Numeric edge semantics",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "Value::Number is f64 with no documented policy for division by zero, NaN, or Infinity. `say` of NaN/Inf (value.rs:21-27) is undefined behaviour to a reader.",
+      "goal": "Define and implement total numeric semantics.",
+      "accept": [
+        "x/0 and x%0 produce a Runtime error (decided and documented in SPEC.md)",
+        "NaN and Infinity cannot enter Value::Number silently",
+        "int overflow past 2^53 documented",
+        "0/0, 1/0, -1/0, -0.0, NaN.compare, sqrt(-1) all have defined tested outcomes",
+        "display of every non-finite value is specified"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-008",
+      "title": "Out-of-bounds and type errors are errors, never panics",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "Direct `Value` indexing and field access are not proven panic-free across all value shapes.",
+      "goal": "Prove and enforce total indexing and field access.",
+      "accept": [
+        "index -1, index len, index 999 on a list -> Runtime error",
+        "field access on Number/Text/List -> Runtime error, not panic",
+        "missing record key returns a defined value (decided + documented) or errors",
+        "nested path a at 0 at 0 with a short inner list -> error",
+        "no `unwrap()`/`panic!`/direct index survives on a user-reachable path"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-009",
+      "title": "Lexer robustness: malformed and non-ASCII input",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "src/lexer.rs returns `Error::Lexer(String)`. Untested: unterminated strings, CRLF, BOM, NUL bytes, invalid UTF-8 file reads.",
+      "goal": "Every byte sequence produces either a correct token stream or a spanned lexer error.",
+      "accept": [
+        "unterminated string -> spanned error",
+        "CRLF and lone CR handled",
+        "BOM stripped, not tokenized as an identifier",
+        "invalid UTF-8 file -> Io error, not panic",
+        "NUL and control chars rejected with column",
+        "emoji / CJK / RTL / combining marks inside strings round-trip"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-010",
+      "title": "Parser hardening: empty file, stray tokens, deep nesting",
+      "severity": "major",
+      "depends_on": ["phase-005"],
+      "risk": "medium",
+      "finding": "No evidence of tests for empty input, EOF mid-construct, or pathological nesting depth.",
+      "goal": "Parser never panics and never loops forever.",
+      "accept": [
+        "empty file, whitespace-only, comment-only all parse to an empty Program",
+        "unclosed `end`, unclosed string, stray operator, unclosed bracket -> spanned Parser error",
+        "1000-deep nested list literal -> bounded error or success, no stack overflow",
+        "parse is O(n) on a 100k-token input (add a bench)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-011",
+      "title": "Closure capture and lexical scoping",
+      "severity": "critical",
+      "depends_on": ["phase-006"],
+      "risk": "high",
+      "finding": "Value::Function(String, Vec<String>) stores only a name and parameter names (value.rs:13) — there is no captured environment. Nested functions and recursion over closures are therefore unsound or unimplemented.",
+      "goal": "Make function values carry a captured environment, or document and enforce that closures are unsupported with a clean error.",
+      "accept": [
+        "decide: real closures OR explicit unsupported-error",
+        "shadowing, capture-by-value vs by-reference decided and documented",
+        "3+ nested scope depth tested",
+        "mutual recursion tested"
+      ],
+      "timeout_min": 240
+    },
+    {
+      "id": "phase-012",
+      "title": "Object model: inheritance and method dispatch",
+      "severity": "major",
+      "depends_on": ["phase-011"],
+      "risk": "high",
+      "finding": "Value::Object(String, HashMap<String,Value>) flattens everything; parser.rs supports a parent reference but the runtime model for it is unproven.",
+      "goal": "One coherent object model, tested.",
+      "accept": [
+        "inheritance resolves method lookup in a defined order",
+        "field shadowing defined and documented",
+        "extending a frozen/nested object tested",
+        "cycle in the parent chain -> clean error, no infinite loop"
+      ],
+      "timeout_min": 240
+    },
+    {
+      "id": "phase-013",
+      "title": "Bounded loops and interruptible execution",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "`for … times N` and `while` (if present) have no iteration cap and no cancellation hook, so a runaway loop cannot be stopped or tested.",
+      "goal": "Every loop is bounded and interruptible.",
+      "accept": [
+        "MAX_ITERATIONS with a clean Runtime error on exceed",
+        "step budget so a test harness can bound a program",
+        "edge tests: 0 iterations, max iterations, max+1",
+        "infinite loop is testable and terminates"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-014",
+      "title": "Standard library: real filesystem and process modules",
+      "severity": "major",
+      "depends_on": ["phase-005"],
+      "risk": "medium",
+      "finding": "stdlib.rs exposes files/time/json/csv/network but there is no test coverage and no isolated temp-dir discipline.",
+      "goal": "Make stdlib testable and total.",
+      "accept": [
+        "all fs functions tested against a per-test temp dir",
+        "missing file, permission denied, path with spaces, path traversal all defined",
+        "json.parse/stringify round-trip incl. nested, unicode, escapes, empty containers",
+        "csv.parse handles quotes, embedded commas, CRLF, ragged rows",
+        "network module has a documented timeout and is disabled in tests"
+      ],
+      "timeout_min": 180
+    },
+    {
+      "id": "phase-015",
+      "title": "Formatter must be idempotent and lossless",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "src/formatter.rs (431 lines) has zero tests. `rb format --check` compares trimmed strings, so trailing-whitespace and newline differences pass.",
+      "goal": "format(format(x)) == format(x) for every corpus file, and format never changes semantics.",
+      "accept": [
+        "idempotence property test over examples/ + tests/",
+        "format then parse gives an equivalent AST for every example",
+        "--check compares exactly, including trailing newline",
+        "formatter preserves comments"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-016",
+      "title": "Linter must not produce false positives",
+      "severity": "minor",
+      "depends_on": ["phase-003"],
+      "risk": "low",
+      "finding": "src/linter.rs (257 lines) has zero tests; it reports `errors` that make `rb lint` exit 1.",
+      "goal": "Linter output is trustworthy.",
+      "accept": [
+        "zero false positives across examples/ and tests/",
+        "every rule has a positive and a negative test",
+        "rule for shadowing, unused variable, unused import, missing end",
+        "lint never panics on malformed source"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-017",
+      "title": "Language server / editor support scaffolding",
+      "severity": "minor",
+      "depends_on": ["phase-005", "phase-011"],
+      "risk": "low",
+      "finding": "tooling/vscode/README.md and tooling/repl/README.md are placeholders only.",
+      "goal": "A grammar file + LSP skeleton so tooling can attach.",
+      "accept": [
+        "TextMate grammar covers the keyword set",
+        "diagnostics surface phase-005 spanned errors",
+        "no build step required for the grammar to be valid"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-018",
+      "title": "Bytecode format and disassembler (bootstrap S1a)",
+      "severity": "major",
+      "depends_on": ["phase-001", "phase-002", "phase-003", "phase-004", "phase-005", "phase-006", "phase-007", "phase-008", "phase-010", "phase-011", "phase-013"],
+      "risk": "high",
+      "finding": "Redblue is tree-walking only; there is no bytecode representation to bootstrap toward.",
+      "goal": "Define a stable, versioned bytecode format plus `rb compile` and `rb dis`.",
+      "accept": [
+        "docs/BYTECODE.md specifies the format, version, and encoding",
+        "rb compile emits .rbc for every examples/*.rb",
+        "rb dis round-trips and output is deterministic",
+        "unknown opcode version -> clean error"
+      ],
+      "timeout_min": 300
+    },
+    {
+      "id": "phase-019",
+      "title": "Bytecode virtual machine (bootstrap S1b)",
+      "severity": "major",
+      "depends_on": ["phase-018"],
+      "risk": "high",
+      "finding": "No bytecode execution path exists.",
+      "goal": "`rb vm file.rbc` executes bytecode with the same observable behaviour as the tree-walker.",
+      "accept": [
+        "differential test: tree-walk vs bytecode produce identical output for a >=200 program corpus",
+        "identical error kinds and messages",
+        "step budget and call depth enforced in the bytecode VM too",
+        "no native stack overflow path"
+      ],
+      "timeout_min": 360
+    },
+    {
+      "id": "phase-020",
+      "title": "Differential + property test harness",
+      "severity": "major",
+      "depends_on": ["phase-019"],
+      "risk": "medium",
+      "finding": "No differential or property testing infrastructure exists; this is what makes S3 provable.",
+      "goal": "A corpus-driven differential runner plus a property-test generator.",
+      "accept": [
+        "corpus/ of >=200 .rb programs, each with an expected-output file",
+        "random program generator with a seed, reproducible",
+        "shrinker prints a minimal failing program",
+        "wired into cargo test"
+      ],
+      "timeout_min": 240
+    },
+    {
+      "id": "phase-021",
+      "title": "Write the Redblue compiler in Redblue (bootstrap S2)",
+      "severity": "major",
+      "depends_on": ["phase-020"],
+      "risk": "critical",
+      "finding": "The self-hosted path does not exist yet.",
+      "goal": "A lexer+parser+code generator for Redblue, written in Redblue, under bootstrap/.",
+      "accept": [
+        "bootstrap/compiler.rb is itself valid Redblue and passes rb lint",
+        "running it under the Rust rb on the corpus produces .rbc files",
+        "output is byte-identical to the Rust rb compile for the whole corpus",
+        "no Rust-only fast path is reachable from this path"
+      ],
+      "timeout_min": 600
+    },
+    {
+      "id": "phase-022",
+      "title": "Self-hosting fixed point (bootstrap S3)",
+      "severity": "major",
+      "depends_on": ["phase-021"],
+      "risk": "critical",
+      "finding": "S2 exists but nothing proves it can build itself.",
+      "goal": "stage1.rbc and stage2.rbc are byte-identical.",
+      "accept": [
+        "rb vm stage1.rbc -> stage2.rbc, byte-identical to stage1.rbc over the corpus",
+        "the fixed-point check runs in CI on every push",
+        "three consecutive runs produce identical bytes (determinism)",
+        "documented in docs/BOOTSTRAP.md"
+      ],
+      "timeout_min": 480
+    },
+    {
+      "id": "phase-023",
+      "title": "Ship the self-hosted compiler as rb (bootstrap S4)",
+      "severity": "major",
+      "depends_on": ["phase-022"],
+      "risk": "critical",
+      "finding": "Final rung.",
+      "goal": "The released binary is produced by Redblue itself.",
+      "accept": [
+        "release pipeline builds rb via the stage2 compiler",
+        "the resulting rb passes the full four-gate suite",
+        "bootstrap instructions are reproducible from a clean checkout",
+        "a rollback path to the Rust compiler is documented and tested"
+      ],
+      "timeout_min": 600
+    }
+  ]
+}

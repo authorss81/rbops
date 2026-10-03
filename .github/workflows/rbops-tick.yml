@@ -1,0 +1,50 @@
+name: rbops-tick
+
+# Safety net. The primary path is rbops.yml's `retrigger` job, which chains to
+# the next phase in ~10-30s. This cron exists so a lost dispatch, a runner
+# eviction, or a failed re-dispatch does not stall the pipeline for more than
+# one interval.
+#
+# NOTE: this job must have `contents: write`. repository_dispatch is a write
+# operation; with `contents: read` GitHub returns 403 and this safety net is
+# silently useless. That bug is present in the design this borrows from.
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: rbops-tick
+  cancel-in-progress: true      # this is a no-op dispatcher; overlap is fine
+
+permissions:
+  contents: write
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check for in-flight run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          N=$(gh api -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/actions/runs?status=in_progress&per_page=20" \
+              --jq '[.workflow_runs[] | select(.name | startswith("rbops"))] | length' 2>/dev/null || echo 0)
+          if [ "$N" != "0" ]; then
+            echo "::notice::$N rbops run(s) already in progress — skipping tick"
+            exit 0
+          fi
+
+      - name: Dispatch tick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 5
+          gh api -X POST -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/dispatches" \
+            -f "event_type=rbops_tick" \
+            -f "client_payload[reason]=safety_net_cron" \
+            || echo "::warning::dispatch failed"

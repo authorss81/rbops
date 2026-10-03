@@ -1,0 +1,301 @@
+name: rbops
+
+# =============================================================================
+# RBOPS — self-dispatching, self-auditing pipeline for the redblue language.
+#
+# Unlike the llops design, this one cannot be fooled by an agent that merely
+# claims success. `rbops/verify.sh` is a real gate whose non-zero exit blocks
+# `.done`, and it runs the four gates itself.
+#
+# The bot token deliberately has NO `workflows` permission, so a push that
+# touches .github/ is refused by GitHub. That is the lock that makes the gate
+# trustworthy: the implementer cannot edit its own gate.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Force a phase (e.g. phase-001). Empty = auto-select."
+        required: false
+        default: ""
+      action:
+        description: "tick | run | review | audit | status"
+        required: false
+        default: "tick"
+      no_retrigger:
+        description: "Do not chain to the next tick"
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'logs/**'
+      - 'docs/audits/**'
+  repository_dispatch:
+    types: [rbops_tick]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # select: no checkout, one trees API call. Idle ticks cost ~nothing.
+  # ---------------------------------------------------------------------------
+  select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      phase:   ${{ steps.s.outputs.phase }}
+      exists:  ${{ steps.s.outputs.exists }}
+      action:  ${{ steps.s.outputs.action }}
+    steps:
+      - name: Check for halt
+        id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          INPUT_PHASE: ${{ inputs.phase }}
+          INPUT_ACTION: ${{ inputs.action }}
+        run: |
+          set -uo pipefail
+          ACTION="${INPUT_ACTION:-tick}"
+          PHASE="${INPUT_PHASE}"
+
+          if gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
+             | grep -qx 'phases/.stop'; then
+            echo "::notice::phases/.stop present — pipeline halted."
+            echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          if [ "$ACTION" = "audit" ] || [ "$ACTION" = "status" ]; then
+            echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "phase="       >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$PHASE" ]; then
+            echo "phase=$PHASE" >> "$GITHUB_OUTPUT"
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # resume a deferred phase first — cheapest continuity
+          D=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
+              | grep -E '^phases/phase-[0-9]+/\.deferred$' \
+              | cut -d/ -f2 | sort -V | head -1 || true)
+          if [ -n "$D" ]; then
+            echo "::notice::resuming deferred $D"
+            echo "phase=$D" >> "$GITHUB_OUTPUT"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "action=run"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # otherwise the first manifest phase with no .done and no .blocked
+          CAND=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
+              | grep -E '^phases/phase-[0-9]+/$' | cut -d/ -f2 | sort -V | head -1 || true)
+          if [ -n "$CAND" ]; then
+            DONE=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
+                   | grep -qx "phases/$CAND/.done" && echo yes || echo no)
+            BLK=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
+                  | grep -qx "phases/$CAND/.blocked" && echo yes || echo no)
+            if [ "$DONE" = "no" ] && [ "$BLK" = "no" ]; then
+              echo "phase=$CAND" >> "$GITHUB_OUTPUT"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "action=${ACTION}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          BLOCKED=$(gh api "repos/$REPO/git/trees/HEAD?recursive=1" --jq '.tree[].path' \
+                    | grep -cE '^phases/phase-[0-9]+/\.blocked$' || true)
+          [ "${BLOCKED:-0}" -gt 0 ] && \
+            echo "::warning::${BLOCKED} blocked phase(s) await human intervention"
+
+          echo "::notice::queue drained."
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+          echo "phase="       >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # work: clone redblue, run the dispatcher. contents:write is required to
+  # push phase work; it is NOT granted any workflow scope, so the bot cannot
+  # rewrite its own gate.
+  # ---------------------------------------------------------------------------
+  work:
+    needs: select
+    if: needs.select.outputs.exists == 'true' && needs.select.outputs.action != 'status'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # push phase work. NO `workflows` scope.
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install jq and ripgrep
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq ripgrep
+
+      - name: Install opencode (pinned)
+        run: |
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rbops-${{ runner.os }}-${{ hashFiles('rbops/phases.json') }}
+          restore-keys: rbops-${{ runner.os }}-
+
+      - name: Clone redblue
+        run: |
+          git clone --depth 50 https://github.com/authorss81/redblue.git redblue
+          echo "RBOPS_REPO=$PWD/redblue" >> "$GITHUB_ENV"
+
+      - name: Fetch WIP checkpoint
+        continue-on-error: true
+        run: |
+          cd redblue
+          git fetch origin "+refs/heads/rbops-wip/*:refs/remotes/origin/rbops-wip/*" || true
+
+      # Warm the build so the phase's own gate is fast.
+      - name: Warm cargo cache
+        working-directory: redblue
+        run: cargo build --all-targets
+
+      - name: Dispatch
+        id: d
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RBOPS_PHASE: ${{ needs.select.outputs.phase }}
+          RBOPS_RETRIGGER: ${{ inputs.no_retrigger && '0' || '1' }}
+          RBOPS_IMPL_MODELS: opencode/big-pickle,openrouter/thinkingmachines/inkling:free,opencode/nemotron-3-ultra-free,openrouter/poolside/laguna-s-2.1:free
+          RBOPS_REVIEW_MODELS: openrouter/thinkingmachines/inkling:free,opencode/nemotron-3-ultra-free
+          RBOPS_AUDIT_MODELS: opencode/big-pickle,opencode/muse-spark-1.3-contributor-free
+          RBOPS_MODEL_TIMEOUT: 3000
+          RBOPS_MAX_REVIEW_ROUNDS: 3
+        run: |
+          set -uo pipefail
+          PHASE="${RBOPS_PHASE}"
+          if [ "${{ needs.select.outputs.action }}" = "audit" ]; then
+            bash rbops/dispatch.sh audit; rc=$?
+          else
+            bash rbops/dispatch.sh run "$PHASE" || rc=$?
+            rc=${rc:-0}
+            if [ "$rc" = "0" ]; then
+              bash rbops/dispatch.sh review "$PHASE" || rc=$?
+            fi
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Push phase work
+        if: always()
+        env:
+          GIT_NAME: rbops-bot
+          GIT_EMAIL: rbops-bot@users.noreply.github.com
+        run: |
+          set -uo pipefail
+          cd redblue
+          git config user.name "$GIT_NAME"
+          git config user.email "$GIT_EMAIL"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::notice::clean tree — nothing to push"; exit 0
+          fi
+          git add -A
+          git commit -m "rbops: ${RBOPS_PHASE} ($(date -u +%Y-%m-%dT%H:%M:%SZ))" || exit 0
+          for i in 1 2 3 4 5; do
+            git push origin HEAD:main && { echo "pushed"; exit 0; }
+            git pull --rebase origin main || true
+            sleep 3
+          done
+          git branch -f "rbops-recovery/${RBOPS_PHASE}" HEAD
+          git format-patch -1 --stdout > "../recovery-${RBOPS_PHASE}.patch" || true
+          echo "::error::push failed after 5 attempts — recovery branch + patch saved"
+
+      - name: Push RBOPS state
+        if: always()
+        run: |
+          set -uo pipefail
+          git config user.name rbops-bot
+          git config user.email rbops-bot@users.noreply.github.com
+          mkdir -p phases logs
+          cp -r redblue/phases/. phases/ 2>/dev/null || true
+          cp -r redblue/logs/. logs/ 2>/dev/null || true
+          [ -n "$(git status --porcelain phases logs)" ] || { echo "no state change"; exit 0; }
+          git add phases logs
+          git commit -m "rbops: state after ${RBOPS_PHASE}" || exit 0
+          for i in 1 2 3 4 5; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main || true; sleep 3
+          done
+
+      - name: Upload recovery artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rbops-${{ needs.select.outputs.phase || 'audit' }}
+          path: |
+            recovery-*.patch
+            logs/*.log
+          retention-days: 14
+
+      - name: Report status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          rc="${{ steps.d.outputs.rc }}"
+          if [ -f "redblue/phases/${RBOPS_PHASE}/.blocked" ]; then
+            TITLE="RBOPS blocked: ${RBOPS_PHASE}"
+            if ! gh issue list --state open --search "$TITLE in:title" --json number | grep -q number; then
+              gh issue create --title "$TITLE" --body "$(tail -60 logs/${RBOPS_PHASE}.log 2>/dev/null || echo 'see run logs')" || true
+            fi
+          fi
+          echo "phase=${RBOPS_PHASE} rc=${rc}"
+
+  # ---------------------------------------------------------------------------
+  # retrigger: chain to the next phase. Keeps latency at ~10-30s instead of
+  # waiting for the cron safety net.
+  # ---------------------------------------------------------------------------
+  retrigger:
+    needs: [select, work]
+    if: >-
+      always() && needs.select.outputs.exists == 'true' &&
+      needs.select.outputs.action != 'audit' && needs.select.outputs.action != 'status' &&
+      (inputs.no_retrigger != true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write            # repository_dispatch requires contents: write
+    steps:
+      - name: Chain to next tick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select.outputs.phase }}
+          RC: ${{ needs.work.result }}
+        run: |
+          R=ok
+          if [ "$RC" != "success" ]; then R=phase_failed_safety_net_will_retry; fi
+          sleep 10
+          gh api -X POST -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/dispatches" \
+            -f "event_type=rbops_tick" \
+            -f "client_payload[phase]=${PHASE}" \
+            -f "client_payload[reason]=${R}" \
+            -f "client_payload[run_id]=${{ github.run_id }}" \
+            || echo "::warning::re-dispatch failed — cron safety net retries in <=10 min"

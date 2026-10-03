@@ -1,0 +1,116 @@
+name: validate
+
+# RBOPS validating itself. This workflow has NO LLM in it and must never be
+# edited by a phase — see AGENTS.md hard rule 1. Its job is to prove the
+# pipeline's own integrity is intact before any agent runs against it.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'logs/**'
+      - 'docs/audits/**'
+      - 'phases/*/PROMPT.md'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    name: manifest + prompts are consistent
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: manifest is valid JSON and well-formed
+        run: |
+          set -uo pipefail
+          jq empty rbops/phases.json
+          n=$(jq '.phases | length' rbops/phases.json)
+          echo "phases declared: $n"
+          [ "$n" -gt 0 ] || { echo "::error::manifest declares no phases"; exit 1; }
+
+      - name: phase ids are unique, sequential and well-formed
+        run: |
+          set -uo pipefail
+          dup=$(jq -r '.phases[].id' rbops/phases.json | sort | uniq -d)
+          [ -z "$dup" ] || { echo "::error::duplicate phase ids: $dup"; exit 1; }
+          bad=$(jq -r '.phases[].id' rbops/phases.json | grep -vE '^phase-[0-9]{3}$' || true)
+          [ -z "$bad" ] || { echo "::error::malformed phase ids: $bad"; exit 1; }
+
+      - name: every depends_on resolves, and the graph is acyclic
+        run: |
+          set -uo pipefail
+          ids=$(jq -r '.phases[].id' rbops/phases.json)
+          for dep in $(jq -r '.phases[].depends_on[]?' rbops/phases.json); do
+            echo "$ids" | grep -qx "$dep" || { echo "::error::$dep is referenced but not declared"; exit 1; }
+          done
+          # cycle detection: repeatedly strip phases whose deps are all satisfied
+          remaining=$(jq -r '.phases[].id' rbops/phases.json)
+          for _ in $(seq 1 64); do
+            [ -n "$remaining" ] || { echo "graph is acyclic"; exit 0; }
+            progress=0
+            for id in $remaining; do
+              unmet=0
+              for d in $(jq -r --arg p "$id" '.phases[]|select(.id==$p)|.depends_on[]?' rbops/phases.json); do
+                echo "$remaining" | grep -qx "$d" && unmet=1
+              done
+              [ "$unmet" -eq 0 ] && { remaining=$(echo "$remaining" | grep -vx "$id"); progress=1; }
+            done
+            [ "$progress" -eq 0 ] && break
+          done
+          if [ -n "$remaining" ]; then
+            echo "::error::dependency cycle among: $remaining"; exit 1
+          fi
+
+      - name: every declared phase has a committed PROMPT.md
+        run: |
+          set -uo pipefail
+          fail=0
+          for id in $(jq -r '.phases[].id' rbops/phases.json); do
+            [ -f "phases/$id/PROMPT.md" ] || { echo "::error::missing phases/$id/PROMPT.md"; fail=1; }
+          done
+          exit "$fail"
+
+      - name: PROMPT.md files match the manifest
+        run: |
+          set -uo pipefail
+          ./rbops/gen-prompts.sh --check
+
+      - name: shell scripts are syntactically valid
+        run: |
+          for f in rbops/*.sh; do bash -n "$f" || exit 1; done
+          echo "shell OK"
+          command -v shellcheck >/dev/null && shellcheck -S warning rbops/*.sh || echo "(shellcheck not installed; skipped)"
+
+      - name: workflow YAML parses
+        run: |
+          set -uo pipefail
+          for f in .github/workflows/*.yml; do
+            python3 -c "import sys,yaml; yaml.safe_load(open(sys.argv[1]))" "$f" || exit 1
+            echo "YAML OK $f"
+          done
+
+  gate-selfcheck:
+    name: verify.sh still has all its checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: the gate must not have been weakened
+        run: |
+          set -uo pipefail
+          fail=0
+          # The expected baseline lives in the manifest, so lowering it is a
+          # visible diff that a reviewer must approve.
+          while read -r needle; do
+            grep -qF "$needle" rbops/verify.sh || { echo "::error::gate lost a check: $needle"; fail=1; }
+          done < <(jq -r '.gate.selfcheck.required_needles[]' rbops/phases.json)
+          want=$(jq -r '.gate.selfcheck.min_assertions' rbops/phases.json)
+          have=$(grep -cE '^[[:space:]]*(ok|bad) ' rbops/verify.sh)
+          echo "gate assertions: $have (baseline $want)"
+          [ "$have" -ge "$want" ] || { echo "::error::gate assertion count dropped"; fail=1; }
+          exit "$fail"
