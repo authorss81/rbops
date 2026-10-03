@@ -57,25 +57,43 @@ die()  { printf '%s [dispatch] FATAL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit
 # reclaimed rather than blocking the pipeline forever.
 LOCK_DIR="${RBOPS_LOCK:-/tmp/rbops-pipeline.lock}"
 release_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+# The lock records BOTH the owning pid and when it was taken. Liveness answers
+# "is a run still going", age answers "is this pid merely being reused".
+lock_take() { echo $$ > "$LOCK_DIR/pid" 2>/dev/null || true
+              date +%s > "$LOCK_DIR/born" 2>/dev/null || true
+              trap 'release_lock' EXIT INT TERM; }
+lock_age()  { local b; b="$(cat "$LOCK_DIR/born" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - b )); }
+owner_alive() {
+  local p; p="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo 0)"
+  [ "$p" -gt 0 ] 2>/dev/null || return 1
+  kill -0 "$p" 2>/dev/null
+}
 acquire_lock() {
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    date +%s > "$LOCK_DIR/pid" 2>/dev/null || true
-    # `rm -rf`, not `rmdir`: the lock dir holds a pid file, and rmdir refuses
-    # to remove a non-empty directory, so the lock would leak on every exit.
-    trap 'release_lock' EXIT INT TERM
+    lock_take
     return 0
   fi
-  local age now born
-  born="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo 0)"
-  now="$(date +%s)"
-  age=$(( now - born ))
-  if [ "$born" -gt 0 ] && [ "$age" -gt 21600 ]; then
+
+  # Reclaim when the recorded owner is gone. A section killed by `timeout` leaves
+  # the lock behind, and without this the NEXT invocation dies with exit 2 and no
+  # useful message - which is exactly what the smoke suite caught in CI.
+  if ! owner_alive; then
+    log "reclaiming lock from a dead owner (age $(lock_age)s)"
+    rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+    lock_take
+    return 0
+  fi
+
+  # Owner is alive, but it may have been killed long ago and its pid reused.
+  local age; age="$(lock_age)"
+  if [ "$age" -gt 21600 ]; then
     log "reclaiming stale lock (${age}s old)"
     rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
-    trap 'release_lock' EXIT INT TERM
+    lock_take
     return 0
   fi
-  die "another rbops run holds $LOCK_DIR (age ${age}s). Wait, or remove it if no run is active."
+
+  die "another rbops run holds $LOCK_DIR (pid $(cat "$LOCK_DIR/pid" 2>/dev/null || echo '?'), age ${age}s). Wait, or remove it if no run is active."
 }
 
 need_jq() { command -v "$JQ" >/dev/null 2>&1 || die "jq is required (set JQ=/path/to/jq)"; }

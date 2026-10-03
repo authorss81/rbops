@@ -154,6 +154,7 @@ EOS
 # pass for the wrong reason.
 D() { ( cd "$PIPE" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" \
          PATH="$STUB:$PATH" OPENCODE_API_KEY=stub JQ="$JQ" \
+         RBOPS_LOCK="$T/lock" \
          PHASE_UNDER_TEST="${2:-phase-001}" \
          RBOPS_MIN_OUTPUT="${RBOPS_MIN_OUTPUT:-10}" RBOPS_MAX_REVIEW_ROUNDS=1 \
          timeout 120 bash "$PIPE/rbops/dispatch.sh" "$@" 2>&1 ); }
@@ -298,8 +299,11 @@ build_stubs >/dev/null
 head_ "8. a missing API key blocks instead of burning the queue"
 build_fixture >/dev/null
 out="$( cd "$PIPE" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
-        JQ="$JQ" env -u OPENCODE_API_KEY timeout 60 bash "$PIPE/rbops/dispatch.sh" run phase-001 2>&1 )"; rc=$?
-check "$rc" 3 "exit code is 3 (blocked)"
+        JQ="$JQ" RBOPS_LOCK="$T/lock" \
+        env -u OPENCODE_API_KEY timeout 60 bash "$PIPE/rbops/dispatch.sh" run phase-001 2>&1 | strip )"
+rc=${PIPESTATUS[0]}
+if [ "$rc" = "3" ]; then ok "exit code is 3 (blocked)"
+else no "exit code is 3 (blocked): got '$rc'"; printf '%s\n' "$out" | tail -6 | sed 's/^/      /'; fi
 marker phase-001 .blocked && ok ".blocked written" || no ".blocked missing"
 case "$out" in *"OPENCODE_API_KEY is not set"*) ok "the reason is stated" ;; *) no "no reason given" ;; esac
 
@@ -339,6 +343,49 @@ commits="$( cd "$PROJ" && git log --oneline HEAD~1..HEAD | wc -l | tr -d ' ' )"
 check "$st" "0" "git status is clean after the agent committed"
 if [ "$commits" -ge 1 ]; then ok "local commit detected -> the push step will ship it"
 else no "local commit missed -> phase would be discarded"; fi
+
+# =========================================================== 12. the lock
+head_ "12. the advisory lock reclaims a dead owner instead of wedging"
+# Use a dead-model stub so `run` returns quickly: this is a lock test, not an
+# agent test. `select` and `status` are deliberately lock-free, so they cannot
+# exercise this path.
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+echo "Error: OpenCode 1.18.0 or newer is required to use the free tier"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+
+LOCK="$T/lock-probe"
+rm -rf "$LOCK" "$PIPE/phases/phase-001"/.[a-z]* 2>/dev/null || true
+mkdir -p "$LOCK"
+echo 999999 > "$LOCK/pid"                 # a pid that cannot be running
+echo $(( $(date +%s) - 5 )) > "$LOCK/born"
+out="$( cd "$PIPE" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" RBOPS_LOCK="$LOCK" OPENCODE_API_KEY=stub RBOPS_MIN_OUTPUT=500 \
+        timeout 60 bash "$PIPE/rbops/dispatch.sh" run phase-001 2>&1 | strip )"; rc=$?
+case "$out" in
+  *"reclaiming lock from a dead owner"*) ok "a lock left by a dead pid is reclaimed" ;;
+  *"another rbops run holds"*) no "a dead owner's lock wedged the dispatcher"; printf '%s\n' "$out" | tail -3 | sed 's/^/      /' ;;
+  *) no "no reclaim message (exit $rc)"; printf '%s\n' "$out" | tail -3 | sed 's/^/      /' ;;
+esac
+[ "$rc" = "42" ] && ok "and the run then proceeded normally (deferred)" \
+                || no "expected 42 after reclaiming, got $rc"
+rm -rf "$LOCK"
+
+# A LIVE owner must still be respected, or the lock protects nothing.
+mkdir -p "$LOCK"
+sleep 300 & LIVE=$!
+echo "$LIVE" > "$LOCK/pid"; date +%s > "$LOCK/born"
+out="$( cd "$PIPE" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" RBOPS_LOCK="$LOCK" OPENCODE_API_KEY=stub RBOPS_MIN_OUTPUT=500 \
+        timeout 60 bash "$PIPE/rbops/dispatch.sh" run phase-001 2>&1 | strip )"; rc=$?
+kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null; rm -rf "$LOCK"
+case "$out" in
+  *"another rbops run holds"*) ok "a live owner's lock is respected (exit $rc)" ;;
+  *) no "the lock did not stop a concurrent run" ;;
+esac
+build_stubs >/dev/null
 
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
