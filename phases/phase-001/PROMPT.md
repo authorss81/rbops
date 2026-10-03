@@ -12,7 +12,7 @@
 ## Evidence — verified finding
 
 ```
-src/testing/harness.rs:execute_test_code() only returns Err on a parse/runtime error. No assertion is ever evaluated, so a Redblue test can only fail by crashing. src/testing/assertions.rs (19 assertion fns) is dead code: only referenced by `pub use assertions::*` in testing/mod.rs.
+src/testing/harness.rs:execute_test_code() returns Ok(()) unless the code fails to parse or throws, so a Redblue test can only fail by crashing - no assertion is ever evaluated. src/testing/assertions.rs (19 assertion fns) is dead code, reachable only via `pub use assertions::*` in testing/mod.rs:6. Verified deeper than first recorded: Expr::Expect is declared at parser.rs:56 but there is NO construction site anywhere in parser.rs, so the `expect A to be B` form does not merely go unasserted, it fails to parse - ParserError: Unexpected token Expect. `rb test` reports 0 tests because every .rb file in tests/ is 100% commented out and discovery only matches lines starting `// test `.
 ```
 
 **Re-verify this before you change anything.** If the finding no longer
@@ -21,7 +21,7 @@ never be "fixed" by inventing a change.
 
 ## Goal
 
-Wire real assertions into the harness so `expect x to be 5` inside a `test` block fails the test.
+Make the `expect A to be B` form parse, evaluate, and FAIL the test on mismatch - so a Redblue test is capable of failing at all.
 
 ## Method
 
@@ -43,10 +43,12 @@ Wire real assertions into the harness so `expect x to be 5` inside a `test` bloc
 
 ## Definition of done
 
+- [ ] parser.rs constructs Expr::Expect for the xpect A to be B form
 - [ ] harness.rs evaluates Expr::Expect and returns TestAssertionError on mismatch
-- [ ] assertions.rs is called, not dead code
-- [ ] a deliberately WRONG test (expect 1 to be 2) is observed to FAIL
-- [ ] cargo test proves a failing test fails
+- [ ] assertions.rs is called from the harness, not dead code
+- [ ] a deliberately WRONG test (expect 1 to be 2) is observed to FAIL, with a message naming both values
+- [ ] a correct test (expect 1 to be 1) PASSES
+- [ ] cargo test proves both directions
 
 ## Test requirements — non-negotiable
 
