@@ -1,0 +1,96 @@
+name: smoke
+
+# =============================================================================
+# The three-minute test.
+#
+# Five wiring bugs cost a full day, and every one of them was only observable
+# inside a twenty-minute agent loop on a GitHub runner:
+#
+#   1. the phase prompt was piped on stdin, which `opencode run` never reads
+#   2. the agent was pointed at the pipeline repo instead of the project
+#   3. VERIFY held BASH_SOURCE[0], so "run the gate" re-ran the dispatcher
+#   4. RBOPS_ROOT was read three lines before it was assigned, under `set -u`
+#   5. the project clone had no push credentials, so nothing could ship
+#
+# Each was found by reading CI logs twenty minutes apart. This job exercises the
+# entire pipeline shape with a stub agent and no model calls, so the next one
+# fails here in under a minute.
+#
+# It is a REQUIRED status check. Orchestration that cannot be tested cheaply
+# will be tested expensively, at 20 minutes a bug, forever.
+# =============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'logs/**'
+      - 'docs/audits/**'
+      - 'phases/*/PROMPT.md'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: pipeline wiring (no model calls)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the smoke suite
+        run: ./rbops/smoke.sh
+
+      - name: Show the manifest still agrees with the prompts
+        run: ./rbops/gen-prompts.sh --check
+
+  coldstart:
+    name: entry points survive a cold start
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run each entry point under `set -u`
+        run: |
+          set -uo pipefail
+          for cmd in status select; do
+            RBOPS_ROOT="$PWD" RBOPS_PROJECT_DIR="$PWD" ./rbops/dispatch.sh "$cmd" >/dev/null \
+              || { echo "::error::dispatch.sh $cmd failed on a cold start"; exit 1; }
+            echo "OK  dispatch.sh $cmd"
+          done
+          # Capture, then grep. Under `pipefail`, `cmd | grep` inherits cmd's
+          # exit status and reports "no match" on output that did match.
+          out=$(RBOPS_ROOT="$PWD" RBOPS_PROJECT_DIR="$PWD" ./rbops/verify.sh phase-999 2>&1) || true
+          if printf '%s\n' "$out" | grep -q FATAL; then
+            echo "OK  verify.sh rejects an unknown phase with a named FATAL"
+          else
+            echo "::error::verify.sh did not fail cleanly"; printf '%s\n' "$out" | tail -5; exit 1
+          fi
+
+  gate-integrity:
+    name: the gate still has all its checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: verify.sh has not been weakened
+        run: |
+          set -uo pipefail
+          rc=0
+          want=$(jq -r '.gate.selfcheck.min_assertions' rbops/phases.json)
+          have=$(grep -cE '^[[:space:]]*(ok|warn|bad) ' rbops/verify.sh)
+          echo "gate assertions: $have (baseline $want)"
+          if [ "$have" -lt "$want" ]; then echo "::error::assertion count dropped"; rc=1; fi
+          while read -r needle; do
+            if ! grep -qF -- "$needle" rbops/verify.sh; then
+              echo "::error::gate lost a check: $needle"; rc=1
+            fi
+          done < <(jq -r '.gate.selfcheck.required_needles[]' rbops/phases.json)
+          exit "$rc"
