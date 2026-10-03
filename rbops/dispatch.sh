@@ -14,7 +14,12 @@
 # =============================================================================
 set -uo pipefail
 
-VERIFY="${BASH_SOURCE[0]}"
+SELF="${BASH_SOURCE[0]}"
+# BASH_SOURCE[0] here is dispatch.sh ITSELF. Using it as the gate path made
+# verify.sh re-run the dispatcher, print its help banner and exit 2 — which the
+# dispatcher read as "gate failed", so every phase failed in milliseconds for a
+# reason that had nothing to do with the code.
+VERIFY="$RBOPS_ROOT/rbops/verify.sh"
 # The pipeline repo (this one) holds phases/, the manifest and the log; the
 # PROJECT is the thing being changed. They are different checkouts and confusing
 # them is the single most expensive bug available here: the agent edits whatever
@@ -22,7 +27,7 @@ VERIFY="${BASH_SOURCE[0]}"
 # `cd && pwd` normalises away any `..` in the path.
 # `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the
 # dispatcher can be exercised against a fixture pipeline root.
-RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "$VERIFY")/.." && pwd)}"
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "$SELF")/.." && pwd)}"
 PHASES="${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}"
 PHASE_ROOT="$RBOPS_ROOT/phases"
 LOG_DIR="${RBOPS_LOG_DIR:-$RBOPS_ROOT/logs}"
@@ -298,8 +303,41 @@ cmd_run() {
 
   local base; base="$(in_project git rev-parse HEAD)"
   {
+    # The brief comes FIRST and is deliberately blunt. A weak model given a
+    # 25KB context with no explicit scope spends its entire budget orienting:
+    # run 3 listed directories for five minutes, read AGENTS.md, started
+    # auditing the pipeline, and never wrote a line of code. Scope and a time
+    # box up front are worth more than a longer brief.
+    cat <<TPL
+# DO THIS, NOW. No orientation phase.
+
+Your working directory is the project checkout. It is the ONLY place you may
+read or write. The RBOPS pipeline that invoked you lives elsewhere; do not
+inspect it, do not audit it, and do not spend a single tool call on it.
+
+You have one job, described below. Work in this order and do not deviate:
+
+1. Reproduce the finding. Smallest command that shows it. Then STOP and note it.
+2. Write ONE failing test that demonstrates it. Run it. Watch it fail.
+3. Make the smallest change that turns that test green.
+4. Add the remaining edge-case tests required below.
+5. Run the four gates. Fix what they report.
+6. Write REPORT.md.
+
+Budget: reproduce in 2 minutes, first test by 5, first edit by 10. If you
+still have not written code by then, you have misread the task — re-read this
+message. Do not browse. Do not read files you have not been told to read. Do not
+write a plan document. There is no human to review a plan.
+
+When you are done, say DONE and stop.
+
+---
+
+## Contract you must obey (AGENTS.md)
+
+TPL
     cat "$RBOPS_ROOT/AGENTS.md"
-    printf '\n\n---\n\n# YOUR PHASE: %s\n\n' "$phase"
+    printf '\n\n---\n\n# YOUR PHASE: %s\n\nProject root: %s\n\n' "$phase" "$PROJECT_DIR"
     cat "$prompt"
     [ -f "$(marker "$phase" .checkpoint)" ] && cat <<'TPL'
 
