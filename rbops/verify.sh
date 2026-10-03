@@ -28,6 +28,7 @@ BASE_REF="${RBOPS_BASE_REF:-HEAD}"
 FAIL=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
 
 # --- 0. integrity: is the phase even declared? ------------------------------
@@ -140,11 +141,29 @@ if ! cargo build >/tmp/build.log 2>&1; then
   bad "cargo build"; tail -20 /tmp/build.log
 fi
 RB="./target/debug/rb"
+BASELINE="${RBOPS_BASELINE:-rbops/baseline.json}"
 if [ -x "$RB" ]; then
   for ex in examples/*.rb modules/*.rb; do
     [ -f "$ex" ] || continue
-    if timeout 60 "$RB" run "$ex" >/dev/null 2>&1; then ok "runs: $ex"
-    else bad "example fails: $ex  ($(timeout 60 "$RB" run "$ex" 2>&1 | tail -1))"; fi
+    if timeout 60 "$RB" run "$ex" >/dev/null 2>&1; then
+      ok "runs: $ex"
+      continue
+    fi
+    detail="$(timeout 60 "$RB" run "$ex" 2>&1 | tail -1)"
+    # Was this failure already known at bootstrap time?
+    known="$("$JQ" -r --arg p "$ex" \
+              '.unparseable[]? | select(.path == $p) | .path' "$BASELINE" 2>/dev/null | head -1)"
+    if [ -n "$known" ]; then
+      # Rule 1: touching a baselined file revokes the exemption. A phase cannot
+      # edit a broken file and keep calling it "pre-existing".
+      if printf '%s\n' "$CHANGED" | grep -qxF -- "$ex"; then
+        bad "example still fails AND this phase touched it (baseline revoked): $ex — $detail"
+      else
+        warn "pre-existing failure, baselined, not touched by this phase: $ex — $detail"
+      fi
+    else
+      bad "example fails: $ex — $detail"
+    fi
   done
   ok "example sweep done"
 else

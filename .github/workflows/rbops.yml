@@ -180,6 +180,10 @@ jobs:
         run: |
           set -uo pipefail
           PHASE="${RBOPS_PHASE}"
+          # Promote to GITHUB_ENV: the commit, state-push and report steps all
+          # reference RBOPS_PHASE, and under `set -u` an unset variable aborts
+          # the step. It was step-scoped to this one and killed Report status.
+          echo "RBOPS_PHASE=$PHASE" >> "$GITHUB_ENV"
           if [ "${{ needs.select.outputs.action }}" = "audit" ]; then
             bash rbops/dispatch.sh audit; rc=$?
           else
@@ -196,6 +200,7 @@ jobs:
         env:
           GIT_NAME: rbops-bot
           GIT_EMAIL: rbops-bot@users.noreply.github.com
+          RBOPS_PHASE: ${{ env.RBOPS_PHASE }}
         run: |
           set -uo pipefail
           cd redblue
@@ -246,16 +251,26 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          RBOPS_PHASE: ${{ env.RBOPS_PHASE }}
         run: |
           set -uo pipefail
+          PHASE="${RBOPS_PHASE:-none}"
           rc="${{ steps.d.outputs.rc }}"
-          if [ -f "redblue/phases/${RBOPS_PHASE}/.blocked" ]; then
-            TITLE="RBOPS blocked: ${RBOPS_PHASE}"
-            if ! gh issue list --state open --search "$TITLE in:title" --json number | grep -q number; then
-              gh issue create --title "$TITLE" --body "$(tail -60 logs/${RBOPS_PHASE}.log 2>/dev/null || echo 'see run logs')" || true
+          echo "phase=${PHASE} rc=${rc:-unknown}"
+          if [ ! -d "redblue/phases/${PHASE}" ]; then
+            echo "::notice::no phase directory for '${PHASE}' — nothing to report"
+            exit 0
+          fi
+          if [ -f "redblue/phases/${PHASE}/.blocked" ]; then
+            TITLE="RBOPS blocked: ${PHASE}"
+            if gh issue list --state open --search "$TITLE in:title" --json number \
+               2>/dev/null | grep -q '"number"'; then
+              echo "::notice::issue already open for $PHASE"
+            else
+              gh issue create --title "$TITLE" \
+                --body "$(tail -60 "logs/${PHASE}.log" 2>/dev/null || echo 'see run logs')" || true
             fi
           fi
-          echo "phase=${RBOPS_PHASE} rc=${rc}"
 
   # ---------------------------------------------------------------------------
   # retrigger: chain to the next phase. Keeps latency at ~10-30s instead of

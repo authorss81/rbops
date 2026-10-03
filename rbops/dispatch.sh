@@ -118,12 +118,12 @@ cmd_select() {
   # directory with a carriage return in its name.
   local p
   # 1. resume a deferral
-  p="$( "$JQ" -r '.phases[].id' "$PHASES" 2>/dev/null | tr -d '\r' \
+  p="$( "$JQ" -r '.phases[].id' "$PHASES" 2>/dev/null | tr -d '\r' | sort -t- -k2 -n \
        | while read -r id; do has "$id" .deferred && { echo "$id"; break; }; done)"
   if [ -n "$p" ]; then log "resuming deferred: $p"; printf '%s\n' "$p"; return; fi
 
   # 2. first phase in manifest order whose deps are satisfied
-  p="$( "$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | while read -r id; do
+  p="$( "$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | sort -t- -k2 -n | while read -r id; do
         has "$id" .done     && continue
         has "$id" .blocked  && continue
         has "$id" .starved  && continue
@@ -155,21 +155,33 @@ run_agent() {
   : > "$logfile"
   local m code pre post growth IFS=,
   for m in $models; do
-    m="$(printf '%s' "$m" | tr -d ' ')"
+    m="$(printf '%s' "$m" | tr -d ' \r')"
     [ -n "$m" ] || continue
     log "model → $m"
     pre="$(wc -c < "$logfile")"
     timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" >>"$logfile" 2>&1
     code=$?
     post="$(wc -c < "$logfile")"; growth=$((post-pre))
-    [ "$code" -eq 0 ] && { log "model ok: $m"; return 0; }
+    # A model can exit 0 having produced nothing at all — an unknown model id,
+    # a bad request, or a CLI that gives up quietly. Accepting exit 0 as
+    # success is how a phase "passes" with zero work done, so require BOTH a
+    # zero exit AND real output before believing it.
+    if [ "$code" -eq 0 ] && [ "$growth" -ge "${RBOPS_MIN_OUTPUT:-500}" ]; then
+      log "model ok: $m (${growth} bytes)"; return 0
+    fi
+    if [ "$code" -eq 0 ] && [ "$growth" -lt "${RBOPS_MIN_OUTPUT:-500}" ]; then
+      log "model $m exited 0 but produced only ${growth} bytes — advancing chain"
+      tail -5 "$logfile" | sed 's/^/    | /'
+      continue
+    fi
     if infra_failure "$logfile" || [ "$growth" -lt 200 ]; then
       log "model unusable ($m, exit $code) — advancing chain"; continue
     fi
     log "model failed with a real work error ($m, exit $code) — keeping result"
     return "$code"
   done
-  log "entire model chain unusable"; return 1
+  log "every model in the chain was unusable — this is an infra problem, not a phase problem"
+  return 1
 }
 
 # Strict classifiers. The bare word "retry" must NOT match, or normal agent
@@ -386,7 +398,9 @@ case "${1:-}" in
   stop)   mkdir -p phases; touch phases/.stop; log "HALTED — remove phases/.stop to resume" ;;
   resume) rm -f phases/.stop; log "RESUMED" ;;
   status) need_jq
-          "$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | while read -r id; do
+          # Sort numerically: manifest order is a convenience for humans, and the
+  # dispatcher must not jump the queue when a phase is appended.
+  "$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | sort -t- -k2 -n | while read -r id; do
             st="pending"
             for m in .done .failed .deferred .blocked; do has "$id" "$m" && st="${m#.}"; done
             printf '%-12s %-9s %-9s %s\n' "$id" \

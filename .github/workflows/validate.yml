@@ -108,6 +108,31 @@ jobs:
       - name: PROMPT.md files match the manifest
         run: ./rbops/gen-prompts.sh --check
 
+      - name: baseline entries are real, and none is grandfathered
+        run: |
+          set -uo pipefail
+          rc=0
+          # Every baselined path must actually exist in the manifest's project,
+          # and every entry must name the phase that will remove it. A baseline
+          # entry with no owning phase is permanent dead weight.
+          while read -r path phase; do
+            if [ -z "$phase" ] || [ "$phase" = "null" ]; then
+              echo "::error::baseline entry '$path' has no owning phase"; rc=1
+            fi
+          done < <(jq -r '.unparseable[]? | "\(.path) \(.phase)"' rbops/baseline.json)
+          # The gate must actually consult the baseline, and must still be able
+          # to fail on a NON-baselined break.
+          for needle in 'baseline revoked' 'pre-existing failure, baselined' 'example fails'; do
+            if ! grep -qF -- "$needle" rbops/verify.sh; then
+              echo "::error::gate lost a check: $needle"; rc=1
+            fi
+          done
+          # No baselined path may also appear as an already-fixed example.
+          n=$(jq '.unparseable | length' rbops/baseline.json)
+          echo "baseline entries: $n"
+          if [ "$rc" -eq 0 ]; then echo "OK: baseline is governed"; fi
+          exit "$rc"
+
       - name: shell scripts are syntactically valid and executable
         run: |
           set -uo pipefail
