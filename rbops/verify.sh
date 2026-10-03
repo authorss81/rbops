@@ -112,10 +112,16 @@ while read -r f; do
 done <<< "$CHANGED"
 ok "forbidden-path scan done"
 
-# 2b. forbidden diff patterns = gate weakening
-if git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -nE \
-  '^\+.*(#\[ignore\]|//[[:space:]]*skip|allow\(clippy|allow\(dead_code|#\[allow\()' \
-  | grep -v '^\s*$' | head -20; then
+# 2b. forbidden diff patterns = gate weakening.
+#
+# The attribute must be at the START of an added line, which is how Rust
+# attributes actually appear. Matching `#[ignore]` anywhere in the line
+# produced a false positive: a test that asserts the linter rejects
+# `#[ignore]` contains that token inside a string literal, and the gate
+# blocked a phase for containing the word it was testing against.
+if git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null \
+   | grep -nE '^\+[[:space:]]*(#\[ignore|#\[allow\((clippy|dead_code)|//[[:space:]]*skip\b)' \
+   | head -20; then
   bad "gate-weakening construct added (#[ignore], // skip, allow(clippy::...)) — see AGENTS.md rule 2"
 else
   ok "no gate-weakening constructs added"
@@ -210,7 +216,10 @@ fi
 [ "$FAILASSERT" -ge 1 ] && ok "failure-asserting test present: $FAILASSERT" \
   || bad "no test asserts a failure is produced — mandatory"
 
-SKIPDELTA="$(git diff -U0 "$BASE_REF" 2>/dev/null | grep -cE '^\+.*(#\[ignore\]|//[[:space:]]*skip)')"
+# Same precision rule as the construct scan above: the token must begin the
+# line. A test fixture that embeds `#[ignore]` as data is not a skipped test.
+SKIPDELTA="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+  | grep -cE '^\+[[:space:]]*(#\[ignore|//[[:space:]]*skip\b)')"
 [ "$SKIPDELTA" -eq 0 ] && ok "no newly skipped tests" || bad "$SKIPDELTA newly skipped/ignored tests"
 
 # --- 6. self-consistency: does the report match reality? --------------------

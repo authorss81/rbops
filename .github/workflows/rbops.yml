@@ -237,7 +237,7 @@ jobs:
             echo "::warning::rc=$rc — not chaining; the cron safety net will retry"
           fi
 
-      - name: Push phase work
+      - name: Preserve and push phase work
         if: always()
         env:
           GIT_NAME: rbops-bot
@@ -245,22 +245,52 @@ jobs:
           RBOPS_PHASE: ${{ env.RBOPS_PHASE }}
         run: |
           set -uo pipefail
+          PHASE="${RBOPS_PHASE:-none}"
           cd redblue
           git config user.name "$GIT_NAME"
           git config user.email "$GIT_EMAIL"
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "::notice::clean tree — nothing to push"; exit 0
-          fi
+
+          # DIAGNOSE FIRST. A phase produced 788 changed lines and the previous
+          # version of this step cheerfully reported "clean tree — nothing to
+          # push". Nothing is lost now that this runs first and is unconditional.
+          echo "::group::work inventory for ${PHASE}"
+          echo "  HEAD          : $(git rev-parse --short HEAD) $(git log -1 --pretty=%s)"
+          echo "  local commits : $(git log --oneline origin/main..HEAD 2>/dev/null | wc -l)"
+          echo "  status lines  : $(git status --porcelain | wc -l)"
+          echo "  diff vs HEAD  : $(git diff HEAD --shortstat)"
+          echo "  staged        : $(git diff --cached --shortstat)"
+          git status --porcelain | head -20 | sed 's/^/    /'
+          echo "::endgroup::"
+
+          # ALWAYS capture a patch, before any commit, push or reset. If every
+          # later step fails the work is still recoverable from the artifact.
           git add -A
-          git commit -m "rbops: ${RBOPS_PHASE} ($(date -u +%Y-%m-%dT%H:%M:%SZ))" || exit 0
+          git diff --cached --binary > "../work-${PHASE}.patch" || true
+          echo "patch bytes: $(wc -c < "../work-${PHASE}.patch")"
+
+          has_local_commits() { [ -n "$(git log --oneline origin/main..HEAD 2>/dev/null)" ]; }
+          has_staged()        { ! git diff --cached --quiet; }
+
+          # The agent may have committed its own work. `git status --porcelain`
+          # is EMPTY in that case, which is how a whole phase was discarded.
+          if ! has_staged && ! has_local_commits; then
+            echo "::notice::genuinely nothing to push for ${PHASE}"
+            exit 0
+          fi
+
+          if has_staged; then
+            git commit -m "rbops: ${PHASE} ($(date -u +%Y-%m-%dT%H:%M:%SZ))" || true
+          fi
+
           for i in 1 2 3 4 5; do
-            git push origin HEAD:main && { echo "pushed"; exit 0; }
+            if git push origin HEAD:main; then echo "::notice::pushed ${PHASE}"; exit 0; fi
             git pull --rebase origin main || true
             sleep 3
           done
-          git branch -f "rbops-recovery/${RBOPS_PHASE}" HEAD
-          git format-patch -1 --stdout > "../recovery-${RBOPS_PHASE}.patch" || true
-          echo "::error::push failed after 5 attempts — recovery branch + patch saved"
+
+          git branch -f "rbops-recovery/${PHASE}" HEAD 2>/dev/null || true
+          git push -f origin "HEAD:refs/heads/rbops-recovery/${PHASE}" 2>/dev/null || true
+          echo "::error::push failed after 5 attempts — recovery branch and work-${PHASE}.patch artifact saved"
 
       - name: Push RBOPS state
         if: always()
@@ -285,6 +315,7 @@ jobs:
         with:
           name: rbops-${{ needs.select.outputs.phase || 'audit' }}
           path: |
+            work-*.patch
             recovery-*.patch
             logs/*.log
           retention-days: 14
