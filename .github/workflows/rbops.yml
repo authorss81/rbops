@@ -121,6 +121,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write          # push phase work. NO `workflows` scope.
+    outputs:
+      # Did the pipeline advance? rc 0 means the gate is green and the phase is
+      # awaiting review. 42 deferred / 3 blocked / 1 gate-failed are all "no
+      # progress" and must not chain.
+      progress: ${{ steps.d.outputs.progress }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -208,6 +213,15 @@ jobs:
             fi
           fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # Only a clean run counts as progress. A deferred phase is retried by
+          # the cron safety net instead, so a dead model chain cannot spawn an
+          # unbounded queue of runs that all hit the same wall.
+          if [ "$rc" = "0" ]; then
+            echo "progress=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "progress=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::rc=$rc — not chaining; the cron safety net will retry"
+          fi
 
       - name: Push phase work
         if: always()
@@ -287,15 +301,22 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # retrigger: chain to the next phase. Keeps latency at ~10-30s instead of
-  # waiting for the cron safety net.
+  # retrigger: chain to the next phase ONLY if the pipeline actually advanced.
+  #
+  # Chaining unconditionally is how a failure becomes a storm: the phase defers
+  # or fails, the run is still "successful" as far as Actions is concerned, so a
+  # new run starts, hits the same wall, defers again, and five queued runs burn
+  # MAX_DEFERRALS before anyone looks. A phase that did not progress is retried
+  # by the cron safety net, on purpose, with a human-sized gap.
   # ---------------------------------------------------------------------------
   retrigger:
     needs: [select, work]
     if: >-
       always() && needs.select.outputs.exists == 'true' &&
       needs.select.outputs.action != 'audit' && needs.select.outputs.action != 'status' &&
-      (inputs.no_retrigger != true)
+      (inputs.no_retrigger != true) &&
+      needs.work.result == 'success' &&
+      needs.work.outputs.progress == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write            # repository_dispatch requires contents: write
@@ -304,15 +325,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PHASE: ${{ needs.select.outputs.phase }}
-          RC: ${{ needs.work.result }}
         run: |
-          R=ok
-          if [ "$RC" != "success" ]; then R=phase_failed_safety_net_will_retry; fi
           sleep 10
           gh api -X POST -H "Accept: application/vnd.github+json" \
             "/repos/${{ github.repository }}/dispatches" \
             -f "event_type=rbops_tick" \
             -f "client_payload[phase]=${PHASE}" \
-            -f "client_payload[reason]=${R}" \
+            -f "client_payload[reason]=phase_done_gate_green" \
             -f "client_payload[run_id]=${{ github.run_id }}" \
             || echo "::warning::re-dispatch failed — cron safety net retries in <=10 min"
