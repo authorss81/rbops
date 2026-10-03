@@ -1,7 +1,1384 @@
 [0m
 > build · big-pickle
 [0m
-[91m[1mError: [0mOpenCode 1.18.0 or newer is required to use the free tier
-[91m[1mError: [0mYou must provide a message or a command
-[91m[1mError: [0mYou must provide a message or a command
-[91m[1mError: [0mYou must provide a message or a command
+I'll start by reading the repo state and the relevant files.
+[0m$ [0mgit log --oneline -5 && git status --short && ls
+93b0cbe rbops: fix the PATH bug and make one key sufficient
+978cad1 rbops: resume the pipeline
+c5dc90c rbops: clear markers from the pre-fix pipeline
+f6dda3f rbops: clear attempt markers written by the pre-fix pipeline
+2871dbf rbops: state after phase-005
+ M logs/phase-001.log
+?? logs/phase-001.checkpoint.log
+AGENTS.md
+LICENSE
+README.md
+logs
+opencode.json
+phases
+rbops
+redblue
+[0m
+[0m$ [0mls -R phases/ 2>/dev/null | head -50; echo ---; ls src/ src/testing/ 2>/dev/null
+phases/:
+INVARIANTS.md
+phase-001
+phase-002
+phase-003
+phase-004
+phase-005
+phase-006
+phase-007
+phase-008
+phase-009
+phase-010
+phase-011
+phase-012
+phase-013
+phase-014
+phase-015
+phase-016
+phase-017
+phase-018
+phase-019
+phase-020
+phase-021
+phase-022
+phase-023
+phase-024
+
+phases/phase-001:
+PROMPT.md
+
+phases/phase-002:
+PROMPT.md
+
+phases/phase-003:
+PROMPT.md
+
+phases/phase-004:
+PROMPT.md
+
+phases/phase-005:
+PROMPT.md
+
+phases/phase-006:
+PROMPT.md
+
+phases/phase-007:
+PROMPT.md
+
+phases/phase-008:
+PROMPT.md
+---
+[0m
+[0m$ [0mcat rbops/verify.sh
+#!/usr/bin/env bash
+# =============================================================================
+# rbops/verify.sh — the ONLY authority on whether phase work is real.
+#
+# Exit 0  = phase may be marked .done
+# Exit 1  = gate failed, phase must be retried
+#
+# Design rule: this script must be UNTRUSTWORTHY-PROOF against the agent.
+# The implementer agent cannot edit this file (see AGENTS.md hard rule 1) and
+# the token it runs under has no `workflows` scope, so a push that modifies
+# .github/ is rejected by GitHub itself. Two independent locks.
+# =============================================================================
+set -uo pipefail
+
+PHASE="${1:?usage: verify.sh <phase-id>}"
+PHASES="${RBOPS_PHASES:-rbops/phases.json}"
+# Honour $JQ so a native Linux jq can be substituted when testing outside CI.
+# A Windows jq.exe under WSL emits CRLF and breaks every id and count.
+JQ="${JQ:-jq}"
+REPO="${RBOPS_REPO:-.}"
+
+cd "$REPO" || exit 1
+
+PHASE_DIR="phases/${PHASE}"
+REPORT="${PHASE_DIR}/REPORT.md"
+BASE_REF="${RBOPS_BASE_REF:-HEAD}"
+
+FAIL=0
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
+
+# --- 0. integrity: is the phase even declared? ------------------------------
+step "manifest"
+if command -v "$JQ" >/dev/null 2>&1; then
+  if "$JQ" -e --arg p "$PHASE" '.phases[] | select(.id==$p)' "$PHASES" >/dev/null 2>&1; then
+    ok "phase $PHASE is declared in $PHASES"
+  else
+    bad "phase $PHASE is NOT declared in $PHASES — an undeclared phase cannot pass"
+  fi
+  # dependencies must be .done
+  while read -r dep; do
+    [ -n "$dep" ] || continue
+    if [ -f "phases/${dep}/.done" ]; then ok "dep ${dep} done"
+    else bad "dep ${dep} not done"; fi
+  done < <("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .depends_on[]?' "$PHASES" 2>/dev/null)
+else
+  bad "jq not available — cannot validate manifest"
+fi
+
+# --- 1. report exists and is not a stub -------------------------------------
+step "report"
+if [ -f "$REPORT" ]; then
+  ok "$REPORT exists"
+  # every required section must be present AND non-trivially filled
+  for sec in "What changed" "Tests added" "Gates" "Known gaps"; do
+    if grep -qF "$sec" "$REPORT"; then ok "section: $sec"
+    else bad "report missing section: $sec"; fi
+  done
+  # The evidence table must contain at least one real data row: a markdown row
+  # that names a path. A header-only or placeholder table is a stub.
+  if awk '
+    /^##[[:space:]]+What changed/ { insec=1; next }
+    /^##[[:space:]]/           { insec=0 }
+    insec && /^\|/ && /\// && !/^\|[[:space:]]*-+/ && !/^\|[[:space:]]*File[[:space:]]*\|/ { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$REPORT"; then ok "report has at least one real evidence row"
+  else bad "report evidence table is a stub — needs a row naming an actual file"; fi
+  # a report claiming a green gate it cannot have run
+  if grep -qiE 'cargo test *\| *(pass|green)' "$REPORT" && ! grep -qE '[1-9][0-9]* passed' "$REPORT"; then
+    bad "report claims cargo test passed but records no passing count"
+  fi
+else
+  bad "$REPORT missing — a phase without a report cannot pass"
+fi
+
+# --- 2. diff hygiene ---------------------------------------------------------
+step "diff hygiene"
+CHANGED="$(git diff --name-only "$BASE_REF" 2>/dev/null)"
+if [ -z "$CHANGED" ]; then
+  bad "no changed files detected against $BASE_REF"
+fi
+
+# 2a. forbidden paths (the lock that makes this gate trustworthy)
+while read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    .github/workflows/*|rbops/*|.opencode/agent/*)
+      bad "forbidden path touched: $f" ;;
+  esac
+done <<< "$CHANGED"
+ok "forbidden-path scan done"
+
+# 2b. forbidden diff patterns = gate weakening
+if git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -nE \
+  '^\+.*(#\[ignore\]|//[[:space:]]*skip|allow\(clippy|allow\(dead_code|#\[allow\()' \
+  | grep -v '^\s*$' | head -20; then
+  bad "gate-weakening construct added (#[ignore], // skip, allow(clippy::...)) — see AGENTS.md rule 2"
+else
+  ok "no gate-weakening constructs added"
+fi
+
+# 2c. minimum substance
+MIN_LINES="$('"$JQ"' -r '.gate.min_changed_lines' "$PHASES" 2>/dev/null || echo 5)"
+ADDED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+DELETED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$2} END{print s+0}')"
+if [ "$ADDED" -ge "$MIN_LINES" ]; then ok "diff substance: +${ADDED} -${DELETED} (min +${MIN_LINES})"
+else bad "diff too small: +${ADDED} (min +${MIN_LINES})"; fi
+
+# --- 3. the four gates -------------------------------------------------------
+step "cargo fmt"
+if cargo fmt --all -- --check >/tmp/fmt.log 2>&1; then ok "cargo fmt --check"
+else bad "cargo fmt --check"; tail -20 /tmp/fmt.log; fi
+
+step "cargo clippy"
+if cargo clippy --all-targets -- -D warnings >/tmp/clippy.log 2>&1; then
+  ok "cargo clippy -D warnings"
+else
+  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | head -20
+fi
+
+step "cargo test"
+if cargo test --all-targets >/tmp/test.log 2>&1; then
+  PASSED="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  FAILED="$(grep -oE '[0-9]+ failed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
+  else bad "cargo test reported 0 passing tests — a suite that cannot fail is not a suite"; fi
+else
+  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | head -20
+fi
+
+step "doc tests"
+cargo test --doc >/tmp/doctest.log 2>&1 || { bad "cargo test --doc"; tail -15 /tmp/doctest.log; }
+
+# --- 4. examples still run (the language's spec-by-example) ------------------
+step "examples"
+# Do not hide why the build failed: an unbuilt binary used to surface as the
+# useless "rb binary not built".
+if ! cargo build >/tmp/build.log 2>&1; then
+  bad "cargo build"; tail -20 /tmp/build.log
+fi
+RB="./target/debug/rb"
+BASELINE="${RBOPS_BASELINE:-rbops/baseline.json}"
+if [ -x "$RB" ]; then
+  for ex in examples/*.rb modules/*.rb; do
+    [ -f "$ex" ] || continue
+    if timeout 60 "$RB" run "$ex" >/dev/null 2>&1; then
+      ok "runs: $ex"
+      continue
+    fi
+    detail="$(timeout 60 "$RB" run "$ex" 2>&1 | tail -1)"
+    # Was this failure already known at bootstrap time?
+    known="$("$JQ" -r --arg p "$ex" \
+              '.unparseable[]? | select(.path == $p) | .path' "$BASELINE" 2>/dev/null | head -1)"
+    if [ -n "$known" ]; then
+      # Rule 1: touching a baselined file revokes the exemption. A phase cannot
+      # edit a broken file and keep calling it "pre-existing".
+      if printf '%s\n' "$CHANGED" | grep -qxF -- "$ex"; then
+        bad "example still fails AND this phase touched it (baseline revoked): $ex — $detail"
+      else
+        warn "pre-existing failure, baselined, not touched by this phase: $ex — $detail"
+      fi
+    else
+      bad "example fails: $ex — $detail"
+    fi
+  done
+  ok "example sweep done"
+else
+  bad "rb binary missing at $RB after a successful build — check [[bin]] name in Cargo.toml"
+fi
+
+# --- 5. test policy: edge cases and failure assertions are mandatory ---------
+step "test policy"
+# The quota is disjunctive, matching AGENTS.md 3.3: a phase qualifies with
+# >=6 Rust tests OR >=4 Redblue tests. Requiring both would fail every
+# Rust-side phase, which is not the intent.
+MIN_RS="$('"$JQ"' -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null || echo 6)"
+MIN_RB="$('"$JQ"' -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null || echo 4)"
+NEW_TESTS="$(git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null | grep -cE '^\+\s*(async )?fn (edge_|test_)' )"
+NEW_RB="$(git diff -U0 "$BASE_REF" -- '*.rb' 2>/dev/null | grep -cE '^\+\s*test ' )"
+EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test )edge_')"
+FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(is_err|expect_err|should_panic|expect .* to fail|assert_throws)')"
+
+if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
+  ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
+else
+  bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
+fi
+[ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" || bad "no test named edge_* — mandatory"
+[ "$FAILASSERT" -ge 1 ] && ok "failure-asserting test present: $FAILASSERT" \
+  || bad "no test asserts a failure is produced — mandatory"
+
+SKIPDELTA="$(git diff -U0 "$BASE_REF" 2>/dev/null | grep -cE '^\+.*(#\[ignore\]|//[[:space:]]*skip)')"
+[ "$SKIPDELTA" -eq 0 ] && ok "no newly skipped tests" || bad "$SKIPDELTA newly skipped/ignored tests"
+
+# --- 6. self-consistency: does the report match reality? --------------------
+step "report honesty"
+if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
+  REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
+  if [ -n "${CLAIM:-}" ]; then
+    if [ "$CLAIM" -le $((REAL + 2)) ] && [ "$CLAIM" -ge $((REAL - 2)) ]; then
+      ok "reported test count ($CLAIM) matches actual ($REAL)"
+    else
+      bad "report claims $CLAIM passing, actual run has $REAL"
+    fi
+  fi
+fi
+
+# --- verdict -----------------------------------------------------------------
+printf '\n'
+if [ "$FAIL" -eq 0 ]; then
+  printf '\033[32m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[32m║ VERIFY PASS — %-24s ║\033[0m\n' "$PHASE"
+  printf '\033[32m╚══════════════════════════════════════╝\033[0m\n'
+  exit 0
+fi
+printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+printf '\033[31m║ VERIFY FAIL — %-24s ║\033[0m\n' "$PHASE"
+printf '\033[31m║ %d check(s) failed                    ║\033[0m\n' "$FAIL"
+printf '\033[31m╚══════════════════════════════════════╝\033[0m\n'
+exit 1
+[0m
+[0m$ [0mls -la redblue/ && cat redblue/Cargo.toml 2>/dev/null; echo ---; ls redblue/src redblue/src/testing 2>/dev/null
+total 188
+drwxr-xr-x 11 runner runner  4096 Oct  3 09:25 .
+drwxr-xr-x  8 runner runner  4096 Oct  3 09:25 ..
+drwxr-xr-x  7 runner runner  4096 Oct  3 09:25 .git
+drwxr-xr-x  3 runner runner  4096 Oct  3 09:25 .github
+-rw-r--r--  1 runner runner   304 Oct  3 09:25 .gitignore
+-rw-r--r--  1 runner runner  5411 Oct  3 09:25 AGENTS.md
+-rw-r--r--  1 runner runner  3140 Oct  3 09:25 CODE_OF_CONDUCT.md
+-rw-r--r--  1 runner runner  4818 Oct  3 09:25 CONTRIBUTING.md
+-rw-r--r--  1 runner runner 39427 Oct  3 09:25 Cargo.lock
+-rw-r--r--  1 runner runner   598 Oct  3 09:25 Cargo.toml
+-rw-r--r--  1 runner runner  6670 Oct  3 09:25 HANDOUT.md
+-rw-r--r--  1 runner runner  1079 Oct  3 09:25 LICENSE
+-rw-r--r--  1 runner runner  6272 Oct  3 09:25 PHILOSOPHY.md
+-rw-r--r--  1 runner runner  4032 Oct  3 09:25 README.md
+-rw-r--r--  1 runner runner 28928 Oct  3 09:25 ROADMAP.md
+-rw-r--r--  1 runner runner 11836 Oct  3 09:25 SPEC.md
+drwxr-xr-x  2 runner runner  4096 Oct  3 09:25 docs
+-rw-r--r--  1 runner runner     0 Oct  3 09:25 err.txt
+-rw-r--r--  1 runner runner     0 Oct  3 09:25 errors.txt
+drwxr-xr-x  2 runner runner  4096 Oct  3 09:25 examples
+-rw-r--r--  1 runner runner  3400 Oct  3 09:25 export.sh
+drwxr-xr-x  2 runner runner  4096 Oct  3 09:25 modules
+drwxr-xr-x  4 runner runner  4096 Oct  3 09:25 src
+drwxr-xr-x  4 runner runner  4096 Oct  3 09:25 target
+-rw-r--r--  1 runner runner   622 Oct  3 09:25 test.redblue
+drwxr-xr-x  2 runner runner  4096 Oct  3 09:25 tests
+drwxr-xr-x  4 runner runner  4096 Oct  3 09:25 tooling
+[package]
+name = "redblue"
+version = "0.1.0"
+edition = "2021"
+authors = ["Redblue Contributors"]
+description = "A programming language as readable as plain English"
+license = "MIT"
+repository = "https://github.com/redblue-lang/redblue"
+keywords = ["programming-language", "compiler"]
+categories = ["compiler", "development-tools"]
+
+[[bin]]
+name = "rb"
+path = "src/main.rs"
+
+[lib]
+name = "redblue"
+path = "src/lib.rs"
+
+[dependencies]
+regex = "1.10"
+chrono = "0.4"
+reqwest = { version = "0.11", features = ["blocking"] }
+
+[dev-dependencies]
+regex = "1.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+---
+redblue/src:
+analyzer.rs
+error.rs
+formatter.rs
+lexer.rs
+lib.rs
+linter.rs
+main.rs
+parser.rs
+repl
+stdlib.rs
+testing
+value.rs
+vm.rs
+
+redblue/src/testing:
+assertions.rs
+harness.rs
+mod.rs
+reporter.rs
+runner.rs
+[0m
+[0m$ [0mcat rbops/dispatch.sh
+#!/usr/bin/env bash
+# =============================================================================
+# rbops/dispatch.sh — the self-dispatcher.
+#
+#   dispatch.sh select           pick the next eligible phase, print its id
+#   dispatch.sh run <phase>      implement + gate + record state
+#   dispatch.sh review <phase>   reviewer pass, then re-gate
+#   dispatch.sh tick             select + run + review + retrigger
+#   dispatch.sh audit            phase-generating audit loop
+#
+# Unlike the llops design it borrows its shape from, this NEVER greps the git
+# tree for directories. Ordering, dependencies and severity come from
+# rbops/phases.json, which is validated, diffable and reviewable.
+# =============================================================================
+set -uo pipefail
+
+PHASES="${RBOPS_PHASES:-rbops/phases.json}"
+PHASE_ROOT="phases"
+LOG_DIR="${RBOPS_LOG_DIR:-logs}"
+VERIFY="./rbops/verify.sh"
+# Honour $JQ so a native Linux jq can be substituted when testing outside CI.
+# A Windows jq.exe under WSL emits CRLF and its nested invocations slurp the
+# parent pipe, which silently truncates the phase loop to one iteration.
+JQ="${JQ:-jq}"
+
+# Model chains, ranked. Overridable, comma-separated, first entry is primary.
+IMPL_MODELS="${RBOPS_IMPL_MODELS:-opencode/big-pickle,openrouter/thinkingmachines/inkling:free,opencode/nemotron-3-ultra-free,openrouter/poolside/laguna-s-2.1:free}"
+REVIEW_MODELS="${RBOPS_REVIEW_MODELS:-openrouter/thinkingmachines/inkling:free,opencode/nemotron-3-ultra-free}"
+AUDIT_MODELS="${RBOPS_AUDIT_MODELS:-opencode/big-pickle,opencode/muse-spark-1.3-contributor-free}"
+
+MAX_ATTEMPTS="${RBOPS_MAX_ATTEMPTS:-3}"
+MAX_DEFERRALS="${RBOPS_MAX_DEFERRALS:-5}"
+CHECKPOINT_SECS="${RBOPS_CHECKPOINT_SECS:-300}"
+
+log()  { printf '%s [dispatch] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+die()  { printf '%s [dispatch] FATAL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit 2; }
+
+# Advisory lock. CI enforces one-phase-at-a-time with a `concurrency` group;
+# `mkdir` is atomic, so this also protects a developer running two ticks from
+# one machine. A stale lock (older than 6h, i.e. a runner that was killed) is
+# reclaimed rather than blocking the pipeline forever.
+LOCK_DIR="${RBOPS_LOCK:-/tmp/rbops-pipeline.lock}"
+release_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    date +%s > "$LOCK_DIR/pid" 2>/dev/null || true
+    # `rm -rf`, not `rmdir`: the lock dir holds a pid file, and rmdir refuses
+    # to remove a non-empty directory, so the lock would leak on every exit.
+    trap 'release_lock' EXIT INT TERM
+    return 0
+  fi
+  local age now born
+  born="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  age=$(( now - born ))
+  if [ "$born" -gt 0 ] && [ "$age" -gt 21600 ]; then
+    log "reclaiming stale lock (${age}s old)"
+    rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+    trap 'release_lock' EXIT INT TERM
+    return 0
+  fi
+  die "another rbops run holds $LOCK_DIR (age ${age}s). Wait, or remove it if no run is active."
+}
+
+need_jq() { command -v "$JQ" >/dev/null 2>&1 || die "jq is required (set JQ=/path/to/jq)"; }
+need_rbx(){ command -v opencode >/dev/null 2>&1 || die "opencode CLI not on PATH"; }
+
+# Preflight. A missing binary or a bad key is an OPERATOR problem, not a phase
+# problem: mark the phase .blocked immediately and exit 3 rather than burning
+# MAX_ATTEMPTS on a failure that will never succeed.
+env_check() {
+  local phase="$1"
+  command -v opencode >/dev/null 2>&1 || {
+    touch "$(marker "$phase" .blocked)"
+    log "$phase BLOCKED — opencode CLI not installed"
+    return 3
+  }
+  if [ -z "${OPENCODE_API_KEY:-}" ]; then
+    touch "$(marker "$phase" .blocked)"
+    local repo_hint
+    repo_hint="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    [ -n "$repo_hint" ] || repo_hint="<owner>/rbops"
+    log "$phase BLOCKED — OPENCODE_API_KEY is not set"
+    log "  fix: gh secret set OPENCODE_API_KEY --repo $repo_hint"
+    return 3
+  fi
+  # Cheap auth probe. Do not waste a phase on a bad key.
+  if ! opencode models >/dev/null 2>&1; then
+    touch "$(marker "$phase" .blocked)"
+    log "$phase BLOCKED — opencode auth probe failed (bad or exhausted key)"
+    return 3
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- phase state
+marker() { printf 'phases/%s/%s' "$1" "$2"; }
+has()    { [ -f "$(marker "$1" "$2")" ]; }
+bump()   { # bump <phase> <file>
+  local f; f="$(marker "$1" "$2")"
+  local n=0; [ -f "$f" ] && n="$(tr -cd '0-9' < "$f")"
+  mkdir -p "$(dirname "$f")"; printf '%s' "$((n+1))" > "$f"
+}
+read_n() { local f; f="$(marker "$1" "$2")"; [ -f "$f" ] && tr -cd '0-9' < "$f" || printf '0'; }
+
+# ------------------------------------------------------------------- selection
+# Priority:  1) .deferred (retry, cheapest continuity)
+#            2) lowest-id phase whose deps are all .done and which is not
+#               .done/.blocked  — dependency order comes from the manifest,
+#               not from numeric luck
+#            3) empty  => the queue is drained
+cmd_select() {
+  need_jq
+  if [ -f phases/.stop ]; then log "phases/.stop present — pipeline halted"; printf '\n'; return; fi
+
+  # Portability: `tr -d '\r'` guards against a Windows jq.exe under WSL, whose
+  # CRLF output would otherwise produce a phase id of "phase-001\r" and create a
+  # directory with a carriage return in its name.
+  local p
+  # 1. resume a deferral
+  p="$( "$JQ" -r '.phases[].id' "$PHASES" 2>/dev/null | tr -d '\r' | sort -t- -k2 -n \
+       | while read -r id; do has "$id" .deferred && { echo "$id"; break; }; done)"
+  if [ -n "$p" ]; then log "resuming deferred: $p"; printf '%s\n' "$p"; return; fi
+
+  # 2. first phase in manifest order whose deps are satisfied
+  p="$( "$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | sort -t- -k2 -n | while read -r id; do
+        has "$id" .done     && continue
+        has "$id" .blocked  && continue
+        has "$id" .starved  && continue
+        local unmet=0 dep
+        for dep in $( "$JQ" -r --arg p "$id" '.phases[]|select(.id==$p)|.depends_on[]?' "$PHASES" | tr -d '\r'); do
+          has "$dep" .done || unmet=1
+        done
+        [ "$unmet" -eq 0 ] && { echo "$id"; break; }
+      done)"
+  if [ -n "$p" ]; then
+    # Skipping a blocked phase keeps throughput, but it must never be SILENT.
+    # A lower-id phase that is blocked or repeatedly deferred is a hole in the
+    # plan; anyone reading "selected: phase-004" must not assume 001 is fine.
+    local skipped
+    skipped="$("$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | sort -t- -k2 -n \
+      | while read -r id; do
+          if [ "$id" = "$p" ]; then break; fi
+          has "$id" .blocked  && { echo "$id:blocked"; continue; }
+          d="$(read_n "$id" .deferred_attempts)"
+          [ "$d" -gt 0 ] && echo "$id:deferred($d)"
+        done)"
+    if [ -n "$skipped" ]; then
+      log "WARNING: $p selected while earlier phases are not done:"
+      printf '%s\n' "$skipped" | sed 's/^/          - /'
+      log "  these are stalled. Dispatching stop will halt the pipeline."
+    fi
+    log "selected: $p"
+    printf '%s\n' "$p"
+    return
+  fi
+
+  # 3. queue drained
+  local blocked
+  blocked="$(ls -d "$PHASE_ROOT"/*/.blocked 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${blocked:-0}" -gt 0 ]; then
+    log "WARNING: $blocked phase(s) blocked and need human intervention:"
+    ls -d "$PHASE_ROOT"/*/.blocked 2>/dev/null | sed 's|.*/||;s|/.blocked||' | sed 's/^/          - /'
+  fi
+  log "queue drained"
+  printf '\n'
+}
+
+# ------------------------------------------------------------------- execution
+# Runs the implementer agent against a chain of models, advancing on
+# infrastructure failure only. A real work error is kept, never swallowed.
+# RBOPS_PROMPT_FILE: the phase context (AGENTS.md + PROMPT.md) is passed as the
+# POSITIONAL message, never on stdin. `opencode run [message..]` does not read
+# stdin, so the `< ctx` idiom used by llops-android silently produces
+# "You must provide a message or a command" and a zero-byte no-op.
+run_agent() {
+  local models="$1"; shift
+  local logfile="$1"; shift
+  local prompt_file="${1:-}"; shift || true
+  : > "$logfile"
+  local m code pre post growth msg IFS=,
+  # ARG_MAX on Linux is ~2MB; AGENTS.md + PROMPT.md is ~25KB, so a positional
+  # message is safe. Guard anyway so a runaway ctx fails loudly, not obscurely.
+  msg=""
+  if [ -n "$prompt_file" ] && [ -f "$prompt_file" ]; then
+    local bytes; bytes="$(wc -c < "$prompt_file")"
+    if [ "$bytes" -gt 500000 ]; then
+      log "prompt file is ${bytes} bytes — refusing to pass it as argv"
+      return 2
+    fi
+    msg="$(cat "$prompt_file")"
+  fi
+  for m in $models; do
+    m="$(printf '%s' "$m" | tr -d ' \r')"
+    [ -n "$m" ] || continue
+    log "model → $m"
+    pre="$(wc -c < "$logfile")"
+    if [ -n "$msg" ]; then
+      timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" "$msg" >>"$logfile" 2>&1
+    else
+      timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" >>"$logfile" 2>&1
+    fi
+    code=$?
+    post="$(wc -c < "$logfile")"; growth=$((post-pre))
+    # A model can exit 0 having produced nothing — an unknown model id, a free
+    # tier that has been revoked, or a CLI that gives up quietly. Accepting exit
+    # 0 as success is how a phase "passes" with zero work done, so require BOTH
+    # a zero exit AND real output before believing it.
+    if [ "$code" -eq 0 ] && [ "$growth" -ge "${RBOPS_MIN_OUTPUT:-500}" ]; then
+      log "model ok: $m (${growth} bytes)"; return 0
+    fi
+    if [ "$code" -eq 0 ]; then
+      log "model $m exited 0 but produced only ${growth} bytes — advancing chain"
+      tail -4 "$logfile" | sed 's/^/    | /'
+      continue
+    fi
+    if infra_failure "$logfile" || [ "$growth" -lt 200 ]; then
+      log "model unusable ($m, exit $code) — advancing chain"
+      tail -4 "$logfile" | sed 's/^/    | /'
+      continue
+    fi
+    log "model failed with a real work error ($m, exit $code) — keeping result"
+    return "$code"
+  done
+  log "every model in the chain was unusable — infra problem, not a phase problem"
+  return 75          # EX_TEMPFAIL: retry later, do NOT count a phase attempt
+}
+
+# Strict classifiers. The bare word "retry" must NOT match, or normal agent
+# prose about retrying a build would falsely defer a phase.
+infra_failure() {
+  grep -qiE 'HTTP[ /]?(429|5[0-9][0-9])|too many requests|rate[ _-]?limit|insufficient[ _-]?quota|quota exceeded|model not found|unknown model|invalid model|no such model|overloaded|upstream error|ECONNRESET|ETIMEDOUT|stream.*(closed|failed)' "$1"
+}
+
+# Push work-in-progress every CHECKPOINT_SECS so a timeout or cancellation
+# never loses a partial phase.
+#
+# stdout/stderr MUST be redirected away from the caller. A background job that
+# inherits the pipe keeps it open for as long as it sleeps, so `$(dispatch.sh
+# ...)` and `dispatch.sh ... | tee` block until the 300s sleep expires — the
+# phase appears to hang even though the work finished in seconds.
+checkpoint_loop() {
+  local phase="$1"
+  while sleep "$CHECKPOINT_SECS"; do
+    local tree commit
+    tree="$(git add -A >/dev/null 2>&1; git write-tree 2>/dev/null)" || continue
+    commit="$(git commit-tree "$tree" -p HEAD -m "rbops: ${phase} checkpoint $(date -u +%s)" 2>/dev/null)" || continue
+    git push -f origin "$commit:refs/heads/rbops-wip/${phase}" >/dev/null 2>&1 || true
+    git reset --mixed HEAD >/dev/null 2>&1 || true
+  done
+}
+
+start_checkpoint_loop() {
+  local phase="$1"
+  checkpoint_loop "$phase" >>"${LOG_DIR}/${phase}.checkpoint.log" 2>&1 &
+  CHECK_PID=$!
+}
+
+stop_checkpoint_loop() {
+  [ -n "${CHECK_PID:-}" ] || return 0
+  kill "$CHECK_PID" 2>/dev/null || true
+  wait "$CHECK_PID" 2>/dev/null || true
+  CHECK_PID=""
+}
+
+cmd_run() {
+  local phase="${1:?phase required}"
+  need_jq
+  mkdir -p "$PHASE_ROOT/$phase" "$LOG_DIR"
+  local prompt="$PHASE_ROOT/$phase/PROMPT.md"
+  [ -f "$prompt" ] || die "no PROMPT.md for $phase — an undeclared prompt is not a phase"
+
+  if has "$phase" .done; then log "$phase already .done"; return 0; fi
+  if [ -f phases/.stop ]; then log "halted by phases/.stop"; return 0; fi
+
+  # resume any WIP checkpoint from a previous timeout
+  if git rev-parse --verify -q "origin/rbops-wip/$phase" >/dev/null 2>&1; then
+    log "merging WIP checkpoint for $phase"
+    git merge --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1 || true
+    touch "$(marker "$phase" .checkpoint)"
+  fi
+
+  local base; base="$(git rev-parse HEAD)"
+  {
+    cat AGENTS.md
+    printf '\n\n---\n\n# YOUR PHASE: %s\n\n' "$phase"
+    cat "$prompt"
+    [ -f "$(marker "$phase" .checkpoint)" ] && cat <<'TPL'
+
+---
+## CONTINUATION MODE
+A previous attempt was interrupted and its partial work is already in the tree.
+DO NOT restart. Inspect what exists, continue from it, finish the phase.
+TPL
+  } > "$LOG_DIR/$phase.ctx"
+  cat "$LOG_DIR/$phase.ctx" > "$LOG_DIR/$phase.prompt"   # audit record
+
+  need_rbx
+  env_check "$phase" || return 3
+  CHECK_PID=""
+  start_checkpoint_loop "$phase"
+  local code
+  run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" "$LOG_DIR/$phase.ctx" \
+      --agent build --title "rbops-${phase}"
+  code=$?
+  stop_checkpoint_loop
+
+  # --- classify -------------------------------------------------------------
+  # A dead model chain (75) or an infra-shaped log is a RETRYABLE infra fault.
+  # It must never be counted as a phase attempt: nothing was attempted, so
+  # burning MAX_ATTEMPTS on it would block a phase that never even ran.
+  if [ "$code" = "75" ] || infra_failure "$LOG_DIR/$phase.log"; then
+    rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .done)"
+    bump "$phase" .deferred_attempts
+    local d; d="$(read_n "$phase" .deferred_attempts)"
+    if [ "$d" -ge "$MAX_DEFERRALS" ]; then
+      touch "$(marker "$phase" .blocked)"
+      log "$phase BLOCKED after $d deferrals — the model chain is unusable, this needs a human"
+      return 3
+    fi
+    touch "$(marker "$phase" .deferred)"
+    log "$phase DEFERRED ($d/$MAX_DEFERRALS) — infra, no attempt consumed, retry next tick"
+    tail -6 "$LOG_DIR/$phase.log" | sed 's/^/    | /'
+    return 42
+  fi
+
+  # --- THE GATE -------------------------------------------------------------
+  log "running verify gate for $phase"
+  RBOPS_BASE_REF="$base" "$VERIFY" "$phase"
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    rm -f "$(marker "$phase" .done)" "$(marker "$phase" .checkpoint)"
+    touch "$(marker "$phase" .failed)"
+    local a; a="$(read_n "$phase" .attempts)"; bump "$phase" .attempts
+    a="$(read_n "$phase" .attempts)"
+    if [ "$a" -ge "$MAX_ATTEMPTS" ]; then
+      touch "$(marker "$phase" .blocked)"
+      log "$phase BLOCKED — gate failed $a/$MAX_ATTEMPTS times. A human must look."
+      return 3
+    fi
+    log "$phase GATE FAILED (attempt $a/$MAX_ATTEMPTS)"
+    return 1
+  fi
+
+  # gate passed — do NOT mark done yet, the reviewer must sign off first
+  rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .deferred)" "$(marker "$phase" .deferred_attempts)"
+  log "$phase passed the gate — awaiting review"
+  return 0
+}
+
+# -------------------------------------------------------------------- reviewer
+cmd_review() {
+  local phase="${1:?phase required}"
+  mkdir -p "$LOG_DIR"
+  local base; base="$(git rev-parse HEAD)"
+  local round=0
+
+  while [ "$round" -lt "${RBOPS_MAX_REVIEW_ROUNDS:-3}" ]; do
+    round=$((round+1))
+    log "review round $round for $phase"
+
+    # The reviewer agent is read-only AND has no shell, so it cannot run
+    # `git diff`. The change set has to be handed to it, and it must be the
+    # COMPLETE change set: committed, unstaged and untracked. Reading only
+    # `base..HEAD` hides any work the phase left uncommitted, which is exactly
+    # the work most worth reviewing.
+    local rctx="$LOG_DIR/$phase.review.$round.ctx"
+    {
+      printf '# Review request — round %s of phase %s\n\n' "$round" "$phase"
+      printf 'Rules: .opencode/agent/reviewer.md and AGENTS.md section 5.\n'
+      printf 'The gate is green. Your job is to find what is still wrong.\n\n'
+      printf '## 1. Committed changes (%s..HEAD)\n\n```diff\n' "$base"
+      git diff --no-color "$base"..HEAD 2>/dev/null || printf '(none)\n'
+      printf '```\n\n## 2. Uncommitted tracked changes\n\n```diff\n'
+      git diff --no-color 2>/dev/null || printf '(none)\n'
+      printf '```\n\n## 3. Untracked files (full contents)\n\n'
+      git status --porcelain 2>/dev/null | grep '^??' | sed 's/^?? //' | while read -r f; do
+        printf -- '--- %s\n```\n' "$f"
+        cat "$f" 2>/dev/null || printf '(unreadable)\n'
+        printf '```\n'
+      done
+      printf '\n## 4. The phase REPORT.md\n\n'
+      cat "phases/$phase/REPORT.md" 2>/dev/null || printf '(missing)\n'
+    } > "$rctx"
+
+    run_agent "$REVIEW_MODELS" "$LOG_DIR/$phase.review.$round.log" "$rctx" \
+        --agent reviewer --title "rbops-review-${phase}-${round}"
+
+    local rc_round=$?
+    if [ "$rc_round" = "75" ]; then
+      log "review round $round: model chain unusable — deferring, no attempt consumed"
+      return 42
+    fi
+
+    # Blocking findings present? The second clause is redundant-looking on
+    # purpose: it catches a reviewer that emitted FINDINGS but no severity tags.
+    if grep -qE '\[(BLOCKER|CRITICAL)\]' "$LOG_DIR/$phase.review.$round.log"; then
+      log "review round $round found blocking findings — fixing"
+    elif ! grep -qE '^\s*[0-9]+\.?\s*\[' "$LOG_DIR/$phase.review.$round.log"; then
+      log "review round $round produced no structured findings — treating as clean"
+      break
+    else
+      log "review round $round found non-blocking findings only"
+      break
+    fi
+
+    log "applying review fixes"
+    local fctx="$LOG_DIR/$phase.fix.$round.ctx"
+    {
+      printf '# Fix the review findings for phase %s (round %s)\n\n' "$phase" "$round"
+      printf 'Read the reviewer output below and fix every BLOCKER and CRITICAL.\n'
+      printf 'Do not weaken any gate. Do not add #[ignore], `// skip`, or an'
+      printf ' allow(clippy:: suppression. Do not delete a test.\n'
+      printf 'Then re-run the four gates yourself.\n\n'
+      printf '## Reviewer output\n\n'
+      cat "$LOG_DIR/$phase.review.$round.log"
+    } > "$fctx"
+    run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.fix.$round.log" "$fctx" \
+        --agent build --title "rbops-fix-${phase}-${round}"
+    if [ "$?" = "75" ]; then
+      log "fix round $round: model chain unusable — deferring"
+      return 42
+    fi
+
+    # --- re-gate after fixes. Mandatory. -----------------------------------
+    log "re-running verify gate after review fixes"
+    if RBOPS_BASE_REF="$base" "$VERIFY" "$phase"; then
+      log "gate still green after fixes"
+    else
+      log "gate red after fixes — review loop continues"
+    fi
+  done
+
+  if grep -qE '\[(BLOCKER|CRITICAL)\]' "$LOG_DIR/$phase.review.$round.log" 2>/dev/null; then
+    touch "$(marker "$phase" .blocked)"
+    log "$phase BLOCKED — blocking findings survive $round review round(s)"
+    return 3
+  fi
+
+  touch "$(marker "$phase" .done)"
+  git push -q origin "HEAD:refs/heads/rbops-wip/DELETE_${phase}" 2>/dev/null || true
+  git push -q origin ":refs/heads/rbops-wip/$phase" 2>/dev/null || true
+  log "$phase DONE"
+  return 0
+}
+
+# ----------------------------------------------------------------------- audit
+# The phase-generating loop. The auditor is the only writer of phases.json.
+cmd_audit() {
+  need_rbx
+  mkdir -p "$LOG_DIR"
+  if [ -z "${OPENCODE_API_KEY:-}" ]; then
+    log "audit SKIPPED — OPENCODE_API_KEY is not set"; return 3
+  fi
+  log "audit pass — generating new phases from measured evidence"
+  # The auditor needs to read the tree, so point it at the repo root rather than
+  # rbops/, and hand it the contract rather than assuming it remembers.
+  cat AGENTS.md > "$LOG_DIR/audit.ctx"
+  {
+    printf '\n\n---\n\n# AUDIT REQUEST\n\n'
+    printf 'Follow .opencode/agent/auditor.md and AGENTS.md section 6.\n'
+    printf 'The project under audit is the redblue checkout in this working directory.\n'
+    printf 'MEASURE it, DIFF reality against SPEC.md / ROADMAP.md / README.md,\n'
+    printf 'SAFETY-AUDIT this pipeline, then APPEND new phases to rbops/phases.json.\n'
+    printf 'Every phase needs a real file:line. Do not invent work.\n'
+  } >> "$LOG_DIR/audit.ctx"
+  run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" "$LOG_DIR/audit.ctx" \
+      --agent auditor --title "rbops-audit"
+  local code=$?
+  if [ "$code" = "75" ]; then
+    log "audit DEFERRED — model chain unusable"
+    return 42
+  fi
+  if "$JQ" empty "$PHASES" 2>/dev/null; then
+    log "phases.json still valid JSON after audit"
+  else
+    log "FATAL: audit corrupted phases.json — reverting"
+    git checkout -- "$PHASES"; return 1
+  fi
+  # an audit that invents phases with no evidence is a failed audit
+  if [ "$code" -ne 0 ]; then log "audit agent exited $code"; return "$code"; fi
+  return 0
+}
+
+# ----------------------------------------------------------------------- tick
+cmd_tick() {
+  need_jq
+  local phase; phase="$(cmd_select | tail -1)"
+  [ -n "$phase" ] || { log "idle"; return 0; }
+
+  local rc=0
+  cmd_run "$phase"    || rc=$?
+  case "$rc" in
+    0)  cmd_review "$phase" || rc=$? ;;
+    42) log "deferred — retrigger will retry" ;;
+    3)  log "blocked — retrigger will surface it" ;;
+    *)  log "run failed ($rc)" ;;
+  esac
+
+  # periodic audit
+  local every; every="$( "$JQ" -r '.audit.every_n_phases' "$PHASES" 2>/dev/null || echo 8)"
+  local done_n; done_n="$(ls -d "$PHASE_ROOT"/*/.done 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$((done_n % every))" -eq 0 ] && [ "$done_n" -gt 0 ]; then
+    cmd_audit || log "audit failed"
+  fi
+
+  # queue drained and nothing blocked => stop chaining, save minutes
+  if [ -z "$(cmd_select | tail -1)" ]; then log "queue drained — no retrigger"; return 0; fi
+
+  if [ "${RBOPS_RETRIGGER:-1}" = "1" ] && [ -n "${GITHUB_TOKEN:-}" ]; then
+    sleep "${RBOPS_BACKOFF:-10}"
+    gh api -X POST -H "Accept: application/vnd.github+json" \
+      "/repos/${GITHUB_REPOSITORY}/dispatches" \
+      -f "event_type=rbops_tick" \
+      -f "client_payload[phase]=${phase}" \
+      -f "client_payload[rc]=${rc}" >/dev/null 2>&1 \
+      || log "re-dispatch failed — the cron safety net will retry"
+  fi
+  return "$rc"
+}
+
+case "${1:-}" in
+  select) cmd_select ;;
+  run)    shift; acquire_lock; cmd_run "$@" ;;
+  review) shift; acquire_lock; cmd_review "$@" ;;
+  audit)  acquire_lock; cmd_audit ;;
+  tick)   acquire_lock; cmd_tick ;;
+  stop)   mkdir -p phases; touch phases/.stop; log "HALTED — remove phases/.stop to resume" ;;
+  resume) rm -f phases/.stop; log "RESUMED" ;;
+  status) need_jq
+          # Sort numerically: manifest order is a convenience for humans, and the
+  # dispatcher must not jump the queue when a phase is appended.
+  "$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | sort -t- -k2 -n | while read -r id; do
+            st="pending"
+            for m in .done .failed .deferred .blocked; do has "$id" "$m" && st="${m#.}"; done
+            printf '%-12s %-9s %-9s %s\n' "$id" \
+              "$( "$JQ" -r --arg p "$id" '.phases[]|select(.id==$p)|.severity' "$PHASES")" "$st" \
+              "$( "$JQ" -r --arg p "$id" '.phases[]|select(.id==$p)|.title' "$PHASES")"
+          done ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
+esac
+[0m
+[0m$ [0mcat rbops/phases.json | jq '.phases[] | select(.id=="phase-001")' ; jq '{gate, test_policy, unparseable: (.unparseable|length)}' rbops/phases.json
+{
+  "id": "phase-001",
+  "title": "Make the test harness capable of failing",
+  "severity": "blocker",
+  "depends_on": [],
+  "risk": "medium",
+  "finding": "src/testing/harness.rs:execute_test_code() only returns Err on a parse/runtime error. No assertion is ever evaluated, so a Redblue test can only fail by crashing. src/testing/assertions.rs (19 assertion fns) is dead code: only referenced by `pub use assertions::*` in testing/mod.rs.",
+  "goal": "Wire real assertions into the harness so `expect x to be 5` inside a `test` block fails the test.",
+  "accept": [
+    "harness.rs evaluates Expr::Expect and returns TestAssertionError on mismatch",
+    "assertions.rs is called, not dead code",
+    "a deliberately WRONG test (expect 1 to be 2) is observed to FAIL",
+    "cargo test proves a failing test fails"
+  ],
+  "timeout_min": 120
+}
+{
+  "gate": {
+    "command": "./rbops/verify.sh",
+    "steps": [
+      "cargo fmt --all -- --check",
+      "cargo clippy --all-targets -- -D warnings",
+      "cargo test --all-targets",
+      "cargo test --doc",
+      "./rbops/verify.sh"
+    ],
+    "baseline_file": "rbops/baseline.json",
+    "min_changed_lines": 5,
+    "require_report": true,
+    "selfcheck": {
+      "min_assertions": 23,
+      "required_needles": [
+        "forbidden path touched",
+        "gate-weakening construct added",
+        "diff too small",
+        "cargo fmt --check",
+        "cargo clippy",
+        "cannot fail is not a suite",
+        "baseline revoked",
+        "pre-existing failure, baselined",
+        "example fails",
+        "baseline revoked",
+        "pre-existing failure, baselined",
+        "test quota not met",
+        "no test named edge_",
+        "no test asserts a failure",
+        "newly skipped/ignored tests",
+        "reported test count",
+        "is NOT declared"
+      ]
+    },
+    "reject_paths": [
+      ".github/workflows/",
+      "rbops/",
+      ".opencode/agent/",
+      "rbops/phases.json"
+    ],
+    "forbid_diff_patterns": [
+      "#\\[ignore\\]",
+      "// skip",
+      "allow\\(clippy",
+      "allow\\(dead_code",
+      "expect\\(.*\\)\\s*;\\s*//.*ignore",
+      "\\.unwrap\\(\\)\\s*//\\s*(ok|fine|ignore)"
+    ]
+  },
+  "test_policy": {
+    "min_rust_tests": 6,
+    "min_redblue_tests": 4,
+    "min_edge_named_tests": 1,
+    "min_failure_asserting_tests": 1,
+    "max_allowed_skipped_delta": 0,
+    "edge_matrix": [
+      "empty",
+      "singleton",
+      "boundary",
+      "out_of_bounds",
+      "type_mismatch",
+      "numeric_boundary",
+      "unicode",
+      "nesting_recursion",
+      "duplicate_missing_keys",
+      "malformed_input",
+      "resource_limit"
+    ]
+  },
+  "unparseable": 0
+}
+[0m
+[0m$ [0mcat .gitignore 2>/dev/null; echo "--- tracked redblue?"; git ls-files redblue | head; echo "--- baseline"; cat rbops/baseline.json; echo "--- workflows"; ls .github/workflows/ 2>/dev/null; cat .github/workflows/*.yml 2>/dev/null | head -80
+# RBOPS state — committed markers are the state store.
+!phases/*/
+phases/*/*
+!phases/*/PROMPT.md
+!phases/*/REPORT.md
+!phases/*/FINDINGS.md
+!phases/*/.done
+!phases/*/.failed
+!phases/*/.deferred
+!phases/*/.blocked
+!phases/*/.checkpoint
+!phases/*/.attempts
+!phases/*/.deferred_attempts
+!phases/.stop
+
+# Compiled context + prompts are large; the audit record is kept, the ctx is not.
+logs/*.ctx
+logs/*.prompt
+
+# Secrets — never commit
+.env
+.env.*
+*.key
+*.pem
+*.keystore
+secrets/
+
+# Rust / redblue artifacts
+target/
+**/*.rs.bk
+*.rbc
+redblue/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/--- tracked redblue?
+--- baseline
+{
+  "$comment": [
+    "Known-broken state of authorss81/redblue, captured by a read-only audit.",
+    "",
+    "WHY THIS EXISTS: verify.sh runs every file in examples/ and modules/ and",
+    "fails the phase if any of them breaks. That is correct for REGRESSIONS and",
+    "fatal for PRE-EXISTING breakage: if a file has been broken since before the",
+    "pipeline existed, no phase can ever pass, and the queue silently wedges.",
+    "",
+    "So the gate distinguishes the two. A failure listed here is a WARNING. A",
+    "failure NOT listed here is a FAILURE. The gate still cannot be weakened by",
+    "a phase: adding an entry here requires the phase to have read the file and",
+    "the baseline is validated by validate.yml.",
+    "",
+    "TWO HARD RULES:",
+    "  1. A phase that touches a baselined file must FIX it. The entry stops",
+    "     applying the moment the diff includes that path, so grandfathering",
+    "     your own breakage is impossible.",
+    "  2. Entries are only ever removed by phases that fix them. The auditor",
+    "     prunes entries whose file now passes."
+  ],
+
+  "captured_at": "2026-10-03",
+  "redblue_head": "ad83985",
+
+  "unparseable": [
+    {
+      "path": "modules/MathUtils.rb",
+      "error": "ParserError: Expected function name",
+      "cause": "uses `constant PI to 3.14159`, but `constant` is not a keyword in src/lexer.rs (see the keyword table). The file documents a declaration form the language does not have.",
+      "phase": "phase-024",
+      "verified_by": "rb run modules/MathUtils.rb on ad83985"
+    }
+  ],
+
+  "known_absent": [
+    {
+      "thing": "src/testing/assertions.rs is dead code",
+      "phase": "phase-001"
+    },
+    {
+      "thing": "every .rb file in tests/ is 100% commented out, so `rb test` collects zero tests",
+      "phase": "phase-003"
+    },
+    {
+      "thing": "run_all_tests() reads tests/redblue_test.rs (Rust) as Redblue source",
+      "phase": "phase-002"
+    }
+  ]
+}--- workflows
+rbops-tick.yml
+rbops.yml
+validate.yml
+name: rbops-tick
+
+# Safety net. The primary path is rbops.yml's `retrigger` job, which chains to
+# the next phase in ~10-30s. This cron exists so a lost dispatch, a runner
+# eviction, or a failed re-dispatch does not stall the pipeline for more than
+# one interval.
+#
+# NOTE: this job must have `contents: write`. repository_dispatch is a write
+# operation; with `contents: read` GitHub returns 403 and this safety net is
+# silently useless. That bug is present in the design this borrows from.
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: rbops-tick
+  cancel-in-progress: true      # this is a no-op dispatcher; overlap is fine
+
+permissions:
+  contents: write
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check for in-flight or queued runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Count queued runs too. A run that is waiting on the `rbops-pipeline`
+          # concurrency group has already decided a phase is outstanding, so
+          # dispatching another tick would just add queue noise.
+          N=$(gh api -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/actions/runs?per_page=50" \
+              --jq '[.workflow_runs[]
+                    | select(.name | startswith("rbops"))
+                    | select(.status == "in_progress" or .status == "queued")
+                   ] | length' 2>/dev/null || echo 0)
+          if [ "$N" -ne 0 ]; then
+            echo "::notice::$N rbops run(s) in progress or queued — skipping tick"
+            exit 0
+          fi
+
+      - name: Dispatch tick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 5
+          gh api -X POST -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/dispatches" \
+            -f "event_type=rbops_tick" \
+            -f "client_payload[reason]=safety_net_cron" \
+            || echo "::warning::dispatch failed"name: rbops
+
+# =============================================================================
+# RBOPS — self-dispatching, self-auditing pipeline for the redblue language.
+#
+# Unlike the llops design, this one cannot be fooled by an agent that merely
+# claims success. `rbops/verify.sh` is a real gate whose non-zero exit blocks
+# `.done`, and it runs the four gates itself.
+#
+# The bot token deliberately has NO `workflows` permission, so a push that
+# touches .github/ is refused by GitHub. That is the lock that makes the gate
+# trustworthy: the implementer cannot edit its own gate.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Force a phase (e.g. phase-001). Empty = auto-select."
+        required: false
+        default: ""
+      action:
+        description: "tick | run | review | audit | status"
+        required: false
+        default: "tick"
+[0m
+[0m$ [0msed -n '80,250p' .github/workflows/rbops.yml
+set -uo pipefail
+          ACTION="${INPUT_ACTION:-tick}"
+          PHASE="${INPUT_PHASE}"
+
+          if [ -f phases/.stop ]; then
+            echo "::notice::phases/.stop present — pipeline halted."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$ACTION" = "audit" ] || [ "$ACTION" = "status" ]; then
+            echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+            echo "phase="       >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$PHASE" ]; then
+            PHASE=$(./rbops/dispatch.sh select 2>/dev/null | tail -1)
+          fi
+
+          if [ -n "$PHASE" ]; then
+            echo "::notice::selected $PHASE"
+            echo "phase=$PHASE"   >> "$GITHUB_OUTPUT"
+            echo "exists=true"    >> "$GITHUB_OUTPUT"
+            echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          else
+            ./rbops/dispatch.sh status || true
+            echo "::notice::queue drained."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "phase="       >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # work: clone redblue, run the dispatcher. contents:write is required to
+  # push phase work; it is NOT granted any workflow scope, so the bot cannot
+  # rewrite its own gate.
+  # ---------------------------------------------------------------------------
+  work:
+    needs: select
+    if: needs.select.outputs.exists == 'true' && needs.select.outputs.action != 'status'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # push phase work. NO `workflows` scope.
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install jq and ripgrep
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq ripgrep
+
+      - name: Install opencode (pinned)
+        run: |
+          # 1.15.12 is what llops-android pins, but the free tier now requires
+          # >=1.18.0 and every opencode/* model fails with "OpenCode 1.18.0 or
+          # newer is required to use the free tier".
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.34
+          # $GITHUB_PATH only affects LATER steps, so the binary must be called
+          # by absolute path here or this step dies with exit 127.
+          "$HOME/.opencode/bin/opencode" --version
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rbops-${{ runner.os }}-${{ hashFiles('rbops/phases.json') }}
+          restore-keys: rbops-${{ runner.os }}-
+
+      - name: Clone redblue
+        run: |
+          git clone --depth 50 https://github.com/authorss81/redblue.git redblue
+          echo "RBOPS_REPO=$PWD/redblue" >> "$GITHUB_ENV"
+
+      - name: Fetch WIP checkpoint
+        continue-on-error: true
+        run: |
+          cd redblue
+          git fetch origin "+refs/heads/rbops-wip/*:refs/remotes/origin/rbops-wip/*" || true
+
+      # Warm the build so the phase's own gate is fast.
+      - name: Warm cargo cache
+        working-directory: redblue
+        run: cargo build --all-targets
+
+      - name: Dispatch
+        id: d
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          # Optional. Only needed if you add openrouter/* models to the chains
+          # below; the default chains are opencode/* only so a single key is
+          # sufficient.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RBOPS_PHASE: ${{ needs.select.outputs.phase }}
+          RBOPS_RETRIGGER: ${{ inputs.no_retrigger && '0' || '1' }}
+          # opencode/* only by default: these are served by the OpenCode Zen key.
+          # A dead model advances the chain without consuming a phase attempt,
+          # so a generous list is safe. Benchmark-ranked by Terminal-Bench /
+          # SWE-bench among live free models as of 2026-09; treat as a hint.
+          RBOPS_IMPL_MODELS: opencode/big-pickle,opencode/muse-spark-1.3-contributor-free,opencode/nemotron-3-ultra-free,opencode/nemotron-3.5-lightning-free,opencode/mimo-v2.5-free
+          RBOPS_REVIEW_MODELS: opencode/muse-spark-1.3-contributor-free,opencode/nemotron-3-ultra-free,opencode/big-pickle
+          RBOPS_AUDIT_MODELS: opencode/muse-spark-1.3-contributor-free,opencode/big-pickle,opencode/nemotron-3-ultra-free
+          RBOPS_MODEL_TIMEOUT: 3000
+          RBOPS_MAX_REVIEW_ROUNDS: 3
+        run: |
+          set -uo pipefail
+          PHASE="${RBOPS_PHASE}"
+          # Promote to GITHUB_ENV: the commit, state-push and report steps all
+          # reference RBOPS_PHASE, and under `set -u` an unset variable aborts
+          # the step. It was step-scoped to this one and killed Report status.
+          echo "RBOPS_PHASE=$PHASE" >> "$GITHUB_ENV"
+          if [ "${{ needs.select.outputs.action }}" = "audit" ]; then
+            bash rbops/dispatch.sh audit; rc=$?
+          else
+            bash rbops/dispatch.sh run "$PHASE" || rc=$?
+            rc=${rc:-0}
+            if [ "$rc" = "0" ]; then
+              bash rbops/dispatch.sh review "$PHASE" || rc=$?
+            fi
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Push phase work
+        if: always()
+        env:
+          GIT_NAME: rbops-bot
+          GIT_EMAIL: rbops-bot@users.noreply.github.com
+          RBOPS_PHASE: ${{ env.RBOPS_PHASE }}
+        run: |
+          set -uo pipefail
+          cd redblue
+          git config user.name "$GIT_NAME"
+          git config user.email "$GIT_EMAIL"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::notice::clean tree — nothing to push"; exit 0
+          fi
+          git add -A
+          git commit -m "rbops: ${RBOPS_PHASE} ($(date -u +%Y-%m-%dT%H:%M:%SZ))" || exit 0
+          for i in 1 2 3 4 5; do
+            git push origin HEAD:main && { echo "pushed"; exit 0; }
+            git pull --rebase origin main || true
+            sleep 3
+          done
+          git branch -f "rbops-recovery/${RBOPS_PHASE}" HEAD
+          git format-patch -1 --stdout > "../recovery-${RBOPS_PHASE}.patch" || true
+          echo "::error::push failed after 5 attempts — recovery branch + patch saved"
+
+      - name: Push RBOPS state
+        if: always()
+        run: |
+          set -uo pipefail
+          git config user.name rbops-bot
+          git config user.email rbops-bot@users.noreply.github.com
+          mkdir -p phases logs
+          cp -r redblue/phases/. phases/ 2>/dev/null || true
+          cp -r redblue/logs/. logs/ 2>/dev/null || true
+          [ -n "$(git status --porcelain phases logs)" ] || { echo "no state change"; exit 0; }
+          git add phases logs
+          git commit -m "rbops: state after ${RBOPS_PHASE}" || exit 0
+          for i in 1 2 3 4 5; do
+            git push origin HEAD:main && exit 0
+[0m
+[0m$ [0mwc -l redblue/src/testing/*.rs; echo ---; ls redblue/tests/
+258 redblue/src/testing/assertions.rs
+  168 redblue/src/testing/harness.rs
+  118 redblue/src/testing/mod.rs
+  255 redblue/src/testing/reporter.rs
+  315 redblue/src/testing/runner.rs
+ 1114 total
+---
+integration_test.rb
+redblue_test.rs
+suite.rb
+test_arithmetic.rb
+[0m
+[0m$ [0mls redblue/phases/; echo ---; cd redblue && git log --oneline -3 && git status --short | head
+ls: cannot access 'redblue/phases/': No such file or directory
+---
+ad83985 v0.1.2 - Parser fix for module.function() calls, example fixes
+3737567 v0.1.1 - Build cleanup and warning fixes
+f6f5cac v0.1.1 - Build cleanup and warning fixes
+[0m
+[0m→ [0mRead redblue/src/testing/assertions.rs
+[0m→ [0mRead redblue/src/testing/harness.rs
