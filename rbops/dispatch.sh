@@ -38,6 +38,34 @@ die()  { printf '%s [dispatch] FATAL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit
 need_jq() { command -v "$JQ" >/dev/null 2>&1 || die "jq is required (set JQ=/path/to/jq)"; }
 need_rbx(){ command -v opencode >/dev/null 2>&1 || die "opencode CLI not on PATH"; }
 
+# Preflight. A missing binary or a bad key is an OPERATOR problem, not a phase
+# problem: mark the phase .blocked immediately and exit 3 rather than burning
+# MAX_ATTEMPTS on a failure that will never succeed.
+env_check() {
+  local phase="$1"
+  command -v opencode >/dev/null 2>&1 || {
+    touch "$(marker "$phase" .blocked)"
+    log "$phase BLOCKED — opencode CLI not installed"
+    return 3
+  }
+  if [ -z "${OPENCODE_API_KEY:-}" ]; then
+    touch "$(marker "$phase" .blocked)"
+    local repo_hint
+    repo_hint="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    [ -n "$repo_hint" ] || repo_hint="<owner>/rbops"
+    log "$phase BLOCKED — OPENCODE_API_KEY is not set"
+    log "  fix: gh secret set OPENCODE_API_KEY --repo $repo_hint"
+    return 3
+  fi
+  # Cheap auth probe. Do not waste a phase on a bad key.
+  if ! opencode models >/dev/null 2>&1; then
+    touch "$(marker "$phase" .blocked)"
+    log "$phase BLOCKED — opencode auth probe failed (bad or exhausted key)"
+    return 3
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------- phase state
 marker() { printf 'phases/%s/%s' "$1" "$2"; }
 has()    { [ -f "$(marker "$1" "$2")" ]; }
@@ -169,6 +197,7 @@ TPL
   cat "$LOG_DIR/$phase.ctx" > "$LOG_DIR/$phase.prompt"   # audit record
 
   need_rbx
+  env_check "$phase" || return 3
   checkpoint_loop "$phase" & local cp=$!
   local code
   run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" \
@@ -265,6 +294,9 @@ cmd_review() {
 cmd_audit() {
   need_rbx
   mkdir -p "$LOG_DIR"
+  if [ -z "${OPENCODE_API_KEY:-}" ]; then
+    log "audit SKIPPED — OPENCODE_API_KEY is not set"; return 3
+  fi
   log "audit pass — generating new phases from measured evidence"
   run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" \
       --agent auditor \
