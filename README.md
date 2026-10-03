@@ -79,15 +79,53 @@ State is **git**, in marker files committed under `phases/phase-NNN/`:
 ## Enabling
 
 ```bash
-gh secret set OPENCODE_API_KEY --repo <owner>/rbops
+# 1. the API key. This is the only secret the pipeline needs.
+gh secret set OPENCODE_API_KEY --repo authorss81/rbops
+
+# 2. check the pipeline can prove itself before spending model tokens
+gh workflow run validate.yml
+
+# 3. see what would run next, without running it
+./rbops/dispatch.sh status
+./rbops/dispatch.sh select
+
+# 4. go
 gh workflow run rbops.yml -f action=tick
-gh workflow run rbops.yml -f action=stop     # via dispatch.sh stop instead
 ```
+
+Halt and resume:
+
+```bash
+./rbops/dispatch.sh stop     # touch phases/.stop; every tick becomes a no-op
+./rbops/dispatch.sh resume
+```
+
+### If the key is missing or wrong
+
+`dispatch.sh` preflights before invoking the agent. A missing CLI, an empty
+`OPENCODE_API_KEY`, or a failed `opencode` auth probe marks the phase
+`.blocked` and exits 3 immediately. It does **not** consume a phase attempt, so
+setting the key and running `resume` picks up exactly where it stopped. It never
+reports a key problem as a phase failure or a model outage.
 
 The bot token is deliberately **not** granted the `workflows` scope, so a push
 that touches `.github/` is rejected by GitHub itself. That is the outer lock;
 `verify.sh` is the inner one. Two independent locks, because a gate that the
 implementer can edit is not a gate.
+
+## Cost control
+
+| Knob | Env var | Default |
+|---|---|---|
+| Attempts per phase | `RBOPS_MAX_ATTEMPTS` | 3 |
+| Infra deferrals before blocking | `RBOPS_MAX_DEFERRALS` | 5 |
+| Review rounds before blocking | `RBOPS_MAX_REVIEW_ROUNDS` | 3 |
+| Per-model wall clock | `RBOPS_MODEL_TIMEOUT` | 3000 s |
+| Chain to next tick | `RBOPS_RETRIGGER` | 1 |
+| Audit every N completed phases | `.audit.every_n_phases` | 8 |
+
+`./rbops/dispatch.sh stop` is the kill switch. It is a committed file, so the
+halt survives a runner being replaced.
 
 ## The gate
 
