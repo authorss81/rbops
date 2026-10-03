@@ -35,6 +35,33 @@ CHECKPOINT_SECS="${RBOPS_CHECKPOINT_SECS:-300}"
 log()  { printf '%s [dispatch] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die()  { printf '%s [dispatch] FATAL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit 2; }
 
+# Advisory lock. CI enforces one-phase-at-a-time with a `concurrency` group;
+# `mkdir` is atomic, so this also protects a developer running two ticks from
+# one machine. A stale lock (older than 6h, i.e. a runner that was killed) is
+# reclaimed rather than blocking the pipeline forever.
+LOCK_DIR="${RBOPS_LOCK:-/tmp/rbops-pipeline.lock}"
+release_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    date +%s > "$LOCK_DIR/pid" 2>/dev/null || true
+    # `rm -rf`, not `rmdir`: the lock dir holds a pid file, and rmdir refuses
+    # to remove a non-empty directory, so the lock would leak on every exit.
+    trap 'release_lock' EXIT INT TERM
+    return 0
+  fi
+  local age now born
+  born="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  age=$(( now - born ))
+  if [ "$born" -gt 0 ] && [ "$age" -gt 21600 ]; then
+    log "reclaiming stale lock (${age}s old)"
+    rm -rf "$LOCK_DIR"; mkdir -p "$LOCK_DIR" 2>/dev/null || true
+    trap 'release_lock' EXIT INT TERM
+    return 0
+  fi
+  die "another rbops run holds $LOCK_DIR (age ${age}s). Wait, or remove it if no run is active."
+}
+
 need_jq() { command -v "$JQ" >/dev/null 2>&1 || die "jq is required (set JQ=/path/to/jq)"; }
 need_rbx(){ command -v opencode >/dev/null 2>&1 || die "opencode CLI not on PATH"; }
 
@@ -352,10 +379,10 @@ cmd_tick() {
 
 case "${1:-}" in
   select) cmd_select ;;
-  run)    shift; cmd_run "$@" ;;
-  review) shift; cmd_review "$@" ;;
-  audit)  cmd_audit ;;
-  tick)   cmd_tick ;;
+  run)    shift; acquire_lock; cmd_run "$@" ;;
+  review) shift; acquire_lock; cmd_review "$@" ;;
+  audit)  acquire_lock; cmd_audit ;;
+  tick)   acquire_lock; cmd_tick ;;
   stop)   mkdir -p phases; touch phases/.stop; log "HALTED — remove phases/.stop to resume" ;;
   resume) rm -f phases/.stop; log "RESUMED" ;;
   status) need_jq
