@@ -164,33 +164,56 @@ jobs:
 
       - name: Clone redblue and give it push credentials
         env:
+          # GITHUB_TOKEN is scoped to the repository the workflow runs in, so it
+          # CANNOT push to redblue no matter what `permissions:` says. A
+          # cross-repo push needs a token with access to redblue: a fine-grained
+          # PAT with Contents: Read and write on authorss81/redblue only.
+          #   echo "$PAT" | gh secret set REDBLUE_TOKEN -R authorss81/rbops
+          REDBLUE_TOKEN: ${{ secrets.REDBLUE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          git clone --depth 50 https://github.com/authorss81/redblue.git redblue
+          set -uo pipefail
+          OWNER="${{ github.repository_owner }}"
+          git clone --depth 50 "https://github.com/${OWNER}/redblue.git" redblue
+
           # THE CRITICAL PATH SETTING. dispatch.sh keeps its state in the rbops
           # repo but the agent must edit redblue. Without this the agent runs in
           # the rbops checkout, cannot find src/testing/harness.rs, burns its
           # whole budget searching, and its output is discarded.
           echo "RBOPS_PROJECT_DIR=$PWD/redblue" >> "$GITHUB_ENV"
 
-          # CREDENTIALS. `actions/checkout` configures a credential helper for
-          # ITS OWN repository only. A plain `git clone https://...` of another
-          # repo is anonymous, so every `git push` from redblue/ fails auth:
-          # phase work was unshippable, WIP checkpoints never appeared, and the
-          # WIP fetch failed silently behind `|| true`. Embed the token in the
-          # remote instead of relying on a helper.
-          git -C redblue remote set-url origin \
-            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/redblue.git"
           git -C redblue config user.name  "rbops-bot"
           git -C redblue config user.email "rbops-bot@users.noreply.github.com"
 
-          # Prove it now, loudly, rather than discovering it 20 minutes later
-          # when a finished phase silently fails to ship.
-          if git -C redblue push --dry-run origin HEAD:main 2>&1 | grep -qiE 'could not read|denied|authentication|403'; then
-            echo "::error::redblue clone cannot push — phase work would be lost"
-            exit 1
+          # `actions/checkout` configures a credential helper for ITS OWN repo
+          # only, and a plain clone of another repo is anonymous. Attach an
+          # explicit token, preferring a PAT scoped to redblue.
+          if [ -n "${REDBLUE_TOKEN:-}" ]; then
+            URL="https://x-access-token:${REDBLUE_TOKEN}@github.com/${OWNER}/redblue.git"
+            echo "::notice::using REDBLUE_TOKEN (PAT)"
+          elif [ "${ALLOW_CROSS_REPO:-0}" = "1" ]; then
+            URL="https://x-access-token:${GH_TOKEN}@github.com/${OWNER}/redblue.git"
+            echo "::notice::using GITHUB_TOKEN"
+          else
+            echo "::warning::no REDBLUE_TOKEN configured — the clone can read but NOT push."
+            echo "::warning::phase work will be captured as work-<phase>.patch but not pushed."
+            echo "::warning::to fix: create a fine-grained PAT (Contents: R/W on"
+            echo "::warning::authorss81/redblue) and run:"
+            echo "::warning::  echo \$PAT | gh secret set REDBLUE_TOKEN -R authorss81/rbops"
+            URL="https://github.com/${OWNER}/redblue.git"
           fi
-          echo "::notice::redblue push access verified"
+          git -C redblue remote set-url origin "$URL"
+
+          # Prove write access now, and SHOW git's actual stderr. Swallowing it
+          # behind a grep is how the real cause stays hidden.
+          probe="$(git -C redblue push --dry-run origin HEAD:main 2>&1)"; prc=$?
+          echo "$probe" | sed 's/^/    /'
+          if [ "$prc" -eq 0 ]; then
+            echo "::notice::redblue push access verified"
+          else
+            echo "::warning::redblue push is NOT available (exit $prc) — work will not auto-ship"
+          fi
+          exit 0
 
       - name: Fetch WIP checkpoint
         continue-on-error: true
