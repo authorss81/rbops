@@ -358,6 +358,25 @@ jobs:
             git commit -m "rbops: ${PHASE} ($(date -u +%Y-%m-%dT%H:%M:%SZ))" || true
           fi
 
+          # Park unproven work where a retry can find it. Before overwriting,
+          # archive whatever was parked there before: a worse attempt must not
+          # be able to destroy a better one. Phase-003's first attempt (187
+          # tests) was overwritten by a retry that inherited a broken tree and
+          # managed 1; the only reason that was recoverable is that the run
+          # happened to upload a patch artifact. This makes it unconditional.
+          archive_and_park() {
+            local prev
+            prev="$(git ls-remote origin "refs/heads/rbops-recovery/${PHASE}" 2>/dev/null | awk '{print $1}')"
+            if [ -n "${prev:-}" ] && [ "${prev}" != "$(git rev-parse HEAD)" ]; then
+              if git push -q origin "${prev}:refs/heads/rbops-archive/${PHASE}/${prev:0:7}" 2>/dev/null; then
+                echo "::notice::archived the previous recovery head ${prev:0:7} to rbops-archive/${PHASE}"
+              fi
+            fi
+            git branch -f "rbops-recovery/${PHASE}" HEAD 2>/dev/null || true
+            git push -f origin "HEAD:refs/heads/rbops-recovery/${PHASE}" 2>/dev/null \
+              || echo "::warning::recovery-branch push failed; work-${PHASE}.patch artifact still holds the work"
+          }
+
           # POLICY: only gate-green, reviewed work lands on main. A failed gate
           # means the code is unproven — possibly correct, possibly not — and
           # unproven code does not belong on the language's main branch. It goes
@@ -365,9 +384,7 @@ jobs:
           # can inspect it, and to the patch artifact either way.
           if [ "${PROGRESS:-false}" != "true" ]; then
             echo "::warning::gate did not pass for ${PHASE} — keeping main clean, parking work on rbops-recovery/${PHASE}"
-            git branch -f "rbops-recovery/${PHASE}" HEAD 2>/dev/null || true
-            git push -f origin "HEAD:refs/heads/rbops-recovery/${PHASE}" 2>/dev/null \
-              || echo "::warning::recovery-branch push also failed; work-${PHASE}.patch artifact still holds the work"
+            archive_and_park
             exit 0
           fi
 
@@ -377,8 +394,7 @@ jobs:
             sleep 3
           done
 
-          git branch -f "rbops-recovery/${PHASE}" HEAD 2>/dev/null || true
-          git push -f origin "HEAD:refs/heads/rbops-recovery/${PHASE}" 2>/dev/null || true
+          archive_and_park
           echo "::error::push failed after 5 attempts — recovery branch and work-${PHASE}.patch artifact saved"
 
       - name: Push RBOPS state

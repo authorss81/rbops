@@ -632,6 +632,53 @@ case "$out" in
   *) no "failure rule satisfied by a string literal" ;;
 esac
 
+# =========================================================== 16. no clobber
+head_ "16. parking work archives the previous attempt instead of destroying it"
+# Self-contained: needs a real remote to push refs to, so it builds its own bare
+# repo rather than borrowing $PROJ. A worse retry must never be able to erase a
+# better one — that is how phase-003's 187-test tree was lost.
+AT="$(mktemp -d)"
+git init -q --bare "$AT/remote.git" 2>/dev/null
+git clone -q "$AT/remote.git" "$AT/w" 2>/dev/null
+( cd "$AT/w" && git config user.email t@t && git config user.name t \
+  && PH=phase-999
+  # Verbatim from rbops.yml — if the workflow's copy drifts, this stops testing it.
+  archive_and_park() {
+    local prev
+    prev="$(git ls-remote origin "refs/heads/rbops-recovery/${PH}" 2>/dev/null | awk '{print $1}')"
+    if [ -n "${prev:-}" ] && [ "${prev}" != "$(git rev-parse HEAD)" ]; then
+      if git push -q origin "${prev}:refs/heads/rbops-archive/${PH}/${prev:0:7}" 2>/dev/null; then
+        echo "archived ${prev:0:7}"
+      fi
+    fi
+    git branch -f "rbops-recovery/${PH}" HEAD 2>/dev/null || true
+    git push -f origin "HEAD:refs/heads/rbops-recovery/${PH}" 2>/dev/null || true
+  }
+  echo one > f.txt; git add -A; git commit -qm one
+  git branch -f "rbops-recovery/$PH" HEAD
+  git push -q -f origin "HEAD:refs/heads/rbops-recovery/$PH"
+  GOOD="$(git rev-parse HEAD)"
+  echo two > f.txt; git add -A; git commit -qm two      # a later, worse attempt
+  archive_and_park >/dev/null 2>&1
+  REC="$(git ls-remote origin "refs/heads/rbops-recovery/$PH" | awk '{print $1}')"
+  ARCH="$(git ls-remote origin "refs/heads/rbops-archive/$PH/${GOOD:0:7}" | awk '{print $1}')"
+  N="$(git ls-remote origin "refs/heads/rbops-archive/$PH/*" | wc -l | tr -d ' ')"
+  [ "$REC" = "$(git rev-parse HEAD)" ] && echo "rec=ok" || echo "rec=bad"
+  [ "$ARCH" = "$GOOD" ] && echo "arch=ok" || echo "arch=bad"
+  archive_and_park >/dev/null 2>&1
+  echo "three" > f.txt; git add -A; git commit -qm three
+  archive_and_park >/dev/null 2>&1
+  echo "n=$(git ls-remote origin "refs/heads/rbops-archive/$PH/*" | wc -l | tr -d ' ')"
+) > "$AT/out" 2>&1
+res="$(cat "$AT/out" 2>/dev/null)"
+grep -q 'rec=ok'   <<<"$res" && ok "recovery head tracks the newest attempt" \
+  || no "recovery head is wrong"
+grep -q 'arch=ok'  <<<"$res" && ok "the previous attempt is archived, not destroyed" \
+  || no "the previous attempt was destroyed"
+grep -q '^n=2$'    <<<"$res" && ok "re-parking is idempotent and older attempts accumulate" \
+  || no "archive refs are wrong: $(grep '^n=' <<<"$res")"
+rm -rf "$AT"
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then
