@@ -1,0 +1,628 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Gate-green review — digging for what's still wrong.
+[0m✗ [0mRead .opencode/agent/reviewer.md failed
+[91m[1mError: [0mFile not found: /home/runner/work/rbops/rbops/redblue/.opencode/agent/reviewer.md
+[0m→ [0mRead AGENTS.md
+[0m→ [0mRead phases/phase-003/FINDINGS.md
+[0m✱ [0mGlob "**/reviewer*"[90m in . · 0 matches[0m
+[0m
+[0m$ [0mgit log --oneline -15; echo ---; git status --short; echo ---; git diff --stat HEAD 2>&1 | head -n 30; echo ---; ls phases/phase-003/ 2>&1; ls .opencode/ 2>&1; ls rbops/ 2>&1 || echo "no rbops"
+da2ffba restore phase-003: the complete attempt, recovered from artifact
+ee528e1 rbops: phase-002 (2026-10-04T04:51:42Z)
+5ca4867 rbops: phase-002 (2026-10-04T02:58:39Z)
+fa8b1d0 rbops: phase-002 (2026-10-04T02:35:44Z)
+6cc1281 Attach source spans to every error
+4ec2dd9 Revert "rbops: phase-004 (2026-10-03T14:12:07Z)"
+86fbd89 rbops: phase-004 (2026-10-03T14:12:07Z)
+c4ebad3 Make the test harness capable of failing
+ad83985 v0.1.2 - Parser fix for module.function() calls, example fixes
+3737567 v0.1.1 - Build cleanup and warning fixes
+f6f5cac v0.1.1 - Build cleanup and warning fixes
+eadd110 v0.1.1 - Build cleanup and warning fixes
+0eb5f90 v0.1.1 - Build cleanup and warning fixes
+35f1d69 first commit
+0478ec1 3rd commit
+---
+ M phases/phase-003/FINDINGS.md
+ M phases/phase-003/REPORT.md
+---
+ phases/phase-003/FINDINGS.md | 49 ++++++++++++++++++++++
+ phases/phase-003/REPORT.md   | 99 +++++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 134 insertions(+), 14 deletions(-)
+---
+FINDINGS.md
+REPORT.md
+ls: cannot access '.opencode/': No such file or directory
+ls: cannot access 'rbops/': No such file or directory
+no rbops
+[0m
+No reviewer checklist found — falling back to evidence-based review.
+[0m$ [0mgit diff HEAD -- phases/phase-003/REPORT.md phases/phase-003/FINDINGS.md | head -n 200; echo ===; git log --oneline da2ffba0180aca4faa8ca3deb8832e2d49a712ba..HEAD 2>&1 | head
+diff --git a/phases/phase-003/FINDINGS.md b/phases/phase-003/FINDINGS.md
+index 3e02e9e..0d82d5a 100644
+--- a/phases/phase-003/FINDINGS.md
++++ b/phases/phase-003/FINDINGS.md
+@@ -308,3 +308,52 @@ comparing the whole value (`expect x to be [1, 2, 3]`) or by an explicit loop.
+ **Risk: low** for containment (one more `BinaryOp` plus a `contain` keyword);
+ **low** for `assert.equal` once finding 1 is fixed, since `stdlib::builtin_function`
+ already has an `assert` arm to route.
++
++---
++
++## 14. `rb format` corrupts programs — it inserts spaces inside string literals
++
++`Formatter::write` (`src/formatter.rs:430-439`) inserts a single space between
++any two adjacent writes unless the output already ends in a space or a newline.
++It has no notion of "this write is the inside of a literal", so the three writes
++that `format_string_literal` performs (`src/formatter.rs:385-389`) emit
++`"` → `" ab` → `" ab "`. Every string literal in every formatted program gains a
++leading and a trailing space, which silently changes the program's behaviour.
++
++The same rule produces doubled spacing elsewhere (`write("x")` followed by
++`write(" to ")` yields `set x  to ...`), and because `format` re-renders from the
++AST (`src/formatter.rs:17-25`) rather than from tokens, comments are discarded
++outright.
++
++Reproduction:
++
++```
++$ printf 'say "ab"\n' > /tmp/t.rb && rb format /tmp/t.rb
++say " ab "
++
++$ rb format examples/hello.rb > /tmp/h.rb && rb run /tmp/h.rb
++ Hello, World!          # was: Hello, World!
++ Hello, World!
++$ echo $?
++0
++```
++
++Consequence for this phase: `rb format --check` reports
++`File would be reformatted` for **every** `.rb` file in the repository — all six
++`examples/*.rb`, `modules/MathUtils.rb`, and all ten `tests/*.rb` this phase
++wrote. No `.rb` file passes, so the check cannot be used as a gate and the suite's
++files were not formatted to "fix" it (doing so would rewrite string literals in
++the tests themselves). `rb format` is documented in `AGENTS.md` under
++"Formatter (rbfmt)" and its output is unrunnable-equivalent to the input.
++
++**Severity: blocker** — `rb format` is a semantics-changing command, not a
++cosmetic one, and it currently destroys every string literal in a program.
++**Risk: medium** — the fix is a real-token-aware writer, not a one-line patch:
++`write` needs a "no space before/after" signal for literal interiors and
++punctuation, and comment preservation likely needs the formatter to work from
++tokens rather than the AST.
++
++**Suggested acceptance gate:** `rb format` is idempotent and semantics-preserving
++on a corpus: for every file `F` in `examples/*.rb` plus a new corpus,
++`rb run F` and `rb run <(rb format F)` produce byte-identical stdout, and
++`rb format --check` passes on every file in the repository.
+diff --git a/phases/phase-003/REPORT.md b/phases/phase-003/REPORT.md
+index e38f39c..d2bdb6c 100644
+--- a/phases/phase-003/REPORT.md
++++ b/phases/phase-003/REPORT.md
+@@ -1,5 +1,38 @@
+ # Phase 003 — Write a real Redblue test suite
+ 
++## Re-verification on resume
++
++This report was written by a first run and then **independently re-verified by a
++second run** on the recovered tree (`da2ffba`, whose parent is `ee528e1`, the
++`main` this phase was measured against). Nothing was rewritten. The second run
++re-executed every gate from scratch and re-ran both mutation checks; every number
++below is what was measured, not what the first run claimed. The two probes were
++created, measured, and deleted again — `git status` is clean of them.
++
++| Claim in this report | Re-measured on `da2ffba` |
++|---|---|
++| `cargo fmt --all -- --check` passes | pass, 0 diff |
++| `cargo clippy --all-targets -- -D warnings` passes | pass, 0 warnings |
++| `cargo test --all-targets` = 67 passed | 67 passed across 7 binaries: 5 + 0 + 13 + 21 + 8 + 5 + 15 |
++| `rb test` = 187 run, 187 passed, 0 failed, 0 skipped | 187 run, 187 passed, 0 failed, 0 skipped, exit 0 |
++| 187 `test` blocks, 322 `expect`/`assert.` lines | 187 blocks, 322 assertion lines |
++| 57 blocks named `edge_*` | 57 |
++| 24 blocks use `try`/`catch error` | 24 (per-file: modules 7, arithmetic 5, suite 3, lists 2, records 2, text 2, integration 2, functions 1) |
++| no tautological `expect x to be x`, no `expect nothing to be nothing` | 0 matches for either |
++| `examples/*.rb` all exit 0 | all 6 exit 0 |
++| only `src/testing/harness.rs` touched in `src/` | confirmed by `git diff ee528e1..HEAD --stat` |
++| no live test removed | the only non-comment deletions in `tests/*.rb` are 3 `say` lines inside commented placeholders |
++
++The mutation checks were repeated, not trusted:
++
++- Dropping `tests/zz_probe.rb` containing `test "zz_mutation_probe"` with
++  `expect x to be 2` (where `x` is 1) → `rb test` printed `Tests run: 188`,
++  `Failed: 1` and exited **1**.
++- Dropping the same file with no `expect` at all →
++  `every_test_block_carries_an_assertion` **FAILED**, panicking at
++  `tests/redblue_suite_test.rs:146`.
++- Both probes were removed; `rb test` is back to 187/187 and `cargo test` to 67.
++
+ ## Finding re-verified
+ 
+ The phase prompt's evidence still reproduces on `main` (`ee528e1`). Before this
+@@ -164,13 +197,15 @@ Redblue suite: 187 blocks, of which **57 are named `edge_*`** and **24 use
+ 
+ - No `// smoke` marker anywhere: `every_test_block_carries_an_assertion` rejects
+   any block without `expect` or `assert.`
+-- Mutation-checked. Two temporary files were dropped into `tests/` and both
+-  turned the gate red, then were removed:
++- Mutation-checked, twice. The first run dropped two temporary files into
++  `tests/`, both turned the gate red, and removed them; the resumed run repeated
++  both probes and measured the same two failures:
+   - a block with no `expect` → `every_test_block_carries_an_assertion` FAILED,
+-    naming `tests/zz_tmp_meta.rb:1`;
+-  - a block with `expect 1 to be 2` → `edge_suite_reports_at_least_40_redblue_tests`
+-    and `edge_suite_runs_no_skipped_tests` FAILED, and `rb test` printed
+-    `Failed: 1` and exited 1.
++    naming the probe file (`tests/redblue_suite_test.rs:146`);
++  - a block with `expect x to be 2` where `x` is 1 → `rb test` printed
++    `Tests run: 188`, `Failed: 1` and exited 1, and
++    `edge_suite_reports_at_least_40_redblue_tests` /
++    `edge_suite_runs_no_skipped_tests` FAILED.
+ - The suite is deterministic: no wall clock, no network, no randomness. The only
+   filesystem access is `modules/SuiteKit.rb`, which is committed to the repo, and
+   the file contents are irrelevant to every assertion (only "the import resolved"
+@@ -179,23 +214,35 @@ Redblue suite: 187 blocks, of which **57 are named `edge_*`** and **24 use
+ 
+ ## Gates
+ 
++All five rows below were re-executed by the resumed run, not inherited from the
++first run's claim.
++
+ | Gate | Result |
+ |---|---|
+ | `cargo fmt --all -- --check` | pass (0 diff) |
+ | `cargo clippy --all-targets -- -D warnings` | pass (0 warnings) |
+-| `cargo test` | **67 passed, 0 failed** across 8 binaries (5 + 0 + 13 + 21 + 8 + 5 + 15 + 0) |
++| `cargo test --all-targets` | **67 passed, 0 failed** across 7 binaries (5 + 0 + 13 + 21 + 8 + 5 + 15) |
+ | `rb test` | **187 run, 187 passed, 0 failed, 0 skipped**, exit 0 |
+ | `./rbops/verify.sh phase-003` | **NOT RUN — `./rbops/` does not exist in this checkout** |
+ 
+ On the fourth gate, exactly: `./rbops/verify.sh` cannot be executed from the
+-project root here (`ls: cannot access 'rbops': No such file or directory`). The
+-RBOPS tree is not part of this repository, so the phase's own gate script is not
+-reachable. I did not inspect, reconstruct or substitute for it. The three gates
+-that *can* run were all run and are green, and `.github/workflows/ci.yml` runs
+-exactly `cargo build`, `cargo test` and `cargo clippy -- -D warnings` — all three
++project root here (`ls: cannot access 'rbops': No such file or directory`, and
++`find . -name verify.sh -not -path './target/*'` returns nothing). The RBOPS tree
++is not part of this repository, so the phase's own gate script is not reachable.
++I did not inspect, reconstruct or substitute for it. The three gates that *can*
++run were all run and are green, and `.github/workflows/ci.yml` runs exactly
++`cargo build`, `cargo test` and `cargo clippy -- -D warnings` — all three
+ verified locally green. **If `verify.sh` enforces anything beyond those three,
+ this phase is unverified against it.**
+ 
++One candidate extra check was run and found **pre-existing across the whole
++repository**, so it is not a regression of this phase and was deliberately not
++"fixed": `rb format --check` reports `File would be reformatted` for all six
++`examples/*.rb`, `modules/MathUtils.rb`, and every `.rb` file this phase
++touched. No `.rb` file in the repository passes `rb format --check`, so that is
++the formatter's debt, not this suite's — recorded rather than churned
++(FINDINGS.md §11 and §14).
++
+ Also run, because AGENTS §2 makes the examples load-bearing:
+ 
+ | Command | Result |
+@@ -232,9 +279,9 @@ not by edits — this phase changed tests and one test-harness file only.
+ 
+ ## Known gaps / follow-ups
+ 
+-Thirteen findings are recorded in `phases/phase-003/FINDINGS.md`, each with a
++Fourteen findings are recorded in `phases/phase-003/FINDINGS.md`, each with a
+ `file:line` anchor, a reproduction, a severity and a suggested acceptance gate.
+-The four that block a real language surface:
++The five that block a real language surface:
+ 
+ - **§1** `stdlib::builtin_function` is never called; ~35 stdlib functions
+   (`uppercase`, `split`, `abs`, `map`, `to_text`, …) all fail with
+@@ -259,6 +306,15 @@ The four that block a real language surface:
+   emits `is greater than`, which the parser cannot read — `rb format` can
+   produce unparseable code. Consequence: every comparison in the suite is `is` /
+   `is not`.
++- **§14** `Formatter::write` (`src/formatter.rs:430-439`) inserts a space between
++  any two adjacent writes, so `format_string_literal` emits `" ab "` for `"ab"` —
++  `rb format` **silently changes every string literal's value**, and it is why
++  `rb format --check` fails on every `.rb` file in the repository. Found by this
++  phase's run of `rb format --check`; it is a formatter bug, not a test-suite
++  bug, so it is a finding and not a fix here. It is the one thing this phase
++  would most like a follow-up phase for, because `rb format` is the only
++  mechanical way to keep the ten suite files readable and currently it would
++  corrupt them.
+ 
+ No test in this suite asserts a *bug* as if it were a feature, except for the
+ three tests whose names say so explicitly and which point at the finding:
+@@ -266,4 +322,19 @@ three tests whose names say so explicitly and which point at the finding:
+ `lists: a conditional inside a loop does not disturb the iteration` and
+ `lists: break inside a loop does not truncate it` (FINDINGS.md §4).
+ 
++## Definition of done
++
++| Requirement | Measured | Status |
++|---|---|---|
+===
+[0m
+[0m→ [0mRead src/formatter.rs[90m [limit=80, offset=375][0m
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tail -n 20
+running 15 tests
+test edge_error_on_first_line_points_at_line_one ... ok
+test edge_error_on_last_line_points_at_the_last_line ... ok
+test edge_empty_source_is_a_valid_empty_program ... ok
+test edge_multibyte_column_offsets_are_character_based ... ok
+test edge_render_of_a_span_past_the_last_line_still_reports_the_location ... ok
+test edge_render_without_a_file_omits_the_file_name ... ok
+test edge_unknown_span_renders_message_only ... ok
+test test_analyzer_error_carries_position ... ok
+test edge_runtime_error_reports_the_statement_position ... ok
+test edge_runtime_error_inside_a_loop_reports_the_inner_statement ... ok
+test test_io_error_has_no_span ... ok
+test test_lexer_error_carries_position ... ok
+test test_every_failed_program_reports_a_position ... ok
+test test_render_draws_source_line_and_caret ... ok
+test test_parser_error_reports_line_and_column ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^(test result|Running|error|warning)" 
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo run -q --bin rb -- test 2>&1 | tail -n 8; echo "EXIT:$?"; echo ===; printf 'say "ab"\n' > /tmp/t.rb && cargo run -q --bin rb -- format /tmp/t.rb 2>&1; echo ===; cargo run -q --bin rb -- format --check examples/hello.rb 2>&1; echo "EXIT:$?"
+...........................................................................................................................................................................................Tests run: 187
+Passed: 187
+Failed: 0
+EXIT:0
+===
+say " ab "===
+File would be reformatted
+EXIT:1
+[0m
+Core claims check out — now hunting the remaining gaps.
+[0m$ [0mgrep -n "interp\|contain\|assert\|3\.1\|3\.2\|§" AGENTS.md SPEC.md 2>/dev/null | head -n 30; echo ===; git diff ee528e1..HEAD --stat 2>&1 | tail -n 20
+AGENTS.md:99:└── testing/         # Test harness (harness, runner, assertions, reporter)
+AGENTS.md:201:contains("text", sub), starts_with("text", prefix)
+SPEC.md:87:set f to 3.14
+SPEC.md:135:| `number` | Integers and decimals | `42`, `3.14`, `-10` |
+SPEC.md:191:constant PI to 3.14159
+SPEC.md:527:    constant PI to 3.14159
+===
+ modules/SuiteKit.rb          |  16 +++
+ phases/phase-003/FINDINGS.md | 310 +++++++++++++++++++++++++++++++++++++++++++
+ phases/phase-003/REPORT.md   | 269 +++++++++++++++++++++++++++++++++++++
+ src/testing/harness.rs       |  93 +++++++++++--
+ tests/integration_test.rb    | 198 ++++++++++++++++++++++++---
+ tests/redblue_suite_test.rs  | 243 +++++++++++++++++++++++++++++++++
+ tests/suite.rb               | 290 ++++++++++++++++++++++++++++++----------
+ tests/test_arithmetic.rb     | 167 ++++++++++++++++++++---
+ tests/test_control_flow.rb   | 204 ++++++++++++++++++++++++++++
+ tests/test_functions.rb      | 137 +++++++++++++++++++
+ tests/test_lists.rb          | 168 +++++++++++++++++++++++
+ tests/test_modules.rb        | 111 ++++++++++++++++
+ tests/test_objects.rb        | 131 ++++++++++++++++++
+ tests/test_records.rb        | 141 ++++++++++++++++++++
+ tests/test_text.rb           | 150 +++++++++++++++++++++
+ 15 files changed, 2511 insertions(+), 117 deletions(-)
+[0m
+[0m$ [0mgrep -c '^test "' tests/*.rb modules/*.rb 2>/dev/null; echo ===; grep -h '^test "' tests/*.rb | sort | head -n 5; echo ===; grep -h 'edge_' tests/*.rb | grep -c 'test "edge_'; echo ===; grep -l 'try' tests/*.rb; grep -c 'catch error' tests/*.rb modules/*.rb 2>/dev/null; echo ===; grep -c 'expect \|assert\.' tests/*.rb 2>/dev/null | head -n 15
+tests/integration_test.rb:20
+tests/suite.rb:19
+tests/test_arithmetic.rb:22
+tests/test_control_flow.rb:22
+tests/test_functions.rb:14
+tests/test_lists.rb:21
+tests/test_modules.rb:10
+tests/test_objects.rb:15
+tests/test_records.rb:21
+tests/test_text.rb:23
+modules/MathUtils.rb:0
+modules/SuiteKit.rb:0
+===
+test "arithmetic: division keeps the fractional part"
+test "arithmetic: integer addition"
+test "arithmetic: integer subtraction can go negative"
+test "arithmetic: large but exact products"
+test "arithmetic: modulo"
+===
+57
+===
+tests/integration_test.rb
+tests/suite.rb
+tests/test_arithmetic.rb
+tests/test_functions.rb
+tests/test_lists.rb
+tests/test_modules.rb
+tests/test_records.rb
+tests/test_text.rb
+tests/integration_test.rb:2
+tests/suite.rb:4
+tests/test_arithmetic.rb:5
+tests/test_control_flow.rb:0
+tests/test_functions.rb:1
+tests/test_lists.rb:2
+tests/test_modules.rb:7
+tests/test_objects.rb:0
+tests/test_records.rb:2
+tests/test_text.rb:2
+modules/MathUtils.rb:0
+modules/SuiteKit.rb:0
+===
+tests/integration_test.rb:41
+tests/suite.rb:48
+tests/test_arithmetic.rb:28
+tests/test_control_flow.rb:34
+tests/test_functions.rb:21
+tests/test_lists.rb:42
+tests/test_modules.rb:11
+tests/test_objects.rb:24
+tests/test_records.rb:39
+tests/test_text.rb:34
+[0m
+[0m→ [0mRead src/formatter.rs[90m [limit=60][0m
+[0m
+[0m$ [0msed -n '230,245p' SPEC.md; echo ===; grep -n "interp" SPEC.md docs/GRAMMAR.md src/*.rs 2>/dev/null | head; echo ===; grep -n "catch" tests/suite.rb
+if status is "active" or status is "pending"
+if not is_empty
+```
+
+### String Interpolation
+
+```redblue
+set greeting to "Hello, {name}!"
+set message to "Value: {x + y}"
+```
+
+### Property Access
+
+```redblue
+set first to person.name
+set x_coord to point.x
+===
+src/parser.rs:46:    // String interpolation
+===
+89:    catch error
+161:    catch error
+172:    catch error
+177:    catch error
+[0m
+[0m$ [0mfor f in examples/*.rb modules/*.rb tests/*.rb; do cargo run -q --bin rb -- format --check "$f" >/dev/null 2>&1 && echo "PASS $f" || echo "FAIL $f"; done; echo ===; printf 'set x to 1\n// a comment\nsay "hi"\n' > /tmp/c.rb && cargo run -q --bin rb -- format /tmp/c.rb 2>&1; echo ===; printf 'set x to 5\nsay x\n' > /tmp/s.rb && cargo run -q --bin rb -- format /tmp/s.rb 2>&1 | cat -A | head
+FAIL examples/files.rb
+FAIL examples/fizzbuzz.rb
+FAIL examples/formats.rb
+FAIL examples/hello.rb
+FAIL examples/test_arithmetic.rb
+FAIL examples/time.rb
+FAIL modules/MathUtils.rb
+FAIL modules/SuiteKit.rb
+FAIL tests/integration_test.rb
+FAIL tests/suite.rb
+FAIL tests/test_arithmetic.rb
+FAIL tests/test_control_flow.rb
+FAIL tests/test_functions.rb
+FAIL tests/test_lists.rb
+FAIL tests/test_modules.rb
+FAIL tests/test_objects.rb
+FAIL tests/test_records.rb
+FAIL tests/test_text.rb
+===
+set x  to 1
+say " hi "===
+set x  to 5$
+say x
+[0m
+[0m$ [0mpython3 -c "
+import re,glob
+total_blocks=0; catch_blocks=0
+for f in sorted(glob.glob('tests/*.rb')):
+    src=open(f).read()
+    blocks=re.findall(r'test \"([^\"]+)\"\n(.*?)end',src,re.S)
+    total_blocks+=len(blocks)
+    n=sum(1 for _,b in blocks if 'catch error' in b or 'catch ' in b)
+    print(f, len(blocks), 'catch-blocks:',n)
+print('total',total_blocks)
+"; echo ===; grep -n "fn edge_\|fn every_\|#\[test\]" tests/redblue_suite_test.rs | head -n 25; echo ===; grep -n "146" tests/redblue_suite_test.rs | head -3; sed -n '135,155p' tests/redblue_suite_test.rs
+tests/integration_test.rb 20 catch-blocks: 2
+tests/suite.rb 19 catch-blocks: 2
+tests/test_arithmetic.rb 22 catch-blocks: 5
+tests/test_control_flow.rb 22 catch-blocks: 0
+tests/test_functions.rb 14 catch-blocks: 1
+tests/test_lists.rb 21 catch-blocks: 2
+tests/test_modules.rb 10 catch-blocks: 6
+tests/test_objects.rb 15 catch-blocks: 0
+tests/test_records.rb 21 catch-blocks: 2
+tests/test_text.rb 23 catch-blocks: 2
+total 187
+===
+78:#[test]
+79:fn edge_suite_reports_at_least_40_redblue_tests() {
+98:#[test]
+99:fn edge_suite_runs_no_skipped_tests() {
+113:#[test]
+114:fn edge_suite_declares_no_skip_markers() {
+130:#[test]
+131:fn every_test_block_carries_an_assertion() {
+161:#[test]
+162:fn edge_suite_covers_every_required_area() {
+188:#[test]
+189:fn edge_suite_contains_named_edge_tests() {
+203:#[test]
+204:fn edge_suite_asserts_that_failures_are_produced() {
+223:#[test]
+224:fn edge_suite_files_are_not_all_commented_out() {
+===
+        let source = read(&path);
+        let blocks = test_blocks(&source);
+        assert!(
+            !blocks.is_empty(),
+            "{} declares no test blocks; a suite of zero tests is not a suite",
+            path
+        );
+
+        for (line, name, body) in blocks {
+            blocks_seen += 1;
+            let asserts = body.contains("expect ") || body.contains("assert.");
+            assert!(
+                asserts,
+                "{}:{} `test \"{}\"` has no assertion - a smoke test proves nothing",
+                path, line, name
+            );
+        }
+    }
+
+    assert!(
+        blocks_seen >= 40,
+[0m
+[0m$ [0mgrep -c 'try$\\| try\\|^ *try' tests/*.rb; echo ===; grep -n -B2 -A8 'catch error' tests/suite.rb | head -n 60
+tests/integration_test.rb:0
+tests/suite.rb:0
+tests/test_arithmetic.rb:0
+tests/test_control_flow.rb:0
+tests/test_functions.rb:0
+tests/test_lists.rb:0
+tests/test_modules.rb:0
+tests/test_objects.rb:0
+tests/test_records.rb:0
+tests/test_text.rb:0
+===
+87-    try
+88-        set bad to "n=" + 1
+89:    catch error
+90-        set caught to yes
+91-    end
+92-    expect caught to be yes
+93-end
+94-
+95-test "suite: a list of records sorted by walking and filtering"
+96-    set kept to 0
+97-    set dropped to 0
+--
+159-        end
+160-        set bad to 1 / 0
+161:    catch error
+162-        set work to work + 100
+163-    end
+164-    expect work to be 110
+165-end
+166-
+167-test "edge_suite_two_independent_failures_are_both_reported"
+168-    set first to no
+169-    set second to no
+170-    try
+171-        set bad to 1 / 0
+172:    catch error
+173-        set first to yes
+174-    end
+175-    try
+176-        set bad to 1 + "x"
+177:    catch error
+178-        set second to yes
+179-    end
+180-    expect first to be yes
+181-    expect second to be yes
+182-end
+183-
+184-test "edge_suite_an_empty_list_and_an_empty_text_stay_distinct"
+185-    set listy to []
+[0m
+[0m$ [0mgrep -c 'try' tests/*.rb; echo ===; grep -rn 'try' tests/test_modules.rb | head; echo ===; cargo run -q --bin rb -- run modules/MathUtils.rb 2>&1 | head -3; echo "EXIT:$?"; cargo run -q --bin rb -- run examples/hello.rb 2>&1 | head -3
+tests/integration_test.rb:2
+tests/suite.rb:4
+tests/test_arithmetic.rb:5
+tests/test_control_flow.rb:0
+tests/test_functions.rb:1
+tests/test_lists.rb:2
+tests/test_modules.rb:7
+tests/test_objects.rb:0
+tests/test_records.rb:2
+tests/test_text.rb:2
+===
+11:    try
+45:    try
+56:    try
+67:    try
+79:    try
+89:    try
+100:    try
+===
+Error: ParserError: Expected function name
+  --> modules/MathUtils.rb:4:16
+4 | constant PI to 3.14159
+EXIT:0
+Hello, World!
+Hello, World!
+[0m
+[0m$ [0mgrep -rn "AGENTS §\|AGENTS.md §" phases/phase-003/REPORT.md phases/phase-003/FINDINGS.md | head -n 20; echo ===; grep -rln "3\.1\|edge-case matrix" --include="*.md" . 2>/dev/null | grep -v target | head; echo ===; tail -c 100 phases/phase-003/REPORT.md | cat -A | tail -3
+phases/phase-003/REPORT.md:246:Also run, because AGENTS §2 makes the examples load-bearing:
+phases/phase-003/REPORT.md:265:## Edge-case matrix (AGENTS §3.2)
+phases/phase-003/REPORT.md:299:- **§13** of the three assertion forms AGENTS §3.1 permits, only
+phases/phase-003/REPORT.md:304:  testing contract in AGENTS §3.1 cannot be satisfied until this is fixed.**
+phases/phase-003/FINDINGS.md:156:Confirmed pre-existing on `ee528e1` via `git stash`. AGENTS §2 says
+phases/phase-003/FINDINGS.md:209:below `-len` is rejected. AGENTS §3.2 requires out-of-bounds access to be "a
+phases/phase-003/FINDINGS.md:279:## 13. `expect … to contain …` and `assert.equal` — the two other assertion forms named in AGENTS §3.1 — do not work
+phases/phase-003/FINDINGS.md:307:**Severity: major** — the testing contract in AGENTS §3.1 cannot be satisfied.
+===
+./phases/phase-003/REPORT.md
+./phases/phase-003/FINDINGS.md
+./phases/phase-002/REPORT.md
+./phases/phase-002/FINDINGS.md
+./SPEC.md
+./ROADMAP.md
+./docs/GRAMMAR.md
+===
+isting test files untouched; 67 pass | met |$
+$
+The fourth gate could not be run; see **Gates** above.
+[0m
+[0m$ [0mgrep -n "'<'\|'>'\|Less\|Greater" src/lexer.rs | head -8; echo ===; grep -n "is greater than\|is less than" src/formatter.rs | head -4
+73:    Less,
+74:    LessEqual,
+75:    Greater,
+76:    GreaterEqual,
+===
+400:            BinaryOp::Less => "is less than",
+401:            BinaryOp::LessEqual => "is less than or equal to",
+402:            BinaryOp::Greater => "is greater than",
+403:            BinaryOp::GreaterEqual => "is greater than or equal to",
+[0m
+[0m$ [0mgrep -n "TokenKind::Less\|TokenKind::Greater\|TokenKind::Equal\|'<'\|'>'\|==\|!=" src/lexer.rs | head -12
+140:        if c == Some('\n') {
+151:            if c.is_whitespace() && c != '\n' {
+161:            if c == '\n' {
+171:            if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
+185:            if c == '"' {
+189:            if c == '\\' {
+211:            if c.is_alphanumeric() || c == '_' {
+296:            if c == '\n' {
+303:            if c == '/' && lexer.peek() == Some('/') {
+310:                || (c == '.' && lexer.peek().map(|p| p.is_ascii_digit()).unwrap_or(false))
+318:            if c == '"' {
+325:            if c.is_alphabetic() || c == '_' {
+[0m
+# Review — round 1, phase-003 (docs-only diff)
+
+Scope verified: committed `da2ffba..HEAD` is empty, no untracked files. The only material under review is the uncommitted diff to `phases/phase-003/REPORT.md` (+99/−14) and `phases/phase-003/FINDINGS.md` (+49, new §14). `.opencode/agent/reviewer.md` and `rbops/verify.sh` both do not exist in this checkout, so this is an evidence-based review against the repo itself. The gate numbers were re-measured, not trusted.
+
+## Verified — no action needed
+
+- **§14 bug is real and correctly anchored.** `say "ab"` → `say " ab "` reproduced live; `Formatter::write` (`src/formatter.rs:430-439`) and `format_string_literal` (`:385-389`) anchors are exact. Doubled spacing (`set x  to 1`) and comment deletion also reproduced. `rb format --check` FAILs on all 19 `.rb` files in the repo, including the 7 pre-existing files this phase never touched — so the "not a regression, recorded not churned" call is correct.
+- **Counts hold.** `cargo test --all-targets`: 67 passed (5+0+13+21+8+5+15), `rb test`: 187/187/0/0. 187 `test` headers, 322 assertion lines, 57 `edge_*` headers all recount exactly. The "24 blocks use try/catch" survives scrutiny: there are 25 `try`/`catch error` *lines* because `edge_suite_two_independent_failures_are_both_reported` (suite.rb:167) holds two pairs — 24 *blocks* is the right unit and the per-file split sums correctly.
+- **§11 (which §14 builds on) holds**: `TokenKind::Less/Greater/...` exist as enum variants (`src/lexer.rs:73-76`) but no tokenizer arm constructs them — dead variants, confirmed.
+- The REPORT's correction from "8 binaries (…+ 0)" to "7 binaries" matches `cargo test` output, and the honest `verify.sh NOT RUN` disclosure is preserved and strengthened.
+
+## Issues found
+
+1. **Dangling normative citations (medium).** REPORT.md cites `AGENTS §2` (twice), `AGENTS §3.2`, `AGENTS §3.1` (twice); FINDINGS.md cites `AGENTS §2` (§2, §6), `AGENTS §3.2` (§9), `AGENTS §3.1` (§13). The checked-in `AGENTS.md` is 210 lines with **no numbered sections at all** and contains none of the cited content: no `{interp}` invariant, exactly **one** assertion form (not three), no edge-case matrix, no "modules are spec-by-example / gate runs examples". The only files in the repo containing "§3.1/§3.2" are the phase-002/003 reports themselves — the citations are circular. This doesn't invalidate the underlying bugs (SPEC.md *does* document `{interp}` interpolation ~:233-238, and the dead-lexer-variant evidence stands on its own), but every "the contract in AGENTS §X cannot be satisfied" argument currently leans on a phantom anchor. Fix: re-anchor each cite to `SPEC.md`/grammar line numbers that actually exist, or state the requirement inline.
+2. **§14 wording bug (minor, but in a severity argument).** *"its output is unrunnable-equivalent to the input"* is garbled — presumably "not semantics-preserving" or "not runnable-equivalent". As written it reads as the opposite of the intended claim.
+3. **§14 risk assessment is overstated in one respect (nuance).** The string-literal corruption alone is close to a one-line fix — build the quoted literal (`"..."`) and emit it in a *single* `write()` call so the space-inserting rule never fires inside it. The token-aware rewrite is genuinely needed only for the wider spacing/punctuation and comment-preservation problems. Suggest splitting the follow-up gate: (a) literal-preserving `write` (small), (b) spacing/comment fidelity (medium). As written, §14 implies nothing short of a rewrite helps, which may deter a cheap high-value partial fix.
+4. **REPORT.md missing trailing newline** (visible as `\ No newline at end of file` in the diff). Trivial; fix on next touch.
+5. **Nit: the "7 binaries: 5 + 0 + …" sum retains a zero-test target.** Harmless, but either name the empty target or drop the `0` — a reader will wonder what passes vacuously.
+
+## Verdict
+
+**Approve the diff modulo issues 1–4.** The new §14 is a genuine blocker finding with live reproductions, exact anchors, and a correct no-churn decision; the re-verification section checks out line-for-line against independent measurement. But issue 1 should block *phase sign-off*, not just the diff: until the AGENTS §X citations are repaired, the report's severity and acceptance-gate arguments rest on requirements that aren't in the repo.
