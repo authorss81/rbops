@@ -948,6 +948,94 @@ case "$out" in
 esac
 set_tf 2
 
+# =========================================================== 20. review integrity
+head_ "20. the reviewer is a real gate, not a rubber stamp"
+# Two separate failures made every phase ship unreviewed:
+#
+#  1. `--agent reviewer` resolved to NOTHING ("agent not found, falling back to
+#     default agent"), because dispatch runs opencode with --dir at the redblue
+#     checkout, which has no opencode.json. The reviewer was then told to read
+#     `.opencode/agent/reviewer.md`, which does not exist. So it ran with no
+#     contract at all. One review log is 654 bytes of file-not-found errors.
+#  2. The parser read "no [SEVERITY] tag found" as APPROVAL. Phase-013's review
+#     contained six real defect classes in prose and was discarded wholesale.
+#
+# The contract is now inlined from rbops/agents/*.md, and a review with no
+# parseable verdict is INVALID rather than clean.
+
+# (1) the contract must actually reach the model
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+R() { RBOPS_MIN_OUTPUT=1 D review phase-001 2>&1 | strip; }
+out="$(R)"
+if grep -q 'RBOPS REVIEWER CONTRACT' "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null; then
+  ok "the reviewer contract is inlined into the request"
+else
+  no "the reviewer got no contract"
+fi
+if grep -q 'REVIEW VERDICT' "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null; then
+  ok "the mandatory verdict line is specified"
+else
+  no "no verdict requirement in the reviewer contract"
+fi
+if grep -q '\.opencode/agent/reviewer\.md' "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null; then
+  no "the request still points at a nonexistent agent file"
+else
+  ok "the request no longer points at a nonexistent agent file"
+fi
+[ -s "$PIPE/rbops/agents/reviewer.md" ] && ok "reviewer.md ships in the pipeline repo" \
+  || no "rbops/agents/reviewer.md is missing from the fixture"
+
+# (2) parsing. Drive the real parser through cmd_review with a stub that emits a
+# chosen review log, so each outcome is asserted rather than assumed.
+review_with() {   # $1 = body to emit
+  build_fixture >/dev/null; use_stubs
+  cat > "$STUB/opencode" <<EOS
+#!/usr/bin/env bash
+cat <<'BODY'
+$1
+BODY
+echo "review done"
+exit 0
+EOS
+  chmod +x "$STUB/opencode"
+  RBOPS_MAX_REVIEW_ROUNDS=1 R review phase-001
+}
+# a) prose findings with no tags and no verdict must NOT approve. This is the
+#    exact shape that shipped phase-013.
+out="$(review_with 'I looked hard and found problems.
+- src/vm.rs:473 - for loop ignores step sign, descending ranges never run
+- src/vm.rs:626 - evaluate recurses with no depth check, can overflow the stack
+Please fix these before shipping.')"
+case "$out" in
+  *"INVALID"*) ok "prose findings with no verdict are INVALID, not clean" ;;
+  *) no "a tagless prose review was treated as approval"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /' ;;
+esac
+marker phase-001 .done && no "an invalid review still wrote .done" || ok "an invalid review does NOT write .done"
+# b) an explicit CLEAN verdict approves
+out="$(review_with 'I checked the diff against the report and the gates.
+FINDINGS: none
+REVIEW VERDICT: CLEAN')"
+case "$out" in
+  *"explicit CLEAN"*) ok "an explicit CLEAN verdict approves" ;;
+  *) no "an explicit CLEAN was not honoured"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /' ;;
+esac
+marker phase-001 .done && ok ".done written on a clean review" || ok "no .done (acceptable for this assertion path)"
+# c) BLOCKER in prose form must block, not slip through the tag-only regex
+out="$(review_with 'src/vm.rs:473 - descending for range never executes
+BLOCKER: this is reachable and wrong
+REVIEW VERDICT: FINDINGS 1')"
+case "$out" in
+  *"blocking finding"*) ok "a prose BLOCKER is caught (old regex missed it)" ;;
+  *) no "a prose BLOCKER slipped through"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /' ;;
+esac
+# d) total garbage must not approve either
+out="$(review_with 'I am unable to complete the review.')"
+case "$out" in
+  *"INVALID"*) ok "an unusable review is INVALID" ;;
+  *) no "an unusable review was treated as clean" ;;
+esac
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

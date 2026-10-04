@@ -519,11 +519,20 @@ cmd_review() {
     # COMPLETE change set: committed, unstaged and untracked. Reading only
     # `base..HEAD` hides any work the phase left uncommitted, which is exactly
     # the work most worth reviewing.
-    local rctx="$LOG_DIR/$phase.review.$round.ctx"
+local rctx="$LOG_DIR/$phase.review.$round.ctx"
     {
-      printf '# Review request — round %s of phase %s\n\n' "$round" "$phase"
-      printf 'Rules: .opencode/agent/reviewer.md and AGENTS.md section 5.\n'
-      printf 'The gate is green. Your job is to find what is still wrong.\n\n'
+      printf '# Review request - round %s of phase %s\n\n' "$round" "$phase"
+      printf 'The gate is green. Your job is to find what is still wrong.\n'
+      printf 'The contract below is authoritative and is inlined here on purpose:\n'
+      printf 'dispatch runs you with --dir pointing at the redblue checkout, which has\n'
+      printf 'no opencode.json, so `--agent reviewer` resolves to nothing and silently\n'
+      printf 'falls back to the default agent. Referring you to a config file or an\n'
+      printf '.opencode/agent/*.md path meant you ran with NO contract for every phase.\n\n'
+      printf -- '---\n\n'
+      cat "$RBOPS_ROOT/rbops/agents/reviewer.md" 2>/dev/null \
+        || printf '!! THE REVIEWER CONTRACT IS MISSING. Treat this review as INVALID.\n'
+      printf -- '\n---\n\n'
+      printf '## Change set for phase %s\n\n' "$phase"
       printf '## 1. Committed changes (%s..HEAD)\n\n```diff\n' "$base"
       in_project git diff --no-color "$base"..HEAD 2>/dev/null || printf '(none)\n'
       printf '```\n\n## 2. Uncommitted tracked changes\n\n```diff\n'
@@ -547,16 +556,45 @@ cmd_review() {
       return 42
     fi
 
-    # Blocking findings present? The second clause is redundant-looking on
-    # purpose: it catches a reviewer that emitted FINDINGS but no severity tags.
-    if grep -qE '\[(BLOCKER|CRITICAL)\]' "$LOG_DIR/$phase.review.$round.log"; then
-      log "review round $round found blocking findings — fixing"
-    elif ! grep -qE '^\s*[0-9]+\.?\s*\[' "$LOG_DIR/$phase.review.$round.log"; then
-      log "review round $round produced no structured findings — treating as clean"
+    # --- parse the review -------------------------------------------------------
+    # The rule is asymmetric ON PURPOSE. The old logic was: "no `[SEVERITY]` tag
+    # found, therefore clean". That is not a review, it is an absence of one, and
+    # it silently shipped phase-013, whose review contained six real defect
+    # classes - a descending `for` range that never executes, an uncharged
+    # recursion path that can overflow the Rust stack, env-coupled tests that fail
+    # under REDBLUE_MAX_STEPS - all written as prose with no tags, so all of it was
+    # discarded and the phase was marked done.
+    #
+    # A review that cannot be parsed must not be able to approve anything.
+    local rlog="$LOG_DIR/$phase.review.$round.log"
+    local has_sev has_clean has_verdict blocking
+    has_sev="$(grep -coE '\[(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\]|\*\*?(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL|MAJOR):' "$rlog" 2>/dev/null || echo 0)"
+    has_clean="$(grep -ciE 'FINDINGS: *none|REVIEW VERDICT: *CLEAN' "$rlog" 2>/dev/null || echo 0)"
+    has_verdict="$(grep -ciE '^[[:space:]]*REVIEW VERDICT: *(CLEAN|FINDINGS)' "$rlog" 2>/dev/null || echo 0)"
+    blocking="$(grep -coE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL):' "$rlog" 2>/dev/null || echo 0)"
+
+    if [ "$blocking" -gt 0 ]; then
+      log "review round $round: $blocking blocking finding(s) - fixing"
+    elif [ "$has_clean" -gt 0 ]; then
+      log "review round $round: explicit CLEAN verdict - shipping"
+      break
+    elif [ "$has_sev" -gt 0 ]; then
+      log "review round $round: findings present, none blocking - shipping"
+      break
+    elif [ "$has_verdict" -gt 0 ]; then
+      log "review round $round: verdict line present but no findings and no CLEAN - shipping"
       break
     else
-      log "review round $round found non-blocking findings only"
-      break
+      # No verdict, no severities, no clean marker. Either the model rambled, or
+      # it never received the contract. Either way this is not a sign-off.
+      log "review round $round INVALID - no verdict line, no severity tags, no clean marker"
+      if [ "$round" -ge "${RBOPS_MAX_REVIEW_ROUNDS:-3}" ]; then
+        log "$phase BLOCKED - reviewer never produced a parseable verdict in $round rounds"
+        touch "$(marker "$phase" .blocked)"
+        return 3
+      fi
+      log "retrying review with an explicit re-request"
+      continue
     fi
 
     log "applying review fixes"
@@ -586,9 +624,9 @@ cmd_review() {
     fi
   done
 
-  if grep -qE '\[(BLOCKER|CRITICAL)\]' "$LOG_DIR/$phase.review.$round.log" 2>/dev/null; then
+if grep -qE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL):' "$LOG_DIR/$phase.review.$round.log" 2>/dev/null; then
     touch "$(marker "$phase" .blocked)"
-    log "$phase BLOCKED — blocking findings survive $round review round(s)"
+    log "$phase BLOCKED - blocking findings survive $round review round(s)"
     return 3
   fi
 
@@ -596,6 +634,9 @@ cmd_review() {
   in_project git push -q origin "HEAD:refs/heads/rbops-wip/DELETE_${phase}" 2>/dev/null || true
   in_project git push -q origin ":refs/heads/rbops-wip/$phase" 2>/dev/null || true
   log "$phase DONE"
+
+  # On the live path: the workflow calls select + run + review, never tick.
+  maybe_audit
   return 0
 }
 
@@ -609,19 +650,27 @@ cmd_audit() {
   fi
   mkdir -p "$LOG_DIR"
   log "audit pass — generating new phases from measured evidence"
-  # The auditor needs to read the tree, so point it at the repo root rather than
-  # rbops/, and hand it the contract rather than assuming it remembers.
-  cat "$RBOPS_ROOT/AGENTS.md" > "$LOG_DIR/audit.ctx"
+  # The auditor runs with --dir at the PIPELINE root, not the project. It is the
+  # only component allowed to write rbops/phases.json, and the project checkout
+  # lives one level down, so pointing it at redblue/ made its own write
+  # impossible - it was told to append to a file outside its working directory,
+  # which every other agent is forbidden to touch. From here it can read the
+  # project at ./redblue and write exactly one file: rbops/phases.json.
+  cat "$RBOPS_ROOT/rbops/agents/auditor.md" > "$LOG_DIR/audit.ctx"
   {
     printf '\n\n---\n\n# AUDIT REQUEST\n\n'
-    printf 'Follow .opencode/agent/auditor.md and AGENTS.md section 6.\n'
-    printf 'The project under audit is the redblue checkout in this working directory.\n'
-    printf 'MEASURE it, DIFF reality against SPEC.md / ROADMAP.md / README.md,\n'
-    printf 'SAFETY-AUDIT this pipeline, then APPEND new phases to rbops/phases.json.\n'
+    printf 'The contract above is authoritative and inlined on purpose: dispatch runs\n'
+    printf 'you with an explicit working directory, so `--agent auditor` cannot be\n'
+    printf 'relied on to carry it.\n\n'
+    printf 'Working directory: %s (the pipeline root)\n' "$RBOPS_ROOT"
+    printf 'Project under audit: ./redblue  (READ-ONLY - do not modify it)\n'
+    printf 'You may write exactly ONE file: rbops/phases.json\n\n'
+    printf 'MEASURE the project, DIFF reality against its SPEC/ROADMAP, SAFETY-AUDIT\n'
+    printf 'the pipeline, then APPEND evidence-backed phases to rbops/phases.json.\n'
     printf 'Every phase needs a real file:line. Do not invent work.\n'
   } >> "$LOG_DIR/audit.ctx"
   run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" "$LOG_DIR/audit.ctx" \
-      --dir "$PROJECT_DIR" --agent auditor --title "rbops-audit"
+      --dir "$RBOPS_ROOT" --title "rbops-audit"
   local code=$?
   if [ "$code" = "75" ]; then
     log "audit DEFERRED — model chain unusable"
@@ -640,11 +689,28 @@ cmd_audit() {
   return 0
 }
 
+# --- periodic audit ---------------------------------------------------------
+# Extracted from cmd_tick, where it was DEAD CODE: the workflow drives
+# `select` + `run` and never calls `tick`, so the every-N-phases trigger had
+# never fired once in the project's life. It is called from cmd_review now,
+# which is on the live path.
+maybe_audit() {
+  local every done_n
+  every="$("$JQ" -r '.audit.every_n_phases' "$PHASES" 2>/dev/null)"
+  [ -n "$every" ] && [ "$every" -gt 0 ] 2>/dev/null || every=8
+  done_n="$(ls -d "$PHASE_ROOT"/*/.done 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$done_n" -gt 0 ] || return 0
+  if [ "$((done_n % every))" -eq 0 ]; then
+    log "audit due — $done_n phases done (every $every)"
+    cmd_audit || log "audit failed"
+  fi
+}
+
 # ----------------------------------------------------------------------- tick
 cmd_tick() {
   need_jq
   local phase; phase="$(cmd_select | tail -1)"
-  [ -n "$phase" ] || { log "idle"; return 0; }
+  if [ -z "$phase" ]; then log "idle"; return 0; fi
 
   local rc=0
   cmd_run "$phase"    || rc=$?
@@ -654,13 +720,6 @@ cmd_tick() {
     3)  log "blocked — retrigger will surface it" ;;
     *)  log "run failed ($rc)" ;;
   esac
-
-  # periodic audit
-  local every; every="$( "$JQ" -r '.audit.every_n_phases' "$PHASES" 2>/dev/null || echo 8)"
-  local done_n; done_n="$(ls -d "$PHASE_ROOT"/*/.done 2>/dev/null | wc -l | tr -d ' ')"
-  if [ "$((done_n % every))" -eq 0 ] && [ "$done_n" -gt 0 ]; then
-    cmd_audit || log "audit failed"
-  fi
 
   # queue drained and nothing blocked => stop chaining, save minutes
   if [ -z "$(cmd_select | tail -1)" ]; then log "queue drained — no retrigger"; return 0; fi
