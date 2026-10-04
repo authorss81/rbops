@@ -208,17 +208,30 @@ MIN_RS="$('"$JQ"' -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null || echo
 MIN_RB="$('"$JQ"' -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null || echo 2)"
 NEW_TESTS="$(git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null | grep -cE '^\+\s*(async )?fn (edge_|test_)' )"
 NEW_RB="$(git diff -U0 "$BASE_REF" -- '*.rb' 2>/dev/null | grep -cE '^\+\s*test ' )"
-EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test )edge_')"
-FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(is_err|expect_err|should_panic|expect .* to fail|assert_throws)')"
+# Both idioms must be recognised, in BOTH target languages. The quota above is
+# disjunctive (Rust OR Redblue), so these two rules have to be too — otherwise a
+# Redblue-only phase can satisfy the quota and still be told it proved nothing.
+#   Rust:    fn edge_empty_list()          Redblue:  test "edge_empty list"
+# The optional quote is the whole bug: a Redblue test name is a string literal,
+# so `test edge_x` never occurs, and the unquoted-only regex rejected 61 real
+# tests in phase-003 including correctly-named ones.
+EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test +"?)edge_')"
+# Failure assertions per language. Rust has is_err/should_panic; Redblue has no
+# exceptions and instead has `try ... catch error`, which was missing here
+# entirely — the one construct Redblue offers for asserting a fault. Anchored to
+# the line start so a test whose *data* mentions `catch error` cannot buy a pass.
+FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+  | grep -cE '^\+.*(is_err|expect_err|should_panic|expect .* to fail|assert_throws)|^\+[[:space:]]*catch[[:space:]]+error')"
 
 if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
   ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
 else
   bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
 fi
-[ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" || bad "no test named edge_* — mandatory"
+[ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
+  || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
 [ "$FAILASSERT" -ge 1 ] && ok "failure-asserting test present: $FAILASSERT" \
-  || bad "no test asserts a failure is produced — mandatory"
+  || bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
 
 # Same precision rule as the construct scan above: the token must begin the
 # line. A test fixture that embeds `#[ignore]` as data is not a skipped test.

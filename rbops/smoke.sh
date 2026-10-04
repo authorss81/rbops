@@ -492,6 +492,102 @@ case "$out" in
   *) no "verdict failed on under-claim" ;;
 esac
 
+# =========================================================== 15. bilingual rules
+head_ "15. the mandatory rules work in Redblue, not just Rust"
+# Two rules — "≥1 test named edge_*" and "≥1 test asserting a failure" — were
+# written with Rust-only patterns. They rejected 61 real Redblue tests in
+# phase-003: a Redblue test name is a quoted string, so `test edge_x` never
+# occurs, and Redblue has no exceptions, only `try ... catch error`, which the
+# failure pattern did not list. Both rules must hold in both languages.
+build_fixture >/dev/null; use_stubs
+# tests/*.rb is not swept by the example runner (examples/ and modules/ only),
+# so Redblue tests here are inert fixtures — we are testing the gate's reading
+# of the diff, not the interpreter.
+RB_PASS='test "edge_empty list is rejected"
+    try
+        set x to empty[0]
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+
+test "edge_out_of_bounds index"
+    try
+        set y to [1, 2, 3][9]
+    catch error
+        set caught2 to yes
+    end
+    expect caught2 to be yes
+'
+# A conforming report, so the ONLY thing under test is the two rules.
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase 001 — redblue-only probe
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| tests/probe.rb | +14 −0 | redblue edge + failure tests |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_empty list is rejected | out of bounds |
+| edge_out_of_bounds index | out of bounds |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+printf '%s' "$RB_PASS" > "$PROJ/tests/probe.rb"
+# `git diff HEAD` cannot see an untracked file, and a new test file starts
+# untracked — stage it or the gate correctly reports "no changed files".
+V() { ( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ); }
+out="$(V)"
+case "$out" in
+  *"edge case test present"*) ok "a quoted Redblue name satisfies the edge_* rule" ;;
+  *) no "quoted Redblue test name still rejected"; printf '%s\n' "$out" | grep -E 'edge_|FAIL' | head -4 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"failure-asserting test present"*) ok "try/catch satisfies the failure-assertion rule" ;;
+  *) no "try/catch still rejected"; printf '%s\n' "$out" | grep -E 'failure|FAIL' | head -4 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"VERIFY PASS"*) ok "a Redblue-only phase can now pass the gate" ;;
+  *) no "Redblue-only phase still cannot pass" ;;
+esac
+
+# Now the cheater check: same file, edge_ naming and catch/error both removed.
+# The rules must still bite, or the fix above was a loosening, not a fix.
+printf 'test "list basics"\n    set x to [1, 2, 3]\n    expect length(x) to be 3\n' \
+  > "$PROJ/tests/probe.rb"
+out="$(V)"
+case "$out" in
+  *"no test named edge_"*) ok "un-named test still fails the edge_* rule" ;;
+  *) no "edge_* rule stopped biting" ;;
+esac
+case "$out" in
+  *"no test asserts a failure"*) ok "no-catch test still fails the failure rule" ;;
+  *) no "failure-assertion rule stopped biting" ;;
+esac
+case "$out" in
+  *"VERIFY FAIL"*) ok "verdict is FAIL for a phase that asserts nothing about faults" ;;
+  *) no "verdict was not FAIL" ;;
+esac
+# And the anchored catch must not be buyable from a string literal or prose.
+printf 'test "edge_catch_error is mentioned in the docs"\n    set note to "catch error"\n    expect note to be "catch error"\n' \
+  > "$PROJ/tests/probe.rb"
+out="$(V)"
+case "$out" in
+  *"no test asserts a failure"*) ok "'catch error' as string data cannot buy a pass" ;;
+  *) no "failure rule satisfied by a string literal" ;;
+esac
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

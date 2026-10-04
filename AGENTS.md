@@ -142,6 +142,19 @@ The gate enforces a floor: **≥ 3 new `#[test]` functions or ≥ 2 new Redblue
 `test` blocks**, plus **≥ 1 test named `edge_*`**, **≥ 1 test that asserts a
 failure is produced**, and **zero** newly-skipped or newly-ignored tests.
 
+Both mandatory tests must be expressible in whichever language you are working
+in. Write them like this:
+
+| Requirement | Rust | Redblue |
+|---|---|---|
+| edge case test | `fn edge_empty_list() { … }` | `test "edge_empty list is rejected" do` |
+| asserts a failure | `assert!(r.is_err())` / `#[should_panic]` | `try … catch error … end` |
+
+A Redblue test name is a **string literal**, so it is `test "edge_foo"`, with a
+quote after `test `. Likewise Redblue has no exceptions: `try … catch error` is
+its failure-catching construct, and a test that faults without one is not
+asserting anything. Both forms are recognised by the gate.
+
 Deliberately, the count floor is low. It exists to catch "no verification at
 all", not to judge sufficiency — a hard 6 once failed a genuinely good phase
 with 5 edge tests, which is the gate being smarter than the reviewer. Judging
