@@ -453,6 +453,50 @@ fi
   && ok "inherited diff is measurable against the pre-merge base" \
   || no "inherited work invisible to the diff"
 
+# Precedence. A WIP checkpoint is what a TIMED-OUT attempt left behind:
+# partial, and possibly not even compiling. A recovery branch is a COMPLETE
+# attempt the gate evaluated. When both exist the complete one must win — a
+# stale WIP outranking it once made a retry inherit a broken tree and the
+# phase came out worse than starting clean.
+build_fixture >/dev/null; use_stubs
+( cd "$PROJ" \
+  && printf '// WIP: interrupted, does not compile\n#[ignore]\nfn half_done() {}\n' >> src/vm.rs \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "wip attempt" \
+  && git update-ref "refs/remotes/origin/rbops-wip/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 \
+  && printf '// recovery: complete attempt\n' >> src/vm.rs \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "complete attempt" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+if printf '%s' "$out" | grep -q "resumed from previous attempt"; then
+  ok "with both refs present, the complete attempt is resumed"
+else
+  no "neither resume path logged"
+fi
+if printf '%s' "$out" | grep -q "merging WIP checkpoint"; then
+  no "the partial WIP checkpoint was merged over the complete attempt"
+else
+  ok "the partial WIP checkpoint was not merged"
+fi
+( cd "$PROJ" && grep -q "complete attempt" src/vm.rs && ! grep -q "does not compile" src/vm.rs ) \
+  && ok "the tree holds the complete attempt, not the interrupted one" \
+  || no "wrong tree inherited"
+# And with only a WIP ref, it must still be used — that is its whole purpose.
+build_fixture >/dev/null; use_stubs
+( cd "$PROJ" \
+  && printf '// wip only\n' >> src/vm.rs \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "wip only" \
+  && git update-ref "refs/remotes/origin/rbops-wip/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+if printf '%s' "$out" | grep -q "merging WIP checkpoint" \
+   && grep -q "wip only" "$PROJ/src/vm.rs"; then
+  ok "with only a WIP ref, the checkpoint is still resumed"
+else
+  no "a lone WIP checkpoint is ignored"
+fi
+
 # =========================================================== 14. honesty
 head_ "14. report honesty is asymmetric: over-claim fails, under-claim warns"
 # The stub agent writes a conforming report (claims the 12 the stub cargo

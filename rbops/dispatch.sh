@@ -322,37 +322,40 @@ cmd_run() {
   if has "$phase" .done; then log "$phase already .done"; return 0; fi
   if [ -f "$RBOPS_ROOT/phases/.stop" ]; then log "halted by phases/.stop"; return 0; fi
 
-  # resume any WIP checkpoint from a previous timeout
-  if in_project git rev-parse --verify -q "origin/rbops-wip/$phase" >/dev/null 2>&1; then
-    log "merging WIP checkpoint for $phase"
-    in_project git merge --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1 || true
-    touch "$(marker "$phase" .checkpoint)"
-  fi
-
+  # Capture the base BEFORE any resume merge, so the gate judges the phase's
+  # END STATE. Work inherited from a previous attempt must count toward the
+  # diff and the test quota, or a retry is punished for the tree it was given.
   local base; base="$(in_project git rev-parse HEAD)"
 
-  # Resume from the previous attempt's preserved work. A gate-failed attempt
-  # parks its tree on origin/rbops-recovery/<phase> (the push step does this).
-  # Without this, every retry starts from zero and re-rolls the dice: attempt 1
-  # produced 5 edge tests, attempt 2 produced none, and the pipeline learned
-  # nothing between them.
+  # Two kinds of preserved work exist, and they are NOT equal:
   #
-  # The merge happens AFTER base is captured, so the gate diff (base..HEAD)
-  # credits inherited work. The phase is judged on its end state, not on which
-  # attempt wrote which line. The gate still decides, so bad inherited code
-  # still fails — resuming cannot launder a bad phase.
+  #   rbops-recovery/<phase>  a COMPLETE attempt that the gate evaluated and
+  #                           rejected. Its tests ran. Its tree is coherent.
+  #   rbops-wip/<phase>       whatever a TIMED-OUT attempt had written. Partial
+  #                           by definition, and may not even compile.
   #
-  # Fresh clone + recovery strictly ahead of main means fast-forward, no
-  # conflicts possible. If the merge somehow fails, continue from clean main
-  # rather than wedging the run.
-  if [ ! -f "$(marker "$phase" .checkpoint)" ] \
-     && in_project git rev-parse --verify -q "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
+  # Recovery must therefore win. A stale WIP checkpoint outranking a complete
+  # attempt made a retry inherit a broken tree: clippy failing, one test, and a
+  # #[ignore] the interrupted run had added. The agent dutifully built on it
+  # and the phase got worse than starting clean.
+  local resumed=0
+  if in_project git rev-parse --verify -q "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
+    # Fresh clone + recovery strictly ahead of main means fast-forward, no
+    # conflicts possible. If it somehow fails, continue from clean main rather
+    # than wedging the run.
     if in_project git merge --no-edit --ff-only "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
       log "resumed from previous attempt (rbops-recovery/$phase)"
       touch "$(marker "$phase" .recovered)"
+      resumed=1
     else
       log "recovery branch present but would not fast-forward — starting clean"
     fi
+  fi
+  if [ "$resumed" -eq 0 ] \
+     && in_project git rev-parse --verify -q "origin/rbops-wip/$phase" >/dev/null 2>&1; then
+    log "merging WIP checkpoint for $phase (partial work from a timeout)"
+    in_project git merge --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1 || true
+    touch "$(marker "$phase" .checkpoint)"
   fi
   {
     # The brief comes FIRST and is deliberately blunt. A weak model given a
