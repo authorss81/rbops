@@ -109,11 +109,20 @@ case "$msg" in
 RPT
       cat >> "$dir/src/vm.rs" <<'TST'
 
+// A real Rust test needs the #[test] attribute — without it cargo never runs
+// it. The stub used to emit bare `fn test_a()`, which taught the suite to
+// believe tests can exist without the attribute and hid a quota bug.
+#[test]
 fn edge_empty() { assert!(true); }
+#[test]
 fn test_a() { assert!(true); }
+#[test]
 fn test_b() { assert!(true); }
+#[test]
 fn test_c() { assert!(true); }
+#[test]
 fn test_d() { assert!(true); }
+#[test]
 fn test_e() { let r: Result<(),()> = Err(()); assert!(r.is_err()); }
 TST
       echo "agent wrote a report and 6 tests into $dir" ;;
@@ -678,6 +687,89 @@ grep -q 'arch=ok'  <<<"$res" && ok "the previous attempt is archived, not destro
 grep -q '^n=2$'    <<<"$res" && ok "re-parking is idempotent and older attempts accumulate" \
   || no "archive refs are wrong: $(grep '^n=' <<<"$res")"
 rm -rf "$AT"
+
+# =========================================================== 17. new files count
+head_ "17. a brand-new test file is visible to the gate"
+# `git diff <base>` ignores untracked paths, and a new test file starts
+# untracked. Phase-007 wrote 355 lines and 16 #[test] functions in a new file
+# and the quota reported "0 rust" — so the gate passed a phase it never read.
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase 001 — new-file probe
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| tests/brand_new.rs | +9 −0 | new file, never staged by the agent |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| division_by_zero_reports_an_error | numeric boundary |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+# A new Rust test file with plainly-named tests: no test_ prefix, no edge_
+# prefix. Only one is edge_-named so the naming rule is satisfied separately.
+cat > "$PROJ/tests/brand_new.rs" <<'EOR'
+#[test]
+fn division_by_zero_reports_an_error() { assert!(true); }
+
+#[test]
+fn modulo_by_a_zero_divisor_is_rejected() { assert!(true); }
+
+#[test]
+fn edge_numeric_boundary_is_an_error_not_a_panic() {
+    let r: Result<(), ()> = Err(());
+    assert!(r.is_err());
+}
+EOR
+out="$( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip )"
+case "$out" in
+  *"test quota met: 3 rust"*) ok "3 #[test] fns in a NEW file counted (quota met)" ;;
+  *) no "new test file still invisible"; printf '%s\n' "$out" | grep -E 'quota|diff' | head -3 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"edge case test present"*) ok "the edge_-named test still satisfies the naming rule" ;;
+  *) no "edge naming rule broken" ;;
+esac
+# Control: the same tests with NO edge_ name must still fail the naming rule,
+# proving the count did not quietly satisfy it by accident.
+cat > "$PROJ/tests/brand_new.rs" <<'EOR'
+#[test]
+fn division_by_zero_reports_an_error() { assert!(true); }
+#[test]
+fn modulo_by_a_zero_divisor_is_rejected() { assert!(true); }
+#[test]
+fn another_plainly_named_case() { assert!(true); }
+EOR
+out="$( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip )"
+case "$out" in
+  *"test quota met: 3 rust"*) ok "un-prefixed tests still meet the quota on the #[test] count" ;;
+  *) no "quota still demands a name prefix" ;;
+esac
+case "$out" in
+  *"no test named edge_"*) ok "but the edge_ naming rule still bites" ;;
+  *) no "naming rule stopped biting once the quota passed" ;;
+esac
+# And an untracked file must not be able to smuggle in a skip either.
+printf '#[test]\nfn edge_x() { assert!(true); }\n#[ignore]\nfn y() {}\n' \
+  > "$PROJ/tests/brand_new.rs"
+out="$( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip )"
+case "$out" in
+  *"newly skipped/ignored tests"*) ok "a #[ignore] in a new file is caught too" ;;
+  *) no "a new file can hide a skipped test" ;;
+esac
 
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"

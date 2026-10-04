@@ -100,6 +100,21 @@ fi
 
 # --- 2. diff hygiene ---------------------------------------------------------
 step "diff hygiene"
+
+# STAGE NEW FILES, then diff. `git diff <base>` compares the base tree to the
+# working tree for TRACKED paths only — a brand-new file the agent wrote is
+# untracked, and untracked files are invisible to it. Writing a new test file is
+# the single most natural thing a phase does, and the gate was scoring those
+# phases as if no test existed: phase-007 wrote 355 lines and 16 #[test]
+# functions in tests/numeric_edge_test.rs and the gate reported "0 rust".
+#
+# `git add -N` (intent-to-add), deliberately NOT `git add -A`: it records the
+# path in the index with no content, so the file becomes visible to the diff,
+# while modifications to already-tracked files stay unstaged. That matters
+# because `git checkout -- <path>` restores from the INDEX, so staging
+# tracked edits would silently break every restore-from-HEAD in the pipeline.
+git add -N . >/dev/null 2>&1 || true
+
 CHANGED="$(git diff --name-only "$BASE_REF" 2>/dev/null)"
 if [ -z "$CHANGED" ]; then
   bad "no changed files detected against $BASE_REF"
@@ -206,7 +221,13 @@ step "test policy"
 # the reviewer's call. A high count once failed a good 5-test phase.
 MIN_RS="$('"$JQ"' -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null || echo 3)"
 MIN_RB="$('"$JQ"' -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null || echo 2)"
-NEW_TESTS="$(git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null | grep -cE '^\+\s*(async )?fn (edge_|test_)' )"
+# Count the `#[test]` ATTRIBUTE, not a name prefix. Requiring `fn test_`/`fn
+# edge_` meant a test named `modulo_by_zero_is_a_runtime_error` — perfectly
+# clear, perfectly real — did not count toward the quota. phase-007 wrote 16
+# #[test] functions and the quota read 0 because only the 6 edge_-prefixed ones
+# matched. The prefix belongs to the edge_-naming rule below, which enforces it
+# deliberately; the quota should be counting tests.
+NEW_TESTS="$(git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null | grep -cE '^\+\s*#\[test\]' )"
 NEW_RB="$(git diff -U0 "$BASE_REF" -- '*.rb' 2>/dev/null | grep -cE '^\+\s*test ' )"
 # Both idioms must be recognised, in BOTH target languages. The quota above is
 # disjunctive (Rust OR Redblue), so these two rules have to be too — otherwise a
