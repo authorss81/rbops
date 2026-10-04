@@ -330,6 +330,30 @@ cmd_run() {
   fi
 
   local base; base="$(in_project git rev-parse HEAD)"
+
+  # Resume from the previous attempt's preserved work. A gate-failed attempt
+  # parks its tree on origin/rbops-recovery/<phase> (the push step does this).
+  # Without this, every retry starts from zero and re-rolls the dice: attempt 1
+  # produced 5 edge tests, attempt 2 produced none, and the pipeline learned
+  # nothing between them.
+  #
+  # The merge happens AFTER base is captured, so the gate diff (base..HEAD)
+  # credits inherited work. The phase is judged on its end state, not on which
+  # attempt wrote which line. The gate still decides, so bad inherited code
+  # still fails — resuming cannot launder a bad phase.
+  #
+  # Fresh clone + recovery strictly ahead of main means fast-forward, no
+  # conflicts possible. If the merge somehow fails, continue from clean main
+  # rather than wedging the run.
+  if [ ! -f "$(marker "$phase" .checkpoint)" ] \
+     && in_project git rev-parse --verify -q "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
+    if in_project git merge --no-edit --ff-only "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
+      log "resumed from previous attempt (rbops-recovery/$phase)"
+      touch "$(marker "$phase" .recovered)"
+    else
+      log "recovery branch present but would not fast-forward — starting clean"
+    fi
+  fi
   {
     # The brief comes FIRST and is deliberately blunt. A weak model given a
     # 25KB context with no explicit scope spends its entire budget orienting:
@@ -379,6 +403,28 @@ TPL
 A previous attempt was interrupted and its partial work is already in the tree.
 DO NOT restart. Inspect what exists, continue from it, finish the phase.
 TPL
+    # Tell the agent what it inherited and, crucially, why the previous attempt
+    # failed — otherwise it repeats the same failure. The prior REPORT.md names
+    # the failing checks; the gate output below is quoted from the last run.
+    if [ -f "$(marker "$phase" .recovered)" ]; then
+      cat <<TPL
+
+---
+## RESUMED WORK — read this before touching anything
+A previous attempt's work is already merged into your tree. DO NOT start over
+and DO NOT rewrite it from scratch. Your job is to finish what is missing:
+
+1. Run the four gates FIRST, before changing anything, to see the current state.
+2. Read phases/$phase/REPORT.md from the previous attempt (harvested below if
+   present) to see what it claimed and what the gate actually said.
+3. Fix exactly what failed. Add what is missing. Do not remove working code.
+TPL
+      if [ -f "$RBOPS_ROOT/phases/$phase/REPORT.md" ]; then
+        printf '\n### Previous REPORT.md (do not trust its gate claims — verify them)\n\n```\n'
+        cat "$RBOPS_ROOT/phases/$phase/REPORT.md"
+        printf '\n```\n'
+      fi
+    fi
   } > "$LOG_DIR/$phase.ctx"
   cat "$LOG_DIR/$phase.ctx" > "$LOG_DIR/$phase.prompt"   # audit record
 

@@ -424,6 +424,35 @@ case "$out" in
   *) no "the lock did not stop a concurrent run" ;;
 esac
 use_stubs
+# =========================================================== 13. resume
+head_ "13. a retry resumes the preserved work instead of starting from zero"
+build_fixture >/dev/null; use_stubs
+# Forge a previous attempt: a commit on the recovery ref with distinctive content.
+( cd "$PROJ" \
+  && printf '// recovered work from attempt 1\n' >> src/vm.rs \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 )
+# Sanity: the fixture project is back to clean, the ref points at the work.
+( cd "$PROJ" && git rev-parse --verify -q "origin/rbops-recovery/phase-001" >/dev/null ) \
+  || { no "fixture ref not created"; }
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+[ "$rc" = "42" ] && ok "dead-model stub still defers after a merge (exit 42)" \
+  || no "expected deferral, got $rc"
+[ -f "$PIPE/phases/phase-001/.recovered" ] \
+  && ok ".recovered marker written" || no ".recovered marker missing"
+( cd "$PROJ" && git log --oneline -1 | grep -q "attempt 1" ) \
+  && ok "the preserved commit is in the tree" || no "preserved work not merged"
+if grep -q "RESUMED WORK" "$PIPE"/logs/phase-001.ctx 2>/dev/null; then
+  ok "the agent was told what it inherited"
+else
+  no "no RESUMED WORK note in the context"
+fi
+# And the base capture must predate the merge, so inherited work counts.
+( cd "$PROJ" && git diff --stat HEAD~1 HEAD | grep -q "vm.rs" ) \
+  && ok "inherited diff is measurable against the pre-merge base" \
+  || no "inherited work invisible to the diff"
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then
