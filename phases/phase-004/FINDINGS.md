@@ -1,90 +1,60 @@
-# Phase 004 — FINDINGS
+# Phase 004 — Findings
 
-Out-of-scope work discovered while fixing deterministic record ordering. Not done here
-(AGENTS.md rule 7: one phase, one concern). Each item is anchored to a line that was read.
+Out-of-scope items discovered while working this phase. Recorded for the auditor;
+none were fixed here.
 
-## 1. `rbops/` and `phases/` are missing from this checkout — the fourth gate cannot run
+## 1. `rbops/verify.sh` and `phases/` are missing from the checkout
 
+The phase prompt requires running four gates, the fourth being
+`./rbops/verify.sh phase-004`. In this working tree there is no `rbops/`
+directory, no `phases/` directory, and no `.opencode/agent/`. Only
+`.github/` exists. The gate could not be run, and per hard rule 1 nothing under
+`rbops/` may be authored or edited to work around that.
+
+The three gates that do exist were run and are green:
+
+- `cargo fmt --all -- --check` — clean
+- `cargo clippy --all-targets -- -D warnings` — 0 warnings
+- `cargo test --all-targets` — 54 passed, 0 failed, 0 ignored
+
+`phases/phase-004/` was created solely to hold this phase's `REPORT.md` and this
+file, as required by AGENTS.md section 4. It contains no pipeline code.
+
+Suggested phase: audit why `rbops/` is absent from the dispatched checkout, or
+amend the phase prompt so the gate list matches what agents actually receive.
+
+## 2. `SPEC.md:107` documents a record form the parser rejects
+
+`SPEC.md:107` (and `SPEC.md:148`) show:
+
+```redblue
+set person to record {
+    name: "Alice",
+    age: 30
+}
 ```
-$ ls rbops
-ls: cannot access 'rbops': No such file or directory
-$ ls phases
-ls: cannot access 'phases': No such file or directory
-$ find . -name verify.sh -not -path './target/*'
-(no output)
-```
 
-`rbops/verify.sh`, `rbops/phases.json`, `rbops/dispatch.sh` and `phases/` are all absent,
-even though AGENTS.md and the phase prompt reference them as the sources of truth. The
-phase directory `phases/phase-004/` was created by hand to hold `REPORT.md`.
+`src/parser.rs:1244` only accepts a bare `{…}` literal in expression position;
+the `record` keyword form fails with `ParserError: Expected field name`.
 
-Impact: `./rbops/verify.sh phase-004` could not be run. AGENTS.md section 3.4 makes it a
-required gate. Substitutes run and reported in `REPORT.md`: the full `examples/` +
-`modules/` + `tests/` sweep via `rb run`, `rb test` on both Redblue test files, `rb lint`,
-and the exact CI clippy command.
+Reproduce: `printf 'set p to record {\n    name: "Alice"\n}\nsay p\n' > /tmp/r.rb && ./target/debug/rb run /tmp/r.rb`
 
-**Needed:** either restore `rbops/` into the checkout, or correct the prompt to stop
-citing a gate that does not exist. As it stands a phase cannot honestly claim gate 4.
+Pre-existing on `4ec2dd9` (verified by running the pre-phase build), untouched by
+this phase, and it is a spec-vs-parser drift question rather than an ordering one
+— so it needs its own phase with an explicit decision on which side moves.
 
-## 2. `modules/MathUtils.rb` does not parse
+## 3. VM scopes are still `HashMap` (latent, not observable)
 
-```
-$ ./target/debug/rb run modules/MathUtils.rb
-Error: ParserError: Expected function name      # exit 1
-```
+`src/vm.rs:11` (`globals`) and `src/vm.rs:12` (`locals`) remain
+`HashMap<String, Value>`. Grepped for iteration into output — there is none
+today, so no current behaviour depends on their order. They are the same hazard
+this phase just closed for records, waiting for the first feature that prints a
+scope. Left alone deliberately: replacing them is not required for deterministic
+record ordering and would widen this diff.
 
-Confirmed pre-existing: identical error and exit code on the pre-phase tree (source files
-stashed, rebuilt). The file uses `constant PI to 3.14159` (line 3) and
-`constant TAU to 6.28318` (line 5) at top level. AGENTS.md section 2 names
-`modules/*.rb` as part of the language's specification-by-example, so a module file that
-does not parse is a real gap — but it is a parser/`constant` feature question, nothing to
-do with record ordering.
+## 4. `assert_type` in `src/testing/runner.rs:285` has no callers
 
-**Needed:** a phase for top-level `constant` declarations (or for whatever the intended
-module syntax is), with the error anchored at the `constant` parse site in `src/parser.rs`.
-
-## 3. `Value::Object` is dead
-
-`grep -rn "Value::Object(" src/ tests/` returns five hits, all of them *matches*, none
-constructions:
-
-- `src/value.rs:52` — `Display` arm
-- `src/value.rs:66` — `is_truthy` arm
-- `src/testing/runner.rs:295` — `assert_type` arm
-- `src/vm.rs:889` — `type_name` arm
-- `src/vm.rs:1076` — `json_stringify` arm
-
-Meanwhile `src/vm.rs:270-278`, `Statement::Object`, builds
-`Value::Record(Fields::new())` — an empty *record*, discarding the `name`, `extends` and
-`body` it was given. So `object Foo ... end` produces a plain empty record, and nothing in
-the language can ever produce a `Value::Object`. The phase prompt asked to "preserve
-insertion order for records **and objects**"; the object half is untestable until objects
-are constructed.
-
-**Needed:** a phase implementing `Statement::Object` against `SPEC.md`'s object section
-(SPEC.md:459 `say "I'm {this.name}"`, SPEC.md:484 `set this.name to name`). Ordering for
-objects comes for free once the payload is `Fields`.
-
-## 4. `stdlib::builtins()` is still a `HashMap`
-
-`src/stdlib.rs:4` — `pub fn builtins() -> HashMap<String, Value>`.
-
-Not user-visible today (nothing iterates it into output), and out of scope for an
-ordering-of-records phase, so it was deliberately left as `HashMap`. If any future builtin
-iterates the global namespace — `dir()`, autocompletion in the REPL, or a bootstrap
-compiler dumping its symbol table — it will inherit the same nondeterminism this phase just
-removed from records.
-
-**Needed:** fold into whichever phase first iterates the builtin table, or a small
-housekeeping phase converting it to the same `Fields` alias.
-
-## 5. Non-determinism is not asserted anywhere else
-
-`edge_twenty_key_record_is_identical_across_fifty_runs` runs the pipeline 50× in one
-process. That catches per-process seed variation (the original bug), but not a
-second-order source: two *different processes* on the same machine. The original
-reproduction needed 6 separate `rb run` invocations to show 3 distinct orderings.
-
-**Needed:** a CLI-level test that shells out to the built binary N times and diffs
-stdout. That needs a test that locates `env!("CARGO_BIN_EXE_rb")`, which no test in
-`tests/` currently does.
+`assert_type` is `pub` and never invoked anywhere in `src/` or `tests/`. It had
+to be edited by this phase (`TypeId::of::<HashMap<String, Value>>()` no longer
+type-matched the new storage), but nothing exercises it, so its `TypeId` mapping
+is unverified. Worth either wiring up or removing.
