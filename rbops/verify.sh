@@ -232,10 +232,19 @@ if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
   REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
   CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
   if [ -n "${CLAIM:-}" ]; then
-    if [ "$CLAIM" -le $((REAL + 2)) ] && [ "$CLAIM" -ge $((REAL - 2)) ]; then
-      ok "reported test count ($CLAIM) matches actual ($REAL)"
+    # Asymmetric by design. The threat model is FABRICATION: claiming green
+    # that was never earned. A claim ABOVE reality (+2 tolerance for reruns)
+    # fails the phase. A claim BELOW reality is sloppiness in prose, not a lie
+    # that ships bad code — the gate itself measured the real number, so warn
+    # and move on. This distinction once blocked a phase with 59 green tests
+    # over a "0 passing" typo.
+    if [ "$CLAIM" -gt $((REAL + 2)) ]; then
+      bad "report claims $CLAIM passing, actual run has $REAL — over-claiming is fabrication"
+    elif [ "$CLAIM" -lt $((REAL - 2)) ]; then
+      warn "report claims $CLAIM passing, actual run has $REAL — under-claimed, fix the number"
+      ok "reported test count ($CLAIM) does not exceed actual ($REAL)"
     else
-      bad "report claims $CLAIM passing, actual run has $REAL"
+      ok "reported test count ($CLAIM) matches actual ($REAL)"
     fi
   fi
 fi

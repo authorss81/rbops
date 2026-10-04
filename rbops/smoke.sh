@@ -453,6 +453,45 @@ fi
   && ok "inherited diff is measurable against the pre-merge base" \
   || no "inherited work invisible to the diff"
 
+# =========================================================== 14. honesty
+head_ "14. report honesty is asymmetric: over-claim fails, under-claim warns"
+# The stub agent writes a conforming report (claims the 12 the stub cargo
+# reports) plus real tests, so the gate passes cleanly. That is the control.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null
+V() { ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ); }
+out="$(V)"
+case "$out" in
+  *"VERIFY PASS"*) ok "control: conforming report passes" ;;
+  *) no "control gate did not pass"; printf '%s\n' "$out" | grep -E 'FAIL|FATAL' | head -5 | sed 's/^/      /' ;;
+esac
+# Over-claim: report says 50, reality is 12. Must FAIL — this is fabrication,
+# the one threat the honesty check exists for.
+sed -i 's/12 passed/50 passed/' "$PIPE/phases/phase-001/REPORT.md"
+out="$(V)"
+case "$out" in
+  *"over-claiming is fabrication"*) ok "over-claim fails the phase" ;;
+  *) no "over-claim did not fail" ;;
+esac
+case "$out" in
+  *"VERIFY FAIL"*) ok "verdict is FAIL on over-claim" ;;
+  *) no "verdict was not FAIL on over-claim" ;;
+esac
+# Under-claim: report says 0, reality is 12. Must WARN, not fail — the code is
+# proven good by the gate itself, and a wrong number in prose is sloppiness,
+# not a lie that ships bad code. This exact case once blocked a 59-green phase.
+sed -i 's/50 passed/0 passed/' "$PIPE/phases/phase-001/REPORT.md"
+out="$(V)"
+case "$out" in
+  *"under-claimed"*) ok "under-claim warns" ;;
+  *) no "under-claim did not warn"; printf '%s\n' "$out" | grep -E 'FAIL|WARN' | head -5 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"VERIFY PASS"*) ok "verdict stays PASS on under-claim" ;;
+  *) no "verdict failed on under-claim" ;;
+esac
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then
