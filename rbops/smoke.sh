@@ -206,6 +206,23 @@ case "$out" in
   *) ok "project dir accepted" ;;
 esac
 
+# Dependencies must resolve against the pipeline root even though the gate runs
+# inside the project. A relative phases/ here once failed a satisfied phase.
+out="$( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" JQ="$JQ" \
+        bash "$PIPE/rbops/verify.sh" phase-002 2>&1 | strip )"
+case "$out" in
+  *"dep phase-001 not done"*) ok "an unsatisfied dependency is reported" ;;
+  *) no "dependency check did not fire"; printf '%s\n' "$out" | head -4 | sed 's/^/      /' ;;
+esac
+touch "$PIPE/phases/phase-001/.done"
+out="$( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" JQ="$JQ" \
+        bash "$PIPE/rbops/verify.sh" phase-002 2>&1 | strip )"
+case "$out" in
+  *"dep phase-001 done"*) ok "a satisfied dependency resolves from the pipeline root" ;;
+  *) no "satisfied dependency misreported"; printf '%s\n' "$out" | head -4 | sed 's/^/      /' ;;
+esac
+rm -f "$PIPE/phases/phase-001/.done"
+
 # =========================================================== 3. run + gate
 head_ "3. run: agent is pointed at the project, report is harvested, gate passes"
 rm -f "$PIPE/phases/phase-001"/.[a-z]* 2>/dev/null

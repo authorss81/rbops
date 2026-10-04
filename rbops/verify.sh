@@ -59,10 +59,13 @@ if command -v "$JQ" >/dev/null 2>&1; then
   else
     bad "phase $PHASE is NOT declared in $PHASES — an undeclared phase cannot pass"
   fi
-  # dependencies must be .done
+  # dependencies must be .done. Anchored to the pipeline root: this script cd's
+  # into the project, so a relative phases/ path would resolve inside redblue/
+  # and every satisfied dependency would read as missing — which is exactly how
+  # a good phase-002 attempt once failed its own gate.
   while read -r dep; do
     [ -n "$dep" ] || continue
-    if [ -f "phases/${dep}/.done" ]; then ok "dep ${dep} done"
+    if [ -f "$RBOPS_ROOT/phases/${dep}/.done" ]; then ok "dep ${dep} done"
     else bad "dep ${dep} not done"; fi
   done < <("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .depends_on[]?' "$PHASES" 2>/dev/null)
 else
