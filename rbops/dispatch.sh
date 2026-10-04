@@ -357,6 +357,11 @@ still have not written code by then, you have misread the task — re-read this
 message. Do not browse. Do not read files you have not been told to read. Do not
 write a plan document. There is no human to review a plan.
 
+Files: read and write ONLY inside your working directory. Never write to /tmp,
+/home, or anywhere outside the project — the permission system auto-rejects
+those calls, and in this pipeline a rejected tool call ends your run. If you
+need scratch space, use ./target/tmp/ inside the project.
+
 When you are done, say DONE and stop.
 
 ---
