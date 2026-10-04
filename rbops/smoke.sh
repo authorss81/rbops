@@ -1036,6 +1036,75 @@ case "$out" in
   *) no "an unusable review was treated as clean" ;;
 esac
 
+# =========================================================== 21. one pipeline, one lock
+head_ "21. both workflows share one concurrency group"
+# rbops.yml and rbops-tick.yml drive ONE pipeline. Separate concurrency groups do
+# not exclude each other, and a cron tick at :17/:47 fired while the retrigger
+# chain was mid-phase. Both runs worked phase-015 at once, on separate runners.
+# Phase-015's work landed on redblue twice and its `.done` was clobbered back to
+# `.failed`, so a merged phase got queued for a third attempt.
+#
+# The in-tick guard (count in-progress runs) cannot fix this: it checks, sleeps,
+# then dispatches, and a retrigger inside that window dispatches too. The mkdir
+# lock in dispatch.sh cannot either — every CI run has its own /tmp.
+WF="$RBOPS_ROOT/.github/workflows"
+# Parsed with awk, not jq: these are YAML files and jq only reads JSON. Scoped to
+# the `concurrency:` block so a `group:` key elsewhere cannot be picked up.
+conc_field() {  # $1=file $2=key
+  awk -v key="$2" '
+    /^concurrency:/ { inc=1; next }
+    inc && /^[^[:space:]]/ { inc=0 }
+    inc && $1 == key":" { $1=""; sub(/^[[:space:]]+/,""); print; exit }
+  ' "$1"
+}
+for w in rbops.yml rbops-tick.yml; do
+  if [ -r "$WF/$w" ]; then
+    g="$(conc_field "$WF/$w" group)"
+    [ "$g" = "rbops-pipeline" ] && ok "$w declares group rbops-pipeline" \
+      || no "$w declares group '$g' — the two workflows can race"
+  else
+    no "$w is missing"
+  fi
+done
+# cancel-in-progress would let a tick kill a half-finished phase's state push,
+# which is how .done gets lost in the first place.
+for w in rbops.yml rbops-tick.yml; do
+  [ -r "$WF/$w" ] || continue
+  c="$(conc_field "$WF/$w" cancel-in-progress)"
+  [ "$c" = "false" ] && ok "$w does not cancel in-progress runs" \
+    || no "$w sets cancel-in-progress: '$c' — a running phase can be killed mid-push"
+done
+# Both files are read from the real repo, not the fixture: build_fixture copies
+# only rbops/, phases/ and AGENTS.md, so checking $PIPE here would silently pass
+# against nothing. Assert both are actually readable instead.
+for w in rbops.yml rbops-tick.yml; do
+  [ -r "$WF/$w" ] && ok "$w is readable" || no "$w is unreadable — the checks above cannot be trusted"
+done
+
+# =========================================================== 22. done is authoritative
+head_ "22. writing .done clears the failure markers"
+# cmd_select reads only `.done`, so a phase carrying both `.done` and `.failed`
+# looks finished to one reader and unfinished to another - which is exactly how
+# phase-015 ended up merged on redblue and still queued for another attempt.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+mkdir -p "$PIPE/phases/phase-001"
+: > "$PIPE/phases/phase-001/.failed"
+: > "$PIPE/phases/phase-001/.deferred"
+out="$(R)"
+marker phase-001 .done && ok ".done written" || no ".done missing"
+[ -f "$PIPE/phases/phase-001/.failed" ] && no ".failed survived alongside .done" \
+  || ok ".failed cleared when .done was written"
+[ -f "$PIPE/phases/phase-001/.deferred" ] && no ".deferred survived alongside .done" \
+  || ok ".deferred cleared when .done was written"
+# And a phase with .done must not be selected again.
+out="$( cd "$PIPE" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/dispatch.sh" select 2>&1 | tail -1 | strip )"
+case "$out" in
+  *"phase-001"*) no "a .done phase is still selectable" ;;
+  *) ok "a .done phase is not selected again" ;;
+esac
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

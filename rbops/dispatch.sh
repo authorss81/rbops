@@ -630,7 +630,17 @@ if grep -qE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(B
     return 3
   fi
 
+  # `.done` is the ONLY completion signal cmd_select reads, so the moment it is
+  # written the phase must be incapable of looking unfinished. Clearing the
+  # failure markers here rather than in cmd_run is deliberate: a phase can reach
+  # review with `.failed` still set (the gate clears it, but a resumed attempt
+  # that fails again and then passes leaves the sequence easy to get wrong), and
+  # phase-015 shipped to redblue twice with `.done` absent and `.failed` present,
+  # so it was queued for a third attempt against work already merged.
+  rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .deferred)" \
+        "$(marker "$phase" .deferred_attempts)" "$(marker "$phase" .checkpoint)"
   touch "$(marker "$phase" .done)"
+  [ -f "$(marker "$phase" .done)" ] || { log "$phase FAILED to write .done"; return 3; }
   in_project git push -q origin "HEAD:refs/heads/rbops-wip/DELETE_${phase}" 2>/dev/null || true
   in_project git push -q origin ":refs/heads/rbops-wip/$phase" 2>/dev/null || true
   log "$phase DONE"
