@@ -163,6 +163,36 @@ an untested branch is a MAJOR finding, fixed and re-gated). The gate is the
 floor — cheap, mechanical, never wrong in the pass direction. The reviewer is
 the ceiling.
 
+### 3.5 You must implement, not only test
+
+Most rules in this file measure *verification*. None of them measure *ambition*,
+so the cheapest way to pass the gate would be to write tests for behaviour that
+already exists and change no implementation at all. That is not a phase.
+
+Every phase in `rbops/phases.json` from 011 onward declares `must_touch` — the
+areas where that phase's work must land. The gate fails the phase if **no**
+changed file falls under any of them:
+
+```json
+"must_touch": ["src/"]                 // phases 011-013, 015, 016, 018, 019
+"must_touch": ["src/", "modules/"]// phase 014, 024 — either is acceptable
+"must_touch": ["src/", "bootstrap/"]    // phases 021-023
+"must_touch": ["tests/"]                // phase 020 — a harness, test-only by design
+```
+
+Read your own phase's entry before you start. If your finding genuinely cannot
+be fixed in the declared area, that is a manifest bug: say so in
+`FINDINGS.md` with the file:line, and fix it in the area the finding names
+rather than bending the phase. Phase-024 is the worked example — its finding
+cites both `src/lexer.rs` and `modules/MathUtils.rb`, so both are declared and
+either is a valid answer.
+
+Note what this rule is **not**: it is a floor, satisfied by one changed line
+under `src/`. It says "you implemented something", not "you implemented enough".
+Judging that the change is correct, complete and proportionate is the
+reviewer's job, and an `edge_*` test that does not actually pin the new
+behaviour is a BLOCKER finding.
+
 ### 3.4 The four gates, in order
 
 ```

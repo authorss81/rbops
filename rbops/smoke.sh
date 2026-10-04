@@ -771,6 +771,183 @@ case "$out" in
   *) no "a new file can hide a skipped test" ;;
 esac
 
+# =========================================================== 18. must_touch
+head_ "18. a phase must implement, not only test"
+# Every other gate rule measures verification; none measures ambition. So the
+# cheapest pass was to write tests for behaviour that already exists and touch
+# no implementation. Phase-004 did: goal was insertion order in src/value.rs,
+# landed 19 lines of src/ and 532 of tests. must_touch closes that escape hatch.
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase 001 — must_touch probe
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| tests/probe.rb | +9 −0 | redblue tests |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_empty list is rejected | out of bounds |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+set_mt() { "$JQ" --argjson v "$1" '.phases |= map(if .id=="phase-001" then .must_touch=$v else . end)' \
+             "$PIPE/rbops/phases.json" > "$PIPE/phases.json.t" && mv "$PIPE/phases.json.t" "$PIPE/rbops/phases.json"; }
+RB_TESTS='test "edge_empty list is rejected"
+    try
+        set x to empty[0]
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+
+test "edge_out_of_bounds index is a clean error"
+    try
+        set y to [1, 2, 3][9]
+    catch error
+        set caught2 to yes
+    end
+    expect caught2 to be yes
+'
+printf '%s' "$RB_TESTS" > "$PROJ/tests/probe.rb"
+V() { ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ); }
+
+# The cheat: a complete, passing, honest test-only phase.
+set_mt '["src/"]'
+out="$(V)"
+case "$out" in
+  *"no implementation change"*) ok "tests-only phase FAILS against must_touch src/" ;;
+  *) no "must_touch did not fire on a tests-only phase"; printf '%s\n' "$out" | grep -E 'must_touch|implementation|DBG' | head -3 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"VERIFY FAIL"*) ok "verdict is FAIL" ;;
+  *) no "verdict was not FAIL" ;;
+esac
+# Now do the same work plus one line of implementation. Must pass, and the only
+# thing that changed is that src/ was touched — proving the rule is about area,
+# not volume.
+( cd "$PROJ" && printf '// implementation\n' >> src/vm.rs )
+out="$(V)"
+case "$out" in
+  *"implementation touched src/"*) ok "touching src/ satisfies must_touch" ;;
+  *) no "must_touch not satisfied by a src/ change"; printf '%s\n' "$out" | grep -E 'must_touch|implementation' | head -3 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"VERIFY PASS"*) ok "and the phase passes" ;;
+  *) no "phase still fails after implementing"; printf '%s\n' "$out" | grep -E 'FAIL' | head -3 | sed 's/^/      /' ;;
+esac
+# A test-only phase that DECLARES tests/ is legitimate work and must pass.
+( cd "$PROJ" && git checkout -- src/vm.rs )
+set_mt '["tests/"]'
+out="$(V)"
+case "$out" in
+  *"implementation touched tests/"*) ok "a phase declaring tests/ is satisfied by tests" ;;
+  *) no "must_touch wrongly fired on a legitimate test-only phase" ;;
+esac
+case "$out" in
+  *"VERIFY PASS"*) ok "phase-020-style harness phase is not blocked" ;;
+  *) no "a test-only phase was blocked" ;;
+esac
+# Several acceptable areas: touching ANY one is enough.
+( cd "$PROJ" && git checkout -- tests/probe.rb 2>/dev/null; printf '%s' "$RB_TESTS" > "$PROJ/tests/probe.rb" )
+set_mt '["src/", "modules/"]'
+mkdir -p "$PROJ/modules"; printf '// a module fix\n' >> "$PROJ/modules/SuiteKit.rb"
+out="$(V)"
+case "$out" in
+  *"implementation touched modules/"*) ok "any one of several declared areas satisfies it" ;;
+  *) no "multi-area must_touch too strict" ;;
+esac
+# No declaration at all: unconstrained, must not fail.
+set_mt 'null'
+out="$(V)"
+case "$out" in
+  *"no must_touch declared"*) ok "a phase with no must_touch is unconstrained" ;;
+  *) no "an undeclared phase was constrained anyway" ;;
+esac
+case "$out" in
+  *"VERIFY PASS"*) ok "unconstrained phase passes on tests alone (history is not rewritten)" ;;
+  *) no "unconstrained phase failed" ;;
+esac
+
+# =========================================================== 19. manifest is read
+head_ "19. the gate reads the manifest instead of falling back to defaults"
+# verify.sh read its thresholds with '$("...\"$JQ\"..." )' — a single-quoted
+# string CONTAINING the literal characters "$JQ". Bash does not expand it, so the
+# command ran as a program literally named `"$JQ"`, failed, and the `|| echo N`
+# fallback supplied the number. min_changed_lines and BOTH test-quota floors were
+# therefore hardcoded and had never once been read from phases.json. They matched
+# by coincidence, so nothing looked wrong — and any future manifest edit would
+# have been silently ignored.
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase 001 — manifest probe
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| tests/probe.rb | +14 −0 | redblue tests |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_empty list is rejected | out of bounds |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+set_tf() { "$JQ" '.test_policy.min_redblue_tests='"$1" "$PIPE/rbops/phases.json" > "$PIPE/t.json" \
+            && mv "$PIPE/t.json" "$PIPE/rbops/phases.json"; }
+cat > "$PROJ/tests/probe.rb" <<'EOR'
+test "edge_empty list is rejected"
+    try
+        set x to empty[0]
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+
+test "edge_out_of_bounds index is a clean error"
+    expect 1 to be 1
+EOR
+V() { ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ); }
+# Two redblue tests: passes the real floor of 2.
+out="$(V)"
+case "$out" in
+  *"test quota met: 0 rust / 2 redblue (need 3 or 2)"*) ok "the real floor (2) is read from the manifest" ;;
+  *) no "quota floor is not the manifest value"; printf '%s\n' "$out" | grep -E 'quota' | head -2 | sed 's/^/      /' ;;
+esac
+# Raise the floor to 9: the SAME tree must now fail. If the gate were using a
+# hardcoded default this would still pass, which is exactly the bug.
+set_tf 9
+out="$(V)"
+case "$out" in
+  *"test quota not met: 0 rust (need 3) and 2 redblue (need 9)"*) ok "raising the manifest floor to 9 fails the same tree" ;;
+  *) no "the manifest floor is ignored"; printf '%s\n' "$out" | grep -E 'quota' | head -2 | sed 's/^/      /' ;;
+esac
+# And no warning may be emitted: a fallback firing is itself the bug.
+case "$out" in
+  *"could not read .test_policy"*) no "a silent jq fallback fired" ;;
+  *) ok "no silent fallback warning" ;;
+esac
+set_tf 2
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

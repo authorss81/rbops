@@ -146,11 +146,51 @@ else
 fi
 
 # 2c. minimum substance
-MIN_LINES="$('"$JQ"' -r '.gate.min_changed_lines' "$PHASES" 2>/dev/null || echo 5)"
+# NOTE ON QUOTING: these read `"$JQ"`, never `'"$JQ"'`. The latter is a
+# single-quoted string CONTAINING the literal characters "$JQ" — bash does not
+# expand it, so the command ran as a program named `"$JQ"`, failed, and the
+# `|| echo N` fallback silently supplied the default. Every one of these reads
+# had been dead since the gate was written: min_changed_lines and BOTH test
+# quota floors came from the fallback, not the manifest. They matched by luck.
+# A wrong fallback also hid the failure completely, so each now warns.
+MIN_LINES="$("$JQ" -r '.gate.min_changed_lines' "$PHASES" 2>/dev/null)" || MIN_LINES=""
+if [ -z "$MIN_LINES" ]; then warn "could not read .gate.min_changed_lines from the manifest; using 5"; MIN_LINES=5; fi
 ADDED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
 DELETED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$2} END{print s+0}')"
 if [ "$ADDED" -ge "$MIN_LINES" ]; then ok "diff substance: +${ADDED} -${DELETED} (min +${MIN_LINES})"
 else bad "diff too small: +${ADDED} (min +${MIN_LINES})"; fi
+
+# 2d. must_touch: the phase must IMPLEMENT, not only test.
+#
+# Every other rule here measures verification. None of them measures ambition, so
+# the cheapest way to pass was to write tests for behaviour that already existed
+# and touch no implementation at all. Phase-004 did exactly that: its goal was
+# preserving insertion order in src/value.rs and it landed 19 lines of src/ and
+# 532 of tests. A gate that cannot tell the difference will happily keep buying
+# that.
+#
+# This is a FLOOR, not a judgement of substance — one line under src/ satisfies
+# it. Judging whether the change is big enough, correct, or complete is the
+# reviewer's job (AGENTS.md 5). What it removes is the tests-only escape hatch.
+#
+# It is per-phase and opt-in: a phase whose real work IS tests (phase-020, the
+# differential harness) declares tests/, and a phase with no must_touch is not
+# constrained at all. Several acceptable areas may be listed; touching ANY one
+# satisfies the phase, because which of them is correct depends on the finding.
+MUST_TOUCH="$("$JQ" -r --arg p "$PHASE" '[.phases[] | select(.id==$p) | (.must_touch // [])[]] | join(" ")' "$PHASES" 2>/dev/null)" || MUST_TOUCH=""
+if [ -n "${MUST_TOUCH// /}" ]; then
+  _hit=""
+  for _pat in $MUST_TOUCH; do
+    if printf '%s\n' "$CHANGED" | grep -q "^$_pat"; then _hit="$_pat"; break; fi
+  done
+  if [ -n "$_hit" ]; then
+    ok "implementation touched ${_hit} (must_touch: ${MUST_TOUCH})"
+  else
+    bad "no implementation change — must_touch requires a change under one of: ${MUST_TOUCH} — see AGENTS.md 3.5"
+  fi
+else
+  ok "no must_touch declared (nothing to enforce)"
+fi
 
 # --- 3. the four gates -------------------------------------------------------
 step "cargo fmt"
@@ -219,8 +259,10 @@ step "test policy"
 # >=3 Rust tests OR >=2 Redblue tests. This is deliberately a low floor, not a
 # target — it catches "no verification at all", and sufficiency beyond it is
 # the reviewer's call. A high count once failed a good 5-test phase.
-MIN_RS="$('"$JQ"' -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null || echo 3)"
-MIN_RB="$('"$JQ"' -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null || echo 2)"
+MIN_RS="$("$JQ" -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null)" || MIN_RS=""
+if [ -z "$MIN_RS" ]; then warn "could not read .test_policy.min_rust_tests; using 3"; MIN_RS=3; fi
+MIN_RB="$("$JQ" -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null)" || MIN_RB=""
+if [ -z "$MIN_RB" ]; then warn "could not read .test_policy.min_redblue_tests; using 2"; MIN_RB=2; fi
 # Count the `#[test]` ATTRIBUTE, not a name prefix. Requiring `fn test_`/`fn
 # edge_` meant a test named `modulo_by_zero_is_a_runtime_error` — perfectly
 # clear, perfectly real — did not count toward the quota. phase-007 wrote 16
