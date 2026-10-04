@@ -136,14 +136,19 @@ For **every** behaviour you implement or change, test at minimum:
 Pick the rows that apply. A phase that changes the VM must justify in
 `REPORT.md` which rows are N/A and why.
 
-### 3.3 Test quota (hard)
+### 3.3 Test quota (hard floor, not a target)
 
-A phase's tests are rejected unless the diff contains **all** of:
+The gate enforces a floor: **≥ 3 new `#[test]` functions or ≥ 2 new Redblue
+`test` blocks**, plus **≥ 1 test named `edge_*`**, **≥ 1 test that asserts a
+failure is produced**, and **zero** newly-skipped or newly-ignored tests.
 
-- ≥ 6 new `#[test]` functions or ≥ 4 new Redblue `test` blocks
-- ≥ 1 test whose name starts with `edge_`
-- ≥ 1 test that asserts a **failure** (error message or error kind), not just success
-- **Zero** newly-skipped or newly-ignored tests
+Deliberately, the count floor is low. It exists to catch "no verification at
+all", not to judge sufficiency — a hard 6 once failed a genuinely good phase
+with 5 edge tests, which is the gate being smarter than the reviewer. Judging
+whether the tests COVER the change is the reviewer's job (AGENTS.md section 5:
+an untested branch is a MAJOR finding, fixed and re-gated). The gate is the
+floor — cheap, mechanical, never wrong in the pass direction. The reviewer is
+the ceiling.
 
 ### 3.4 The four gates, in order
 

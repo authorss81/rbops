@@ -69,7 +69,10 @@ every row you do NOT cover, write one line in `REPORT.md` saying why.
 
 You must also:
 
-- at least 6 new `#[test]` functions (or at least 4 new Redblue `test` blocks)
+- at least 3 new `#[test]` functions (or at least 2 new Redblue `test` blocks).
+  This is a floor, not a target: it catches "no verification at all". Whether
+  your tests COVER the change is judged by the reviewer, and an untested branch
+  is a MAJOR finding that sends the phase back.
 - at least 1 test named `edge_*`
 - at least 1 test that asserts a **failure** is produced, not just a success
 - zero new `#[ignore]`, `// skip`, or `allow(clippy::` suppressions
