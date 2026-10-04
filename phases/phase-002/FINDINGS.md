@@ -1,79 +1,70 @@
-# phase-002 — FINDINGS
+# FINDINGS — phase-002
 
-Work that does **not** belong to this phase. Recorded here so the auditor can
-promote it to a real phase. Nothing below was changed by phase-002.
+Out-of-scope defects observed while fixing test discovery. Each is anchored to a
+line I read. Not actioned in this phase (hard rule 7: one phase, one concern).
 
-## 1. `collect_test_files` mangles non-UTF-8 paths
+## F1 — All `.rb` tests in `tests/` have empty bodies; `rb test` reports vacuous passes
 
-- **Where:** `src/testing/mod.rs` → `collect_test_files`, the
-  `files.push(path.to_string_lossy().to_string())` line.
-- **Problem:** a `.rb` file (or a directory in its path) whose name is not valid
-  UTF-8 becomes a lossy string containing U+FFFD. `TestHarness::run_file` then
-  fails to open it and the harness reports a *test failure* for a file it can
-  never reach. Pre-existing: the same `to_string_lossy()` was there before this
-  phase.
-- **Suggested fix:** use `Path::to_str()` and skip (or report once, as a warning)
-  a path that is not representable, rather than collecting a path that cannot be
-  read.
-- **Why not now:** a file the harness cannot name is a discoverability policy
-  question, not a discovery-extension question. phase-002 changed only the
-  extension match.
+`rb test` reports `Tests run: 22 / Passed: 21 / Failed: 0`. Every one of those 21
+bodies is a comment. Examples:
 
-## 2. `find_test_files` has no recursion-depth cap
+- `tests/suite.rb:8` — `// test "Lexer: Numbers"` is followed only by `//` lines.
+- `tests/test_arithmetic.rb:3` — `// test "Basic addition"` body is all `//`.
+- `tests/integration_test.rb:3` — same.
 
-- **Where:** `src/testing/mod.rs` → `collect_test_files`.
-- **Problem:** `path.is_dir()` follows symlinks. A symlink loop inside `tests/`
-  recurses until the process stack overflows. The Redblue VM has its own call
-  guard; filesystem discovery has none.
-- **Suggested fix:** a depth counter, or `std::fs::symlink_metadata` to not
-  follow directory symlinks, plus a documented maximum depth.
+The scanner at `src/testing/harness.rs:31` collects the lines between
+`// test "name"` and `// end`; every such span is empty, so
+`src/testing/harness.rs:147` lexes an empty program and records a pass. This is
+the largest remaining source of tests that cannot fail. → needs a phase that
+writes real bodies using `expect … to be …`.
 
-## 3. `run_test_file` bypasses the `.rb` guard
+## F2 — Harness does not implement the documented `test "name" … end` syntax
 
-- **Where:** `src/testing/mod.rs:31`, `pub fn run_test_file(path: &str)`.
-- **Problem:** it calls `harness.run_source(&source)` after its own
-  `read_to_string`, so it never passes through `TestHarness::run_file` and never
-  receives the new extension guard added by this phase. It has no callers in
-  `src/` or `tests/` — grep confirms — so it is currently dead public API.
-- **Suggested fix:** either delete it, or route it through `harness.run_file`.
-  Leaving two entry points with different validation is a trap for the next
-  phase.
+`AGENTS.md` ("Built-in Test Syntax") and the test-harness docs specify
 
-## 4. `// test "name"` quotes are not stripped from `test_name`
+```redblue
+test "my test"
+    set result to 2 + 3
+    expect result to be 5
+end
+```
 
-- **Where:** `src/testing/harness.rs:31-35`. The marker is trimmed of the
-  `// test ` prefix but the `"` characters are kept, so `TestError::test_name`
-  is `"\"my test\""` rather than `my test`.
-- **Problem:** reporter output shows the quotes; any consumer matching on
-  test names has to know about them.
-- **Suggested fix:** strip a surrounding pair of `"` in `run_source`.
-  phase-002's assertions deliberately use `contains` rather than `==` so this
-  phase does not lock the behaviour in either direction.
+but `src/testing/harness.rs:31` only recognises `// test `, `# test `, `// bench `
+and `// skip`. `src/lexer.rs:263` does tokenize the word `test`
+(`TokenKind::Test`), so the lexer already has the keyword. The `.rb` suite
+therefore cannot be written in the documented style. → needs a phase to add
+block-marker discovery to `TestHarness::run_source`.
 
-## 5. `TestHarness` carries two unused `HashMap` fields
+## F3 — Lexer accepts an unterminated string literal at EOF
 
-- **Where:** `src/testing/harness.rs:11-12`, `_globals` and `_test_context`.
-  `_test_context` is always empty; `_globals` is seeded from `stdlib::builtins()`
-  and never read. Each `TestHarness::new()` rebuilds the whole builtin table.
-- **Problem:** dead weight, and an ordering/nondeterminism hazard the moment
-  anything iterates them (AGENTS.md §5 forbids `HashMap` order reaching output).
-- **Suggested fix:** delete both fields, or wire them up as the shared
-  cross-test scope the harness clearly intended.
+```
+$ printf 'say "open\n' > target/tmp/p2.rb && ./target/debug/rb target/tmp/p2.rb
+open
+```
 
-## 6. `rb test` (no path) and `rb test <path>` report differently
+Exit 0. `src/lexer.rs` string scanning does not report an unterminated literal
+when the input ends; per `AGENTS.md` §3.2 "malformed input" this should be a
+lexer error with a span. I dropped this case from
+`tests/harness_discovery_test.rs` for that reason and used a parse error
+(`set x to`) instead.
 
-- **Where:** `src/lib.rs:62-84`. The no-path branch prints bare
-  `Tests run/Passed/Failed`; the with-path branch prints the `PrettyReporter`
-  table including duration and skipped count.
-- **Problem:** a CI step that greps the output has two different shapes to
-  handle, and the no-path branch omits `skipped` entirely.
-- **Suggested fix:** use `PrettyReporter` in both branches.
+## F4 — `modules/MathUtils.rb` does not parse
 
-## 7. `verify.sh` was not runnable from this checkout
+```
+$ ./target/debug/rb run modules/MathUtils.rb
+Error: ParserError: Expected function name
+  --> modules/MathUtils.rb:4:16
+4 | constant PI to 3.14159
+```
 
-- **Problem:** `rbops/` and `phases/` were absent from the working directory;
-  only `.github/workflows/ci.yml` was present. Gate 4 of the contract
-  (`./rbops/verify.sh phase-002`) could not be executed and is reported as
-  NOT RUN in REPORT.md rather than claimed as a pass.
-- **Suggested fix:** either vendor `rbops/` into the repo so an agent can run
-  gate 4 locally, or drop it from the agent-facing gate list.
+Verified pre-existing: reproduced with my diff stashed
+(`git stash -u` → rebuild → same error). `AGENTS.md` §2 says `modules/*.rb` is
+specification-by-example and the gate runs it. The parser has no `constant`
+declaration form. → needs its own phase.
+
+## F5 — `find_test_files` returns `Result` but cannot fail
+
+`src/testing/mod.rs:57` returns `Result<Vec<String>>` while every failure path is
+swallowed (`if let Ok(entries) = std::fs::read_dir(dir)`), so the `?` on the
+recursive call at `src/testing/mod.rs:64` can never trigger. Harmless today;
+noted so a future change does not read it as "errors are propagated".

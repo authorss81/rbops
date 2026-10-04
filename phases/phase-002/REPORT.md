@@ -1,176 +1,155 @@
 # Phase 002 — Fix test discovery: stop feeding Rust source to the Redblue harness
 
-## Reproduction (before any change)
+## Reproduction (before the change)
 
-The finding was re-verified on `main` (commit `6cc1281`) with the pre-built
-`target/debug/rb`.
-
-**1. A Rust source is read by the Redblue harness:**
+`src/testing/mod.rs:66` collected `ext == "rs" || ext == "rb"`, and
+`run_all_tests()` passed every collected path to `TestHarness::run_file`. Probe:
 
 ```
-$ strace -f -e trace=openat ./target/debug/rb test 2>&1 | grep -c tests/redblue_test.rs
-1
-```
-
-**2. A Rust source that contains a `// test` marker is parsed as Redblue and
-reported as a Redblue failure.** `tests/zz_probe_test.rs` is exactly the shape
-the harness wrongly recognises (Rust source + a `// test "…"` / `// end` block):
-
-```
-$ printf '// test "rust source masquerading as redblue"\nexpect 1 to be 2\n// end\n' > tests/zz_probe_test.rs
+$ printf 'fn main() {}\n// test "rust source leaked into harness"\nsay "not redblue"\n// end\n' \
+    > tests/zz_probe_test.rs
 $ ./target/debug/rb test
-............F.........SKIP: // skip "Awaiting full test harness implementation" - // Reason: Need to complete test integration
+.....................this is not redblue
+..................SKIP: ...
 Tests run: 23
-Passed: 21
-Failed: 1
-EXIT=1
+Passed: 22
+Failed: 0
 ```
 
-Exact wrong output: `Failed: 1`, exit code `1`, caused entirely by a file that is
-not Redblue at all. The fixture was deleted immediately; nothing under `tests/`
-was left modified.
-
-**Re-verification note (honest, partial divergence from the phase text).** The
-finding as written says `tests/redblue_test.rs` *"is parsed as Redblue code and
-reported as a failure"*. On `main` the **read** half is exactly right, but the
-**reported-as-a-failure** half does not manifest for the checked-in `.rs` files:
-none of `expect_test.rs`, `redblue_test.rs`, `span_test.rs` has a line that,
-after trimming, starts with `// test ` (they use `#[test]`, and the two literal
-`// test "…"` strings in `expect_test.rs` are mid-line). So `rb test` on `main`
-reports `Failed: 0` by luck of file contents, not by design. The defect is
-therefore real but latent — it fires the moment a Rust test file happens to carry
-a marker line at column 0, which is proven by reproduction 2 above. The phase was
-**not** treated as stale: the definition of done ("no `.rs` path is ever read by
-the Redblue harness") is objectively unmet on `main`.
+The Rust file was read by the Redblue harness, its body was lexed and executed
+(`this is not redblue` printed), and it was counted as a **passing** test — worse
+than the reported "reported as a failure", which is the same code path when the
+Rust body happens not to lex. Probe file removed afterwards; `tests/` is back to
+its six tracked files.
 
 ## What changed
 
 | File | Lines | What |
 |---|---|---|
-| `src/testing/mod.rs` | +18 −16 | `find_test_files` now collects `.rb` only; recursion split into `collect_test_files` so it can sort its result (`read_dir` order is filesystem-dependent); `run_all_tests` drops its now-redundant `_test.rs \|\| .rb` filter |
-| `src/testing/harness.rs` | +10 −0 | `TestHarness::run_file` refuses a non-`.rb` path with `Error::Io`, so `rb test tests/foo.rs` is rejected before any read |
-| `src/testing/mod.rs` | +193 | new `#[cfg(test)] mod discovery_tests` |
+| `src/testing/mod.rs` | +14 −9 | `find_test_files` collects `.rb` only; `run_all_tests` drops the `_test.rs` branch; discovery results sorted for a stable report. `find_test_files` made `pub` so the discovery contract is testable from `tests/`. |
+| `tests/harness_discovery_test.rs` | +319 | new — 15 tests pinning the discovery contract |
+| `phases/phase-002/FINDINGS.md` | new | 5 out-of-scope defects recorded |
 
-Production diff is 28 added / 16 removed lines across two files. No signature,
-public type, or language surface changed.
+Nothing else touched. No language surface, no `tests/*.rb` body, no existing test.
 
 ## Tests added
 
-9 new `#[test]` functions, all in `src/testing/mod.rs::discovery_tests`
-(available via `cargo test --lib`; `cargo test --all-targets` runs them).
-Fixtures are written under `$CARGO_TARGET_TMPDIR` (fallback `target/tmp/`), never
-into the repo.
+`tests/harness_discovery_test.rs`, 15 `#[test]` functions.
 
 | Test | Edge class covered |
 |---|---|
-| `discovers_only_rb_files` | boundary — the real `tests/` tree yields ≥1 `.rb` and zero `.rs` |
-| `run_all_tests_reports_no_errors_from_rust_sources` | asserts `total > 0` (guards against "fix by collecting nothing") **and** that no error carries a `.rs` path |
-| `run_file_rejects_a_rust_source` | **asserts a failure**: a `.rs` path must produce `Err` naming `.rb`, and record zero tests |
-| `edge_rs_file_with_failing_marker_is_never_collected` | the exact reproduction fixture — a Rust source with a failing `// test` block must not be collected |
-| `edge_extension_match_is_exact` | boundary — `suite.rb` vs `suite.rb.bak`, `suite.RB`, `suite.rsx`, `suite_test.rs`, `notes.txt` |
-| `edge_nested_directories_ignore_rust_sources` | nesting/recursion — 3 levels deep, `.rb` kept, `_test.rs` dropped |
-| `edge_missing_directory_is_not_an_error` | malformed input — absent directory returns empty, not `Err` |
-| `edge_empty_suite_directory_yields_no_tests` | empty — empty directory yields 0 tests |
-| `a_failing_expect_is_still_reported_as_a_failure` | **asserts a failure** still happens for genuine Redblue failures: `total == 1`, `failed == 1`, named test, both expected and actual populated. This is the anti-muting guard |
+| `discovers_only_rb_files_and_never_rust_sources` | the defect itself; `.rs`/`.txt`/`.rbc` beside a `.rb` |
+| `repository_tests_directory_yields_only_rb_paths` | defect asserted against the real `tests/` tree, not a fixture |
+| `edge_run_all_tests_reports_no_failure_from_rust_sources` | `run_all_tests()` reports 0 failures, none blaming a `.rs` |
+| `edge_rust_source_between_rb_files_leaves_both_neighbours` | boundary — `.rb` at index 0 and index len−1 survive the dropped `.rs` |
+| `discovers_a_single_rb_file` | singleton |
+| `empty_directory_yields_no_files` | empty |
+| `discovers_nested_rb_files_and_drops_nested_rust_sources` | nesting/recursion, 3 levels, `.rs` dropped at depth |
+| `duplicate_basenames_in_different_directories_are_both_collected` | duplicate keys analogue — same basename in two dirs, both kept |
+| `edge_rb_file_beside_identically_named_rs_file_is_still_collected` | duplicate/missing — `.rb` vs same-named `.rs` |
+| `discovery_order_is_sorted` | determinism (read_dir order is filesystem-dependent) |
+| `discovers_paths_with_spaces_and_unicode` | unicode — Cyrillic + emoji file names in a directory with a space |
+| `edge_uppercase_extension_is_not_collected` | boundary — `.RB` is not `.rb` |
+| `edge_missing_directory_yields_no_files_and_does_not_panic` | resource/state — absent directory, no panic |
+| `edge_non_utf8_rb_file_is_reported_as_an_io_failure` | **asserts a failure of a named kind** (`Error::Io`), no panic, no silent pass |
+| `edge_malformed_rb_test_body_is_reported_as_a_failure` | **asserts a failure of a named kind** — incomplete statement inside a `// test` body yields 1 failure, 0 passes, message naming the parser error |
 
-### Red → green evidence
+Quotas: 15 ≥ 6 new `#[test]`s; 7 `edge_*` tests; 2 tests assert a *failure kind*
+(`Error::Io`, parser error) rather than only success; 0 new `#[ignore]`, 0
+`.skip`, 0 clippy suppressions.
 
-Before the production change, `cargo test --lib testing::` reported
-`3 passed; 6 failed` for the right reasons, e.g.:
+### Red before green
+
+The first run of `cargo test --test harness_discovery_test`, before the fix:
 
 ```
-edge_rs_file_with_failing_marker_is_never_collected:
-  a Rust source with a `// test` marker must not be collected,
-  got ["target/tmp/phase-002/failing-rs-not-collected/probe_test.rs"]
-
-run_file_rejects_a_rust_source:
-  a .rs path must be refused, not parsed as Redblue
+failures:
+    discovers_nested_rb_files_and_drops_nested_rust_sources
+    discovers_only_rb_files_and_never_rust_sources
+    discovery_order_is_sorted
+    edge_rb_file_beside_identically_named_rs_file_is_still_collected
+    edge_rust_source_between_rb_files_leaves_both_neighbours
+    repository_tests_directory_yields_only_rb_paths
+    ...
+test result: FAILED. 8 passed; 7 failed
 ```
 
-After: `14 passed; 0 failed` for the whole `--lib` target.
+e.g. `the Redblue harness must not be given ["tests/redblue_test.rs",
+"tests/span_test.rs", "tests/expect_test.rs", "tests/harness_discovery_test.rs"]`.
+Disclosure, per AGENTS.md §8: to make the contract testable I first changed
+`fn find_test_files` to `pub fn find_test_files` — a visibility change only, no
+behaviour change — and the red run above was made against that. The behaviour
+change landed afterwards.
 
 ## Gates
 
 | Gate | Result |
 |---|---|
-| `cargo fmt --all -- --check` | pass |
-| `cargo clippy --all-targets -- -D warnings` | pass (`Finished dev profile`) |
-| `cargo test --all-targets` | 55 passed, 0 failed, 0 ignored (lib 14, main 0, expect_test 21, redblue_test 5, span_test 15) |
-| `./rbops/verify.sh phase-002` | **NOT RUN — the script is not present in this checkout** |
+| `cargo fmt --all -- --check` | pass (clean) |
+| `cargo clippy --all-targets -- -D warnings` | pass (`Finished dev profile`, no warnings) |
+| `cargo test --all-targets` | pass — 61 passed, 0 failed, 0 ignored (lib 5, expect_test 21, harness_discovery_test 15, redblue_test 5, span_test 15, bin 0) |
+| `./rbops/verify.sh phase-002` | **not run — `rbops/` does not exist in this checkout** (see below) |
 
-### Gate 4 could not be run — reported, not glossed over
-
-`rbops/` and `phases/` did not exist in the working directory when this phase
-started (only `.github/workflows/ci.yml` was present); the pipeline lives
-outside this checkout. So `./rbops/verify.sh phase-002` was **not executed** and
-I am not claiming it passed. `phases/phase-002/` was created by this run to hold
-this report. The three gates I could run were run and are green.
-
-Substitute checks run in place of the examples portion of `verify.sh`:
-
-```
-$ for f in examples/*.rb; do ./target/debug/rb run "$f"; done
-examples fail=0          # files.rb fizzbuzz.rb formats.rb hello.rb test_arithmetic.rb time.rb
-$ ./target/debug/rb test
-Tests run: 22 / Passed: 21 / Failed: 0 ; EXIT=0
-$ strace -f -e trace=openat ./target/debug/rb test | grep tests/
-openat("tests/", O_DIRECTORY)
-openat("tests/integration_test.rb", O_RDONLY)
-openat("tests/suite.rb", O_RDONLY)
-openat("tests/test_arithmetic.rb", O_RDONLY)
-```
-
-No `.rs` path is opened by the Redblue harness any more — the third row of the
-definition of done, proved at the syscall level.
-
-```
-$ ./target/debug/rb test tests/redblue_test.rs
-Error: IoError: Not a Redblue test file (expected a .rb path): tests/redblue_test.rs
-EXIT=1
-```
-
-## Definition of done
-
-- [x] `run_all_tests()` only collects `.rb` — `find_test_files` matches `ext == "rb"` only; the `_test.rs` branch is deleted. Asserted by `discovers_only_rb_files` and `edge_extension_match_is_exact`.
-- [x] `rb test` reports 0 errors for the Rust suite — `Failed: 0`, exit 0. Rust tests run under `cargo test` only (`tests/expect_test.rs` 21, `redblue_test.rs` 5, `span_test.rs` 15, all passing).
-- [x] no `.rs` path is ever read by the Redblue harness — verified by `strace`; enforced by `TestHarness::run_file`'s extension guard, which is the single choke point used by both `run_all_tests` and `rb test <path>`.
+Additional check, not a gate: `rb run` over all of `examples/*.rb` and
+`modules/*.rb` — all pass except `modules/MathUtils.rb`, which fails identically
+with my diff stashed (`git stash -u`, rebuild, same `ParserError: Expected
+function name` at `modules/MathUtils.rb:4`). Pre-existing → FINDINGS.md F4.
 
 ## Invariants touched
 
-None. No `Value` variant, no `Error` variant, no grammar, no `.rb` extension
-meaning, no `to … end`, no `set x to`, no `say`. `run_all_tests` keeps its
-signature; `TestHarness::run_file` keeps its signature and now returns an
-existing `Error::Io` on a path it was never meant to accept.
+- None. No change to `Value`, `Error`, the grammar, `.rb` as the source
+  extension, `say`, `set … to`, or `… end` blocks.
+- Behavioural change outside the language: the Redblue test harness no longer
+  reads `.rs` files (was: `rb test` executed Rust sources as Redblue), and
+  `run_all_tests()` no longer re-filters by filename (`find_test_files` already
+  filtered). Public API grew by one item: `redblue::testing::find_test_files`.
 
-## Edge-case matrix — every row
+## Test-requirement matrix (phase prompt §"Test requirements")
 
-| Row | Status |
-|---|---|
-| empty | **covered** — `edge_empty_suite_directory_yields_no_tests` |
-| singleton | **covered** — `discovers_only_rb_files` (exactly the 3 `.rb` in `tests/`) and `a_failing_expect_is_still_reported_as_a_failure` (`total == 1`) |
-| boundary | **covered** — `edge_extension_match_is_exact` (`.rb` / `.rb.bak` / `.RB` / `.rsx`); recursion depth boundary in `edge_nested_directories_ignore_rust_sources` |
-| out_of_bounds | **covered** — index `-1`/`len`/`999` are N/A for this change: `find_test_files` indexes no collection, and the collection itself is asserted for *absence* of `.rs` (`edge_rs_file_with_failing_marker_is_never_collected` collects zero). No slice indexing was added. |
-| type_mismatch | **covered** — `run_file_rejects_a_rust_source`: a path whose *kind* is wrong (Rust source where a Redblue file is required) must produce `Err`, not a silent skip and not a parse. This is the type/kind mismatch of this function's input. |
-| numeric_boundary | N/A — no arithmetic exists in `find_test_files`, `run_file` or the new tests. The only numbers are `TestResults` counters, asserted for exact equality. |
-| unicode | N/A — the change is a filename-extension comparison; no source text is decoded here. `read_to_string` behaviour on non-UTF-8 is unchanged by this diff. |
-| nesting_recursion | **covered** — `edge_nested_directories_ignore_rust_sources`: 3 levels, recursion collects only the 2 `.rb` and drops 2 `_test.rs` |
-| duplicate_missing_keys | N/A — no map is built; `find_test_files` returns a `Vec<String>` and the harness's `TestResults.errors` is untouched. (The harness's `HashMap` globals remain `_`-prefixed/unused and are out of scope for this phase — see FINDINGS.md.) |
-| malformed_input | **covered** — `edge_missing_directory_is_not_an_error` (absent dir), `edge_extension_match_is_exact` (`suite.rb.bak`, `suite.RB`). Partial: a path with invalid UTF-8 bytes is *not* covered — see follow-up below. |
-| resource_limit | **covered** — `edge_missing_directory_is_not_an_error` and `edge_empty_suite_directory_yields_no_tests` bound the recursion input to 0 entries; no unbounded work is introduced (`collect_test_files` visits each directory entry once, as before). Follow-up recorded for the unbounded-recursion-depth case. |
+- **empty** — covered: `empty_directory_yields_no_files`; a directory with nothing
+  to run yields an empty list, not an error.
+- **singleton** — covered: `discovers_a_single_rb_file`.
+- **boundary** — covered: `edge_rust_source_between_rb_files_leaves_both_neighbours`
+  keeps the `.rb` at index 0 and index len−1; `edge_uppercase_extension_is_not_collected`
+  covers the `.rb`/`.RB` extension boundary.
+- **out_of_bounds** — covered: `edge_missing_directory_yields_no_files_and_does_not_panic`
+  (a path that was never created returns empty rather than panicking). No
+  index-based access exists in the code under change.
+- **type_mismatch** — covered: `.rs`, `.txt` and `.rbc` candidates in a scanned
+  directory are all rejected while the `.rb` is kept
+  (`discovers_only_rb_files_and_never_rust_sources`).
+- **numeric_boundary** — N/A + why: this change adds no arithmetic and reads no
+  numbers; the only counts involved are `Vec::len` in assertions, and the
+  boundary there is covered by the index-0/len−1 test above.
+- **unicode** — covered: `discovers_paths_with_spaces_and_unicode` uses a
+  directory named `a folder 🎉` containing `тест файл.rb` and `emoji 🎉.rb`.
+- **nesting_recursion** — covered: `discovers_nested_rb_files_and_drops_nested_rust_sources`
+  descends three levels with `.rs` decoys at each depth. Recursion is
+  per-directory, one frame per level; no user-controlled depth is reachable
+  through `rb test`, which is hardcoded to `tests/`.
+- **duplicate_missing_keys** — covered (file analogue): duplicate basenames in
+  different directories are both collected, and a `.rb` sharing a basename with
+  a `.rs` is still collected. There are no records/keys in this code path.
+- **malformed_input** — covered: `edge_malformed_rb_test_body_is_reported_as_a_failure`
+  (incomplete statement inside a discovered body) and
+  `edge_non_utf8_rb_file_is_reported_as_an_io_failure` (invalid UTF-8 bytes →
+  `Error::Io`, no panic, no silent pass). Unterminated-string-at-EOF is **not**
+  covered: the lexer accepts it silently today, so the test would have asserted
+  current wrong behaviour → FINDINGS.md F3.
+- **resource_limit** — covered: absent directory, three-level recursion, and a
+  `.rb` that cannot be decoded all terminate cleanly with a recorded outcome.
+  No unbounded loop is introduced; the only unbounded construct is directory
+  recursion, which is bounded by the filesystem depth of `tests/`.
 
 ## Known gaps / follow-ups
 
-Recorded in `phases/phase-002/FINDINGS.md`, not fixed here (out of scope for a
-discovery bug-fix):
-
-- Non-UTF-8 filename: `collect_test_files` still uses `Path::to_string_lossy()`,
-  so a `.rb` file whose path is not valid UTF-8 yields a mangled path that
-  `run_file` then cannot read, reported as a failure. Pre-existing, unchanged.
-- `find_test_files` has no directory-depth cap; a symlink cycle under `tests/`
-  would recurse forever. Pre-existing, unchanged.
-- `run_test_file(path)` in `src/testing/mod.rs:31` does not go through
-  `TestHarness::run_file` and therefore does not get the `.rb` guard. It is dead
-  code today (no caller in `src/` or `tests/`); noted, not touched.
-- The `// test "name"` marker keeps its surrounding quotes in
-  `TestError::test_name` (`"\"deliberately fails\""`). Pre-existing; my
-  assertion uses `contains` so it does not lock the behaviour in.
+- `rbops/verify.sh` could not be executed: this checkout has no `rbops/` and no
+  `phases/` directory (`ls: cannot access 'rbops': No such file or directory`),
+  and the gate script lives outside the project. I created
+  `phases/phase-002/` to hold this report and FINDINGS.md. The three cargo gates
+  were run locally and are green.
+- The 21 tests `rb test` still reports are all vacuous (empty bodies) →
+  FINDINGS.md F1. Discovery is now correct; the suite's contents are not.
+- The documented `test "name" … end` block syntax is still unsupported by the
+  harness → FINDINGS.md F2.
+- `modules/MathUtils.rb` does not parse → FINDINGS.md F4.
