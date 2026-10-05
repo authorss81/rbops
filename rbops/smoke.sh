@@ -1105,6 +1105,98 @@ case "$out" in
   *) ok "a .done phase is not selected again" ;;
 esac
 
+# =========================================================== 23. failure_assert scope
+head_ "23. the failure-assertion rule is skipped only where it cannot apply"
+# A linter reports problems as a diagnostics collection, a formatter and an LSP
+# emit documents. There is no Result::Err to assert on, so requiring is_err()/
+# should_panic of them is a category error - and phase-016's linter tests were
+# asserting failure correctly as `assert_eq!(warnings.len(), 1, ...)` when it
+# blocked it. Both 015 and 016 burned every attempt on it.
+#
+# The escape is declared per phase and must be VISIBLE when it fires, or it is
+# indistinguishable from the rule being satisfied.
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase 001 — failure_assert probe
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| tests/probe.rs | +8 −0 | tests only |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_warns_on_unused_variable | false positive |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+set_fa() { "$JQ" --argjson v "$1" '.phases |= map(if .id=="phase-001" then .failure_assert=$v else . end)' \
+             "$PIPE/rbops/phases.json" > "$PIPE/f.json" && mv "$PIPE/f.json" "$PIPE/rbops/phases.json"; }
+# A linter-shaped test: asserts the diagnostic count. No is_err, no should_panic.
+cat > "$PROJ/tests/probe.rb" <<'EOR'
+test "edge_warns_on_unused_variable"
+    set total to 1
+    expect total to be 1
+
+test "edge_no_warning_on_used_variable"
+    expect 1 to be 1
+EOR
+V() { ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ); }
+# default: the rule applies and this phase fails it
+set_fa 'null'
+out="$(V)"
+case "$out" in
+  *"no test asserts a failure"*) ok "by default the rule applies and a diagnostics-only test fails it" ;;
+  *) no "the rule stopped applying by default"; printf '%s\n' "$out" | grep -E 'failure' | head -2 | sed 's/^/      /' ;;
+esac
+# declared not applicable: skipped, and announced
+set_fa '"not_applicable"'
+out="$(V)"
+case "$out" in
+  *"NOT APPLICABLE"*) ok "the skip is announced, not silent" ;;
+  *) no "the skip was silent — indistinguishable from passing"; printf '%s\n' "$out" | grep -E 'failure' | head -2 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"no test asserts a failure"*) no "the rule fired despite the declaration" ;;
+  *) ok "the rule is skipped when declared" ;;
+esac
+case "$out" in
+  *"VERIFY PASS"*) ok "a linter/formatter-shaped phase can now pass" ;;
+  *) no "still blocked on an inapplicable rule"; printf '%s\n' "$out" | grep -E 'FAIL' | head -3 | sed 's/^/      /' ;;
+esac
+# And the other mandatory rules must still bite under the declaration - the
+# exemption is for the failure check ONLY.
+rm -f "$PROJ/tests/probe.rb"
+out="$(V)"
+case "$out" in
+  *"no test named edge_"*) ok "the edge_* rule still applies under the exemption" ;;
+  *) no "the exemption leaked into other rules" ;;
+esac
+case "$out" in
+  *"test quota not met"*) ok "the quota still applies under the exemption" ;;
+  *) no "the exemption leaked into the quota" ;;
+esac
+# And every phase that DID declare it is a non-error-producing one, by title.
+na="$(cd "$RBOPS_ROOT" && "$JQ" -r '[.phases[] | select(.failure_assert=="not_applicable") | "\(.id) \(.title)"] | .[]' rbops/phases.json)"
+echo "$na" | sed 's/^/      /'
+if echo "$na" | grep -qiE 'formatter|linter|language server'; then
+  ok "every exemption is a diagnostics/document producer"
+else
+  no "an exemption was granted to a phase that does produce errors"
+fi
+n_ex="$(echo "$na" | grep -c .)"
+[ "$n_ex" -le 4 ] && ok "the exemption is narrow ($n_ex phases)" \
+  || no "$n_ex phases exempted — too broad"
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

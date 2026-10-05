@@ -279,12 +279,39 @@ NEW_RB="$(git diff -U0 "$BASE_REF" -- '*.rb' 2>/dev/null | grep -cE '^\+\s*test 
 # so `test edge_x` never occurs, and the unquoted-only regex rejected 61 real
 # tests in phase-003 including correctly-named ones.
 EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test +"?)edge_')"
-# Failure assertions per language. Rust has is_err/should_panic; Redblue has no
-# exceptions and instead has `try ... catch error`, which was missing here
-# entirely — the one construct Redblue offers for asserting a fault. Anchored to
-# the line start so a test whose *data* mentions `catch error` cannot buy a pass.
-FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
-  | grep -cE '^\+.*(is_err|expect_err|should_panic|expect .* to fail|assert_throws)|^\+[[:space:]]*catch[[:space:]]+error')"
+# Some subsystems have no failure channel to assert on. A linter reports
+# problems as a diagnostics collection; a formatter and an LSP produce documents,
+# not errors. Requiring `is_err`/`should_panic` of them is a category error, and
+# it is not hypothetical: phase-015 (formatter) and phase-016 (linter) were both
+# blocked after burning every attempt on it, while phase-016's tests were
+# asserting failure correctly as `assert_eq!(warnings.len(), 1, ...)`.
+#
+# Such a phase declares `failure_assert: "not_applicable"` and the check is
+# SKIPPED, visibly — never silently passed, and never a global relaxation. The
+# reviewer still judges whether the tests can actually fail, and every
+# error-producing phase keeps the rule at full strength.
+FAILASSERT_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .failure_assert // "required"' "$PHASES" 2>/dev/null)" || FAILASSERT_MODE="required"
+[ -n "$FAILASSERT_MODE" ] || FAILASSERT_MODE="required"
+
+# Failure assertions per language. Rust has is_err/expect_err/should_panic;
+# Redblue has no exceptions and instead has `try ... catch error`, which was
+# missing here entirely — the one construct Redblue offers for asserting a fault.
+# Anchored to the line start so a test whose *data* mentions `catch error` cannot
+# buy a pass.
+
+if [ "$FAILASSERT_MODE" = "not_applicable" ]; then
+  # Skipped, and said out loud. A silent pass here would be indistinguishable
+  # from the rule being satisfied.
+  warn "failure-assertion rule NOT APPLICABLE to this phase (failure_assert: not_applicable) — the reviewer still judges whether the tests can fail"
+else
+  FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|expect .* to fail|assert_throws)|^\+[[:space:]]*catch[[:space:]]+error')"
+  if [ "$FAILASSERT" -ge 1 ]; then
+    ok "failure-asserting test present: $FAILASSERT"
+  else
+    bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
+  fi
+fi
 
 if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
   ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
@@ -293,8 +320,6 @@ else
 fi
 [ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
   || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
-[ "$FAILASSERT" -ge 1 ] && ok "failure-asserting test present: $FAILASSERT" \
-  || bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
 
 # Same precision rule as the construct scan above: the token must begin the
 # line. A test fixture that embeds `#[ignore]` as data is not a skipped test.

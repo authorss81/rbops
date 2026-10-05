@@ -155,6 +155,14 @@ quote after `test `. Likewise Redblue has no exceptions: `try … catch error` i
 its failure-catching construct, and a test that faults without one is not
 asserting anything. Both forms are recognised by the gate.
 
+**Not every phase has a failure channel.** A linter reports problems as a
+diagnostics collection; a formatter and an LSP emit documents. There is no
+`Result::Err` to assert on, so the "asserts a failure is produced" rule cannot
+apply to them. Phases 015, 016 and 017 declare `failure_assert:
+"not_applicable"` and the gate **skips that one check and says so**. Every other
+phase keeps it at full strength — a phase that changes what the interpreter
+*executes* must prove it produces a clean error when it should.
+
 Deliberately, the count floor is low. It exists to catch "no verification at
 all", not to judge sufficiency — a hard 6 once failed a genuinely good phase
 with 5 edge tests, which is the gate being smarter than the reviewer. Judging
