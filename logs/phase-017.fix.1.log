@@ -1,0 +1,508 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by exploring the relevant files to understand the current state.
+[0m$ [0mgit log --oneline -10 && git status
+58d9644 rbops: phase-015 (2026-10-04T12:38:03Z)
+329e83d rbops: phase-015 (2026-10-04T12:30:57Z)
+27d4aeb rbops: phase-014 (2026-10-04T11:39:19Z)
+e2f72aa rbops: phase-013 (2026-10-04T11:19:22Z)
+570671b rbops: phase-012 (2026-10-04T10:53:28Z)
+8e892de rbops: phase-011 (2026-10-04T10:26:40Z)
+bd59fde rbops: phase-010 (2026-10-04T09:59:50Z)
+2d54e2d rbops: phase-009 (2026-10-04T09:31:45Z)
+e9bf84b rbops: phase-008 (2026-10-04T09:24:48Z)
+5cec921 rbops: phase-007 (2026-10-04T09:09:03Z)
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   Cargo.toml
+	new file:   phases/phase-017/FINDINGS.md
+	new file:   phases/phase-017/REPORT.md
+	modified:   src/error.rs
+	modified:   src/lexer.rs
+	modified:   src/lib.rs
+	new file:   src/lsp.rs
+	new file:   tests/tooling_grammar_test.rs
+	modified:   tooling/vscode/README.md
+	new file:   tooling/vscode/language-configuration.json
+	new file:   tooling/vscode/package.json
+	new file:   tooling/vscode/syntaxes/redblue.tmLanguage.json
+
+no changes added to commit (use "git add" and/or "git commit -a")
+[0m
+[0m$ [0mls phases/phase-017/ 2>/dev/null && ls tests/
+FINDINGS.md
+REPORT.md
+call_depth_test.rs
+closure_capture_test.rs
+discovery_test.rs
+expect_test.rs
+formatter_test.rs
+index_bounds_test.rs
+integration_test.rb
+lexer_robustness_test.rs
+loop_bounds_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+span_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_control_flow.rb
+test_functions.rb
+test_lists.rb
+test_modules.rb
+test_numeric_edges.rb
+test_object_model.rb
+test_objects.rb
+test_records.rb
+test_text.rb
+tooling_grammar_test.rs
+[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs
+[0m→ [0mRead phases/phase-017/REPORT.md
+[0m→ [0mRead src/lsp.rs
+[0m→ [0mRead src/linter.rs[90m [limit=80][0m
+[0m→ [0mRead src/linter.rs[90m [offset=255, limit=35][0m
+[0m→ [0mRead src/lib.rs[90m [offset=120, limit=70][0m
+[0m→ [0mRead src/linter.rs[90m [offset=80, limit=175][0m
+[0m
+[0m$ [0mgrep -n "^pub mod\|^mod " src/lib.rs
+1:mod analyzer;
+2:mod error;
+3:pub mod formatter;
+4:pub mod lexer;
+5:pub mod linter;
+6:pub mod lsp;
+7:pub mod parser;
+8:pub mod repl;
+9:pub mod stdlib;
+10:pub mod testing;
+11:mod value;
+12:mod vm;
+[0m
+[0m$ [0mls rbops/ 2>&1; ls examples/
+ls: cannot access 'rbops/': No such file or directory
+files.rb
+fizzbuzz.rb
+formats.rb
+hello.rb
+test_arithmetic.rb
+time.rb
+[0m
+Now let me apply the fixes. First, finding 3 (avoid the double frontend run):
+[0m← [0mEdit src/lsp.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lsp.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+@@ -156,13 +156,17 @@
+ }
+ 
+ /// [`diagnostics`] as the JSON array an editor or language server consumes.
+ pub fn diagnostics_json(source: &str) -> String {
+-    let entries: Vec<String> = diagnostics(source)
+-        .iter()
+-        .map(Diagnostic::to_json)
+-        .collect();
++    diagnostics_to_json(&diagnostics(source))
++}
+ 
++/// Already-computed [`Diagnostic`]s as the same JSON array [`diagnostics_json`]
++/// produces, so a caller that has the findings does not have to run the
++/// frontend a second time to render them.
++pub fn diagnostics_to_json(found: &[Diagnostic]) -> String {
++    let entries: Vec<String> = found.iter().map(Diagnostic::to_json).collect();
++
+     format!("[{}]", entries.join(","))
+ }
+ 
+ /// The word-boundary alternation that matches every keyword, as a regex source
+
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -169,9 +169,12 @@
+ },
+ "diagnostics" => match fs::read_to_string(path) {
+     Ok(source) => {
+         let found = diagnostics(&source);
+-        println!("{}", diagnostics_json(&source));
++        // Rendered from the findings just computed: re-running
++        // the frontend to format them would lex, parse and
++        // analyze the file a second time.
++        println!("{}", diagnostics_to_json(&found));
+         // Exit non-zero when anything is an error, the way
+         // `rb lint` does, so this is usable as a CI check.
+         if found.iter().any(|d| d.severity == Severity::Error) {
+             process::exit(1);
+
+[0m
+[0m$ [0mgrep -n "diagnostics_json\|use crate::lsp\|lsp::" src/lib.rs | head -20
+22:pub use lsp::{
+23:    diagnostics, diagnostics_json, textmate_grammar, Diagnostic, Severity, GRAMMAR_PATH,
+[0m
+[0m→ [0mRead src/lib.rs[90m [limit=12, offset=18][0m
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -19,9 +19,10 @@
+ use testing::reporter::Reporter;
+ 
+ pub use error::{Error, Span};
+ pub use lsp::{
+-    diagnostics, diagnostics_json, textmate_grammar, Diagnostic, Severity, GRAMMAR_PATH,
++    diagnostics, diagnostics_json, diagnostics_to_json, textmate_grammar, Diagnostic, Severity,
++    GRAMMAR_PATH,
+ };
+ // `FunctionValue` is re-exported because it is the payload of the public
+ // `Value::Function` variant: a caller that matches that variant has to be able
+ // to name the type it binds.
+
+[0m
+Now the BLOCKER/MAJOR fix — the missing linter-warning test:
+[0m← [0mEdit tests/tooling_grammar_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
+@@ -193,8 +193,76 @@
+     );
+ }
+ 
+ #[test]
++fn diagnostics_report_linter_findings_as_warnings() {
++    // A program that runs fine but leaves a variable behind: nothing here is an
++    // error, so the linter finding must reach the editor as a warning.
++    let source = "set x to 1\n";
++
++    let (lint_errors, lint_warnings) = redblue::linter::lint(source);
++    assert_eq!(
++        (lint_errors.len(), lint_warnings.len()),
++        (0, 1),
++        "the fixture must be valid with exactly one unused variable: {:?} / {:?}",
++        lint_errors,
++        lint_warnings
++    );
++    assert_eq!(
++        (lint_warnings[0].line, lint_warnings[0].column),
++        (0, 0),
++        "the linter reports a whole-program finding with no position"
++    );
++
++    let found = diagnostics(source);
++
++    assert_eq!(
++        found.len(),
++        1,
++        "one lint finding means one diagnostic: {:?}",
++        found
++    );
++
++    let warning = &found[0];
++    assert_eq!(
++        warning.severity,
++        Severity::Warning,
++        "a lint finding must not be reported as an error, or `rb diagnostics` \
++         would exit non-zero on a program that runs"
++    );
++    assert_ne!(
++        warning.severity,
++        Severity::Error,
++        "the warning path must stay distinguishable from the error path"
++    );
++    assert_eq!(
++        (warning.line, warning.column),
++        (1, 1),
++        "the unplaceable 0:0 finding must fold to the first character"
++    );
++    assert!(
++        warning.message.contains("Unused variable") && warning.message.contains('x'),
++        "the warning must name the unused variable, got: {}",
++        warning.message
++    );
++
++    // The same single finding reaches the JSON an editor consumes, still as a
++    // warning rather than an error.
++    let value: serde_json::Value =
++        serde_json::from_str(&diagnostics_json(source)).expect("diagnostics are not JSON");
++    let entries = value.as_array().expect("not an array");
++    assert_eq!(entries.len(), 1, "one warning, one JSON entry");
++    assert_eq!(entries[0]["severity"].as_str(), Some("warning"));
++    assert_eq!(entries[0]["line"].as_u64(), Some(1));
++    assert_eq!(entries[0]["column"].as_u64(), Some(1));
++    assert_eq!(
++        entries[0]["message"].as_str(),
++        Some(warning.message.as_str()),
++        "the JSON must render the very finding `diagnostics` returned"
++    );
++}
++
++#[test]
+ fn edge_empty_source_produces_no_diagnostics() {
+     assert!(
+         diagnostics("").is_empty(),
+         "an empty file is an empty program, not a failure: {:?}",
+
+[0m
+[0m$ [0mcargo test --test tooling_grammar_test 2>&1 | tail -25
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 1.19s
+[1m[92m     Running[0m tests/tooling_grammar_test.rs (target/debug/deps/tooling_grammar_test-5168e83e5b43e7a2)
+
+running 13 tests
+test diagnostics_json_is_a_well_formed_array_of_located_entries ... ok
+test diagnostics_surface_a_spanned_analyzer_error ... ok
+test diagnostics_surface_a_spanned_lexer_error ... ok
+test diagnostics_report_linter_findings_as_warnings ... ok
+test diagnostics_surface_a_spanned_parser_error ... ok
+test edge_diagnostic_columns_count_characters_not_bytes ... ok
+test edge_diagnostic_json_escapes_a_message_containing_quotes_and_newlines ... ok
+test edge_empty_source_produces_no_diagnostics ... ok
+test edge_escape_json_escapes_quotes_backslashes_controls_and_unicode ... ok
+test every_listed_keyword_lexes_as_a_keyword_not_an_identifier ... ok
+test shipped_grammar_file_is_valid_json_with_a_redblue_scope ... ok
+test shipped_grammar_file_matches_the_generator ... ok
+test grammar_covers_the_lexer_keyword_set ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mwc -l tests/tooling_grammar_test.rs && cargo test 2>&1 | grep -E "^test result|running [0-9]+ tests" | head -40
+371 tests/tooling_grammar_test.rs
+running 6 tests
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 11 tests
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+running 26 tests
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+running 13 tests
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+running 21 tests
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 39 tests
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 16 tests
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 22 tests
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 26 tests
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+running 25 tests
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+running 5 tests
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 39 tests
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.10s
+running 13 tests
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo test 2>&1 | grep -oE "[0-9]+ passed" | awk -F' ' '{s+=$1} END {print s" passed total"}'
+336 passed total
+[0m
+[0m$ [0mwc -l src/lsp.rs && git diff --numstat src/lib.rs src/lsp.rs
+261 src/lsp.rs
+32	0	src/lib.rs
+261	0	src/lsp.rs
+[0m
+[0m← [0mEdit phases/phase-017/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+@@ -38,11 +38,11 @@
+ ## What changed
+ 
+ | File | Lines | What |
+ |---|---|---|
+-| `src/lsp.rs` (new) | +257 | `Diagnostic`/`Severity`, `diagnostics()`, `diagnostics_json()`, `escape_json()`, `keyword_pattern()`, `textmate_grammar()`, `GRAMMAR_PATH` |
++| `src/lsp.rs` (new) | +261 | `Diagnostic`/`Severity`, `diagnostics()`, `diagnostics_json()`, `diagnostics_to_json()`, `escape_json()`, `keyword_pattern()`, `textmate_grammar()`, `GRAMMAR_PATH` |
+ | `src/lexer.rs` | +138 −110 | `KEYWORDS` table becomes the single source of truth; `Lexer::keyword()` matches through it; `Lexer::keywords()` publishes the word list |
+-| `src/lib.rs` | +28 | `pub mod lsp`, re-exports, `rb grammar`, `rb keywords`, `rb diagnostics <file>` |
++| `src/lib.rs` | +32 | `pub mod lsp`, re-exports, `rb grammar`, `rb keywords`, `rb diagnostics <file>` |
+ | `src/error.rs` | +7 −1 | `Error::message()` made public — a diagnostic carries the message and the position separately |
+ | `tooling/vscode/syntaxes/redblue.tmLanguage.json` (new) | +16 | generated TextMate grammar, checked in, `source.redblue` |
+ | `tooling/vscode/package.json` (new) | +35 | language + grammar contribution, no JS entry point, no build step |
+ | `tooling/vscode/language-configuration.json` (new) | +21 | `#` comments, brackets, auto-closing quotes |
+
+[0m
+Now update REPORT.md so its claims match the code:
+[0m← [0mEdit phases/phase-017/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+@@ -46,9 +46,9 @@
+ | `tooling/vscode/syntaxes/redblue.tmLanguage.json` (new) | +16 | generated TextMate grammar, checked in, `source.redblue` |
+ | `tooling/vscode/package.json` (new) | +35 | language + grammar contribution, no JS entry point, no build step |
+ | `tooling/vscode/language-configuration.json` (new) | +21 | `#` comments, brackets, auto-closing quotes |
+ | `tooling/vscode/README.md` | +36 −90 | describes what exists and what does not |
+-| `tests/tooling_grammar_test.rs` (new) | +303 | 12 tests |
++| `tests/tooling_grammar_test.rs` (new) | +371 | 13 tests |
+ | `Cargo.toml` | +1 | `serde_json` as a **dev-dependency** for JSON assertions in tests |
+ 
+ `Cargo.lock` is gitignored and needed no change: `serde_json 1.0.151` is
+ already in the tree as a `reqwest` dependency.
+
+[0m
+[0m← [0mEdit phases/phase-017/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+@@ -66,9 +66,9 @@
+ containing emoji or accented text.
+ 
+ ## Tests added
+ 
+-All in `tests/tooling_grammar_test.rs`. 12 tests, 4 of them `edge_*`.
++All in `tests/tooling_grammar_test.rs`. 13 tests, 4 of them `edge_*`.
+ 
+ | Test | Edge class covered |
+ |---|---|
+ | `grammar_covers_the_lexer_keyword_set` | both directions: no keyword missing from the grammar, no stale word in it |
+
+[0m
+[0m← [0mEdit phases/phase-017/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+@@ -77,9 +77,9 @@
+ | `shipped_grammar_file_is_valid_json_with_a_redblue_scope` | malformed input: the grammar is valid JSON declaring `source.redblue` |
+ | `diagnostics_surface_a_spanned_lexer_error` | **failure asserted**: unterminated string → 1 Error diagnostic at 1:5 |
+ | `diagnostics_surface_a_spanned_parser_error` | **failure asserted**: `say x +` → parser diagnostic at 2:8 |
+ | `diagnostics_surface_a_spanned_analyzer_error` | **failure asserted**: undefined name → analyzer diagnostic at 2:1, naming the identifier |
+-| `diagnostics_report_linter_findings_as_warnings` | **failure asserted**: unused variable → `Severity::Warning` (not error) at a placeable position |
++| `diagnostics_report_linter_findings_as_warnings` | **failure asserted**: unused variable → exactly one `Severity::Warning` (asserted `!= Error`, so `rb diagnostics` still exits 0) at `1:1`, the fold of the linter's `0:0`; the JSON entry is `"warning"` too |
+ | `diagnostics_json_is_a_well_formed_array_of_located_entries` | malformed input: the JSON array parses, severity `error`, position and message match |
+ | `edge_empty_source_produces_no_diagnostics` | **empty**: `diagnostics("")` is empty and `diagnostics_json("") == "[]"` |
+ | `edge_diagnostic_columns_count_characters_not_bytes` | **unicode**: emoji + `é` before the literal; column 10, and `assert_ne!(column, 14)` so a byte offset cannot pass |
+ | `edge_escape_json_escapes_quotes_backslashes_controls_and_unicode` | **unicode/escapes**: `"`, `\`, `\n`, `\t`, `\u{1}`, emoji all round-trip through `escape_json` |
+
+[0m
+[0m← [0mEdit phases/phase-017/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+@@ -89,9 +89,9 @@
+ 
+ | Row | Status |
+ |---|---|
+ | empty / zero / "nothing" | covered — `edge_empty_source_produces_no_diagnostics` |
+-| singleton and boundary | covered — the unterminated-string diagnostic is the only entry (`assert_eq!(entries.len(), 1)`), and the `0:0` linter position folds to the first character `1:1` |
++| singleton and boundary | covered — the unterminated-string diagnostic is the only entry (`assert_eq!(entries.len(), 1)`); the `0:0` linter position folding to the first character `1:1` is pinned by `diagnostics_report_linter_findings_as_warnings`, which also asserts the finding is the *only* diagnostic for its program |
+ | out of bounds | **N/A** — no indexed access exists in the new code; a diagnostic's line/column is copied from a `Span`, never indexed into a buffer |
+ | type mismatch | **N/A** — `diagnostics()` takes `&str` and returns `Vec<Diagnostic>`; there is no runtime value to mismatch. The nearest analogue, an unplaceable finding, is covered above |
+ | numeric boundary | **N/A** — no arithmetic. Numeric *literals* in the grammar are a regex string, not numbers |
+ | unicode and escapes | covered — `edge_diagnostic_columns_count_characters_not_bytes`, `edge_escape_json_...`, `edge_diagnostic_json_escapes_...` |
+
+[0m
+[0m← [0mEdit phases/phase-017/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+@@ -107,9 +107,9 @@
+ | Gate | Result |
+ |---|---|
+ | `cargo fmt --all -- --check` | pass |
+ | `cargo clippy --all-targets -- -D warnings` | pass |
+-| `cargo test` | **335 passed, 0 failed** (12 of them new) |
++| `cargo test` | **336 passed, 0 failed** (13 of them new) |
+ | `./rbops/verify.sh phase-017` | **NOT RUN** — `rbops/` is not present in this checkout (`ls: cannot access 'rbops/verify.sh': No such file or directory`). `rbops/phases.json` is absent too, so this phase's `must_touch` could not be read. See FINDINGS.md §1. The dispatcher must run it |
+ | `examples/*.rb` (backwards compatibility) | 6/6 run clean under `rb` |
+ 
+ Zero new `#[ignore]`, `// skip` or `allow(clippy::` suppressions. Zero
+
+[0m
+[0m← [0mEdit phases/phase-017/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-017/REPORT.md
+@@ -64,8 +64,14 @@
+ parses. Positions are 1-based **character** columns, the same convention
+ `Error::render` draws its caret with, so an editor caret lines up on a line
+ containing emoji or accented text.
+ 
++`rb diagnostics` runs the frontend **once**: `diagnostics()` returns the
++findings and `diagnostics_to_json()` renders the slice it was handed, so the
++command does not re-lex, re-parse and re-analyze the file just to format a
++result it already holds. `diagnostics_json(source)` keeps the one-shot
++convenience form by delegating to the two.
++
+ ## Tests added
+ 
+ All in `tests/tooling_grammar_test.rs`. 13 tests, 4 of them `edge_*`.
+ 
+
+[0m
+Now re-running the four gates:
+[0m$ [0mcargo fmt --all -- --check && echo "GATE 1 fmt: PASS"
+GATE 1 fmt: PASS
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -5 && echo "GATE 2 clippy: PASS"
+[1m[92m    Checking[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.09s
+GATE 2 clippy: PASS
+[0m
+[0m$ [0mcargo test 2>&1 | grep -E "FAILED|failures|error\[" | head -20; cargo test 2>&1 | grep -oE "[0-9]+ passed" | awk '{s+=$1} END {print "GATE 3 test: "s" passed, 0 failed"}'
+test edge_project_tests_directory_has_no_failures ... ok
+test edge_suite_asserts_that_failures_are_produced ... ok
+GATE 3 test: 336 passed, 0 failed
+[0m
+[0m$ [0mfor f in examples/*.rb; do printf '%s: ' "$f"; cargo run -q --bin rb -- run "$f" >/dev/null 2>&1 && echo ok || echo FAIL; done
+examples/files.rb: ok
+examples/fizzbuzz.rb: ok
+examples/formats.rb: ok
+examples/hello.rb: ok
+examples/test_arithmetic.rb: ok
+examples/time.rb: ok
+[0m
+[0m$ [0m./rbops/verify.sh phase-017 2>&1 || echo "GATE 4: rbops/verify.sh not present in this checkout"
+/bin/bash: line 1: ./rbops/verify.sh: No such file or directory
+GATE 4: rbops/verify.sh not present in this checkout
+[0m
+[0m$ [0mprintf 'set x to 1\n' > /tmp/opencode/warn.rb && cargo run -q --bin rb -- diagnostics /tmp/opencode/warn.rb; echo "exit=$?"
+[{"line":1,"column":1,"severity":"warning","message":"Unused variable: 'x'"}]
+exit=0
+[0m
+All findings fixed and gates re-run.
+
+**1. BLOCKER — `phases/phase-017/REPORT.md:81` claimed a test that did not exist.** Added it: `diagnostics_report_linter_findings_as_warnings` (tests/tooling_grammar_test.rs:196) asserts the linter reports `(0 errors, 1 warning)` at `0:0`, that `diagnostics()` returns **exactly one** diagnostic with `severity == Warning`, explicitly `assert_ne!(…, Severity::Error)`, at `1:1`, and that the JSON entry reads `"warning"`. The report's test count (12 → 13) and the table now agree.
+
+**2. MAJOR — the `known_position` / `0:0 → 1:1` fold and the Warning loop had no coverage.** The new test pins both, and the report's singleton/boundary row now names it instead of asserting coverage in prose.
+
+**3. MINOR — `rb diagnostics` ran the frontend twice.** Added `lsp::diagnostics_to_json(&[Diagnostic])` (src/lsp.rs:158); `diagnostics_json` delegates to it, and `src/lib.rs:174` now renders the `found` slice it already holds.
+
+Gates: `cargo fmt --all -- --check` pass · `cargo clippy --all-targets -- -D warnings` pass · `cargo test` **336 passed, 0 failed** · `examples/*.rb` 6/6 clean. Gate 4 (`./rbops/verify.sh phase-017`) cannot run — `rbops/` is absent from this checkout, already recorded in REPORT.md:112. No tests deleted, skipped, or suppressed.
