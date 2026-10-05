@@ -1,0 +1,170 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by examining the flagged code in the formatter and the related parser logic.
+[0m→ [0mRead src/formatter.rs[90m [offset=380, limit=80][0m
+[0m→ [0mRead src/formatter.rs[90m [offset=740, limit=90][0m
+Both findings confirmed at the code level. Let me verify the parser behavior and understand the test/gate setup.
+[0m→ [0mRead src/parser.rs[90m [limit=40, offset=590][0m
+[0m→ [0mRead src/parser.rs[90m [limit=50, offset=960][0m
+[0m
+[0m$ [0mgit log --oneline -12 && echo "--- STATUS ---" && git status --short
+e4717b0 Merge remote-tracking branch 'origin/rbops-wip/phase-015'
+8dc0466 rbops: phase-017 (2026-10-05T02:38:36Z)
+fb4c0ae rbops: phase-015 checkpoint 1791122225
+3eb0d39 rbops: phase-015 (2026-10-04T12:56:19Z)
+58d9644 rbops: phase-015 (2026-10-04T12:38:03Z)
+329e83d rbops: phase-015 (2026-10-04T12:30:57Z)
+27d4aeb rbops: phase-014 (2026-10-04T11:39:19Z)
+e2f72aa rbops: phase-013 (2026-10-04T11:19:22Z)
+570671b rbops: phase-012 (2026-10-04T10:53:28Z)
+8e892de rbops: phase-011 (2026-10-04T10:26:40Z)
+bd59fde rbops: phase-010 (2026-10-04T09:59:50Z)
+2d54e2d rbops: phase-009 (2026-10-04T09:31:45Z)
+--- STATUS ---
+ M phases/phase-015/REPORT.md
+ M src/formatter.rs
+ M tests/formatter_test.rs
+[0m
+[0m$ [0mls && echo "=== phases ===" && ls phases/ 2>/dev/null | head -30
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+docs
+err.txt
+errors.txt
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+=== phases ===
+phase-002
+phase-003
+phase-004
+phase-006
+phase-007
+phase-008
+phase-009
+phase-010
+phase-011
+phase-012
+phase-013
+phase-014
+phase-015
+phase-017
+[0m
+[0m$ [0mgit diff --stat && echo "=== REPORT ===" && ls phases/phase-015/
+phases/phase-015/REPORT.md | 312 +++++++++++++++++--
+ src/formatter.rs           |  47 ++-
+ tests/formatter_test.rs    | 752 +++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 1046 insertions(+), 65 deletions(-)
+=== REPORT ===
+FINDINGS.md
+REPORT.md
+[0m
+Confirmed: both parser behaviors are real. Let me check the in-flight diff and identify the four gates.
+[0m→ [0mRead phases/phase-015/FINDINGS.md
+Let me locate the phase-workflow AGENTS.md that defines the four gates.
+[0m
+[0m$ [0mhead -60 phases/phase-015/REPORT.md
+# Phase 015 — Formatter must be idempotent and lossless
+
+## What changed
+
+Three runs contributed. The first (commit `329e83d`) fixed the finding; the
+second (`fb4c0ae`) closed the coverage gap it left behind; the third (this
+round) fixed everything review round 1 raised against the first two — one
+BLOCKER and four MAJORs, all of them real. A verification pass between the
+second and third re-ran every gate and corrected the test counts, which the
+earlier runs understated — see "Count correction" below.
+
+| File | Lines | What |
+|---|---|---|
+| `src/formatter.rs` | +384 −147 | **run 1** — comment attachment (`//` comments no longer dropped), exact `needs_reformat` comparison helper, exact trailing-newline emission, text-literal escaping that round-trips, operator-grouping parentheses preserved, no state carried between `format` calls |
+| `src/lib.rs` | +1 −1 | **run 1** — `rb format --check` now calls `formatter::needs_reformat(&source, &formatted)` instead of `source.trim() != formatted.trim()` |
+| `tests/formatter_test.rs` | +978 −0 | **run 1** — 39 `#[test]` functions, 21 `edge_*` |
+| `src/formatter.rs` | +98 −1 | **run 2** — `give back` pair rendering and block-tail comment attachment |
+| `tests/formatter_test.rs` | +370 −0 | **run 2** — 12 `#[test]` functions, all 12 `edge_*`: 7 pinning comment attachment at block depth (else, try/catch/finally, nested block tail, trailing comment) and 5 covering the spec-documented forms no corpus file and no prior test reached (see F5) |
+| `src/formatter.rs` | +40 −10 | **run 3 (this round)** — the `catch` BLOCKER and block-opening-line comment loss, see "Review round 1" |
+| `tests/formatter_test.rs` | +455 −38 | **run 3 (this round)** — 10 `#[test]` functions, all 10 `edge_*`, and a structural replacement for the debug-string tree oracle |
+
+Phase total, `27d4aeb`→`HEAD`: `src/formatter.rs` +521 −157 (476 → 840
+lines), `tests/formatter_test.rs` +1841 −38 (new file), `src/lib.rs` +1 −1.
+`src/lib.rs` shows +33 −1 over that range because phase-017 also edited it;
+phase-015's share is the single `needs_reformat` line.
+
+### The finding, reproduced
+
+The finding quoted `src/formatter.rs` as "431 lines"; at the pre-phase commit
+`27d4aeb` it was **476** (`git show 27d4aeb:src/formatter.rs | wc -l`). The
+claim of "zero tests" is the load-bearing part and was correct:
+`tests/formatter_test.rs` did not exist before this phase.
+
+Before the change, `src/lib.rs:173` compared:
+
+```rust
+if source.trim() != formatted.trim() {
+```
+
+`trim()` erases trailing whitespace and the trailing newline, so a file
+differing from its formatted form *only* in those respects was reported as
+already formatted. Re-verified against the current tree in the verification
+pass — all now exit 1, which the old comparison would have reported as exit 0:
+
+```
+printf 'say "hi"\n   \n'  > f.rb ; rb format --check f.rb   # trailing whitespace  -> exit 1
+printf 'say "hi"'        > f.rb ; rb format --check f.rb   # no trailing newline   -> exit 1
+printf 'say "hi"\r\n'    > f.rb ; rb format --check f.rb   # CRLF line ending      -> exit 1
+printf 'say "hi"\n\n'    > f.rb ; rb format --check f.rb   # trailing blank line   -> exit 1
+printf 'say "hi"\n'      > f.rb ; rb format --check f.rb   # already formatted     -> exit 0
+```
+
+## Tests added
+
+**61** `#[test]` functions in `tests/formatter_test.rs`, **43** named
+`edge_*`. 39 from run 1, 12 from run 2, 10 from run 3. Zero `#[ignore]`,
+`// skip`, or `allow(clippy::`. No test was deleted in run 3; the one function
+that *was* removed is `strip_spans`, the debug-string helper replaced by the
+structural walk in the BLOCKER-4 fix below.
+[0m
+[0m$ [0mls -a /home/runner/work/rbops/rbops/ && echo "=== parent AGENTS ===" && ls /home/runner/work/rbops/ /home/runner/work/ 2>/dev/null
+.
+..
+.git
+.gitattributes
+.github
+.gitignore
+AGENTS.md
+LICENSE
+README.md
+logs
+opencode.json
+phases
+rbops
+redblue
+=== parent AGENTS ===
+/home/runner/work/:
+_PipelineMapping
+_actions
+_temp
+rbops
+
+/home/runner/work/rbops/:
+rbops
+[0m
+[93m[1m! [0mpermission requested: external_directory (/home/runner/work/rbops/rbops/*); auto-rejecting
+[0m✗ [0mRead /home/runner/work/rbops/rbops/AGENTS.md failed
+[91m[1mError: [0mThe user rejected permission to use this specific tool call.
