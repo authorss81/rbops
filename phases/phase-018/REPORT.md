@@ -1,222 +1,331 @@
 # Phase 018 — Bytecode format and disassembler (bootstrap S1a)
 
-## Finding reproduced
+## Reproduction of the finding
+
+Before this phase there was no bytecode representation to bootstrap toward:
 
 ```
-$ cargo run --bin rb -- compile examples/hello.rb
-Redblue v0.1.0 - A programming language as readable as plain English
-
-Usage:
-  rb              Start interactive REPL
-  rb <file>      Run a Redblue file
-  rb run <file>  Run a Redblue file
-  …
-$ echo $?
+$ git show 563a351^:src/lib.rs | grep -c bytecode
 0
+$ ls src/bytecode
+ls: cannot access 'src/bytecode': No such file or directory
 ```
 
-`rb compile` was not a subcommand: the fourth argument of `rb` was treated as an
-unknown command and printed the help, exiting **0**. There was no `bytecode`
-module in `src/`, no `.rbc` file format, no disassembler and no version field
-anywhere:
+`Lexer → Parser → Analyzer → VM` was the whole pipeline; nothing emitted
+anything another process could read. Both commands are run at the parent of the
+phase-018 checkpoint and are reproduced by `git show 563a351^:src/lib.rs`.
 
-```
-$ grep -rn "bytecode\|MAGIC\|FORMAT_VERSION" src/ | wc -l
-0
-```
-
-Redblue was tree-walking only, which is what S1a exists to change. The finding
-reproduces.
-
-## Red test, before any production change
-
-`tests/bytecode_test.rs` was written first, 36 tests against an API that did
-not exist. It failed to compile, for the right reason:
-
-```
-error[E0432]: unresolved import `redblue::bytecode`
-error[E0599]: no function or associated item named `from_byte` found for struct `Opcode`
-```
-
-After the change the same file passes, and each test was checked to fail for
-its own reason by breaking the thing it names. Two examples, both reverted and
-re-run:
-
-- removing `depth + 1` from the nested-block call in `src/bytecode/codegen.rs`
-  makes `edge_a_program_nested_past_the_block_limit_is_refused` fail — the
-  compile-depth guard was dead code until that test forced it live;
-- the `-o` guard was first written against `args[2]`, which is the *source path*
-  in `rb compile <file> -o <out>`, and `rb_compile_writes_a_rbc_that_rb_dis_reads_back`
-  caught it (`rb compile wrote no .rbc file`).
+The finding no longer reproduces on `main`.
 
 ## What changed
 
 | File | Lines | What |
 |---|---|---|
-| `src/bytecode/opcode.rs` (new) | +297 | the 46 opcodes with **explicit, stable byte values**, `from_byte`/`to_byte`, `name`, `has_operand`/`has_aux`/`takes_constant_index` |
-| `src/bytecode/format.rs` (new) | +497 | `MAGIC`, `FORMAT_VERSION`, `Constant`, `Instruction`, `Block`, `BlockKind`, `Chunk::encode`, `Chunk::decode`, `Chunk::compile`, the bounds-checked `Reader`, `NO_BLOCK`, `MAX_BLOCK_DEPTH`, `INSTRUCTION_SIZE` |
-| `src/bytecode/codegen.rs` (new) | +530 | AST → `Chunk`: one pass, one instruction list per block, jump patching, interned names, `Decl` for the six constructs that own a body |
-| `src/bytecode/disasm.rs` (new) | +119 | `disassemble`: header, constant pool, per-block listing, per-operand comments, every printed index checked |
-| `src/bytecode/mod.rs` (new) | +33 | the module, its re-exports, and a doc-test that compiles, encodes, decodes and disassembles |
-| `src/lib.rs` | +61 −0 | `pub mod bytecode`, `compile_source`/`Chunk` re-exports, `rb compile <file> [-o out.rbc]`, `rb dis <file.rbc>`, `bytecode_path_for`, `compile_command`, `dis_command`, help text |
-| `docs/BYTECODE.md` (new) | +301 | the normative format: layout, every field, the full opcode table with stack effects, per-statement lowering, what a decoder must refuse, what `rb dis` prints |
-| `tests/bytecode_test.rs` (new) | +1233 | 38 tests, 21 of them `edge_*` |
-| `phases/phase-018/FINDINGS.md` (new) | +75 | five findings, none of them fixed here |
+| `docs/BYTECODE.md` | +375 −0 | the normative format: magic, `FORMAT_VERSION`, header, constant pool, block records, 13-byte instruction record, the opcode table, the reading rules and what `rb dis` prints |
+| `src/bytecode/mod.rs` | +33 −0 | module surface — `compile_source`, `Chunk`, `disassemble`, `Opcode`, `FORMAT_VERSION`, `MAX_BLOCK_DEPTH`, `NO_BLOCK`, `NO_CONST` |
+| `src/bytecode/opcode.rs` | +325 −0 | the opcode table, each opcode's operand/aux usage, and which operand is a constant index or a block index |
+| `src/bytecode/format.rs` | +568 −0 | `Chunk`/`Block`/`Constant`/`Instruction`, the encoder, and a `Reader` that bounds-checks every field and every declared count |
+| `src/bytecode/codegen.rs` | +548 −0 | AST → bytecode, one pass per block, interning names into a canonical constant pool |
+| `src/bytecode/disasm.rs` | +206 −0 | chunk → text; index order only, every printed index checked, heap walk over the block tree |
+| `src/lib.rs` | +67 −2 | `pub mod bytecode`, re-exports, `rb compile` and `rb dis`, help text |
+| `tests/bytecode_test.rs` | +1602 −0 | 43 tests |
 
-### The format, in one paragraph
+Continuation pass — a defect found in the checkpoint's own output, fixed:
 
-A `.rbc` is a packed little-endian byte stream: the 4-byte magic `RED\x1a`, a
-`u16` format version, a `u32` constant count, the constant pool, and one block
-tree. Each block is a kind byte, a `u32` arity, a length-prefixed UTF-8 name, a
-`u32` instruction count, that many **fixed 13-byte** instruction records
-(`opcode: u8`, `arg: u32`, `aux: u32`, `line: u32`), a `u32` child count, and
-its children. There is one constant pool per file, shared by every block, so a
-name used inside a function body is one entry.
+| File | Lines | What |
+|---|---|---|
+| `src/bytecode/disasm.rs` | +15 −11 | a jump to one past the last instruction is the block exit, not an out-of-range target; only a target *past* it is reported |
+| `docs/BYTECODE.md` | +10 −4 | the "every jump target is an instruction of the block" claim was false; the exit form is now specified |
+| `tests/bytecode_test.rs` | +109 −0 | two tests, below |
 
-### What makes the format stable rather than merely defined
+### The defect the continuation pass fixed
 
-- **Opcode byte values are part of the file.** Every variant carries its byte
-  written out (`Nop = 0,` … `Expect = 45,`), so inserting one between two
-  others is a deliberate act rather than an accident of declaration order.
-  `Opcode::ALL` is the table in byte order and `from_byte` reads it, and
-  `the_opcode_table_in_the_spec_is_the_opcode_table_in_the_code` asserts the
-  code against **the opcode table in `docs/BYTECODE.md`** and that the bytes
-  are consecutive from zero — so neither the code nor the spec can drift from
-  the other or from the file. Verified by swapping two rows of the spec's table
-  and watching that test fail.
-- **A retired byte is reserved, never reused.** Written into the module docs and
-  into `docs/BYTECODE.md`.
-- **Anything that would make an older file decode differently bumps
-  `FORMAT_VERSION`.** A reader refuses an unknown version rather than guessing
-  (`edge_unknown_format_version_is_rejected`).
-- **Jumps are block-local.** A block is the unit a jump target is resolved
-  against, which is what lets a decoder check every target against a length it
-  already knows.
+`patch_here` (`src/bytecode/codegen.rs`) points an exit jump at the next
+instruction to be emitted, which for a `while` or a bare `if` at the end of a
+block is the instruction count. The disassembler compared with `>=`, so the
+compiler's own valid output was reported as malformed:
 
-### Why names and not slots
+```
+$ ./target/debug/rb compile target/tmp/w.rb -o target/tmp/w.rbc
+$ ./target/debug/rb dis target/tmp/w.rbc
+0005  JUMP_IF_FALSE    9  ; line 2: target 9 is outside this block's 9 instructions
+```
 
-`LOAD`/`STORE` carry a name, not a slot number. A Redblue function closes over
-the local scopes live where it was declared (`src/value.rs:29-41`), so a name
-has to survive into the file for a VM to resolve it against those captured
-scopes. Slot allocation is a later stage and a version bump, because it changes
-what a version-1 file means. The one name the compiler introduces is
-`$counter`; `$` is not an identifier character in the lexer, so it cannot
-collide with a program-declared name.
+The instruction count is now a documented, legal target meaning "leave this
+block", and only a target past it is reported. `docs/BYTECODE.md` stated the
+opposite of what the compiler emits; it now states what the compiler emits.
 
-### Determinism
+## Review round 1
 
-Compiling the same source twice gives the same bytes, and disassembling the same
-bytes gives the same text: no `HashMap` iteration, no clock, no address, no
-sorting. Names are interned through an `IndexMap` in first-use order, so the
-pool does not depend on which use the compiler reached first.
+An adversarial review of the pass above returned five findings: two BLOCKER,
+three MAJOR. All five are fixed. Two of them were lossy encodings — source
+constructs the compiler silently dropped on the way to the file — so fixing them
+changed what a file means, and `FORMAT_VERSION` moved from 1 to 2 by the
+format's own rule.
+
+| File | Lines | What |
+|---|---|---|
+| `src/bytecode/codegen.rs` | +18 | `extends` interns the parent's name instead of a flag; a field's `default` is compiled in front of the `DEF_FIELD` that consumes it |
+| `src/bytecode/format.rs` | +71 | `NO_CONST` and the refusal of a pool that reaches it; `encode`, `all_blocks` and `Drop` all walk on the heap |
+| `src/bytecode/opcode.rs` | +20 | what `DEF_OBJECT`'s second operand and `DEF_FIELD`'s stack effect are, and which opcodes take a block index |
+| `src/bytecode/disasm.rs` | +83 | a heap walk over the block tree, and a check for every index it prints |
+| `src/bytecode/mod.rs` | ±0 | re-exports `NO_CONST` |
+| `docs/BYTECODE.md` | +67 | version 2, a version history, the stack discipline, what the decoder refuses versus what `rb dis` reports |
+| `tests/bytecode_test.rs` | +349 | five new tests; four existing ones tightened, none deleted |
+
+### BLOCKER 1 — `extends` threw the parent's name away
+
+`Statement::Object` compiled to `u32::from(extends.is_some())`: one bit in
+`DEF_OBJECT`'s secondary operand, no operand for *which* object. The parent
+chain is walked by name (`src/vm.rs`, `declare_object`), so a file written
+before this fix could not be resolved by anything:
+
+```
+$ ./target/debug/rb dis target/tmp/ob.rbc          # before
+main (main, arity 0)
+0002  DEF_OBJECT       1, 1  ; line 5               # 1 = "extends something"
+...
+; constants: 5                                     # and "Base" is only the
+;   [1] Base                                      # parent's own STORE
+```
+
+The parent is now interned like every other name and carried as a constant
+index, with the reserved index `NO_CONST` for an object that extends nothing —
+the same shape `TRY` uses for an absent handler. `rb dis` prints `none` rather
+than `4294967295`, and names the parent in the comment:
+
+```
+; redblue bytecode v2
+main (main, arity 0)
+0002  DEF_OBJECT       1, 2  ; line 5: extends Base; block 1 (object, `Child`)
+0000  DEF_OBJECT       0, none  ; line 1: block 0 (object, `Base`)
+```
+
+A pool that could reach `NO_CONST` would make the operand ambiguous, so the
+declared count is refused at `NO_CONST` before a single entry is read.
+
+### BLOCKER 2 — `has f default e` threw the default away
+
+`Statement::Has { name, .. }` ignored `default: Option<Expr>`, and `DEF_FIELD`
+had only a name operand, so `has size default 5 + 2` compiled to a declaration
+with no value at all — the tree-walking VM evaluates the default
+(`src/vm.rs:1397`) and the file said nothing about it.
+
+`DEF_FIELD` is now the consumer of the value pushed in front of it, so a default
+may be any expression; a `has` with no default pushes `nothing`, which is what
+the VM gives such a field. The object body reads as one initialisation per
+field, in source order:
+
+```
+  main.blocks[1] (object, arity 0)
+0000  PUSH_CONST       3  ; line 6: 5
+0001  PUSH_CONST       4  ; line 6: 2
+0002  ADD                ; line 6
+0003  DEF_FIELD        5  ; line 6: size
+0004  PUSH_CONST       6  ; line 7: nothing
+0005  DEF_FIELD        7  ; line 7: label
+```
+
+### MAJOR 3 — a test contradicted the format it was pinning
+
+`every_jump_target_is_inside_its_own_block` asserted `target < code.len()`,
+while `docs/BYTECODE.md` and the continuation-pass test above define
+`target == code.len()` as the legal block exit. The old invariant only passed
+because its program had a loop-back jump after every exit jump. It now asserts
+`<=`, and the test runs three programs so that the exit form is exercised: the
+`while` and the bare `if` must each exit by jumping to the instruction count,
+which is asserted as `exits == 2`. Reverting `<=` to `<` fails the test, with
+`"JUMP_IF_FALSE" jumps to 9 but block holds 9 instructions`.
+
+### MAJOR 4 — three walks recursed per nesting level
+
+`disasm::render_blocks`, `Block::collect` and `write_block` each put a call
+frame on the stack per level of nesting, so a `Chunk` deeper than
+`MAX_BLOCK_DEPTH` — which the public fields let a caller build — overflowed
+the stack through the public `disassemble`/`all_blocks`/`encode`. All three are
+now explicit-stack walks in the same depth-first order, so the output is
+byte-identical and the depth costs heap. Dropping a `Block` had the same problem
+in the destructor, which is where the first version of this test died:
+`Drop for Block` takes the children out and frees them one at a time.
+
+`MAX_BLOCK_DEPTH` is unchanged and is still what bounds a *file*: the compiler
+refuses to nest deeper, `Reader::block` refuses to decode deeper, and a
+hand-built tree past it still encodes to a file this build's decoder refuses.
+
+### MAJOR 5 — the disassembler's "every index is checked" was false
+
+`describe` checked constant-pool indices and jump targets only, while
+`Reader::instruction` accepted any `u32` for either operand. A corrupt block
+index decoded silently and disassembled without comment. Block operands are now
+checked against the holding block's own list — `DEF_FUNCTION`, `DEF_METHOD`,
+`DEF_OBJECT`, `TEST`, and both halves of a `TRY` — and the parent in
+`DEF_OBJECT` is checked against the pool. An operand with no value to name says
+nothing: `NO_BLOCK` is legal, not out of range.
+
+The decoder deliberately still accepts an out-of-range *operand*: it reads
+records and does not interpret what they address, so such a file is structurally
+sound. What the decoder refuses is a structure it cannot hold. `docs/BYTECODE.md`
+now says exactly that, in the same words, where before it implied operands were
+validated too.
+
+### Every new test was checked against the code it replaces
+
+| Test | Restored the old code and it… |
+|---|---|
+| `an_extending_object_names_its_parent_in_the_constant_pool` | fails: `left: 0`, the reserved index is not written |
+| `a_field_default_is_compiled_before_the_declaration_that_consumes_it` | fails: `left: ["DEF_FIELD", "DEF_FIELD"]` |
+| `edge_a_pool_that_reaches_the_reserved_constant_index_is_refused` | fails: the file with `NO_CONST` constants decodes |
+| `edge_a_tree_deeper_than_the_block_limit_still_renders_and_walks` | aborts with `has overflowed its stack` — once per recursive walk restored (`all_blocks`, `write_block`, `render_blocks`) and once per recursive `Drop` |
+| `edge_the_disassembler_reports_a_block_index_out_of_range` | fails: no comment names the block |
+| `every_jump_target_is_inside_its_own_block` | fails on `<` instead of `<=` |
+
+`edge_declared_counts_larger_than_the_file_are_refused` now claims 1,000,000
+constants rather than `u32::MAX`. Its assertion is unchanged and still fails on
+a count past the bytes left; the reserved-index refusal is a new, separate test
+rather than a shadowing one.
+
+## Definition of done
+
+- [x] `docs/BYTECODE.md` specifies the format, version and encoding — 375
+      lines; `rb dis` output shown in it is generated by the disassembler.
+- [x] `rb compile` emits `.rbc` for every `examples/*.rb` — pinned by
+      `rb_compile_and_dis_cover_every_example_through_the_binary`, which runs
+      the binary over the corpus and compares its bytes to the library's.
+- [x] `rb dis` round-trips and its output is deterministic — pinned by
+      `rb_compile_writes_a_rbc_that_rb_dis_reads_back` (two runs, byte-equal
+      stdout) and `disassembly_is_a_deterministic_function_of_the_bytes`.
+- [x] unknown opcode version → clean error — `edge_unknown_format_version_is_rejected`,
+      `edge_unknown_opcode_byte_is_rejected`; both are `Error::Parser` with a
+      message naming the version/byte, exit 1 through `rb dis`.
 
 ## Tests added
 
-All in `tests/bytecode_test.rs`. 38 tests, 21 `edge_*`, 1 doctest.
+`tests/bytecode_test.rs`, 43 tests (36 from the checkpoint, 2 from the
+continuation pass, 5 from review round 1).
 
 | Test | Edge class covered |
 |---|---|
-| `compile_encode_decode_round_trips_losslessly` | the format: decode(encode(c)) == c **and** encode(decode(b)) == b, so the encoding is a fixed point, not just reversible |
-| `every_example_compiles_and_encodes_deterministically` | backwards compatibility: all six `examples/*.rb` compile, encode twice to identical bytes, and survive a decode/encode round trip |
-| `disassembly_is_a_deterministic_function_of_the_bytes` | nondeterminism: disassembled twice, and the decoded chunk disassembles identically; asserts the opcodes are actually printed |
-| `edge_unknown_format_version_is_rejected` | **failure asserted**: version bumped to 2 → `Err` naming the version |
-| `edge_bad_magic_is_rejected` | **failure asserted**: first byte flipped → `Err` saying the file is not bytecode |
-| `edge_every_truncation_of_a_valid_file_is_rejected_without_panicking` | malformed input / out of bounds: **every** prefix shorter than the file is refused — each of the 90-odd byte offsets of a real `.rbc`, not one hand-picked |
-| `edge_unknown_opcode_byte_is_rejected` | malformed input: opcode byte 255 → `Err` naming it |
-| `edge_non_utf8_string_constant_is_rejected` | unicode/escapes: a byte inside a pooled text flipped to 0xFF → `Err` naming the text constant |
-| `edge_declared_counts_larger_than_the_file_are_refused` | resource limit: constant count and instruction count set to `u32::MAX` → refused on the count, before any allocation |
-| `expressions_compile_to_the_documented_instruction_sequences` | the codegen: the exact mnemonic sequence for list/index/record/property/`say`, and each count-carrying operand |
-| `calls_carry_their_name_and_arity_and_properties_carry_their_name` | the codegen: `files.read("a")` is a `CALL_METHOD` whose `arg` names `read` in the pool and whose `aux` is 1 |
-| `loops_and_branches_produce_jumps_inside_their_own_block` | the codegen: the exact sequence for `for each` + `if` + `while` + `skip`, and that exactly two jumps are backward |
-| `every_jump_target_is_inside_its_own_block` | **out of bounds**: every `JUMP`/`JUMP_IF_FALSE` in every block of the tree points inside that block; walks all blocks, not just `main` |
-| `functions_tests_and_methods_become_named_blocks` | nesting: a function nested in a function, an object body, a `to can` method, a `test` — names, arities, and the parent/child shape |
-| `try_compiles_to_a_handler_instruction_and_separate_blocks` | nesting: `TRY`'s two operands are the indices of a catch block and a finally block, in that order |
-| `try_without_handlers_names_no_blocks` | **empty**: `try` with no handler writes `NO_BLOCK` twice and creates no block |
-| `imports_compile_to_an_import_per_item_bound_to_its_alias` | duplicate/missing keys: each import item is an `IMPORT` naming the module and a `STORE` naming the *alias* |
-| `edge_the_same_name_is_one_constant_so_the_pool_is_canonical` | determinism: a name used three times is one pooled entry, and all three instructions point at it |
-| `edge_duplicate_record_keys_and_missing_names_still_compile` | duplicate/missing keys: `{a: 1, a: 2}` is `BUILD_RECORD 2`, and the key written twice is one pooled entry |
-| `edge_unicode_and_escapes_survive_the_constant_pool_byte_for_byte` | unicode: emoji, CJK, an RTL mark, an escaped quote, an escaped backslash, an escape-produced newline — all read back out of the file and re-encoded to the same bytes |
-| `edge_numeric_boundaries_survive_the_constant_pool` | numeric boundary: `0`, `-0.0`, `9007199254740993`, `1e308`, `3.14159`, `0.1` — every one decodes finite, the file is exactly `46 + 13 * instructions` bytes, and `-0.0` is a `NEG` |
-| `compile_refuses_a_program_the_frontend_rejects` | **failure asserted**: an unterminated string is `Err` with a message |
-| `edge_deeply_nested_declarations_still_compile_within_a_bounded_block_tree` | nesting: 8 nested `to … end` produce 8 nested blocks and round-trip |
-| `rb_compile_writes_a_rbc_that_rb_dis_reads_back` | the CLI: `rb compile … -o` writes a file starting with the magic, `rb dis` prints exactly `disassemble()`, and two separate processes print the same bytes |
-| `edge_rb_dis_refuses_a_source_file_and_a_missing_file` | **failure asserted**: `rb dis a.rb` and `rb dis missing.rbc` both exit non-zero with a message |
-| `edge_rb_compile_reports_a_bad_source_and_writes_nothing` | **failure asserted**: a program that does not parse exits non-zero, says why, and leaves **no** `.rbc` behind |
-| `rb_compile_without_an_output_flag_writes_beside_the_source` | the CLI: the default output path, and that the bytes written are the documented encoding |
-| `rb_help_documents_the_two_new_subcommands` | drift: `rb help` mentions `compile` and `dis` |
-| `edge_an_interpolated_text_becomes_build_text_over_its_parts` | the one AST node Redblue source cannot reach (`Expr::InterpolatedText` — see FINDINGS.md §2), lowered from a constructed AST |
-| `edge_a_program_nested_past_the_block_limit_is_refused` | **resource limit**: a constructed program nested past `MAX_BLOCK_DEPTH` is a diagnostic, not unbounded recursion. This test found the guard dead |
-| `edge_blocks_nested_past_the_limit_are_refused_when_decoding` | resource limit: a file that nests past the limit is refused, so a decoder cannot be walked off the stack |
-| `edge_an_unassigned_byte_in_any_enum_is_rejected` | malformed input: block kind 200, constant tag 99, `yes`/`no` byte 7 — each refused by name |
-| `edge_trailing_bytes_after_the_last_block_are_refused` | malformed input: one byte past the end |
-| `edge_the_disassembler_reports_an_out_of_range_operand_instead_of_panicking` | panic path: a hand-built chunk with `PUSH_CONST 9` (pool of 1) and `JUMP 40` (block of 2) disassembles with both reported as out of range, and does not panic |
-| `the_opcode_table_in_the_spec_is_the_opcode_table_in_the_code` | drift: the 46 opcodes, byte values and mnemonics in `docs/BYTECODE.md` are the ones the code writes, and the bytes are consecutive from zero so no variant can be slipped in between two others |
-| `all_blocks_reaches_every_block_of_a_nested_program` | nesting: every block of an eight-block tree is reached exactly once, including both `try` handlers |
-| `edge_empty_program_compiles_to_an_empty_main_block` | **empty**: `""` → no instructions, no constants, no blocks; still encodes, round-trips, and disassembles with its version header |
-| `edge_a_single_statement_program_is_not_empty` | singleton: one statement is exactly two instructions and one constant |
+| `edge_a_tree_deeper_than_the_block_limit_still_renders_and_walks` | nesting_recursion / resource_limit — **new**; 3000 levels walked on a 128 KiB stack by `all_blocks`, `encode` and `disassemble`, and freed |
+| `edge_the_disassembler_reports_a_block_index_out_of_range` | out_of_bounds — **new**; a block index past the list, a parent past the pool, and `NO_BLOCK` as the legal value it is |
+| `edge_a_pool_that_reaches_the_reserved_constant_index_is_refused` | malformed_input / resource_limit — **new**; the reserved index is refused from the declared count |
+| `an_extending_object_names_its_parent_in_the_constant_pool` | codegen shape — **new**; the parent's name is in the pool, interned once, and says so in the disassembly |
+| `a_field_default_is_compiled_before_the_declaration_that_consumes_it` | codegen shape — **new**; a non-trivial default is compiled, and a field with none is `nothing` |
+| `edge_a_jump_to_the_end_of_a_block_is_the_exit_not_an_out_of_range_target` | boundary / out_of_bounds — the exit jump is `code.len()`, is documented, is not reported as out of range, and survives a round trip |
+| `rb_compile_and_dis_cover_every_example_through_the_binary` | the phase's definition of done, end to end |
+| `edge_empty_program_compiles_to_an_empty_main_block` | empty — zero instructions, zero constants, round trips |
+| `edge_a_single_statement_program_is_not_empty` | singleton — one statement, one constant, two instructions |
+| `edge_declared_counts_larger_than_the_file_are_refused` | resource_limit / out_of_bounds — a constant count and an instruction count past the bytes left |
+| `edge_the_disassembler_reports_an_out_of_range_operand_instead_of_panicking` | out_of_bounds — a constant index and a jump target past the block |
+| `edge_bad_magic_is_rejected` | malformed_input — asserts a failure |
+| `edge_unknown_format_version_is_rejected` | malformed_input — asserts a failure |
+| `edge_unknown_opcode_byte_is_rejected` | malformed_input — asserts a failure |
+| `edge_every_truncation_of_a_valid_file_is_rejected_without_panicking` | malformed_input — every prefix of a valid file, and the whole file still decodes after |
+| `edge_an_unassigned_byte_in_any_enum_is_rejected` | malformed_input — block kind 200, constant tag 99, yes/no byte 7 |
+| `edge_trailing_bytes_after_the_last_block_are_refused` | malformed_input — one byte past the end |
+| `edge_non_utf8_string_constant_is_rejected` | unicode / malformed_input |
+| `edge_unicode_and_escapes_survive_the_constant_pool_byte_for_byte` | unicode — emoji, CJK, an RTL override, `\"`, `\\`, a newline |
+| `edge_numeric_boundaries_survive_the_constant_pool` | numeric_boundary — `0`, `-0.0`, `9007199254740993`, `1e308`, `3.14159`, `0.1`; every one finite, and the file length is the documented size |
+| `edge_duplicate_record_keys_and_missing_names_still_compile` | duplicate_missing_keys |
+| `edge_deeply_nested_declarations_still_compile_within_a_bounded_block_tree` | nesting_recursion — 8 levels, one block each |
+| `edge_a_program_nested_past_the_block_limit_is_refused` | nesting_recursion / resource_limit — asserts a failure |
+| `edge_blocks_nested_past_the_limit_are_refused_when_decoding` | nesting_recursion / malformed_input — asserts a failure |
+| `edge_an_interpolated_text_becomes_build_text_over_its_parts` | nesting_recursion — the AST node the parser cannot build (FINDINGS §2) |
+| `edge_the_same_name_is_one_constant_so_the_pool_is_canonical` | determinism — one name, one constant |
+| `every_example_compiles_and_encodes_deterministically` | determinism — same bytes from two compiles |
+| `disassembly_is_a_deterministic_function_of_the_bytes` | determinism |
+| `rb_compile_writes_a_rbc_that_rb_dis_reads_back` | determinism — two `rb dis` runs agree |
+| `edge_rb_dis_refuses_a_source_file_and_a_missing_file` | asserts a failure — non-`.rbc`, and a missing file |
+| `edge_rb_compile_reports_a_bad_source_and_writes_nothing` | asserts a failure — a non-parsing program leaves no file |
+| `rb_compile_without_an_output_flag_writes_beside_the_source` | resource / CLI surface |
+| `rb_help_documents_the_two_new_subcommands` | CLI surface |
+| `compile_encode_decode_round_trips_losslessly` | format |
+| `expressions_compile_to_the_documented_instruction_sequences` | codegen shape |
+| `calls_carry_their_name_and_arity_and_properties_carry_their_name` | codegen shape |
+| `loops_and_branches_produce_jumps_inside_their_own_block` | codegen shape |
+| `every_jump_target_is_inside_its_own_block` | codegen shape / boundary — every target in range *or* the documented exit, with the exit form asserted to occur |
+| `functions_tests_and_methods_become_named_blocks` | codegen shape |
+| `try_compiles_to_a_handler_instruction_and_separate_blocks` | codegen shape |
+| `try_without_handlers_names_no_blocks` | empty handler |
+| `imports_compile_to_an_import_per_item_bound_to_its_alias` | codegen shape |
+
+Quota: 43 `#[test]` functions (floor 3); 25 named `edge_*` (floor 1); 15
+assert a failure is produced (floor 1); 0 new `#[ignore]`, `// skip`, or
+`allow(clippy::` suppressions; 0 pre-existing tests failing.
 
 ### Mandatory edge-case matrix
 
-| Row | Status |
-|---|---|
-| empty / zero / "nothing" | covered — `edge_empty_program_compiles_to_an_empty_main_block` (empty source: no instructions, no constants, still a valid file), `try_without_handlers_names_no_blocks` (`NO_BLOCK` operands), `edge_unicode_…` (empty-ish text, the `""` in the escaped-quote case), `edge_numeric_…` (`0`) |
-| singleton and boundary | covered — `edge_a_single_statement_program_is_not_empty` (exactly one statement → exactly two instructions, one constant), `edge_the_same_name_is_one_constant…` (one pool entry for three uses), `edge_duplicate_record_keys…` (one pair and two pairs), `every_jump_target_is_inside_its_own_block` (a jump to the **last** instruction, `JUMP_IF_FALSE` to `end`, is in range — the assertion is `< code.len()`, not `<=`) |
-| out of bounds | covered — `every_jump_target_is_inside_its_own_block` (a jump target past the block is impossible from the compiler and is reported, not read, when constructed by hand); `edge_the_disassembler_reports_an_out_of_range_operand_instead_of_panicking` (constant index 9 in a pool of 1, jump 40 in a block of 2); `edge_every_truncation_of_a_valid_file_is_rejected_without_panicking` (every prefix, including one byte short of every field); `edge_declared_counts_larger_than_the_file_are_refused` (`u32::MAX` counts) |
-| type mismatch | **N/A** — this phase produces and reads a file; no runtime value is ever combined. The nearest analogue is the decoder meeting a tagged byte it does not assign, which is a mismatch between the file's claim and the format's vocabulary, and it is covered by `edge_an_unassigned_byte_in_any_enum_is_rejected` and `edge_bad_magic_is_rejected` |
-| numeric boundary | covered — `edge_numeric_boundaries_survive_the_constant_pool`: `0`, `-0.0`, `0.1`, `3.14159`, `9007199254740993` (past `MAX_EXACT_INT`), `1e308` (finite but at the edge), each asserted to decode finite; `-0.0` asserted to be a `NEG`; `1e308 * 1e308` needs no case because `Value::number` (`src/value.rs:181`) already refuses non-finite numbers before a constant is ever built, so no constant can hold `Infinity` or `NaN`. `Constant::Number` is public, so `Constant`'s `PartialEq` compares `f64` **bits** — a `NaN` round-trips as itself instead of comparing unequal to itself |
-| unicode and escapes | covered — `edge_unicode_and_escapes_survive_the_constant_pool_byte_for_byte` (emoji, CJK, RTL mark U+202E, `\"`, `\\`, escape-produced newline), `edge_non_utf8_string_constant_is_rejected` (bytes that are not UTF-8 at all) |
-| nesting and recursion | covered — `functions_tests_and_methods_become_named_blocks` (a function inside a function, an object body holding a method, a test), `try_compiles_to_a_handler_instruction_and_separate_blocks`, `edge_deeply_nested_declarations_still_compile_within_a_bounded_block_tree` (8 deep), and both directions of the limit: `edge_a_program_nested_past_the_block_limit_is_refused` (compiling) and `edge_blocks_nested_past_the_limit_are_refused_when_decoding` (decoding). `all_blocks_reaches_every_block_of_a_nested_program` walks a tree holding a function in a function, an object method, a test and both of a `try`'s handlers |
-| duplicate and missing keys | covered — `edge_the_same_name_is_one_constant_so_the_pool_is_canonical` (a repeated name), `edge_duplicate_record_keys_and_missing_names_still_compile` (a record with a repeated key and a read of a field that is not there), `imports_compile_to_…` (a module name and an alias that differ) |
-| malformed input | covered — every prefix of a real file refused; bad magic; wrong version; unknown opcode, block-kind, constant-tag and `yes`/`no` bytes; non-UTF-8 text; a trailing byte; `compile_refuses_a_program_the_frontend_rejects` and `edge_rb_compile_reports_a_bad_source_and_writes_nothing` (the frontend side), including that a failed compile leaves no file behind |
-| resource and state | covered — `edge_declared_counts_larger_than_the_file_are_refused` (a declared count is checked against the bytes left *before* `Vec::with_capacity`, so a 4-billion claim cannot become a 4-billion-element allocation), `edge_blocks_nested_past_the_limit_are_refused_when_decoding` and `edge_a_program_nested_past_the_block_limit_is_refused` (both recursion directions bounded at 64), `edge_the_disassembler_reports_an_out_of_range_operand_instead_of_panicking`. Tests write only under `target/tmp/bytecode-test/`, never the system temp dir. No test reads the clock, the network, or a file outside the checkout |
+Every row is covered. The 11 rows and where each is pinned:
+
+- **empty** — `edge_empty_program_compiles_to_an_empty_main_block`,
+  `try_without_handlers_names_no_blocks`
+- **singleton** — `edge_a_single_statement_program_is_not_empty`
+- **boundary** — `edge_a_jump_to_the_end_of_a_block_is_the_exit_not_an_out_of_range_target`
+  (target == instruction count, the boundary of the legal range),
+  `every_jump_target_is_inside_its_own_block` (the same boundary, asserted to
+  be reached twice), and `edge_numeric_boundaries_survive_the_constant_pool`
+  (`0`, `-0.0`, `2^53+1`)
+- **out_of_bounds** — `edge_the_disassembler_reports_an_out_of_range_operand_instead_of_panicking`,
+  `edge_the_disassembler_reports_a_block_index_out_of_range`,
+  `edge_declared_counts_larger_than_the_file_are_refused`
+- **type_mismatch** — the format is untyped, so there is no runtime type check
+  to fail here. What *is* refused is a mistyped tag: a constant that is not one
+  of `Number/Text/YesNo/Nothing`, a `yes`/`no` byte that is not 0 or 1, and a
+  block kind this build does not assign —
+  `edge_an_unassigned_byte_in_any_enum_is_rejected`.
+- **numeric_boundary** — `edge_numeric_boundaries_survive_the_constant_pool`
+- **unicode** — `edge_unicode_and_escapes_survive_the_constant_pool_byte_for_byte`,
+  `edge_non_utf8_string_constant_is_rejected`
+- **nesting_recursion** — `edge_deeply_nested_declarations_still_compile_within_a_bounded_block_tree`,
+  `edge_a_program_nested_past_the_block_limit_is_refused`,
+  `edge_blocks_nested_past_the_limit_are_refused_when_decoding`,
+  `edge_a_tree_deeper_than_the_block_limit_still_renders_and_walks`
+- **duplicate_missing_keys** — `edge_duplicate_record_keys_and_missing_names_still_compile`
+- **malformed_input** — the eight `edge_*` malformed-input tests listed above
+- **resource_limit** — `edge_declared_counts_larger_than_the_file_are_refused`
+  (a count past the bytes left is refused *before* `Vec::with_capacity`),
+  `edge_a_pool_that_reaches_the_reserved_constant_index_is_refused`,
+  `MAX_BLOCK_DEPTH` in the three nesting tests, and the existing
+  `call_depth_test` / `loop_bounds_test` suites that bound execution
 
 ## Gates
 
-Run in the project checkout, 2026-10-05.
+Run after review round 1, on the tree this report describes:
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --all-targets -- -D warnings` | pass |
-| `cargo test` | **380 passed, 0 failed** (38 new in `bytecode_test.rs`, 21 of them `edge_*`, plus 1 new doctest) |
-| `./rbops/verify.sh phase-018` | **NOT RUN** — `rbops/` is not present in this checkout (`ls: cannot access 'rbops/verify.sh'`). Same as phase-017; the dispatcher must run it. See FINDINGS.md §4 |
-| `examples/*.rb` compile (`rb compile … -o …`) | 6/6 |
-| `examples/*.rb` disassemble deterministically (`rb dis` twice, byte-compare) | 6/6 |
-| `examples/*.rb` still run (`rb run`) | 4/4 run; `files.rb`, `formats.rb` and `time.rb` skipped by the existing convention — they write files, do network I/O and read the clock, which `tests/formatter_test.rs:859` already excludes |
-
-Zero new `#[ignore]` or `allow(clippy::` attributes anywhere in the new files.
-The only `skip` occurrences in them are the Redblue `skip` keyword inside test
-source strings and one comment — no test is skipped. Zero pre-existing tests
-were modified, skipped or deleted: `git diff --stat` over tracked files is
-`src/lib.rs | 61 +++`, additive only.
+| `cargo test --all-targets` | 433 passed, 0 failed, 0 ignored (43 in `bytecode_test`) |
+| `cargo test --doc` | 1 passed (`src/bytecode/mod.rs` round-trip example) |
+| `./rbops/verify.sh phase-018` | **not run** — `rbops/` is not in this checkout: `ls: cannot access 'rbops/verify.sh': No such file or directory`. Recorded as not run, not as passed. See FINDINGS §4. |
+| `rb run examples/*.rb` (backwards compatibility) | 6/6 ok |
 
 ## Invariants touched
 
-- **None.** No grammar change, no `Value` variant added, no `Error` variant
-  added, `.rb` unchanged, `set … to` / `say` / `to … end` unchanged, and no
-  existing `rb` subcommand altered.
-- Additive only: a `bytecode` module, two subcommands, two re-exports and two
-  help lines.
-- `pub use bytecode::{compile_source, Chunk}` in `src/lib.rs` adds to the
-  public API; nothing is removed or re-typed.
-- Decode failures are `Error::Parser` with `Span::unknown()`. That is a
-  *pre-existing* variant used for a new kind of input (a `.rbc` rather than
-  `.rb`); no new error type enters the public API.
+- **The bytecode format version moved from 1 to 2.** That is the one thing that
+  changed for something outside this phase: a `.rbc` written by the phase-018
+  checkpoint is refused by this build with
+  `unknown bytecode format version 1: this build reads version 2`. Rule 2 of
+  `docs/BYTECODE.md` requires it, because `DEF_OBJECT`'s second operand and
+  `DEF_FIELD`'s stack effect both changed meaning; nothing else in the file's
+  layout, and no byte value, moved.
+- No language surface changed: `.rb` is still the extension, `say` still
+  prints, `to … end` / `if … end` / `for … end` are untouched, `Value`
+  and `Error` are unchanged, and `rb run` still tree-walks. `rb compile` and
+  `rb dis` read source and write a file; nothing existing routes through them,
+  which is why all 6 examples still run unchanged.
+- The tree-walking VM is untouched. `DEF_FIELD` popping a value is a fact about
+  the file format; stage S1b is where a VM consumes it.
 
 ## Known gaps / follow-ups
 
-- **Nothing runs a `.rbc`.** `rb vm file.rbc` does not exist. The ladder in
-  `AGENTS.md` §7 continues at S1b → FINDINGS.md §5
-- `Expr::InterpolatedText` is unreachable from Redblue source — the parser never
-  builds it, so `BUILD_TEXT` is only reachable from a constructed AST. `say
-  "n is {n}"` prints the braces. Not a bytecode bug → FINDINGS.md §2
-- `modules/MathUtils.rb` cannot be compiled: `constant PI to 3.14159` does not
-  parse, because `constant` is not a keyword. `rb run` fails on it identically,
-  so it predates this phase → FINDINGS.md §1
-- `AGENTS.md` documents `import a, b as c`; the parser accepts `import a to c` →
-  FINDINGS.md §3
-- `BREAK`/`SKIP` semantics, where a loop releases its iterator, and what value a
-  `catch` block is entered with are written down as requirements for S1b and are
-  **not** implemented → FINDINGS.md §5
-- Slot resolution for names is deferred to a later stage and a version bump, by
-  design
+- Nothing runs a `.rbc`. `rb vm` does not exist. This is stage S1a and the
+  ladder starts at S1b. Recorded in FINDINGS §5.
+- `modules/MathUtils.rb` does not parse, so `rb compile` cannot compile it
+  (`constant … to …` is not in the lexer). Predates this phase —
+  `rb run modules/MathUtils.rb` fails identically. FINDINGS §1.
+- `Expr::InterpolatedText` is unreachable from source; the compiler lowers it
+  correctly and a constructed AST pins that. FINDINGS §2.
+- Nothing decides what a `.rbc` VM should do with a parent that is not
+  declared. The tree-walking VM reports it at run time, and the file now
+  carries the parent's name for a VM to do the same. FINDINGS §5.
