@@ -1197,6 +1197,87 @@ n_ex="$(echo "$na" | grep -c .)"
 [ "$n_ex" -le 4 ] && ok "the exemption is narrow ($n_ex phases)" \
   || no "$n_ex phases exempted — too broad"
 
+# =========================================================== 24. fix-pass honesty
+head_ "24. a fix pass that ignores the findings is caught, not retried"
+# phase-015 spent three review rounds on a single defect. The fix pass wrote
+# "| src/formatter.rs | +40 -10 | **run 3 (this round)** - the `catch` BLOCKER"
+# into its own summary while leaving the cited code untouched, so the reviewer
+# correctly re-reported it and each round cost ~11 minutes to learn nothing.
+#
+# The dispatcher now hashes every file the blocking findings cite, runs the fix,
+# and hashes again. If nothing cited changed, it blocks with that reason rather
+# than looping.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+# The stubs below run as separate processes, so $PIPE/$PROJ are NOT visible to
+# them: D() cd's into $PIPE and inherits only exported variables. Without these
+# exports the stub silently took its review branch on BOTH invocations - the fix
+# branch was never entered, and the "non-fix" check passed for the wrong reason.
+export SMOKE_PIPE="$PIPE" SMOKE_PROJ="$PROJ"
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+n=0
+[ -f "$SMOKE_PIPE/logs/phase-001.fix.1.log" ] && n=1
+if [ "$n" = "0" ]; then
+  # review round 1: one blocking finding citing src/vm.rs
+  echo "1. [BLOCKER] src/vm.rs:1 - the defect is here - fix it - done"
+  echo "REVIEW VERDICT: FINDINGS 1"
+  echo "review done"
+else
+  # the fix pass: reports a fix, edits NOTHING
+  echo "| src/vm.rs | +40 -10 | run 3 (this round) - the BLOCKER |"
+  echo "fix done"
+fi
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$(R)"
+case "$out" in
+  *"DID NOT TOUCH any file cited"*) ok "a fix pass that edited nothing is detected" ;;
+  *) no "the non-fix was not detected"; printf '%s\n' "$out" | grep -E 'fix round|BLOCKED' | head -4 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"BLOCKED - fix pass never addressed the findings"*) ok "it blocks instead of looping again" ;;
+  *) no "it did not block on a non-fix" ;;
+esac
+case "$out" in
+  *"fix round 1: 1 file(s) cited by the findings"*) ok "the findings' files were tracked" ;;
+  *) no "cited files were not tracked" ;;
+esac
+# Only ONE fix round may have been spent: a second would mean it looped.
+n_rounds="$(grep -c 'applying review fixes' <<<"$out")"
+[ "${n_rounds:-0}" -le 1 ] && ok "no blind retry after the non-fix ($n_rounds fix round(s))" \
+  || no "it retried $n_rounds times after a non-fix"
+
+# And the control: a fix pass that DOES touch the cited file must proceed to the
+# next review round. Otherwise this check could be passing by blocking everything.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+n=0
+[ -f "$SMOKE_PIPE/logs/phase-001.fix.1.log" ] && n=1
+if [ "$n" = "0" ]; then
+  echo "1. [BLOCKER] src/vm.rs:1 - the defect is here - fix it - done"
+  echo "REVIEW VERDICT: FINDINGS 1"
+  echo "review done"
+else
+  printf '// the cited file WAS edited\n' >> "$SMOKE_PROJ/src/vm.rs"
+  echo "edited src/vm.rs"
+fi
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$(R)"
+case "$out" in
+  *"fix round 1: 1 cited file(s) actually changed"*) ok "a real fix is recognised" ;;
+  *) no "a real fix was not recognised"; printf '%s\n' "$out" | grep -E 'fix round|BLOCKED|review round' | head -5 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"DID NOT TOUCH"*) no "a real fix was misreported as a non-fix" ;;
+  *) ok "a real fix is not mistaken for a non-fix" ;;
+esac
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

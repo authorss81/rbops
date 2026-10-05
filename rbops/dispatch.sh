@@ -597,6 +597,30 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       continue
     fi
 
+    # --- did the fix pass actually address the finding? ---------------------
+    # A fix pass is another model run, and it can report a fix it did not make.
+    # phase-015 burned three review rounds on one defect: the pass wrote
+    # "| src/formatter.rs | +40 -10 | **run 3 (this round)** - the `catch`
+    # BLOCKER" into its own summary while leaving the `if let Some(var)` arm
+    # exactly as it was. The reviewer was right to re-report it every time.
+    #
+    # So verify mechanically: hash every file the blocking findings cite, run the
+    # fix, hash again. If not one cited file changed, the pass did not attempt the
+    # finding, and looping again just burns ~11 minutes to learn the same thing.
+    # Block immediately with that reason instead.
+    local cited; cited="$(mktemp)"
+    grep -oE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.(rs|rb|md|json|toml)' "$rlog" 2>/dev/null \
+      | grep -vE '^(Cargo\.lock|Cargo\.toml)$' | sort -u > "$cited" || true
+    local before after touched=0 f
+    before="$(mktemp)"; after="$(mktemp)"
+    while read -r f; do
+      [ -n "$f" ] || continue
+      if [ -f "$PROJECT_DIR/$f" ]; then
+        printf '%s %s\n' "$(cksum < "$PROJECT_DIR/$f" | awk '{print $1"-"$2}')" "$f" >> "$before"
+      fi
+    done < "$cited"
+    if [ -s "$before" ]; then log "fix round $round: $(wc -l < "$cited") file(s) cited by the findings"; fi
+
     log "applying review fixes"
     local fctx="$LOG_DIR/$phase.fix.$round.ctx"
     {
@@ -612,8 +636,31 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
         --dir "$PROJECT_DIR" --agent build --title "rbops-fix-${phase}-${round}"
     if [ "$?" = "75" ]; then
       log "fix round $round: model chain unusable — deferring"
+      rm -f "$cited" "$before" "$after"
       return 42
     fi
+
+    while read -r f; do
+      [ -n "$f" ] || continue
+      if [ -f "$PROJECT_DIR/$f" ]; then
+        printf '%s %s\n' "$(cksum < "$PROJECT_DIR/$f" | awk '{print $1"-"$2}')" "$f" >> "$after"
+      fi
+    done < "$cited"
+    if [ -s "$before" ]; then
+      touched="$(join -j 2 -o 1.1,2.1 <(sort -k2 "$before") <(sort -k2 "$after") 2>/dev/null \
+                | awk '$1 != $2 {print $1}' | wc -l | tr -d ' ')"
+      if [ "${touched:-0}" -eq 0 ]; then
+        log "fix round $round DID NOT TOUCH any file cited by the findings:"
+        sed 's/^/    /' "$cited" | head -8
+        log "the pass reported progress without editing the code under review — not retrying"
+        rm -f "$cited" "$before" "$after"
+        touch "$(marker "$phase" .blocked)"
+        log "$phase BLOCKED - fix pass never addressed the findings"
+        return 3
+      fi
+      log "fix round $round: $touched cited file(s) actually changed"
+    fi
+    rm -f "$cited" "$before" "$after"
 
     # --- re-gate after fixes. Mandatory. -----------------------------------
     log "re-running verify gate after review fixes"
