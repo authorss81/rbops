@@ -618,6 +618,251 @@
         "edge tests: duplicate constant name, constant reassignment, constant used before declaration, constant shadowed by a local"
       ],
       "timeout_min": 90
+    },
+    {
+      "id": "phase-025",
+      "title": "Make `break` and `skip` leave the loop instead of silently doing nothing",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "src/vm.rs:517-523 \u2014 `Statement::Break` and `Statement::Skip` each carry `// TODO: Implement proper control flow` and evaluate to `Ok(Value::Nothing)`. No loop consults them: `for each` (src/vm.rs:460), `repeat N times` (src/vm.rs:489) and `while` (src/vm.rs:505) all run their body to completion. Verified against the built binary: `for each i in [1,2,3] / if i is 2 then break end / say i / end` prints 1 2 3 and exits 0, and the same program with a `break` after `set n to n + 1` inside `repeat 5 times` still reports n = 5. SPEC.md:417-433 documents both statements with worked examples (`if i is 50 / break / end`), GRAMMAR.md:245-246 lists them, and src/lexer.rs:19-20 reserves the words while src/parser.rs:433-441 parses them \u2014 so the language accepts a program that compiles, runs, exits 0 and gives the WRONG ANSWER. Worse, two green tests pin the broken behaviour as correct: tests/test_lists.rb:108 `test \"lists: break inside a loop does not truncate it\"` asserts `expect total to be 10` where a working `break` at value 3 would make it 3, and tests/test_lists.rb:92 `test \"lists: a conditional inside a loop does not disturb the iteration\"` asserts `expect seen to be 4` where a working `skip` at value 2 would make it 3. A silent no-op that reports success is the most expensive class of defect this pipeline can ship.",
+      "goal": "Make `break` exit the innermost enclosing loop and `skip` advance to its next iteration, in `for each`, `repeat N times` and `while`, and correct the two Redblue tests that currently assert the broken behaviour.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`for each i in [1,2,3] / if i is 2 then break end / say i / end` exits 0 and prints 1 only",
+        "`for each i in [1,2,3] / if i is 2 then skip end / say i / end` exits 0 and prints 1 then 3",
+        "the same two programs behave identically inside `repeat N times` and inside `while`, and a `break` in the body of a nested loop leaves only the INNER loop \u2014 an outer loop with its own counter keeps counting, pinned by a test",
+        "tests/test_lists.rb:92 and tests/test_lists.rb:108 are CORRECTED, not deleted: both are rewritten to assert the real semantics (`seen` is 3 with a working `skip`, `total` is 3 with a working `break` at value 3), and a test asserts those two named tests still exist and still pass",
+        "edge tests named edge_* cover: `break`/`skip` as the first statement of a body, as the last, inside an `if` nested two blocks deep, in a loop whose body is a single statement, and `skip` on the final iteration of a `for each`",
+        "edge tests assert a FAILURE for `break` and for `skip` outside any loop \u2014 a clean caught RuntimeError naming the statement, not a silent no-op and not a panic; both must also be catchable with `try`/`catch error` inside a loop",
+        "the iteration budget is charged and released exactly as an uninterrupted iteration does, so `cargo test --all-targets` reports 0 failures including the 22 tests in tests/loop_bounds_test.rs",
+        "`cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ exits 0 (MathUtils.rb excepted, baselined until phase-024)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-026",
+      "title": "Lex the comparison symbols `<` `>` `=` `!` so the comparison parser is reachable",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "src/lexer.rs:398 is the operator table (`let kind = match c`) and it has arms for `+ - * / % ( ) [ ] { } , . :` only; the `_ =>` arm at src/lexer.rs:446 raises `Unexpected character '{c}'`. There is no arm for `<`, `>`, `=` or `!`, so `if x > 10` fails with `LexerError: Unexpected character '>'`. Consequently TokenKind::Equal/NotEqual/Less/LessEqual/Greater/GreaterEqual (declared src/lexer.rs:137-144) are NEVER constructed by the lexer: `grep -rn 'TokenKind::Less\\|TokenKind::Greater\\|TokenKind::Equal\\|TokenKind::NotEqual' src/*.rs` matches only src/parser.rs:1183-1258, i.e. the whole comparison arm block in parse_comparison is unreachable code. README.md:18 (`if count is greater than 10`), SPEC.md:277-282 (`>`, `>=`, `<`, `<=`, `==`, `!=`) and docs/GRAMMAR.md:93-98 all document these forms as working. Consequence: the language has NO ordering comparison at all \u2014 `x > y`, `x < y`, `x == y`, `x != y` are all lex errors today.",
+      "goal": "Make `<`, `<=`, `>`, `>=`, `==`, `!=` lex into the TokenKind variants the parser already handles, so ordering comparison is reachable in the language.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`cargo test` is green and a new test runs a .rb file containing `if x > 10 then`, `if x >= 10 then`, `if x < 10 then`, `if x <= 10 then`, `if x == 10 then` and `if x != 10 then` through `rb run` and asserts exit 0 with the branch it selects",
+        "a lexer test pins each of `<`, `<=`, `>`, `>=`, `==`, `!=` to its exact TokenKind, and `<=`/`>=` are one token rather than two",
+        "edge tests named edge_* cover: the equality boundary in both directions (`x < x` is no, `x <= x` is yes, `x > x` is no, `x >= x` is yes), reversed operands, and `==` on two lists and two records that hold equal contents",
+        "edge tests assert a FAILURE for ordering two operands of different types (`1 < \"a\"`, `yes >= 3`) and for ordering a list against a number \u2014 the result must be a caught RuntimeError, never a `yes` and never a panic",
+        "no existing behaviour regresses: `cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0 (MathUtils.rb excepted, it stays baselined until phase-024)",
+        "SPEC.md and docs/GRAMMAR.md are left stating what the code now does"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-027",
+      "title": "Parse the English comparison forms `is greater than` / `is less than` / `is equal to`",
+      "severity": "critical",
+      "depends_on": [
+        "phase-026"
+      ],
+      "risk": "medium",
+      "finding": "src/parser.rs:1170 `fn parse_comparison` handles `TokenKind::Is` at src/parser.rs:1176-1198 by looking only for a following `TokenKind::Equal` (1182-1187) or `TokenKind::Not` (1188-1193) and otherwise falling through to `BinaryOp::Equal` at 1196-1197. `greater`, `less`, `than`, `to` and `or` are plain identifiers, so `if x is greater than 10 then` consumes `greater` as the right operand of `is` and then fails with `ParserError: Expected Then but got Identifier(\"than\")`. `if x is equal to 1 then` fails with `Expected Then but got To`. Six of the seven documented comparison spellings in README.md:18, SPEC.md:273-274, SPEC.md:281-282, ROADMAP.md:10 and docs/GRAMMAR.md:93-98 therefore do not parse; only bare `is` (equality) and `is not` work. This is the flagship example of README.md:18 and of ROADMAP.md:10.",
+      "goal": "Make `is greater than`, `is greater than or equal to`, `is less than`, `is less than or equal to`, `is equal to` and `is not` parse, matching what README.md, SPEC.md and docs/GRAMMAR.md already promise.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "a new test runs a .rb file using all six word forms through `rb run`, asserts exit 0, and asserts which branch each one took",
+        "the word forms agree with the symbolic forms added in phase-025 on the same inputs: `x is greater than y` and `x > y` select the same branch for equal, greater, less, and non-comparable operands",
+        "`is greater than or equal to` binds looser than `is greater than`, so `x is greater than or equal to y` is not parsed as `(x is greater than y) or equal to y` \u2014 a test pins that specifically",
+        "edge tests named edge_* cover: the equality boundary in both directions, both operands in reversed order, and operands that are lists or records",
+        "edge tests assert a FAILURE for ordering a number against text and a record against a number \u2014 a caught RuntimeError, not a `yes` and not a panic",
+        "`cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0 (MathUtils.rb excepted, baselined until phase-024)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-028",
+      "title": "Implement the range loop `for each i from A to B [by C]`",
+      "severity": "critical",
+      "depends_on": [
+        "phase-026"
+      ],
+      "risk": "medium",
+      "finding": "src/parser.rs:651 `fn parse_for` has exactly one arm \u2014 `TokenKind::Each` at src/parser.rs:656 \u2014 and it unconditionally calls `self.expect(&TokenKind::In)?` at src/parser.rs:676 before parsing the iterable. There is no `from A to B [by C]` arm and no `by` step. `for each i from 1 to 3` therefore fails with `ParserError: Expected In but got From`, and so does every range loop in README.md:101-103, SPEC.md:380-391 and docs/GRAMMAR.md:222. Statement::ForEach (src/parser.rs:696) carries no bounds, so the VM has nothing to iterate. This is the single most common loop in the language's own README and it does not run. Note that phase-025 and phase-026 must land first: a range loop over a numeric boundary is untestable without `<`, `>` and `is greater than`.",
+      "goal": "Make `for each i from A to B`, `for each i from A to B by C` parse and run, with the iteration count bounded by the same MAX_ITERATIONS guard every other loop uses.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`rb run` of a file with `for each i from 1 to 5` exits 0 and prints 1 2 3 4 5 once each, in order",
+        "`for each i from 0 to 10 by 5` visits 0, 5, 10 and nothing else; `by 1` and an omitted `by` agree",
+        "the loop variable is a local: setting it inside the body does not change the sequence, and it is out of scope after `end` (an AnalyzerError, not a silent global)",
+        "edge tests named edge_* cover: an empty range (`from 5 to 1` visits nothing and does not hang), a single-iteration range (`from 3 to 3`), a descending `by`, a fractional `by` on a whole-number range, and `from`/`to`/`by` given a non-number (a clean RuntimeError naming the argument)",
+        "edge tests assert a FAILURE for `by 0` (infinite loop) \u2014 it must stop with a RuntimeError naming MAX_ITERATIONS, not hang and not abort",
+        "the existing iteration guard is reused rather than bypassed: a range whose length exceeds the configured MAX_ITERATIONS stops with the same RuntimeError a `repeat N times` gives",
+        "`cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0 (MathUtils.rb excepted, baselined until phase-024)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-029",
+      "title": "Make `mod` a keyword and implement the `in` membership operator",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "`In,` is a `BinaryOp` variant at src/parser.rs:86 but is never constructed anywhere in src/ \u2014 `grep -rn 'BinaryOp::In' src/` returns nothing \u2014 so `if \"a\" is in words then` fails with `ParserError: Unexpected token In`, though SPEC.md:325 and docs/GRAMMAR.md:372 both document it. Separately, `mod` is absent from the KEYWORDS table at src/lexer.rs:14-60 and the lexer only maps the symbol form `'%' => TokenKind::Mod` at src/lexer.rs:413, so SPEC.md:206 (`set remainder to 10 mod 3`) and docs/GRAMMAR.md:90 fail with `AnalyzerError: Unknown variable 'mod'` \u2014 a misleading message, because the source is well-formed Redblue. No file in examples/, modules/ or tests/ uses `mod` as an identifier (verified: `grep -rn '\\bmod\\b' examples/*.rb modules/*.rb tests/*.rb` is empty), so reserving the word cannot break an existing program.",
+      "goal": "Make `x mod y` and `is in` work as SPEC.md and docs/GRAMMAR.md document them, so a well-formed program is never rejected as an unknown variable.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`rb run` of a file with `set m to 10 mod 3` exits 0 and prints 1; the same file using `10 % 3` prints the same value",
+        "`x mod y` and `x % y` agree on the SPEC.md:224 boundary cases, including `-5 mod 3` = -2, and on every operand of `% 1`, `mod 1`, `% 0` and `mod 0` \u2014 the last two are caught RuntimeErrors naming `Modulo by zero`",
+        "`if \"a\" is in [\"a\",\"b\"] then` takes the then-branch and `if \"z\" is in [\"a\",\"b\"] then` takes the else-branch; `is in` on a text haystack is likewise defined by a test, or SPEC.md is corrected to say list-only",
+        "edge tests named edge_* cover: an empty haystack, a haystack that is an empty text, a needle that is `nothing`, and a needle of the wrong type",
+        "edge tests assert a FAILURE for `is in` on a record and on a number \u2014 a caught RuntimeError, not `no` and not a panic",
+        "`cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0 (MathUtils.rb excepted, baselined until phase-024)"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-030",
+      "title": "Implement the `unless` block the lexer already reserves",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "`(\"unless\", TokenKind::Unless)` is at src/lexer.rs:23 and `unless` is listed as a reserved word in SPEC.md:73 and docs/GRAMMAR.md:43, but the statement dispatch table at src/parser.rs:420 (`let stmt: Option<Statement> = match &token.kind`) has no `TokenKind::Unless` arm \u2014 `grep -c 'TokenKind::Unless' src/parser.rs` is 0. The token is therefore produced and immediately rejected: `unless no then ... end` fails with `ParserError: Unexpected token Unless`. SPEC.md:364-370 documents the construct.",
+      "goal": "Make `unless <expr> ... end` parse and run with the same block, `then`, and `end` shape as `if`, and take its body exactly when the condition is false.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`rb run` of a file with `unless no then say \"x\" end` exits 0 and prints x; the same program with `unless yes` prints nothing",
+        "`unless` accepts the same condition grammar as `if`, so a test runs one program through both forms with the condition negated and the two pick opposite branches",
+        "edge tests named edge_* cover: an empty body, a body of exactly one statement, and `unless` as the last statement in a file",
+        "edge tests assert a FAILURE for an `unless` block with no `end` \u2014 a spanned ParserError naming the missing `end`, not a panic and not a silent pass",
+        "an unclosed `unless` is rejected by `rb lint` and by `rb diagnostics` as an error, matching how `rb lint` already treats a missing `end` for `if`",
+        "`cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0 (MathUtils.rb excepted, baselined until phase-024)"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-031",
+      "title": "Implement `module ... end`, `export`, and the `import X as Y` alias",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "`(\"module\", TokenKind::Module)` is at src/lexer.rs:43 and `(\"export\", TokenKind::Export)` at src/lexer.rs:45, and SPEC.md:618-648 plus docs/GRAMMAR.md:143-157 document a full module system. Neither token has an arm in the statement dispatch at src/parser.rs:420 (`grep -c 'TokenKind::Module\\|TokenKind::Export' src/parser.rs` is 0 each): `module M ... end` fails with `ParserError: Unexpected token Module`. `import` IS handled (src/parser.rs:465) but the `as` alias it parses at src/parser.rs:501 is never bound, so `import json as J` then `J.parse(\"{}\")` fails with `AnalyzerError: Unknown variable 'as'` and `Unknown variable 'J'`. Nothing in the repo exercises a module declaration: neither modules/MathUtils.rb nor modules/SuiteKit.rb contains the word `module`, so the `examples/` sweep in rbops/verify.sh:225 has never run one.",
+      "goal": "Make `module Name ... export ... end` parse, and make `import Name as Alias` bind the alias so the imported name can actually be called through it.",
+      "must_touch": [
+        "src/",
+        "modules/"
+      ],
+      "accept": [
+        "`rb run` of a file that does `import json as J` and then calls `J.parse(\"{}\")` exits 0 and prints the parsed record",
+        "importing a name that no module defines is a clean error naming the name, not a silent no-op \u2014 a test pins the message",
+        "a module declared with `module Name ... export ... end` parses and `rb run` on it exits 0",
+        "modules/MathUtils.rb gains the `module`/`export` wrapper its header comments describe, or a test explains in REPORT.md why it does not need one",
+        "edge tests named edge_* cover: an import of a name that shadows a local, a module with nothing exported, and `export` naming a function the module does not define",
+        "edge tests assert a FAILURE for a circular import and for a module re-declared in the same file \u2014 a caught RuntimeError, not a hang and not a panic",
+        "`cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ exits 0, with the rbops/baseline.json `unparseable` entry for modules/MathUtils.rb removed only if the phase actually fixed it"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-032",
+      "title": "Reconcile the stdlib module list in SPEC.md with src/stdlib.rs",
+      "severity": "major",
+      "depends_on": [
+        "phase-026"
+      ],
+      "risk": "medium",
+      "finding": "src/stdlib.rs:7 declares `pub const MODULES: &[&str] = &[\"console\", \"csv\", \"files\", \"json\", \"network\", \"time\"]` and src/analyzer.rs:270 rejects a bare receiver that is neither in scope nor in `stdlib::MODULES` with `Unknown variable`. SPEC.md \u00a7Standard Library documents four modules that are not in that list \u2014 `text` (SPEC.md:753-760), `math` (762-769), `list` (782-788) and `formats` (797-803) \u2014 so `text.uppercase(\"hi\")` fails with `AnalyzerError: Unknown variable 'text'` and `formats.parse_json(\"{}\")` with `Unknown variable 'formats'`. The functions those sections describe already exist as bare builtins at src/stdlib.rs:22-153 (`uppercase`, `lowercase`, `split`, `join`, `sqrt`, `map`, `filter`, `reduce`, `json_parse`, `csv_parse`); they are registered under flat names, not under the module names SPEC.md prints. README.md:120-151 documents only files/time/network/json/csv, which agrees with src/stdlib.rs \u2014 so README and SPEC disagree with each other.",
+      "goal": "Make src/stdlib.rs, SPEC.md and README.md agree on which module names exist, routing the builtins that already exist under the documented names or correcting the documents to the names the code really uses.",
+      "must_touch": [
+        "src/",
+        "docs/"
+      ],
+      "accept": [
+        "a test reads SPEC.md and README.md, extracts the module names each documents, and fails when a documented name is absent from MODULES at src/stdlib.rs:7 or present in MODULES but documented nowhere",
+        "every module name in SPEC.md \u00a712 and README.md \u00a7Standard Library is callable, and `rb run` of a file calling each one exits 0",
+        "where SPEC.md shows a call this parser cannot parse \u2014 SPEC.md:785 `list.map([1,2,3], to (x) give back x*2)`, which depends on the function literal of phase-034 \u2014 SPEC.md is corrected in this phase and the correction is named in REPORT.md",
+        "edge tests named edge_* cover: a module function called with no arguments, with too many, and with an argument of the wrong type \u2014 each a caught RuntimeError naming the function, never a panic",
+        "edge tests assert a FAILURE for an unknown module name (`nosuchmodule.read(\"x\")`) \u2014 a clean error, not a silent `nothing`",
+        "`cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0 (MathUtils.rb excepted, baselined until phase-024)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-033",
+      "title": "Test the REPL and route it through the ReplCommand it already has",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "All four modules of the REPL have zero tests: `grep -c '#\\[test\\]' src/repl/*.rs` is 0 for mod.rs, commands.rs, completer.rs and history.rs, and `grep -rn repl tests/*.rs` finds no test that exercises one. README.md:73 documents bare `rb` as the REPL entry point and src/lib.rs:100 dispatches `args.len() == 1` to `run_repl()`. Worse, 333 of the REPL's 730 lines are unreachable: `ReplCommand` (src/repl/commands.rs:1), `ReplCompleter` (src/repl/completer.rs:1) and `ReplHistory` (src/repl/history.rs:3) are declared and re-exported at src/repl/mod.rs:9-11 but never constructed anywhere \u2014 `Repl` keeps its own `history: Vec<String>` (src/repl/mod.rs:18) and re-parses the command word by hand at src/repl/mod.rs:78-84, duplicating the table already written at src/repl/commands.rs:32-83. `ReplHistory::search`, `search_all`, `save_to_file` and `load_from_file` (src/repl/history.rs:32-87) have no caller at all, so the history-file format is unexercised. clippy stays silent because all three types are `pub`.",
+      "goal": "Make the REPL a tested surface and remove the duplicated command parsing, so the 333 lines that nothing constructs stop being untested dead weight.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`Repl::handle_command` routes through `ReplCommand::parse` (src/repl/commands.rs:20) instead of its own match, and the diff removes the duplicated table rather than adding a second one",
+        "unit tests cover `ReplHistory`: push, the consecutive-duplicate suppression at src/repl/history.rs:17, eviction at max_size, `search` returning the most recent match, `search` on a prefix that matches nothing, and a `save_to_file`/`load_from_file` round trip in a temp dir",
+        "unit tests cover `ReplCompleter`: a prefix that matches a variable, a function, a builtin and a module name; a prefix that matches nothing; and an empty prefix",
+        "an end-to-end test drives `rb` over piped stdin with `:help`, `:vars`, `:funcs`, `:history`, `:quit`, a program that raises a caught error and a multi-line block, and asserts on stdout and on the exit code",
+        "edge tests named edge_* cover: a REPL session whose first line is a syntax error (the REPL must stay alive and prompt again), an unterminated multi-line block followed by EOF (must terminate, not hang), and `:load` of a path that does not exist",
+        "the tests are deterministic: no wall-clock assertions, no fixed ports, no writes outside a temp dir",
+        "`cargo test --all-targets` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-034",
+      "title": "Add the function literal `to (x) ... end` as an expression",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "`Expr` (src/parser.rs:5-68) has Number, Text, YesNo, Nothing, Variable, Binary, Unary, Call, Property, MethodCall, Index, InterpolatedText, List, Record and Expect \u2014 and no function-literal variant, while docs/GRAMMAR.md:413-419 specifies `function_literal = 'to' [ '(' parameter { ',' parameter } ')' ] { statement } 'end'` and SPEC.md:484-491 shows `set double to to (x) give back x * 2`. `to` is only accepted as a statement (src/parser.rs:461 `TokenKind::To => self.parse_function()?`) and never as a primary expression, so `set double to to (x) give back x * 2` fails with `ParserError: Unexpected token To`, and so does `[1,2,3].map(to (x) give back x * 2)`. SPEC.md:496-502's `give back to ... end` counter form is equally unreachable. Closures themselves work \u2014 phase-011 landed capture and tests/closure_capture_test.rs has 26 passing tests \u2014 but only through a NAMED nested `to name() ... end` declaration, so there is no way to write a higher-order function at all, and SPEC.md:785's `list.map` example can never run.",
+      "goal": "Add a function literal to the AST and the grammar so an anonymous function is a value, closing the gap between the working named-closure behaviour and what SPEC.md documents.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`rb run` of a file with `set double to to (x) give back x * 2` followed by `say double(21)` exits 0 and prints 42",
+        "the literal captures its enclosing bindings by value at the point it is written, matching the policy pinned by tests/closure_capture_test.rs:17-22 \u2014 a closure defined inside a function sees that function's locals, not the caller's",
+        "`rb run` of a file passing a literal to `map` exits 0 and prints the mapped list, so the SPEC.md:785 shape runs",
+        "edge tests named edge_* cover: a literal with zero parameters, a literal whose parameter shadows an enclosing binding, three nested literals each capturing its own level, and a literal assigned to a name that is then reassigned",
+        "edge tests assert a FAILURE for calling a literal with the wrong argument count, for an unterminated literal (a spanned ParserError naming the missing `end`, never a panic), and for a literal nested inside itself",
+        "cargo test --all-targets reports 0 failures, and the existing 26 tests in tests/closure_capture_test.rs and 22 in tests/loop_bounds_test.rs still pass unchanged",
+        "SPEC.md, docs/GRAMMAR.md and the `Expr` enum in src/parser.rs agree on the form"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-035",
+      "title": "Remove the reachable panics in the time builtins",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "src/vm.rs:924, src/vm.rs:1089, src/vm.rs:1238, src/vm.rs:1250 and src/vm.rs:1263 each call `SystemTime::now().duration_since(UNIX_EPOCH).unwrap()`. `duration_since` returns `Err(SystemTimeError)` for any instant before 1970-01-01T00:00:00Z and `.unwrap()` on it panics. All five sit inside the time builtins, reachable from a plain Redblue program through `time.now()` with no test, no flag and no unusual input \u2014 only a host clock set before the epoch. Every other error path in those functions is a RuntimeError; these five unwind through the interpreter thread and abort the process. This is the reachable-`unwrap` class the reviewer contract (AGENTS.md section 5) names as a hunt target, and it is the only place in src/ where `.unwrap()` appears outside test code \u2014 the other 7 unwraps are all in `mod tests` blocks.",
+      "goal": "Turn the five clock unwraps into RuntimeErrors, so no Redblue program can panic the interpreter through a host clock set before the Unix epoch.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "no `.unwrap()` remains in src/ outside a `#[cfg(test)]` or `mod tests` block, and `grep -rn 'unwrap()' src/` is pasted into REPORT.md showing only test lines",
+        "the five call sites report a caught RuntimeError naming the clock rather than panicking, and a Redblue `try`/`catch error` around a failing `time.now()` yields the error instead of aborting the process",
+        "the failure is exercised WITHOUT moving the machine clock: the seconds-since-epoch conversion is extracted behind a function that takes the instant as an argument, so a test passes a pre-epoch instant directly and asserts the error \u2014 the test is deterministic and does not depend on wall-clock state",
+        "edge tests named edge_* cover a pre-epoch instant, the exact epoch boundary, and `time.format` given an argument that is not a number or not a text",
+        "`cargo test --all-targets` reports 0 failures and the 39 tests in tests/stdlib_modules_test.rs, including `network_timeouts_are_published_and_bounded`, still pass",
+        "`cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added"
+      ],
+      "timeout_min": 90
     }
   ]
 }
