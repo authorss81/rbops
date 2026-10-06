@@ -1,0 +1,39 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-2 review — hunting the diff for what's still broken.
+[0m→ [0mRead src/analyzer.rs
+[0m→ [0mRead src/parser.rs[90m [limit=80, offset=600][0m
+[0m→ [0mRead src/vm.rs[90m [limit=120, offset=185][0m
+Seen the analyzer and loader shape — now digging into execution and edge cases.
+[0m→ [0mRead src/linter.rs[90m [limit=60, offset=190][0m
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/vm.rs[90m [limit=250, offset=330][0m
+[0m→ [0mRead src/vm.rs[90m [limit=120, offset=720][0m
+[0m→ [0mRead modules/MathUtils.rb
+[0m→ [0mRead tests/constant_test.rs[90m [limit=80, offset=260][0m
+[0m→ [0mRead src/bytecode/opcode.rs[90m [limit=80, offset=165][0m
+[0m→ [0mRead src/vm.rs[90m [limit=90, offset=100][0m
+[0m→ [0mRead tests/bytecode_test.rs[90m [limit=90, offset=795][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [limit=40, offset=145][0m
+[0m→ [0mRead src/vm.rs[90m [limit=120, offset=1590][0m
+Bytecode shape looks consistent — now scanning for panic paths and spec drift.
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|unimplemented!"[90m in src · 38 matches[0m
+[0m→ [0mRead SPEC.md[90m [limit=60, offset=647][0m
+[0m→ [0mRead src/bytecode/opcode.rs[90m [limit=95, offset=243][0m
+[0m→ [0mRead src/error.rs[90m [limit=40, offset=90][0m
+[0m→ [0mRead docs/GRAMMAR.md[90m [limit=40, offset=175][0m
+[0m→ [0mRead src/vm.rs[90m [limit=110, offset=660][0m
+Core patterns mapped — now verifying the last details before the verdict.
+[0m→ [0mRead src/error.rs[90m [limit=90, offset=1][0m
+[0m→ [0mRead src/vm.rs[90m [limit=40, offset=1055][0m
+[0m→ [0mRead src/linter.rs[90m [limit=80, offset=1][0m
+[0m→ [0mRead src/linter.rs[90m [limit=80, offset=300][0m
+FINDINGS:
+1. [MAJOR] src/analyzer.rs:319 — `Statement::Import` declares each module name with `declare` (innermost scope) while `Vm::bind_module_name` writes them to `globals` — an `import` inside a function body binds globally at runtime but stays local in the analyzer, so a read after the body is rejected by `rb run` yet accepted by the VM (and vice versa) — fix by declaring imported names with `declare_in_program_scope` like `constant`/`set` do.
+2. [MAJOR] src/analyzer.rs:482 — `collect_later_names` recurses into `Function`/`Method`/`Object`/`Test` bodies and `if`/`loop`/`try` branches, so a `constant`/`import` that never executes (uncalled function, untaken branch) still whitelists reads in other deferred bodies — analyzer passes a program the VM then rejects with `Unknown variable` — fix by collecting only unconditional top-level declarations, and add the missing test (constant inside an uncalled function must not satisfy a read in another body).
+3. [MAJOR] src/vm.rs:669 — `Statement::Function` does `declare(name)` then `set_var(name, ...)`, and `set_var` returns early on a local hit without consulting `refuse_constant_rebind` — defining `to F()`/`object F` over `constant F` silently shadows instead of erroring, unlike `set F` — fix by checking `constants` before binding function/object/record names, and add the missing `edge_function_named_as_constant_is_refused` test.
+4. [MAJOR] src/vm.rs:432 — `bind_constant` only refuses when `constants` already holds the name and otherwise overwrites `globals` unconditionally — `set X to 1` then `constant X to 2` (or `set X` then importing a module with `constant X`) silently discards the variable with no test on that side of the branch — fix by refusing when a global already exists or by specifying in SPEC.md that set-then-constant is allowed, plus the missing test.
+5. [MINOR] src/vm.rs:197 — second search path is `format!("./modules/{name}")` with no `.rb` extension, so it can never match a module file despite the comment saying it is the same directory with a leading `./` — fix to `format!("./modules/{name}.rb")`.
+REVIEW VERDICT: FINDINGS 5
