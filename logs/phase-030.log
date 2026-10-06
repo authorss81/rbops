@@ -1,0 +1,3044 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m$ [0mgrep -n 'Unless' src/lexer.rs src/parser.rs src/analyzer.rs src/vm.rs src/ast.rs 2>/dev/null; echo "---"; ls src/
+src/lexer.rs:25:    ("unless", TokenKind::Unless),
+src/lexer.rs:95:    Unless,
+---
+analyzer.rs
+bytecode
+error.rs
+formatter.rs
+lexer.rs
+lib.rs
+linter.rs
+lsp.rs
+main.rs
+parser.rs
+repl
+runtime.rs
+stdlib.rs
+testing
+value.rs
+vm.rs
+[0m
+[0m$ [0mmkdir -p ./target/tmp && printf 'unless no then say "x"\nend\n' > ./target/tmp/u.rb && cargo run -q --bin rb -- run ./target/tmp/u.rb 2>&1 | tail -20
+Error: ParserError: Unexpected token Unless
+  --> ./target/tmp/u.rb:1:1
+1 | unless no then say "x"
+  | ^
+[0m
+Reproduced. Now let me look at the parser's `if` handling.
+[0m$ [0mgrep -n 'TokenKind::If\|Statement::If\|fn parse_if\|Unexpected token' src/parser.rs | head -40
+343:            Some(TokenKind::If)
+439:            TokenKind::If => self.parse_if()?,
+640:    fn parse_if(&mut self) -> Result<Option<Statement>> {
+681:        Ok(Some(Statement::If {
+1761:                format!("Unexpected token {:?}", token.kind),
+[0m
+[0m$ [0mgrep -rn 'Unexpected token' src/parser.rs | head -20; echo "=== git log ==="; git log --oneline -3
+1761:                format!("Unexpected token {:?}", token.kind),
+=== git log ===
+694cc85 rbops: phase-029 (2026-10-06T20:57:38Z)
+6b9a59b rbops: phase-028 (2026-10-06T20:44:53Z)
+8d7669d rbops: phase-027 (2026-10-06T20:29:51Z)
+[0m
+[0m→ [0mRead src/parser.rs[90m [offset=320, limit=140][0m
+[0m→ [0mRead src/parser.rs[90m [limit=70, offset=636][0m
+[0m
+[0m$ [0mgrep -n 'fn expect' -A 20 src/parser.rs | head -30
+302:    fn expect(&mut self, kind: &TokenKind) -> Result<Token> {
+303-        let token = self
+304-            .advance()
+305-            .ok_or_else(|| Error::Parser("Unexpected end of input".to_string(), self.span()))?;
+306-
+307-        if &token.kind != kind {
+308-            return Err(Error::Parser(
+309-                format!("Expected {:?} but got {:?}", kind, token.kind),
+310-                token.span(),
+311-            ));
+312-        }
+313-
+314-        Ok(token)
+315-    }
+316-
+317-    /// Accounts for one more level of expression nesting.
+318-    ///
+319-    /// Returns a spanned [`Error::Parser`] once the nesting passes
+320-    /// [`MAX_NESTING_DEPTH`], so a pathological source line is a diagnostic
+321-    /// instead of a stack overflow.
+322-    fn enter_nesting(&mut self) -> Result<()> {
+[0m
+[0m$ [0mls tests/ | head -50; echo "==="; grep -rn 'unless' src/linter.rs src/analyzer.rs src/lsp.rs src/formatter.rs 2>/dev/null | head
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+closure_capture_test.rs
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+index_bounds_test.rs
+integration_test.rb
+lexer_robustness_test.rs
+linter_test.rs
+loop_bounds_test.rs
+mod_in_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+span_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+test_control_flow.rb
+test_functions.rb
+test_lists.rb
+test_mod_in.rb
+test_modules.rb
+test_numeric_edges.rb
+test_object_model.rb
+test_objects.rb
+test_records.rb
+test_text.rb
+tooling_grammar_test.rs
+===
+[0m
+[0m$ [0mgrep -n 'end\|Unless\|If' src/linter.rs | head -40
+226:            Statement::If {
+246:                end,
+251:                self.analyze_expr(end);
+287:                extends,
+291:                // `object Child extends Parent` reads the parent record when
+294:                if let Some(parent) = extends {
+314:                // Only a file-level import is a dependency of the file. An
+318:                // dependency.
+440:    let rendered;
+444:            rendered = other.to_string();
+445:            (rendered.as_str(), Span::unknown())
+[0m
+[0m$ [0mls phases/ | tail -8; echo "=== lsp/diagnostics ==="; grep -rn 'fn diagnostics\|diagnostics' src/lsp.rs src/main.rs | head -20
+phase-017
+phase-018
+phase-019
+phase-024
+phase-026
+phase-027
+phase-028
+phase-029
+=== lsp/diagnostics ===
+src/lsp.rs:11://! * [`diagnostics`] turns a source file into the spanned lexer, parser and
+src/lsp.rs:89:    /// This is the shape `rb diagnostics` prints and the editor tooling
+src/lsp.rs:118:/// `rb diagnostics` does not run the frontend twice per file. The findings are
+src/lsp.rs:121:pub fn diagnostics(source: &str) -> Vec<Diagnostic> {
+src/lsp.rs:179:/// [`diagnostics`] as the JSON array an editor or language server consumes.
+src/lsp.rs:180:pub fn diagnostics_json(source: &str) -> String {
+src/lsp.rs:181:    diagnostics_to_json(&diagnostics(source))
+src/lsp.rs:184:/// Already-computed [`Diagnostic`]s as the same JSON array [`diagnostics_json`]
+src/lsp.rs:187:pub fn diagnostics_to_json(found: &[Diagnostic]) -> String {
+[0m
+[0m→ [0mRead src/linter.rs[90m [limit=40, offset=215][0m
+[0m
+[0m$ [0mgrep -n 'pub enum Expression' -A 45 src/parser.rs | head -60
+(no output)
+[0m
+[0m$ [0mgrep -n 'Not\|"not"' src/parser.rs src/lexer.rs src/formatter.rs | head -30
+src/parser.rs:10:    Nothing,
+src/parser.rs:79:    NotEqual,
+src/parser.rs:92:    Not,
+src/parser.rs:1202:                | Some(TokenKind::Nothing)
+src/parser.rs:1207:                | Some(TokenKind::Not)
+src/parser.rs:1346:                kind: TokenKind::Not,
+src/parser.rs:1350:                BinaryOp::NotEqual
+src/parser.rs:1390:                    kind: TokenKind::NotEqual,
+src/parser.rs:1394:                    BinaryOp::NotEqual
+src/parser.rs:1526:                TokenKind::Not => {
+src/parser.rs:1532:                        op: UnaryOp::Not,
+src/parser.rs:1672:            TokenKind::Nothing => {
+src/parser.rs:1674:                Ok(Expr::Nothing)
+src/lexer.rs:49:    ("not", TokenKind::Not),
+src/lexer.rs:53:    ("nothing", TokenKind::Nothing),
+src/lexer.rs:78:    Nothing,
+src/lexer.rs:117:    Not,
+src/lexer.rs:142:    NotEqual,
+src/lexer.rs:463:                // read as `Not` followed by `Equal` by the parser, so `!` alone
+src/lexer.rs:494:                        TokenKind::NotEqual
+src/lexer.rs:496:                        TokenKind::Not
+src/formatter.rs:34:        | BinaryOp::NotEqual
+src/formatter.rs:477:            Expr::Nothing => self.write("nothing"),
+src/formatter.rs:494:                            op: UnaryOp::Not,
+src/formatter.rs:642:            BinaryOp::NotEqual => "is not",
+src/formatter.rs:660:            UnaryOp::Not => self.write("not"),
+[0m
+[0m→ [0mRead src/formatter.rs[90m [limit=30, offset=483][0m
+[0m
+[0m$ [0mgrep -rn 'Statement::If' src/ --include=*.rs | grep -v '^src/parser.rs' | head -30; echo "=== parser matches on If ==="; grep -n 'Statement::If' src/parser.rs
+src/formatter.rs:248:            Statement::If {
+src/linter.rs:226:            Statement::If {
+src/analyzer.rs:172:            Statement::If {
+src/analyzer.rs:470:            Statement::If {
+src/vm.rs:580:            Statement::If {
+src/bytecode/codegen.rs:209:            Statement::If {
+=== parser matches on If ===
+681:        Ok(Some(Statement::If {
+[0m
+[0m$ [0msed -n '355,380p' SPEC.md; echo "=== GRAMMAR ==="; sed -n '38,50p' docs/GRAMMAR.md
+else
+    say "zero"
+end
+```
+
+### When (Pattern Matching)
+
+```redblue
+when value
+    case 1 then say "one"
+    case 2 then say "two"
+    else say "other"
+end
+```
+
+### Unless
+
+```redblue
+unless is_valid
+    say "Invalid!"
+end
+```
+
+### For Loop (Iteration)
+
+```redblue
+=== GRAMMAR ===
+
+### 1.3 Keywords (Reserved)
+
+```
+keywords = 'set' | 'constant' | 'to' | 'is' | 'are' | 'nothing' | 'yes' | 'no'
+         | 'if' | 'then' | 'else' | 'end' | 'when' | 'unless'
+         | 'for' | 'each' | 'in' | 'from' | 'times' | 'while' | 'repeat'
+         | 'break' | 'skip' | 'return' | 'give back'
+         | 'to' | 'takes' | 'needs' | 'called' | 'might fail'
+         | 'number' | 'text' | 'yes/no' | 'list' | 'record' | 'object'
+         | 'module' | 'import' | 'export' | 'as'
+         | 'and' | 'or' | 'not' | 'either' | 'neither'
+         | 'try' | 'catch' | 'finally' | 'error'
+[0m
+[0m$ [0msed -n '330,356p' SPEC.md
+is no substring form — `x is in "abc"` is a runtime error
+`Right side of 'in' must be a list`, not a search — and no `is not in`;
+write `if not (x is in haystack)`.
+
+---
+
+## Statements
+
+### If-Then-Else
+
+```redblue
+if condition
+    // statements
+end
+
+if condition
+    // then branch
+else
+    // else branch
+end
+
+if x > 0
+    say "positive"
+else if x < 0
+    say "negative"
+else
+    say "zero"
+[0m
+[0m$ [0mgrep -rn 'pub enum Statement' -A 90 src/parser.rs | sed -n '1,100p'
+96:pub enum Statement {
+97-    // say "Hello"
+98-    Say(Expr),
+99-
+100-    // Expression statement (for side effects)
+101-    Expr(Expr),
+102-
+103-    // print "Hello"
+104-    Print(Expr),
+105-
+106-    // set x to 10
+107-    Set {
+108-        name: String,
+109-        value: Expr,
+110-    },
+111-
+112-    // constant NAME to <expr> — a name bound once, which no assignment may
+113-    // rebind. A module file uses it for the values every function of the
+114-    // module shares, as `modules/MathUtils.rb` does for `PI`.
+115-    Constant {
+116-        name: String,
+117-        value: Expr,
+118-    },
+119-
+120-    // set x.y to 10
+121-    SetProperty {
+122-        object: String,
+123-        property: String,
+124-        value: Expr,
+125-    },
+126-
+127-    // if condition then ... end
+128-    If {
+129-        condition: Expr,
+130-        then_branch: Vec<Stmt>,
+131-        else_branch: Vec<Stmt>,
+132-    },
+133-
+134-    // for each x in list ... end
+135-    ForEach {
+136-        variable: String,
+137-        iterable: Expr,
+138-        body: Vec<Stmt>,
+139-    },
+140-
+141-    // for each i from 1 to 10 ... end
+142-    ForRange {
+143-        variable: String,
+144-        start: Expr,
+145-        end: Expr,
+146-        step: Option<Expr>,
+147-        body: Vec<Stmt>,
+148-    },
+149-
+150-    // repeat 10 times ... end
+151-    Repeat {
+152-        count: Expr,
+153-        body: Vec<Stmt>,
+154-    },
+155-
+156-    // while condition ... end
+157-    While {
+158-        condition: Expr,
+159-        body: Vec<Stmt>,
+160-    },
+161-
+162-    // break
+163-    Break,
+164-
+165-    // skip
+166-    Skip,
+167-
+168-    // return value
+169-    Return(Option<Expr>),
+170-
+171-    // give back value
+172-    GiveBack(Option<Expr>),
+173-
+174-    // to function(args) ... end
+175-    Function {
+176-        name: String,
+177-        params: Vec<String>,
+178-        body: Vec<Stmt>,
+179-    },
+180-
+181-    // to can method(args) ... end
+182-    Method {
+183-        name: String,
+184-        params: Vec<String>,
+185-        body: Vec<Stmt>,
+186-    },
+[0m
+Now let me write the failing test first.
+[0m→ [0mRead tests/linter_test.rs[90m [limit=45][0m
+[0m
+[0m$ [0msed -n '1,60p' tests/parser_hardening_test.rs
+use redblue::lexer::Lexer;
+use redblue::parser::{parse, Parser, MAX_BLOCK_DEPTH, MAX_NESTING_DEPTH};
+use redblue::Error;
+
+fn lex_and_parse(source: &str) -> Result<redblue::parser::Program, Error> {
+    let tokens = Lexer::tokenize(source)?;
+    parse(tokens)
+}
+
+fn parser_error(source: &str) -> Error {
+    lex_and_parse(source).expect_err("source should fail to parse")
+}
+
+/// Builds `set x to ` followed by `open` repeated `depth` times, `1`, and
+/// `close` repeated `depth` times.
+fn nested(open: &str, close: &str, depth: usize) -> String {
+    format!(
+        "set x to {}{}{}\n",
+        open.repeat(depth),
+        "1",
+        close.repeat(depth)
+    )
+}
+
+fn assert_spanned_parser_error(error: &Error) {
+    match error {
+        Error::Parser(message, span) => {
+            assert!(
+                span.is_known(),
+                "parser error must carry a span, got {span:?} for {message:?}"
+            );
+            assert!(!message.is_empty(), "parser error must carry a message");
+        }
+        other => panic!("expected a Parser error, got {other:?}"),
+    }
+}
+
+// --- empty / degenerate input ------------------------------------------------
+
+#[test]
+fn edge_empty_file_parses_to_empty_program() {
+    let program = lex_and_parse("").expect("an empty file is valid Redblue");
+    assert!(
+        program.statements.is_empty(),
+        "empty file should produce no statements, got {}",
+        program.statements.len()
+    );
+}
+
+#[test]
+fn edge_whitespace_only_and_comment_only_are_empty_programs() {
+    for source in [
+        "   ",
+        "\n\n\n",
+        "\t \t",
+        " \r\n \r\n",
+        "// only a comment\n",
+    ] {
+        let program =
+            lex_and_parse(source).unwrap_or_else(|e| panic!("{source:?} should parse: {e}"));
+[0m
+[0m$ [0mgrep -rn 'fn run_program\|capture\|fn eval\|Source:' tests/redblue_test.rs | head -20; echo "=== lib exports ==="; grep -n 'pub mod\|pub use\|pub fn' src/lib.rs | head -30
+=== lib exports ===
+1:pub mod analyzer;
+2:pub mod bytecode;
+4:pub mod formatter;
+5:pub mod lexer;
+6:pub mod linter;
+7:pub mod lsp;
+8:pub mod parser;
+9:pub mod repl;
+11:pub mod stdlib;
+12:pub mod testing;
+23:pub use error::{Error, Span};
+24:pub use lsp::{
+31:pub use bytecode::{compile_source, Chunk, Opcode};
+32:pub use value::{FunctionBody, FunctionValue, Value};
+33:pub use vm::{
+39:pub fn run_file(path: &str) -> Result<(), Error> {
+61:pub fn run_source(source: &str) -> Result<(), Error> {
+77:pub fn run_source_value(source: &str) -> Result<Value, Error> {
+86:pub fn run_repl() {
+91:pub fn run_test(path: Option<&str>) -> Result<(), Error> {
+115:pub fn run_cli() {
+[0m
+[0m$ [0msed -n '33,90p' src/lib.rs
+pub use vm::{
+    resolve_max_iterations, resolve_max_iterations_from, resolve_max_steps, resolve_max_steps_from,
+    run_isolated, Vm, MAX_CALL_DEPTH, MAX_CALL_DEPTH_ENV, MAX_ITERATIONS, MAX_ITERATIONS_ENV,
+    MAX_STEPS, MAX_STEPS_ENV, NETWORK_CONNECT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS,
+};
+
+pub fn run_file(path: &str) -> Result<(), Error> {
+    let source = fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
+
+    run_source(&source)
+}
+
+/// Runs `path` and, when it fails, renders the source line and caret for the
+/// failure next to the message.
+fn run_file_with_diagnostic(path: &str) -> std::result::Result<(), String> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(e) => return Err(Error::Io(e.to_string()).to_string()),
+    };
+
+    run_source(&source).map_err(|e| e.render(&source, Some(path)))
+}
+
+fn report(rendered: &str) -> ! {
+    eprintln!("Error: {}", rendered);
+    process::exit(1);
+}
+
+pub fn run_source(source: &str) -> Result<(), Error> {
+    let tokens = Lexer::tokenize(source)?;
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze(&ast)?;
+
+    let (_vm, result) = vm::run_isolated(&ast);
+    result.map(|_| ())
+}
+
+/// The whole pipeline on `source` — lexer, parser, analyzer, then the VM — and
+/// the value of its last statement.
+///
+/// [`run_source`] is the same pipeline and reports only whether it succeeded.
+/// This returns what the program evaluated to, so a caller can assert on a run
+/// that went through the analyzer rather than around it: a test that skips the
+/// analyzer cannot fail on what the analyzer refuses.
+pub fn run_source_value(source: &str) -> Result<Value, Error> {
+    let tokens = Lexer::tokenize(source)?;
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze(&ast)?;
+
+    let (_vm, result) = vm::run_isolated(&ast);
+    result
+}
+
+pub fn run_repl() {
+    let mut repl = repl::Repl::new();
+    repl.run();
+}
+[0m
+[0m$ [0mgrep -rln 'say' tests/*.rs | head; echo "==="; grep -rn 'set_repeat\|scanner\|capture\|Stdio\|spawn' tests/*.rs src/testing/*.rs | head -20
+tests/bytecode_test.rs
+tests/bytecode_vm_test.rs
+tests/call_depth_test.rs
+tests/closure_capture_test.rs
+tests/comparison_lex_test.rs
+tests/comparison_words_test.rs
+tests/constant_test.rs
+tests/expect_test.rs
+tests/for_range_test.rs
+tests/formatter_test.rs
+===
+tests/bytecode_test.rs:1516:        .spawn(move || {
+tests/bytecode_vm_test.rs:338:        "nesting/closure-captures-and-writes",
+tests/closure_capture_test.rs:15://! * **Globals are not captured.** They are read at call time, so a closure
+tests/closure_capture_test.rs:131:/// A parameter shadows a captured binding of the same name.
+tests/closure_capture_test.rs:133:fn a_parameter_shadows_what_the_declaration_captured() {
+tests/closure_capture_test.rs:148:/// Capture is a copy: assigning to a captured name inside the body changes that
+tests/closure_capture_test.rs:155:fn capture_is_by_value_so_an_assignment_does_not_escape() {
+tests/closure_capture_test.rs:173:/// A global is not part of the capture, so a closure that counts in one counts
+tests/closure_capture_test.rs:176:fn a_global_is_read_at_call_time_not_captured() {
+tests/closure_capture_test.rs:200:fn three_levels_of_nesting_each_capture_the_level_outside() {
+tests/closure_capture_test.rs:331:/// Two closures stored in one list keep separate captures, reached by index.
+tests/closure_capture_test.rs:333:fn edge_two_closures_in_one_list_keep_separate_captures() {
+tests/closure_capture_test.rs:374:/// Empty text and an empty list captured by value. A function value yields
+tests/closure_capture_test.rs:376:/// the closure is asked for the captured values one at a time.
+tests/closure_capture_test.rs:378:fn edge_empty_captured_values_survive() {
+tests/closure_capture_test.rs:402:/// A declaration that captures nothing is still a function.
+tests/closure_capture_test.rs:404:fn edge_a_declaration_with_no_captured_bindings_is_a_function() {
+tests/closure_capture_test.rs:452:/// Unicode text captured by value and read back.
+tests/closure_capture_test.rs:454:fn edge_unicode_capture_survives() {
+tests/closure_capture_test.rs:471:/// capture or the body.
+[0m
+[0m$ [0mcat > ./target/tmp/t.rb <<'EOF'
+set hit to "none"
+if no then
+    set hit to "if"
+else
+    set hit to "else"
+end
+say hit
+EOF
+cargo run -q --bin rb -- run ./target/tmp/t.rb 2>&1 | tail -5
+else
+[0m
+[0m← [0mWrite tests/unless_test.rs
+Wrote file successfully.
+[0m
+[0m$ [0msed -n '20,35p' src/lib.rs; echo "=== Diagnostic ==="; sed -n '80,120p' src/lsp.rs
+use crate::lexer::Lexer;
+use testing::reporter::Reporter;
+
+pub use error::{Error, Span};
+pub use lsp::{
+    diagnostics, diagnostics_json, diagnostics_to_json, textmate_grammar, Diagnostic, Severity,
+    GRAMMAR_PATH, LANGUAGE_CONFIG_PATH,
+};
+// `FunctionValue` is re-exported because it is the payload of the public
+// `Value::Function` variant: a caller that matches that variant has to be able
+// to name the type it binds.
+pub use bytecode::{compile_source, Chunk, Opcode};
+pub use value::{FunctionBody, FunctionValue, Value};
+pub use vm::{
+    resolve_max_iterations, resolve_max_iterations_from, resolve_max_steps, resolve_max_steps_from,
+    run_isolated, Vm, MAX_CALL_DEPTH, MAX_CALL_DEPTH_ENV, MAX_ITERATIONS, MAX_ITERATIONS_ENV,
+=== Diagnostic ===
+            None => (1, 1),
+        };
+        let message = error.message().to_string();
+
+        Self::new(line, column, message, Severity::Error)
+    }
+
+    /// This diagnostic as a JSON object: `{line, column, severity, message}`.
+    ///
+    /// This is the shape `rb diagnostics` prints and the editor tooling
+    /// consumes. It is deliberately *not* the LSP `Diagnostic` object: LSP
+    /// carries a `range` of 0-based `{line, character}` positions and a numeric
+    /// severity, while this carries 1-based [`crate::Span`] positions and a
+    /// severity name, which is what an editor-facing line needs. A language
+    /// server translates; it does not forward these bytes.
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\"line\":{},\"column\":{},\"severity\":\"{}\",",
+                "\"message\":{}}}"
+            ),
+            self.line,
+            self.column,
+            self.severity.as_str(),
+            escape_json(&self.message),
+        )
+    }
+}
+
+/// Every problem the compiler finds in `source`, in the order an editor should
+/// show them.
+///
+/// The compile stages stop at the first failure — there is no program to
+/// analyze once lexing fails — so at most one error is reported, followed by
+/// the linter's findings when the program does parse.
+///
+/// The source is lexed and parsed exactly once: the AST that clears the
+/// analyzer is the one the linter reads ([`crate::linter::lint_program`]), so
+/// `rb diagnostics` does not run the frontend twice per file. The findings are
+/// in a fixed order for a given source — the linter sorts its unused-variable
+/// warnings by name — so the JSON an editor diffs between saves does not churn.
+[0m
+Let me clean up the helper to return the message instead of a re-wrapped error.
+[0m← [0mEdit tests/unless_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+@@ -21,9 +21,11 @@
+ fn parser_error(source: &str) -> Error {
+     lex_and_parse(source).expect_err("source should fail to parse")
+ }
+ 
+-fn assert_spanned_parser_error(error: &Error) -> Error {
++/// Asserts `error` is a spanned [`Error::Parser`] with a non-empty message and
++/// hands the message back for the caller to match against.
++fn assert_spanned_parser_error(error: &Error) -> String {
+     match error {
+         Error::Parser(message, span) => {
+             assert!(
+                 span.is_known(),
+@@ -32,11 +34,9 @@
+             assert!(
+                 !message.is_empty(),
+                 "parser error must carry a message naming what was missing"
+             );
+-            return match (message.as_str(), span) {
+-                (message, _) => Error::Parser(message.to_string(), *span),
+-            };
++            message.clone()
+         }
+         other => panic!("expected a Parser error, got {other:?}"),
+     }
+ }
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import re
+p='tests/unless_test.rs'
+s=open(p).read()
+s=s.replace('''        let error = assert_spanned_parser_error(&parser_error(source));
+        let Error::Parser(message, _) = &error else {
+            unreachable!("assert_spanned_parser_error returned a non-parser error")
+        };
+        assert!(
+            message.contains("End") || message.contains("end"),
+            "the error for {source:?} must name the missing `end`, got {message:?}"
+        );''','''        let message = assert_spanned_parser_error(&parser_error(source));
+        assert!(
+            message.contains("End") || message.contains("end"),
+            "the error for {source:?} must name the missing `end`, got {message:?}"
+        );''')
+s=s.replace('''    let error = assert_spanned_parser_error(&parser_error("unless no\\n    say \\"x\\"\\nend\\n"));
+    let Error::Parser(message, _) = &error else {
+        unreachable!("assert_spanned_parser_error returned a non-parser error")
+    };
+    assert!(
+        message.contains("Then"),''','''    let message =
+        assert_spanned_parser_error(&parser_error("unless no\\n    say \\"x\\"\\nend\\n"));
+    assert!(
+        message.contains("Then"),''')
+s=s.replace('''    let error = assert_spanned_parser_error(&parser_error(
+        "unless no then\\n    say \\"a\\"\\nelse\\n    say \\"b\\"\\nend\\n",
+    ));
+    let Error::Parser(message, _) = &error else {
+        unreachable!("assert_spanned_parser_error returned a non-parser error")
+    };
+    assert!(
+        message.contains("End") || message.contains("Else"),''','''    let message = assert_spanned_parser_error(&parser_error(
+        "unless no then\\n    say \\"a\\"\\nelse\\n    say \\"b\\"\\nend\\n",
+    ));
+    assert!(
+        message.contains("End") || message.contains("Else"),''')
+open(p,'w').write(s)
+PY
+grep -n 'unreachable' tests/unless_test.rs
+(no output)
+[0m
+[0m$ [0mcargo test --test unless_test 2>&1 | tail -40
+1: core::panicking::panic_fmt
+   2: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0}
+   3: <core::result::Result<redblue::parser::Program, redblue::error::Error>>::unwrap_or_else::<unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0}>
+   4: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+   5: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0}
+   6: <unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- unless_with_a_true_condition_skips_its_body stdout ----
+
+thread 'unless_with_a_true_condition_skips_its_body' (5257) panicked at tests/unless_test.rs:51:23:
+"set hit to \"none\"\nunless yes then\n    set hit to \"body\"\nend\n" should run, got Parser("Unexpected token Unless", Span { line: 2, column: 1 })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: unless_test::branch_taken_by
+   3: unless_test::unless_with_a_true_condition_skips_its_body
+   4: unless_test::unless_with_a_true_condition_skips_its_body::{closure#0}
+   5: <unless_test::unless_with_a_true_condition_skips_its_body::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error
+    edge_an_unclosed_unless_is_rejected_by_the_linter_as_an_error
+    edge_body_of_exactly_one_statement
+    edge_empty_body_parses_and_runs
+    edge_unless_as_the_last_statement_in_a_file
+    edge_unless_nests_inside_if_and_unless
+    edge_unless_rejects_else_because_its_body_has_no_alternative
+    edge_unless_with_a_missing_then_is_a_spanned_parser_error
+    edge_unless_without_end_is_a_spanned_parser_error
+    unless_condition_supports_the_full_expression_grammar
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+    unless_with_a_false_condition_takes_its_body
+    unless_with_a_true_condition_skips_its_body
+
+test result: FAILED. 0 passed; 13 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unless_test`
+[0m
+[0m$ [0msed -n '165,185p;465,480p' src/analyzer.rs; echo "=== vm ==="; sed -n '575,610p' src/vm.rs; echo "=== formatter ==="; sed -n '240,275p' src/formatter.rs; echo "=== codegen ==="; sed -n '200,235p' src/bytecode/codegen.rs
+object: _,
+                property: _,
+                value,
+            } => {
+                self.analyze_expr(value, &span);
+                // Property access is valid if object exists
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.analyze_expr(condition, &span);
+                self.push_scope();
+                for stmt in then_branch {
+                    self.analyze_statement(stmt);
+                }
+                self.pop_scope();
+                self.push_scope();
+                for stmt in else_branch {
+                    self.analyze_statement(stmt);
+                for item in items {
+                    out.imported
+                        .extend(crate::vm::module_bound_names(&item.name));
+                }
+            }
+            Statement::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_later_names(then_branch, out);
+                collect_later_names(else_branch, out);
+            }
+            Statement::ForEach { body, .. }
+            | Statement::ForRange { body, .. }
+            | Statement::Repeat { body, .. }
+=== vm ===
+                    fields.insert(property.clone(), val);
+                    self.set_var(object, Value::Record(fields))?;
+                }
+                Ok(Value::Nothing)
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let cond = self.evaluate(condition)?;
+                if cond.is_truthy() {
+                    for stmt in then_branch {
+                        self.execute_statement(stmt)?;
+                    }
+                } else {
+                    for stmt in else_branch {
+                        self.execute_statement(stmt)?;
+                    }
+                }
+                Ok(Value::Nothing)
+            }
+            Statement::ForEach {
+                variable,
+                iterable,
+                body,
+            } => {
+                let iterable_value = self.evaluate(iterable)?;
+                if let Value::List(items) = iterable_value {
+                    let mut loop_iterations = 0;
+                    for item in items {
+                        self.charge_iteration(&mut loop_iterations, "for each")?;
+                        self.push_scope();
+                        self.declare(variable);
+                        self.set_var(variable, item)?;
+                        for stmt in body {
+=== formatter ===
+            } => {
+                self.write("set ");
+                self.write(object);
+                self.write(".");
+                self.write(property);
+                self.write(" to ");
+                self.format_expression(value);
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.write("if ");
+                self.format_expression(condition);
+                // `then` is not optional to the parser.
+                self.write(" then");
+                self.newline();
+                self.format_block(then_branch);
+
+                if !else_branch.is_empty() {
+                    self.write_keyword_line("else");
+                    self.newline();
+                    self.format_block(else_branch);
+                }
+                self.write_keyword_line("end");
+            }
+            Statement::ForEach {
+                variable,
+                iterable,
+                body,
+            } => {
+                self.write("for each ");
+                self.write(variable);
+                self.write(" in ");
+                self.format_expression(iterable);
+=== codegen ===
+                property,
+                value,
+            } => {
+                let object = self.text(object_name);
+                emit(code, Opcode::Load, object, 0, line);
+                self.expr(value, code, line)?;
+                let target = self.text(&format!("{object_name}.{property}"));
+                emit(code, Opcode::SetProperty, target, 0, line);
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr(condition, code, line)?;
+                // The `end` of an `if` with no `else` is where a false
+                // condition lands, so there is one jump either way.
+                let to_else = jump(code, Opcode::JumpIfFalse, line);
+                self.statements(then_branch, code, blocks, depth)?;
+                if else_branch.is_empty() {
+                    patch_here(code, to_else);
+                } else {
+                    let to_end = jump(code, Opcode::Jump, line);
+                    let else_start = code.len() as u32;
+                    patch(code, to_else, else_start);
+                    self.statements(else_branch, code, blocks, depth)?;
+                    patch_here(code, to_end);
+                }
+            }
+            Statement::ForEach {
+                variable,
+                iterable,
+                body,
+            } => {
+                self.expr(iterable, code, line)?;
+                emit(code, Opcode::GetIter, 0, 0, line);
+[0m
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -130,8 +130,19 @@
+     then_branch: Vec<Stmt>,
+     else_branch: Vec<Stmt>,
+ },
+ 
++// unless condition then ... end
++//
++// The body is taken when the condition is *false*, and there is no second
++// branch: `unless` has an `else` only as its own absence, so a second
++// alternative is written `if`. `unless condition ... end` and
++// `if not condition ... end` therefore mean the same thing.
++Unless {
++    condition: Expr,
++    body: Vec<Stmt>,
++},
++
+ // for each x in list ... end
+ ForEach {
+     variable: String,
+     iterable: Expr,
+
+[0m
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -351,8 +351,9 @@
+ fn opens_block(&self) -> bool {
+     matches!(
+         self.current().map(|token| &token.kind),
+         Some(TokenKind::If)
++            | Some(TokenKind::Unless)
+             | Some(TokenKind::For)
+             | Some(TokenKind::Repeat)
+             | Some(TokenKind::While)
+             | Some(TokenKind::To)
+
+[0m
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -448,8 +448,9 @@
+ }
+ TokenKind::Set => self.parse_set()?,
+ TokenKind::Constant => self.parse_constant()?,
+ TokenKind::If => self.parse_if()?,
++TokenKind::Unless => self.parse_unless()?,
+ TokenKind::For => self.parse_for()?,
+ TokenKind::Repeat => self.parse_repeat()?,
+ TokenKind::While => self.parse_while()?,
+ TokenKind::Break => {
+
+[0m
+Now `parse_unless`, right after `parse_if`:
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -697,8 +697,38 @@
+         else_branch,
+     }))
+ }
+ 
++/// Parses `unless <expr> then ... end`.
++///
++/// The condition grammar is `if`'s — the same [`Parser::parse_expression`]
++/// call — and the block is closed by the same `end`. There is no `else`
++/// arm: `else` here is a token the grammar does not accept, and it fails
++/// at [`Parser::expect`] with a spanned parser error rather than being
++/// swallowed as an alternative branch.
++fn parse_unless(&mut self) -> Result<Option<Statement>> {
++    self.advance(); // consume 'unless'
++    let condition = self.parse_expression()?;
++
++    self.skip_newlines();
++    self.expect(&TokenKind::Then)?;
++    self.skip_newlines();
++
++    let mut body = Vec::new();
++    while self.current().map(|t| &t.kind) != Some(&TokenKind::End)
++        && self.current().map(|t| &t.kind) != Some(&TokenKind::Eof)
++    {
++        if let Some(stmt) = self.parse_statement()? {
++            body.push(stmt);
++        }
++        self.skip_newlines();
++    }
++
++    self.expect(&TokenKind::End)?;
++
++    Ok(Some(Statement::Unless { condition, body }))
++}
++
+ fn parse_for(&mut self) -> Result<Option<Statement>> {
+     self.advance(); // consume 'for'
+ 
+     match self.current() {
+
+[0m
+[0m✗ [0mEdit src/analyzer.rs failed
+[91m[1mError: [0mNo changes to apply: oldString and newString are identical.
+Now the four consumers: analyzer (2 sites), vm, linter, formatter, codegen.
+[0m→ [0mRead src/analyzer.rs[90m [limit=25, offset=172][0m
+[0m
+[0m← [0mEdit src/analyzer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/analyzer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/analyzer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/analyzer.rs
+@@ -185,8 +185,16 @@
+         self.analyze_statement(stmt);
+     }
+     self.pop_scope();
+ }
++Statement::Unless { condition, body } => {
++    self.analyze_expr(condition, &span);
++    self.push_scope();
++    for stmt in body {
++        self.analyze_statement(stmt);
++    }
++    self.pop_scope();
++}
+ Statement::ForEach {
+     variable,
+     iterable,
+     body,
+
+[0m
+[0m← [0mEdit src/analyzer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/analyzer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/analyzer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/analyzer.rs
+@@ -482,8 +482,11 @@
+ } => {
+     collect_later_names(then_branch, out);
+     collect_later_names(else_branch, out);
+ }
++Statement::Unless { body, .. } => {
++    collect_later_names(body, out);
++}
+ Statement::ForEach { body, .. }
+ | Statement::ForRange { body, .. }
+ | Statement::Repeat { body, .. }
+ | Statement::While { body, .. } => collect_later_names(body, out),
+
+[0m
+[0m← [0mEdit src/vm.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/vm.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/vm.rs
++++ /home/runner/work/rbops/rbops/redblue/src/vm.rs
+@@ -593,8 +593,19 @@
+         }
+     }
+     Ok(Value::Nothing)
+ }
++Statement::Unless { condition, body } => {
++    // The body is taken exactly when the condition is false, so a
++    // true condition leaves the interpreter where it was.
++    let cond = self.evaluate(condition)?;
++    if !cond.is_truthy() {
++        for stmt in body {
++            self.execute_statement(stmt)?;
++        }
++    }
++    Ok(Value::Nothing)
++}
+ Statement::ForEach {
+     variable,
+     iterable,
+     body,
+
+[0m
+[0m← [0mEdit src/linter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/linter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/linter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/linter.rs
+@@ -231,8 +231,12 @@
+     self.analyze_expr(condition);
+     self.analyze_body(then_branch);
+     self.analyze_body(else_branch);
+ }
++Statement::Unless { condition, body } => {
++    self.analyze_expr(condition);
++    self.analyze_body(body);
++}
+ Statement::ForEach {
+     variable,
+     iterable,
+     body,
+
+[0m
+[0m✗ [0mEdit src/formatter.rs failed
+[91m[1mError: [0mFound multiple matches for oldString. Provide more surrounding context to make the match unique.
+[0m
+[0m← [0mEdit src/formatter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/formatter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/formatter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/formatter.rs
+@@ -263,8 +263,17 @@
+         self.format_block(else_branch);
+     }
+     self.write_keyword_line("end");
+ }
++Statement::Unless { condition, body } => {
++    self.write("unless ");
++    self.format_expression(condition);
++    // `then` is not optional to the parser.
++    self.write(" then");
++    self.newline();
++    self.format_block(body);
++    self.write_keyword_line("end");
++}
+ Statement::ForEach {
+     variable,
+     iterable,
+     body,
+
+[0m
+[0m← [0mEdit src/bytecode/codegen.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
+@@ -225,8 +225,17 @@
+         self.statements(else_branch, code, blocks, depth)?;
+         patch_here(code, to_end);
+     }
+ }
++Statement::Unless { condition, body } => {
++    self.expr(condition, code, line)?;
++    // The body is the false branch: jump over it when the condition
++    // is true, and the `end` of a one-branch block is that jump's
++    // landing pad.
++    let to_end = jump(code, Opcode::JumpIfFalse, line);
++    self.statements(body, code, blocks, depth)?;
++    patch_here(code, to_end);
++}
+ Statement::ForEach {
+     variable,
+     iterable,
+     body,
+
+[0m
+[0m$ [0mgrep -n 'enum Opcode' -A 60 src/bytecode/mod.rs 2>/dev/null | head -70 || grep -rn 'enum Opcode' -A 60 src/bytecode/*.rs | head -70
+(no output)
+[0m
+I made a logic error — `JumpIfFalse` skips the body when false, which is backwards for `unless`. Let me check available opcodes.
+[0m$ [0mgrep -rn 'JumpIf' src/bytecode/*.rs | head -20
+src/bytecode/codegen.rs:217:                let to_else = jump(code, Opcode::JumpIfFalse, line);
+src/bytecode/codegen.rs:234:                let to_end = jump(code, Opcode::JumpIfFalse, line);
+src/bytecode/codegen.rs:286:                let to_end = jump(code, Opcode::JumpIfFalse, line);
+src/bytecode/disasm.rs:172:    if matches!(instruction.opcode, Opcode::Jump | Opcode::JumpIfFalse) {
+src/bytecode/opcode.rs:125:    JumpIfFalse,
+src/bytecode/opcode.rs:204:        Opcode::JumpIfFalse,
+src/bytecode/opcode.rs:267:            Opcode::JumpIfFalse => "JUMP_IF_FALSE",
+src/bytecode/vm.rs:335:                    block.code[*at].opcode == Opcode::JumpIfFalse && block.code[*at].arg > back_edge
+src/bytecode/vm.rs:1159:            Opcode::JumpIfFalse => {
+[0m
+[0m$ [0mgrep -n 'Not' src/bytecode/opcode.rs src/bytecode/vm.rs src/bytecode/codegen.rs | head -20
+src/bytecode/opcode.rs:84:    NotEqual,
+src/bytecode/opcode.rs:102:    Not,
+src/bytecode/opcode.rs:188:        Opcode::NotEqual,
+src/bytecode/opcode.rs:197:        Opcode::Not,
+src/bytecode/opcode.rs:251:            Opcode::NotEqual => "NOT_EQUAL",
+src/bytecode/opcode.rs:260:            Opcode::Not => "NOT",
+src/bytecode/opcode.rs:301:                | Opcode::NotEqual
+src/bytecode/opcode.rs:310:                | Opcode::Not
+src/bytecode/vm.rs:158:                Some(Value::Nothing)
+src/bytecode/vm.rs:194:            Ok(Some(Value::Nothing))
+src/bytecode/vm.rs:372:    static NOT_EQUAL: BinaryOp = BinaryOp::NotEqual;
+src/bytecode/vm.rs:387:        Opcode::NotEqual => &NOT_EQUAL,
+src/bytecode/vm.rs:401:    static NOT: UnaryOp = UnaryOp::Not;
+src/bytecode/vm.rs:500:            outcome: Value::Nothing,
+src/bytecode/vm.rs:554:        self.outcome = Value::Nothing;
+src/bytecode/vm.rs:829:            Constant::Nothing => Ok(Value::Nothing),
+src/bytecode/vm.rs:907:        let mut value = Value::Nothing;
+src/bytecode/vm.rs:1131:            | Opcode::NotEqual
+src/bytecode/vm.rs:1146:            Opcode::Neg | Opcode::Not => {
+src/bytecode/vm.rs:1283:                    expect_range_number(operands.first().unwrap_or(&Value::Nothing), "from", span)?;
+[0m
+[0m← [0mEdit src/bytecode/codegen.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
+@@ -227,11 +227,12 @@
+     }
+ }
+ Statement::Unless { condition, body } => {
+     self.expr(condition, code, line)?;
+-    // The body is the false branch: jump over it when the condition
+-    // is true, and the `end` of a one-branch block is that jump's
+-    // landing pad.
++    // There is no `JumpIfTrue`, so the condition is negated and the
++    // existing jump runs the body exactly when it was false. The
++    // `end` of a one-branch block is that jump's landing pad.
++    emit(code, Opcode::Not, 0, 0, line);
+     let to_end = jump(code, Opcode::JumpIfFalse, line);
+     self.statements(body, code, blocks, depth)?;
+     patch_here(code, to_end);
+ }
+
+[0m
+`Opcode::Not` exists. Fixing the codegen to negate before the conditional jump:
+[0m$ [0mcargo check --all-targets 2>&1 | grep -E '^(error|warning: unused|warning: unre)' -A 8 | head -60
+(no output)
+[0m
+[0m$ [0mcargo test --test unless_test 2>&1 | tail -25
+thread 'unless_with_a_true_condition_skips_its_body' (6232) panicked at tests/unless_test.rs:50:22:
+expected text from "set hit to \"none\"\nunless yes then\n    set hit to \"body\"\nend\n", got Nothing
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: unless_test::branch_taken_by
+   3: unless_test::unless_with_a_true_condition_skips_its_body
+   4: unless_test::unless_with_a_true_condition_skips_its_body::{closure#0}
+   5: <unless_test::unless_with_a_true_condition_skips_its_body::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error
+    edge_body_of_exactly_one_statement
+    edge_empty_body_parses_and_runs
+    edge_unless_nests_inside_if_and_unless
+    unless_condition_supports_the_full_expression_grammar
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+    unless_with_a_false_condition_takes_its_body
+    unless_with_a_true_condition_skips_its_body
+
+test result: FAILED. 5 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unless_test`
+[0m
+[0m$ [0mgrep -n 'Statement::Expr' -A 4 src/vm.rs | head -10
+798:            Statement::Expr(expr) => self.evaluate(expr),
+799-        }
+800-    }
+801-
+802-    fn execute_statements(&mut self, statements: &[Stmt]) -> Result<Value> {
+[0m
+[0m← [0mEdit tests/unless_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+@@ -40,13 +40,17 @@
+         other => panic!("expected a Parser error, got {other:?}"),
+     }
+ }
+ 
+-/// Runs `source` through lexer, parser, analyzer and VM, and returns the text
+-/// held in `hit` afterwards — the branch a program took, read back as a value
+-/// rather than scraped off stdout.
++/// Runs `source` through lexer, parser, analyzer and VM and returns the text a
++/// bare trailing `hit` evaluates to — the branch a program took, read back as a
++/// value rather than scraped off stdout.
++///
++/// Callers write `set hit to ...` inside the branches under test; this appends
++/// the read-back so the assertion is on a value the VM produced.
+ fn branch_taken_by(source: &str) -> String {
+-    match run_source_value(source) {
++    let source = format!("{source}hit\n");
++    match run_source_value(&source) {
+         Ok(Value::Text(text)) => text,
+         Ok(other) => panic!("expected text from {source:?}, got {other:?}"),
+         Err(error) => panic!("{source:?} should run, got {error:?}"),
+     }
+
+[0m
+A bare expression statement returns its value. Let me fix the helper to append a trailing `hit`.
+[0m$ [0mcargo test --test unless_test 2>&1 | tail -25
+thread 'unless_condition_supports_the_full_expression_grammar' (6331) panicked at tests/unless_test.rs:151:5:
+assertion `left == right` failed: `not (n is 3)` is false, so `unless not (n is 3)` must not take its body
+  left: "negated"
+ right: "none"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<alloc::string::String, &str>
+   4: unless_test::unless_condition_supports_the_full_expression_grammar
+   5: unless_test::unless_condition_supports_the_full_expression_grammar::{closure#0}
+   6: <unless_test::unless_condition_supports_the_full_expression_grammar::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error
+    edge_empty_body_parses_and_runs
+    unless_condition_supports_the_full_expression_grammar
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+
+test result: FAILED. 9 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unless_test`
+[0m
+[0m$ [0mcargo test --test unless_test 2>&1 | grep -B 3 'panicked at' | head -40
+---- edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error stdout ----
+
+thread 'edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error' (6368) panicked at tests/unless_test.rs:330:5:
+--
+
+---- edge_empty_body_parses_and_runs stdout ----
+
+thread 'edge_empty_body_parses_and_runs' (6371) panicked at tests/unless_test.rs:171:9:
+--
+
+---- unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches stdout ----
+
+thread 'unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches' (6385) panicked at tests/unless_test.rs:96:9:
+--
+
+---- unless_condition_supports_the_full_expression_grammar stdout ----
+
+thread 'unless_condition_supports_the_full_expression_grammar' (6384) panicked at tests/unless_test.rs:151:5:
+[0m
+[0m$ [0mcargo test --test unless_test 2>&1 | sed -n '/edge_empty_body_parses_and_runs stdout/,/^----/p' | head -20; echo "########"; cargo test --test unless_test edge_an_unclosed_unless_is_rejected_by_diagnostics 2>&1 | grep -A 6 'panicked' | head -12
+---- edge_empty_body_parses_and_runs stdout ----
+
+thread 'edge_empty_body_parses_and_runs' (6424) panicked at tests/unless_test.rs:171:9:
+assertion `left == right` failed: empty `unless` body should still be one statement
+  left: 2
+ right: 1
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: unless_test::edge_empty_body_parses_and_runs
+   5: unless_test::edge_empty_body_parses_and_runs::{closure#0}
+   6: <unless_test::edge_empty_body_parses_and_runs::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches stdout ----
+########
+thread 'edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error' (6455) panicked at tests/unless_test.rs:330:5:
+assertion `left == right` failed: the diagnostic must point at the line after the unterminated body: "Expected End but got Eof"
+  left: 3
+ right: 2
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+[0m
+[0m→ [0mRead tests/unless_test.rs[90m [offset=70, limit=85][0m
+Let me rewrite the over-complicated paired test into a clean single-program version.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/unless_test.rs'
+s=open(p).read()
+start=s.index('#[test]\nfn unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches()')
+end=s.index('#[test]\nfn unless_condition_supports_the_full_expression_grammar()')
+new='''#[test]
+fn unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches() {
+    // One program, one condition, read through both forms. `if` takes its body
+    // when the condition holds; `unless` takes its body when it does not. Run
+    // it once with the condition true and once false and the two forms must
+    // swap: neither may ever take both bodies or neither.
+    for (condition, if_branch, unless_branch) in
+        [("yes", "if", "skipped"), ("no", "skipped", "unless")]
+    {
+        let source = format!(
+            "set flag to {condition}\\n\\
+             set via_if to \\"skipped\\"\\n\\
+             set via_unless to \\"skipped\\"\\n\\
+             if flag then\\n    set via_if to \\"if\\"\\nend\\n\\
+             unless flag then\\n    set via_unless to \\"unless\\"\\nend\\n\\
+             if via_if is not \\"skipped\\" then\\n    set verdict to \\"{if_branch}-taken\\"\\nelse\\n\\
+             set verdict to \\"{if_branch}-skipped\\"\\nend\\n\\
+             unless via_unless is not \\"skipped\\" then\\n\\
+             set verdict to \\"{unless_branch}-taken\\"\\nend\\n"
+        );
+
+        let program = lex_and_parse(&source).unwrap_or_else(|e| {
+            panic!("`if`/`unless` on condition {condition:?} should parse: {e}")
+        });
+        assert_eq!(
+            program.statements.len(),
+            6,
+            "the paired program should hold six top-level statements, got {}",
+            program.statements.len()
+        );
+
+        match run_source_value(&source) {
+            Ok(Value::Text(verdict)) => {
+                // `unless` only writes the verdict when it took its body, so a
+                // `unless`-skipped run keeps the `if` form's verdict.
+                let expected = if unless_branch == "skipped" {
+                    format!("{if_branch}-taken")
+                } else {
+                    format!("{unless_branch}-taken")
+                };
+                assert_eq!(
+                    verdict, expected,
+                    "with condition {condition:?}, `if` and `unless` must pick opposite branches"
+                );
+            }
+            Ok(other) => panic!("expected text for condition {condition:?}, got {other:?}"),
+            Err(error) => panic!("condition {condition:?} should run, got {error:?}"),
+        }
+    }
+
+    // The two forms are exact opposites: with the condition true exactly one
+    // body ran, and with it false the other one did.
+    for (condition, taken) in [("yes", "if"), ("no", "unless")] {
+        let via_if = branch_taken_by(&format!(
+            "set hit to \\"skipped\\"\\nset flag to {condition}\\n\\
+             if flag then\\n    set hit to \\"if\\"\\nend\\n"
+        ));
+        let via_unless = branch_taken_by(&format!(
+            "set hit to \\"skipped\\"\\nset flag to {condition}\\n\\
+             unless flag then\\n    set hit to \\"unless\\"\\nend\\n"
+        ));
+        let ran = usize::from(via_if == "if") + usize::from(via_unless == "unless");
+        assert_eq!(
+            ran, 1,
+            "with condition {condition:?} exactly one of `if`/`unless` must take its body, \\
+             got if={via_if:?} unless={via_unless:?}"
+        );
+        assert_eq!(
+            if condition == "no" {
+                via_unless
+            } else {
+                via_if
+            },
+            taken,
+            "the wrong form took its body for condition {condition:?}"
+        );
+    }
+}
+
+'''
+s=s[:start]+new+s[end:]
+open(p,'w').write(s)
+PY
+echo ok
+ok
+[0m
+[0m← [0mEdit tests/unless_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+@@ -173,10 +173,10 @@
+         branch_taken_by(
+             "set hit to \"none\"\nset n to 3\n\
+              unless not (n is 3) then\n    set hit to \"negated\"\nend\n"
+         ),
+-        "none",
+-        "`not (n is 3)` is false, so `unless not (n is 3)` must not take its body"
++        "negated",
++        "`n is 3` is true, so `not (n is 3)` is false and `unless` takes its body"
+     );
+ }
+ 
+ // --- edge cases -------------------------------------------------------------
+
+[0m
+Now fix the three wrong expectations in my own tests.
+[0m← [0mEdit tests/unless_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+@@ -190,10 +190,11 @@
+ let program = lex_and_parse(&source)
+     .unwrap_or_else(|e| panic!("empty `unless` body should parse: {e}"));
+ assert_eq!(
+     program.statements.len(),
+-    1,
+-    "empty `unless` body should still be one statement"
++    2,
++    "`set hit` plus the empty `unless` is two statements, got {}",
++    program.statements.len()
+ );
+ assert_eq!(
+     branch_taken_by(&source),
+     "none",
+
+[0m
+[0m← [0mEdit tests/unless_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+@@ -349,10 +349,10 @@
+     "an unclosed `unless` is an error, not a warning: {:?}",
+     found[0].message
+ );
+ assert_eq!(
+-    found[0].line, 2,
+-    "the diagnostic must point at the line after the unterminated body: {:?}",
++    found[0].line, 3,
++    "the diagnostic must point at the end of input that never saw `end`: {:?}",
+     found[0].message
+ );
+ 
+ assert!(
+
+[0m
+[0m$ [0mcargo test --test unless_test 2>&1 | tail -20
+assertion `left == right` failed: the paired program should hold six top-level statements, got 7
+  left: 7
+ right: 6
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+   5: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0}
+   6: <unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unless_test`
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/unless_test.rs'
+s=open(p).read()
+s=s.replace('''             set via_unless to \\"skipped\\"\\n\\
+             if flag then\\n''','''             set via_unless to \\"skipped\\"\\n\\
+             set verdict to \\"\\"\\n\\
+             if flag then\\n''')
+s=s.replace('''            program.statements.len(),
+            6,
+            "the paired program should hold six top-level statements, got {}",''','''            program.statements.len(),
+            8,
+            "the paired program should hold eight top-level statements, got {}",''')
+open(p,'w').write(s)
+PY
+cargo test --test unless_test 2>&1 | tail -12
+2: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+   3: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0}
+   4: <unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unless_test`
+[0m
+[0m$ [0mcargo test --test unless_test unless_uses 2>&1 | grep -A 6 'panicked' | head -12
+thread 'unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches' (6730) panicked at tests/unless_test.rs:125:26:
+expected text for condition "yes", got Nothing
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+   3: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0}
+[0m
+[0m✗ [0mEdit tests/unless_test.rs failed
+[91m[1mError: [0mCould not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+[0m→ [0mRead tests/unless_test.rs[90m [limit=20, offset=96][0m
+[0m
+[0m← [0mEdit tests/unless_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+@@ -94,18 +94,19 @@
+      unless flag then\n    set via_unless to \"unless\"\nend\n\
+      if via_if is not \"skipped\" then\n    set verdict to \"{if_branch}-taken\"\nelse\n\
+      set verdict to \"{if_branch}-skipped\"\nend\n\
+      unless via_unless is not \"skipped\" then\n\
+-     set verdict to \"{unless_branch}-taken\"\nend\n"
++     set verdict to \"{unless_branch}-taken\"\nend\n\
++     verdict\n"
+ );
+ 
+ let program = lex_and_parse(&source).unwrap_or_else(|e| {
+     panic!("`if`/`unless` on condition {condition:?} should parse: {e}")
+ });
+ assert_eq!(
+     program.statements.len(),
+-    8,
+-    "the paired program should hold eight top-level statements, got {}",
++    9,
++    "the paired program should hold nine top-level statements, got {}",
+     program.statements.len()
+ );
+ 
+ match run_source_value(&source) {
+
+[0m
+[0m$ [0mcargo test --test unless_test 2>&1 | tail -12
+4: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+   5: unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0}
+   6: <unless_test::unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unless_test`
+[0m
+[0m$ [0mcargo test --test unless_test unless_uses 2>&1 | grep -A 6 'panicked' | head -12
+thread 'unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches' (6882) panicked at tests/unless_test.rs:121:17:
+assertion `left == right` failed: with condition "yes", `if` and `unless` must pick opposite branches
+  left: "skipped-taken"
+ right: "if-taken"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+[0m
+[0m$ [0mcat > ./target/tmp/y.rb <<'EOF'
+set flag to yes
+set via_if to "skipped"
+if flag then
+    set via_if to "if"
+end
+say via_if
+if via_if is not "skipped" then
+    say "verdict taken"
+else
+    say "verdict skipped"
+end
+EOF
+cargo run -q --bin rb -- run ./target/tmp/y.rb 2>&1 | tail -5
+if
+verdict taken
+[0m
+[0m$ [0mcat > ./target/tmp/p.rb <<'EOF'
+set flag to yes
+set via_if to "skipped"
+set via_unless to "skipped"
+set verdict to ""
+if flag then
+set via_if to "if"
+end
+unless flag then
+set via_unless to "unless"
+end
+if via_if is not "skipped" then
+set verdict to "if-taken"
+else
+set verdict to "if-skipped"
+end
+unless via_unless is not "skipped" then
+set verdict to "skipped-taken"
+end
+say verdict
+EOF
+cargo run -q --bin rb -- run ./target/tmp/p.rb 2>&1 | tail -5
+skipped-taken
+[0m
+A pre-existing `is not` precedence quirk, not `unless`. Let me simplify that test to avoid the unrelated parsing trap.
+[0m$ [0mcat > ./target/tmp/q.rb <<'EOF'
+set via_if to "skipped"
+if via_if is not "zzz" then
+    say "taken"
+else
+    say "skipped"
+end
+EOF
+cargo run -q --bin rb -- run ./target/tmp/q.rb 2>&1 | tail -3
+taken
+[0m
+[0m$ [0mcat > ./target/tmp/q2.rb <<'EOF'
+set v to "skipped"
+if v is not "skipped" then
+    say "taken"
+else
+    say "skipped"
+end
+say v is not "skipped"
+EOF
+cargo run -q --bin rb -- run ./target/tmp/q2.rb 2>&1 | tail -3
+skipped
+no
+[0m
+[0m$ [0mcat > ./target/tmp/q3.rb <<'EOF'
+set v to "skipped"
+unless v is not "skipped" then
+    say "unless took body"
+end
+say "done"
+EOF
+cargo run -q --bin rb -- run ./target/tmp/q3.rb 2>&1 | tail -3
+unless took body
+done
+[0m
+[0m$ [0mfor c in 'v is "other"' 'v is "skipped"' 'v is not "skipped"' 'v is not "other"' 'no' 'yes' 'v is "other" and yes'; do
+printf 'set v to "skipped"\nunless %s then\n    say "TOOK"\nend\nsay "-end"\n' "$c" > ./target/tmp/q4.rb
+printf '%-28s -> ' "$c"; cargo run -q --bin rb -- run ./target/tmp/q4.rb 2>&1 | head -1
+done
+v is "other"                 -> TOOK
+v is "skipped"               -> -end
+v is not "skipped"           -> TOOK
+v is not "other"             -> -end
+no                           -> TOOK
+yes                          -> -end
+v is "other" and yes         -> TOOK
+[0m
+My test logic was wrong, not the implementation. Rewriting the paired test simply and correctly:
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/unless_test.rs'
+s=open(p).read()
+start=s.index('#[test]\nfn unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches()')
+end=s.index('#[test]\nfn unless_condition_supports_the_full_expression_grammar()')
+new = '''#[test]
+fn unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches() {
+    // One program, one condition, read through both forms. `if` takes its body
+    // when the condition holds; `unless` takes its body when it does not. Run
+    // it with the condition true and then false, and the two forms must swap:
+    // neither may ever take both bodies or neither.
+    for (condition, expected) in [("yes", "if"), ("no", "unless")] {
+        let source = format!(
+            "set flag to {condition}\\n\\
+             set via_if to \\"skipped\\"\\n\\
+             set via_unless to \\"skipped\\"\\n\\
+             set verdict to \\"neither\\"\\n\\
+             if flag then\\n    set via_if to \\"if\\"\\nend\\n\\
+             unless flag then\\n    set via_unless to \\"unless\\"\\nend\\n\\
+             if via_if is \\"if\\" then\\n    set verdict to \\"if\\"\\nelse\\n\\
+             set verdict to \\"unless\\"\\nend\\n\\
+             if via_unless is \\"unless\\" then\\n    set verdict to \\"both\\"\\nend\\n\\
+             verdict\\n"
+        );
+
+        let program = lex_and_parse(&source).unwrap_or_else(|e| {
+            panic!("`if`/`unless` on condition {condition:?} should parse: {e}")
+        });
+        assert_eq!(
+            program.statements.len(),
+            9,
+            "the paired program should hold nine top-level statements, got {}",
+            program.statements.len()
+        );
+
+        match run_source_value(&source) {
+            Ok(Value::Text(verdict)) => assert_eq!(
+                verdict, expected,
+                "with condition {condition:?}, `if` and `unless` must take opposite \\
+                 branches: \\"both\\" means both bodies ran, \\"neither\\" means neither did"
+            ),
+            Ok(other) => panic!("expected text for condition {condition:?}, got {other:?}"),
+            Err(error) => panic!("condition {condition:?} should run, got {error:?}"),
+        }
+    }
+}
+
+'''
+s=s[:start]+new+s[end:]
+open(p,'w').write(s)
+PY
+cargo test --test unless_test 2>&1 | tail -8
+failures:
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unless_test`
+[0m
+[0m$ [0mcargo test --test unless_test unless_uses 2>&1 | grep -A 6 'panicked' | head -10
+thread 'unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches' (7210) panicked at tests/unless_test.rs:110:41:
+assertion `left == right` failed: with condition "no", `if` and `unless` must take opposite branches: "both" means both bodies ran, "neither" means neither did
+  left: "both"
+ right: "unless"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/unless_test.rs'
+s=open(p).read()
+start=s.index('#[test]\nfn unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches()')
+end=s.index('#[test]\nfn unless_condition_supports_the_full_expression_grammar()')
+new = '''#[test]
+fn unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches() {
+    // One program, one condition, read through both forms: `if` takes its body
+    // when the condition holds, `unless` takes its body when it does not.
+    for condition in ["yes", "no"] {
+        let source = format!(
+            "set flag to {condition}\\n\\
+             if flag then\\n    say \\"if\\"\\nend\\n\\
+             unless flag then\\n    say \\"unless\\"\\nend\\n"
+        );
+        let program = lex_and_parse(&source).unwrap_or_else(|e| {
+            panic!("`if`/`unless` on condition {condition:?} should parse: {e}")
+        });
+        assert_eq!(
+            program.statements.len(),
+            3,
+            "the paired program should hold three top-level statements, got {}",
+            program.statements.len()
+        );
+        assert!(
+            run_source_value(&source).is_ok(),
+            "the paired program should run for condition {condition:?}"
+        );
+    }
+
+    // With the condition negated the two forms pick opposite branches: exactly
+    // one body runs, and it is the one that belongs to the false condition.
+    for (condition, expected) in [("yes", "if"), ("no", "unless")] {
+        let via_if = branch_taken_by(&format!(
+            "set hit to \\"skipped\\"\\nset flag to {condition}\\n\\
+             if flag then\\n    set hit to \\"if\\"\\nend\\n"
+        ));
+        let via_unless = branch_taken_by(&format!(
+            "set hit to \\"skipped\\"\\nset flag to {condition}\\n\\
+             unless flag then\\n    set hit to \\"unless\\"\\nend\\n"
+        ));
+
+        let bodies_taken = usize::from(via_if == "if") + usize::from(via_unless == "unless");
+        assert_eq!(
+            bodies_taken,
+            1,
+            "with condition {condition:?} exactly one of `if`/`unless` must take its body, \\
+             got if={via_if:?} unless={via_unless:?}"
+        );
+        assert_eq!(
+            if condition == "no" {
+                via_unless
+            } else {
+                via_if
+            },
+            expected,
+            "the wrong form took its body for condition {condition:?}"
+        );
+    }
+}
+
+'''
+s=s[:start]+new+s[end:]
+open(p,'w').write(s)
+PY
+cargo test --test unless_test 2>&1 | tail -8
+test edge_empty_body_parses_and_runs ... ok
+test unless_with_a_false_condition_takes_its_body ... ok
+test unless_condition_supports_the_full_expression_grammar ... ok
+test unless_with_a_true_condition_skips_its_body ... ok
+test unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+All 13 green. Now let me verify the DoD items directly and check the tooling surfaces.
+[0m$ [0mprintf 'unless no then say "x"\nend\n' > ./target/tmp/u.rb && cargo run -q --bin rb -- run ./target/tmp/u.rb; echo "exit=$?"
+printf 'unless yes then say "x"\nend\n' > ./target/tmp/u2.rb && cargo run -q --bin rb -- run ./target/tmp/u2.rb; echo "exit=$? (nothing printed expected)"
+x
+exit=0
+exit=0 (nothing printed expected)
+[0m
+[0m$ [0mprintf 'unless no then\n    say "a"\n' > ./target/tmp/u3.rb; echo "--- lint ---"; cargo run -q --bin rb -- lint ./target/tmp/u3.rb; echo "exit=$?"; echo "--- diagnostics ---"; cargo run -q --bin rb -- diagnostics ./target/tmp/u3.rb; echo "exit=$?"
+printf 'if no then\n    say "a"\n' > ./target/tmp/u4.rb; echo "--- lint (if baseline) ---"; cargo run -q --bin rb -- lint ./target/tmp/u4.rb; echo "exit=$?"
+--- lint ---
+Error: line 3: Syntax error: Expected End but got Eof
+exit=1
+--- diagnostics ---
+[{"line":3,"column":1,"severity":"error","message":"Expected End but got Eof"}]
+exit=1
+--- lint (if baseline) ---
+Error: line 3: Syntax error: Expected End but got Eof
+exit=1
+[0m
+[0m$ [0mgrep -rn 'unless' docs/ textmate* editor* .vscode 2>/dev/null | head; echo "=== GRAMMAR statements ==="; grep -n "if_statement\|statement = \|'if'" docs/GRAMMAR.md | head -20
+docs/GRAMMAR.md:43:         | 'if' | 'then' | 'else' | 'end' | 'when' | 'unless'
+docs/GRAMMAR.md:220:unless_statement = 'unless' expression
+=== GRAMMAR statements ===
+43:         | 'if' | 'then' | 'else' | 'end' | 'when' | 'unless'
+152:import_statement = 'import' identifier { 'as' identifier }
+155:export_statement = 'export' identifier { ',' identifier }
+203:if_statement     = 'if' expression
+220:unless_statement = 'unless' expression
+236:repeat_statement = 'repeat' expression 'times'
+256:return_statement = 'return' [ expression ]
+403:                 | logical_or 'if' expression 'else' conditional
+[0m
+[0m$ [0mprintf 'unless no then\n  say "a"\nend\nunless n > 3 then say "b"\nend\n' > ./target/tmp/f.rb && cargo run -q --bin rb -- format ./target/tmp/f.rb
+unless no then
+    say "a"
+end
+unless n > 3 then
+    say "b"
+end
+[0m
+[0m$ [0msed -n '200,232p' docs/GRAMMAR.md
+```
+// If statement
+if_statement     = 'if' expression
+                    'then'
+                    { statement }
+                    { 'else if' expression
+                      'then'
+                      { statement } }
+                    [ 'else'
+                      { statement } ]
+                    'end'
+
+// When statement (pattern matching)
+when_statement    = 'when' expression
+                    { 'case' pattern 'then' expression }
+                    [ 'else' expression ]
+                    'end'
+
+// Unless statement
+unless_statement = 'unless' expression
+                    'then'
+                    { statement }
+                    'end'
+
+// For loop (iteration)
+for_statement    = 'for' 'each' identifier 'in' expression
+                    { statement }
+                    'end'
+
+// For loop (range)
+for_statement    = 'for' 'each' identifier 'from' expression 'to' expression [ 'by' expression ]
+                    { statement }
+[0m
+Implementation matches `docs/GRAMMAR.md:220` exactly. Now the four gates.
+[0m$ [0mcargo fmt --all -- --check 2>&1 | head -40
+Diff in /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs:115:
+ 
+         let bodies_taken = usize::from(via_if == "if") + usize::from(via_unless == "unless");
+         assert_eq!(
+-            bodies_taken,
+-            1,
++            bodies_taken, 1,
+             "with condition {condition:?} exactly one of `if`/`unless` must take its body, \
+              got if={via_if:?} unless={via_unless:?}"
+         );
+Diff in /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs:220:
+     // No trailing newline, and `end` as the very last token of the source.
+     for tail in ["end", "end\n", "end\r\n"] {
+         let source = format!("unless no then\n    say \"last\"\n{tail}");
+-        let program = lex_and_parse(&source)
+-            .unwrap_or_else(|e| panic!("`unless` ending at EOF with tail {tail:?} should parse: {e}"));
++        let program = lex_and_parse(&source).unwrap_or_else(|e| {
++            panic!("`unless` ending at EOF with tail {tail:?} should parse: {e}")
++        });
+         assert_eq!(
+             program.statements.len(),
+             1,
+Diff in /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs:270:
+ 
+ #[test]
+ fn edge_unless_with_a_missing_then_is_a_spanned_parser_error() {
+-    let message =
+-        assert_spanned_parser_error(&parser_error("unless no\n    say \"x\"\nend\n"));
++    let message = assert_spanned_parser_error(&parser_error("unless no\n    say \"x\"\nend\n"));
+     assert!(
+         message.contains("Then"),
+         "the error must name the missing `then`, got {message:?}"
+Diff in /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs:299:
+         "`rb lint` must report an unclosed `unless` as an error"
+     );
+     assert!(
+-        errors.iter().any(|e| e.message.to_lowercase().contains("end")),
++        errors
++            .iter()
++            .any(|e| e.message.to_lowercase().contains("end")),
+[0m
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN" && git diff --stat
+FMT CLEAN
+ src/analyzer.rs         | 11 +++++++++++
+ src/bytecode/codegen.rs | 10 ++++++++++
+ src/formatter.rs        |  9 +++++++++
+ src/linter.rs           |  4 ++++
+ src/parser.rs           | 43 +++++++++++++++++++++++++++++++++++++++++++
+ src/vm.rs               | 11 +++++++++++
+ 6 files changed, 88 insertions(+)
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -25
+[1m[92m    Checking[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.41s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E '^test result|^error|FAILED|panicked' | head -60
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.02s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mfor f in examples/*.rb; do out=$(cargo run -q --bin rb -- run "$f" 2>&1); if [ $? -ne 0 ]; then echo "FAIL $f"; echo "$out" | head -3; fi; done; echo "examples done"
+examples done
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -c '^test result: ok'; cargo test --all-targets 2>&1 | grep '^test result' | awk -F'[ ;]' '{p+=$4} END {print "total passed:", p}'
+28
+total passed: 588
+[0m
+[0m$ [0mgrep -n 'fn .*if.*branch\|jump\|JumpIfFalse\|fn run_bytecode\|fn eval_chunk' tests/bytecode_test.rs | head -20
+402:fn loops_and_branches_produce_jumps_inside_their_own_block() {
+438:            matches!(i.opcode, Opcode::Jump | Opcode::JumpIfFalse) && (i.arg as usize) <= *index
+445:        "each loop needs exactly one backward jump, got {ops:?}"
+454:/// Every jump target is inside its own block *or* is that block's documented
+456:/// legal (`docs/BYTECODE.md` §"A jump target is…"); a target past the count is
+457:/// not, and neither is a jump into another block.
+459:fn every_jump_target_is_inside_its_own_block() {
+463:        // after them, so their exit jumps land on the instruction count. These
+465:        // make the exit form the only legal target those jumps can have.
+479:                if matches!(instruction.opcode, Opcode::Jump | Opcode::JumpIfFalse) {
+482:                        "{:?} jumps to {} but block holds {} instructions",
+500:        "`repeat` and `while` each compile to one loop-back jump, got {backward}"
+504:        "the `while` and the `if` should each exit their block by jumping to the instruction count, got {exits}"
+509:/// jump to, so its exit jump targets the block's instruction count. That is
+513:fn edge_a_jump_to_the_end_of_a_block_is_the_exit_not_an_out_of_range_target() {
+525:            .filter(|i| matches!(i.opcode, Opcode::Jump | Opcode::JumpIfFalse))
+530:            "{what} at the end of a block should jump out to {end}, got {targets:?}"
+535:                "{what} emitted a jump to {target}, past the end of {end} instructions"
+542:            "{what} produced a jump `rb dis` calls out of range:\n{text}"
+546:            "a jump out of the block should say where it lands:\n{text}"
+[0m
+[0m$ [0mfor f in modules/*.rb; do out=$(cargo run -q --bin rb -- run "$f" 2>&1); if [ $? -ne 0 ]; then echo "FAIL $f: $(echo "$out"|head -2)"; fi; done; echo "modules done"
+modules done
+[0m
+[0m$ [0msed -n '1,40p' tests/bytecode_test.rs; echo "=== 490,550 ==="; sed -n '486,550p' tests/bytecode_test.rs
+//! Bytecode format, `rb compile`, `rb dis` (bootstrap stage S1a).
+//!
+//! These tests pin the format itself: that encoding is lossless and stable,
+//! that decoding refuses a file it does not understand instead of guessing,
+//! and that the disassembler is a deterministic function of the bytes.
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+use redblue::bytecode::{
+    compile_source, disassemble, Block, BlockKind, Chunk, Constant, Instruction, Opcode,
+    END_TRY_MARKER, FORMAT_VERSION, MAGIC, NO_BLOCK, NO_CONST,
+};
+
+fn project_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = project_root().join("target/tmp/bytecode-test").join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+    dir
+}
+
+/// Every source file under `examples/`, sorted so the test itself is
+/// deterministic.
+fn example_sources() -> Vec<(String, String)> {
+    let dir = project_root().join("examples");
+    let mut found: Vec<(String, String)> = fs::read_dir(&dir)
+        .expect("examples/ should be readable")
+        .map(|entry| entry.expect("directory entry should be readable").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rb"))
+        .map(|path| {
+            let source = fs::read_to_string(&path).expect("example should be readable UTF-8");
+            (
+                path.file_name()
+                    .expect("example has a name")
+                    .to_string_lossy()
+=== 490,550 ===
+                    );
+                    if instruction.arg as usize == block.code.len() {
+                        exits += 1;
+                    }
+                }
+                if instruction.opcode == Opcode::Jump {
+                    backward += 1;
+                }
+            }
+        });
+    }
+    assert!(visited >= 3, "the walk should have reached every block");
+    assert_eq!(
+        backward, 2,
+        "`repeat` and `while` each compile to one loop-back jump, got {backward}"
+    );
+    assert_eq!(
+        exits, 2,
+        "the `while` and the `if` should each exit their block by jumping to the instruction count, got {exits}"
+    );
+}
+
+/// A loop or a bare `if` at the end of a block has no instruction after it to
+/// jump to, so its exit jump targets the block's instruction count. That is
+/// the documented way out of a block, not a target past the end of one — and
+/// `rb dis` must not report the compiler's own output as malformed.
+#[test]
+fn edge_a_jump_to_the_end_of_a_block_is_the_exit_not_an_out_of_range_target() {
+    for (source, what) in [
+        ("set i to 0\nwhile i is 1\n    say i\nend\n", "while"),
+        ("set i to 0\nif i is 1 then\n    say i\nend\n", "if"),
+    ] {
+        let chunk = compile_source(source).unwrap_or_else(|e| panic!("{what} should compile: {e}"));
+        let end = chunk.main.code.len() as u32;
+
+        let targets: Vec<u32> = chunk
+            .main
+            .code
+            .iter()
+            .filter(|i| matches!(i.opcode, Opcode::Jump | Opcode::JumpIfFalse))
+            .map(|i| i.arg)
+            .collect();
+        assert!(
+            targets.contains(&end),
+            "{what} at the end of a block should jump out to {end}, got {targets:?}"
+        );
+        for target in &targets {
+            assert!(
+                *target <= end,
+                "{what} emitted a jump to {target}, past the end of {end} instructions"
+            );
+        }
+
+        let text = disassemble(&chunk);
+        assert!(
+            !text.contains("outside this block"),
+            "{what} produced a jump `rb dis` calls out of range:\n{text}"
+        );
+        assert!(
+            text.contains("end of block"),
+            "a jump out of the block should say where it lands:\n{text}"
+        );
+
+        let bytes = chunk.encode();
+        assert_eq!(
+[0m
+[0m$ [0mgrep -n 'pub fn run\|pub fn execute\|pub struct BytecodeVm\|pub fn ' src/bytecode/vm.rs | head -20
+429:pub struct BytecodeVm {
+485:    pub fn new() -> Self {
+510:    pub fn with_max_call_depth(max_call_depth: usize) -> Self {
+520:    pub fn with_max_steps(max_steps: usize) -> Self {
+528:    pub fn with_max_iterations(max_iterations: usize) -> Self {
+536:    pub fn take_expectation_failure(
+548:    pub fn run(&mut self, chunk: &Chunk) -> Result<Value> {
+569:    pub fn take_output(&mut self) -> Vec<String> {
+2049:pub fn limits() -> Limits {
+2064:pub fn run(chunk: &Chunk) -> Result<Value> {
+[0m
+I touched the bytecode codegen, so that branch needs coverage. Let me check how bytecode tests assert runtime behaviour.
+[0m$ [0mgrep -n 'BytecodeVm::new\|take_output' tests/bytecode_vm_test.rs | head -5; echo "==="; sed -n '1,30p' tests/bytecode_vm_test.rs
+74:        output: vm.take_output(),
+95:    let mut vm = BytecodeVm::new();
+98:        output: vm.take_output(),
+1748:        let mut direct = BytecodeVm::new();
+1749:        let mut via_file = BytecodeVm::new();
+===
+//! Bytecode execution (bootstrap stage S1b): `rb vm file.rbc`.
+//!
+//! The tree-walking VM is the specification of what a Redblue program *does*.
+//! These tests pin that the bytecode VM does the same thing — the same output,
+//! the same error kinds and the same error messages — and that it holds the
+//! same resource limits while doing it.
+//!
+//! The comparison runs both VMs as libraries rather than as subprocesses
+//! wherever it can, so a mismatch names the program rather than an exit code.
+//! `rb vm` itself is covered by the tests that shell out, because the CLI is
+//! part of what this phase delivers.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use redblue::bytecode::vm::BytecodeVm;
+use redblue::bytecode::{compile_source, Instruction, Opcode};
+use redblue::{run_isolated, Error};
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/tmp/bytecode-vm-test")
+        .join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+    dir
+}
+[0m
+[0m$ [0msed -n '55,100p' tests/bytecode_vm_test.rs
+/// Runs `source` on the tree-walking VM.
+///
+/// A program that does not lex, parse or analyze has *failed*, and that failure
+/// is the outcome rather than a panic: the corpus deliberately contains
+/// malformed programs, and how each VM reports them is part of what is compared.
+fn tree_walk(source: &str) -> Outcome {
+    let tokens = match redblue::lexer::Lexer::tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(error) => return failed(failure_of(&error)),
+    };
+    let ast = match redblue::parser::parse(tokens) {
+        Ok(ast) => ast,
+        Err(error) => return failed(failure_of(&error)),
+    };
+    if let Err(error) = redblue::analyzer::analyze(&ast) {
+        return failed(failure_of(&error));
+    }
+    let (mut vm, result) = run_isolated(&ast);
+    Outcome {
+        output: vm.take_output(),
+        result: result
+            .map(|value| value.to_string())
+            .map_err(|error| failure_of(&error)),
+    }
+}
+
+/// A frontend failure, as an outcome: nothing ran, so nothing was printed.
+fn failed(message: String) -> Outcome {
+    Outcome {
+        output: Vec::new(),
+        result: Err(message),
+    }
+}
+
+/// Runs `source` through the bytecode compiler and then the bytecode VM.
+fn bytecode(source: &str) -> Outcome {
+    let chunk = match compile_source(source) {
+        Ok(chunk) => chunk,
+        Err(error) => return failed(failure_of(&error)),
+    };
+    let mut vm = BytecodeVm::new();
+    let result = vm.run(&chunk);
+    Outcome {
+        output: vm.take_output(),
+        result: result
+            .map(|value| value.to_string())
+[0m
+[0m→ [0mRead tests/unless_test.rs[90m [limit=12][0m
+I'll add bytecode coverage to my test file so the codegen branch I added is exercised.
+[0m
+[0m← [0mEdit tests/unless_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+@@ -5,9 +5,15 @@
+ //! exactly when the condition is **false**, the condition grammar is the same
+ //! as `if`'s (so one program run through both forms picks opposite branches),
+ //! and a malformed `unless` is a spanned [`Error::Parser`] naming the missing
+ //! `end` rather than a panic or a silent pass.
++//!
++//! The bytecode compiler has its own `unless` arm in
++//! `src/bytecode/codegen.rs`, so the last test runs the same programs through
++//! both VMs and demands they agree.
+ 
++use redblue::bytecode::vm::BytecodeVm;
++use redblue::bytecode::compile_source;
+ use redblue::lexer::Lexer;
+ use redblue::linter::lint;
+ use redblue::lsp::diagnostics;
+ use redblue::parser::{parse, Program};
+
+[0m
+[0m$ [0mcat >> tests/unless_test.rs <<'EOF'
+
+// --- the bytecode compiler ---------------------------------------------------
+
+#[test]
+fn unless_compiles_and_runs_the_same_on_both_vms() {
+    // `codegen.rs` has its own `unless` arm: the condition is negated with
+    // `Opcode::Not` because there is no `JumpIfTrue`, and the body is the
+    // fall-through. A codegen bug that inverted the condition would pass every
+    // tree-walking test above, so both VMs must be compared directly.
+    for (condition, expected) in [
+        ("yes", vec![]),
+        ("no", vec!["body".to_string()]),
+        ("1 is 2", vec!["body".to_string()]),
+        ("1 is 1", vec![]),
+        ("not yes", vec!["body".to_string()]),
+        ("not no", vec![]),
+    ] {
+        let source = format!("set hit to \"skipped\"\nunless {condition} then\n    say \"body\"\nend\n");
+        let chunk = compile_source(&source)
+            .unwrap_or_else(|e| panic!("`unless {condition}` should compile: {e}"));
+        let mut vm = BytecodeVm::new();
+        vm.run(&chunk)
+            .unwrap_or_else(|e| panic!("`unless {condition}` should run on the bytecode VM: {e}"));
+
+        let output = vm.take_output();
+        if condition.starts_with("not ") {
+            // A bare `unless` body only holds a `say`, which the bytecode VM
+            // writes to output rather than into a variable, so the comparison is
+            // over what it printed.
+            assert_eq!(
+                output.first().map(String::as_str),
+                expected.first().map(String::as_str),
+                "bytecode VM printed {output:?} for `unless {condition}`"
+            );
+        } else {
+            assert_eq!(
+                output, expected,
+                "bytecode VM printed {output:?} for `unless {condition}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn edge_unless_whose_body_never_runs_still_exits_its_block() {
+    // The one-branch block compiles to a single `JumpIfFalse` whose target is
+    // the block's instruction count. If the target were wrong the bytecode VM
+    // would report an out-of-range jump or run past the body.
+    for source in [
+        "unless yes then\n    say \"a\"\nend\n",
+        "unless yes then\nend\n",
+        "unless no then\n    say \"a\"\n    say \"b\"\nend\n",
+    ] {
+        let chunk = compile_source(source)
+            .unwrap_or_else(|e| panic!("{source:?} should compile: {e}"));
+        let end = chunk.main.code.len() as u32;
+        let targets: Vec<u32> = chunk
+            .main
+            .code
+            .iter()
+            .filter(|i| matches!(i.opcode, Opcode::Jump | Opcode::JumpIfFalse))
+            .map(|i| i.arg)
+            .collect();
+        for target in &targets {
+            assert!(
+                *target <= end,
+                "{source:?} emitted a jump to {target}, past the end of {end} instructions"
+            );
+        }
+
+        let mut vm = BytecodeVm::new();
+        vm.run(&chunk)
+            .unwrap_or_else(|e| panic!("{source:?} should run on the bytecode VM: {e}"));
+    }
+}
+EOF
+sed -i 's/^use redblue::bytecode::compile_source;$/use redblue::bytecode::{compile_source, Opcode};/' tests/unless_test.rs
+cargo test --test unless_test 2>&1 | tail -20
+running 15 tests
+test edge_an_unclosed_unless_is_rejected_by_the_linter_as_an_error ... ok
+test edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error ... ok
+test edge_body_of_exactly_one_statement ... ok
+test edge_unless_nests_inside_if_and_unless ... ok
+test edge_unless_rejects_else_because_its_body_has_no_alternative ... ok
+test edge_unless_as_the_last_statement_in_a_file ... ok
+test edge_unless_whose_body_never_runs_still_exits_its_block ... ok
+test edge_unless_with_a_missing_then_is_a_spanned_parser_error ... ok
+test edge_unless_without_end_is_a_spanned_parser_error ... ok
+test edge_empty_body_parses_and_runs ... ok
+test unless_condition_supports_the_full_expression_grammar ... ok
+test unless_compiles_and_runs_the_same_on_both_vms ... ok
+test unless_with_a_true_condition_skips_its_body ... ok
+test unless_with_a_false_condition_takes_its_body ... ok
+test unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/unless_test.rs'
+s=open(p).read()
+s=s.replace('''        let output = vm.take_output();
+        if condition.starts_with("not ") {
+            // A bare `unless` body only holds a `say`, which the bytecode VM
+            // writes to output rather than into a variable, so the comparison is
+            // over what it printed.
+            assert_eq!(
+                output.first().map(String::as_str),
+                expected.first().map(String::as_str),
+                "bytecode VM printed {output:?} for `unless {condition}`"
+            );
+        } else {
+            assert_eq!(
+                output, expected,
+                "bytecode VM printed {output:?} for `unless {condition}`"
+            );
+        }''','''        let output = vm.take_output();
+        assert_eq!(
+            output, expected,
+            "the bytecode VM printed {output:?} for `unless {condition}`, expected {expected:?}"
+        );''')
+open(p,'w').write(s)
+PY
+# prove the bytecode test can fail: remove the Not and see it go red
+sed -i 's|                emit(code, Opcode::Not, 0, 0, line);\n||' src/bytecode/codegen.rs
+python3 - <<'PY'
+p='src/bytecode/codegen.rs'
+s=open(p).read()
+s=s.replace("                emit(code, Opcode::Not, 0, 0, line);\n                let to_end = jump(code, Opcode::JumpIfFalse, line);","                let to_end = jump(code, Opcode::JumpIfFalse, line);")
+open(p,'w').write(s)
+PY
+cargo test --test unless_test unless_compiles 2>&1 | grep -E 'test result|bytecode VM printed' | head -5
+assertion `left == right` failed: the bytecode VM printed ["body"] for `unless yes`, expected []
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 14 filtered out; finished in 0.00s
+[0m
+The bytecode test genuinely catches an inverted condition. Restoring:
+[0m← [0mEdit src/bytecode/codegen.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs
+@@ -230,8 +230,9 @@
+     self.expr(condition, code, line)?;
+     // There is no `JumpIfTrue`, so the condition is negated and the
+     // existing jump runs the body exactly when it was false. The
+     // `end` of a one-branch block is that jump's landing pad.
++    emit(code, Opcode::Not, 0, 0, line);
+     let to_end = jump(code, Opcode::JumpIfFalse, line);
+     self.statements(body, code, blocks, depth)?;
+     patch_here(code, to_end);
+ }
+
+[0m
+[0m$ [0mcargo test --test unless_test 2>&1 | tail -4
+test unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Now let me confirm the other edge tests can actually fail, then run the four gates.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/vm.rs'
+s=open(p).read()
+s=s.replace("                if !cond.is_truthy() {\n                    for stmt in body {","                if cond.is_truthy() {\n                    for stmt in body {")
+open(p,'w').write(s)
+PY
+cargo test --test unless_test 2>&1 | grep -E '^test result|^    unless|^    edge' | head -20
+edge_body_of_exactly_one_statement
+    edge_unless_nests_inside_if_and_unless
+    unless_condition_supports_the_full_expression_grammar
+    unless_uses_the_same_condition_grammar_as_if_and_picks_opposite_branches
+    unless_with_a_false_condition_takes_its_body
+    unless_with_a_true_condition_skips_its_body
+test result: FAILED. 9 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Six tests catch an inverted condition. Restoring and running the full gate:
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/vm.rs'
+s=open(p).read()
+s=s.replace("                if cond.is_truthy() {\n                    for stmt in body {","                if !cond.is_truthy() {\n                    for stmt in body {")
+open(p,'w').write(s)
+PY
+git diff --stat src/vm.rs && cargo test --test unless_test 2>&1 | tail -3
+src/vm.rs | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check && echo "GATE1 fmt: PASS"
+GATE1 fmt: PASS
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -5; echo "GATE2 exit=$?"
+[1m[92m    Checking[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.45s
+GATE2 exit=0
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tee ./target/tmp/test.log | grep -E 'FAILED|failed;' | grep -v ' 0 failed' | head; echo "---"; grep '^test result' ./target/tmp/test.log | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed:", p, "failed:", f}'
+---
+passed: 590 failed: 0
+[0m
+[0m$ [0mls phases/phase-029/; echo "=== verify.sh present ==="; ls rbops/verify.sh 2>&1
+FINDINGS.md
+REPORT.md
+=== verify.sh present ===
+ls: cannot access 'rbops/verify.sh': No such file or directory
+[0m
+[0m$ [0msed -n '1,40p' tests/test_control_flow.rb; echo "..."; tail -15 tests/test_control_flow.rb
+// Redblue control-flow tests.
+
+test "control: if takes the then branch"
+    set branch to "none"
+    set n to 1
+    if n is 1 then
+        set branch to "then"
+    end
+    expect branch to be "then"
+end
+
+test "control: if takes the else branch"
+    set branch to "none"
+    set n to 2
+    if n is 1 then
+        set branch to "then"
+    else
+        set branch to "else"
+    end
+    expect branch to be "else"
+end
+
+test "control: an if with no else leaves the accumulator alone"
+    set branch to "none"
+    set n to 2
+    if n is 1 then
+        set branch to "then"
+    end
+    expect branch to be "none"
+end
+
+test "control: an else if chain picks the middle branch"
+    set branch to "other"
+    set n to 0
+    if n is 1 then
+        set branch to "positive"
+    else
+        if n is 0 then
+            set branch to "zero"
+        else
+...
+    finally
+        set log to log + "f"
+    end
+    expect log to be "cf"
+end
+
+test "edge: a named catch still binds the error"
+    set caught to ""
+    try
+        say 1 / 0
+    catch err
+        set caught to err
+    end
+    expect caught to be "error"
+end
+[0m
+I'll add matching Redblue-level tests so the language's own harness covers `unless` too.
+[0m$ [0mcat >> tests/test_control_flow.rb <<'EOF'
+
+test "control: unless takes its body when the condition is false"
+    set branch to "none"
+    set n to 0
+    unless n is 1 then
+        set branch to "body"
+    end
+    expect branch to be "body"
+end
+
+test "control: unless skips its body when the condition is true"
+    set branch to "none"
+    set n to 1
+    unless n is 1 then
+        set branch to "body"
+    end
+    expect branch to be "none"
+end
+
+test "edge: an unless with an empty body changes nothing"
+    set branch to "none"
+    unless no then
+    end
+    unless yes then
+    end
+    expect branch to be "none"
+end
+EOF
+cargo test --test redblue_suite_test 2>&1 | tail -5
+every_test_block_carries_an_assertion
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+[1m[91merror[0m: test failed, to rerun pass `--test redblue_suite_test`
+[0m
+[0m$ [0mcargo test --test redblue_suite_test 2>&1 | grep -B 5 -A 15 'every_test_block_carries_an_assertion stdout' | head -30
+test edge_suite_runs_no_skipped_tests ... ok
+test edge_suite_reports_at_least_40_redblue_tests ... ok
+
+failures:
+
+---- every_test_block_carries_an_assertion stdout ----
+
+thread 'every_test_block_carries_an_assertion' (22831) panicked at tests/redblue_suite_test.rs:146:13:
+tests/test_control_flow.rb:248 `test "control: unless skips its body when the condition is true"` has no assertion - a smoke test proves nothing
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: redblue_suite_test::every_test_block_carries_an_assertion
+   3: redblue_suite_test::every_test_block_carries_an_assertion::{closure#0}
+   4: <redblue_suite_test::every_test_block_carries_an_assertion::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    every_test_block_carries_an_assertion
+[0m
+[0m$ [0msed -n '110,150p' tests/redblue_suite_test.rs
+);
+}
+
+#[test]
+fn edge_suite_declares_no_skip_markers() {
+    for path in suite_files() {
+        let source = read(&path);
+        for (n, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            assert!(
+                !trimmed.starts_with("// skip") && !trimmed.starts_with("# skip"),
+                "{}:{} carries a skip marker: {}",
+                path,
+                n + 1,
+                trimmed
+            );
+        }
+    }
+}
+
+#[test]
+fn every_test_block_carries_an_assertion() {
+    let mut blocks_seen = 0usize;
+
+    for path in suite_files() {
+        let source = read(&path);
+        let blocks = test_blocks(&source);
+        assert!(
+            !blocks.is_empty(),
+            "{} declares no test blocks; a suite of zero tests is not a suite",
+            path
+        );
+
+        for (line, name, body) in blocks {
+            blocks_seen += 1;
+            let asserts = body.contains("expect ") || body.contains("assert.");
+            assert!(
+                asserts,
+                "{}:{} `test \"{}\"` has no assertion - a smoke test proves nothing",
+                path, line, name
+            );
+[0m
+[0m$ [0msed -n '236,275p' tests/test_control_flow.rb
+end
+    expect caught to be "error"
+end
+test "control: unless takes its body when the condition is false"
+    set branch to "none"
+    set n to 0
+    unless n is 1 then
+        set branch to "body"
+    end
+    expect branch to be "body"
+end
+
+test "control: unless skips its body when the condition is true"
+    set branch to "none"
+    set n to 1
+    unless n is 1 then
+        set branch to "body"
+    end
+    expect branch to be "none"
+end
+
+test "edge: an unless with an empty body changes nothing"
+    set branch to "none"
+    unless no then
+    end
+    unless yes then
+    end
+    expect branch to be "none"
+end
+[0m
+[0m$ [0mgrep -n 'fn test_blocks' -A 30 tests/redblue_suite_test.rs
+40:fn test_blocks(source: &str) -> Vec<(usize, String, String)> {
+41-    let lines: Vec<&str> = source.lines().collect();
+42-    let mut blocks = Vec::new();
+43-    let mut i = 0;
+44-
+45-    while i < lines.len() {
+46-        let trimmed = lines[i].trim();
+47-        if let Some(rest) = trimmed.strip_prefix("test ") {
+48-            let name = rest.trim().trim_matches('"').to_string();
+49-            let header_line = i + 1;
+50-            let mut body = Vec::new();
+51-            let mut depth = 1usize;
+52-            i += 1;
+53-            while i < lines.len() && depth > 0 {
+54-                let line = lines[i];
+55-                let t = line.trim();
+56-                if opens_a_block(t) {
+57-                    depth += 1;
+58-                } else if t == "end" {
+59-                    depth -= 1;
+60-                    if depth == 0 {
+61-                        i += 1;
+62-                        break;
+63-                    }
+64-                }
+65-                if depth > 0 {
+66-                    body.push(line);
+67-                }
+68-                i += 1;
+69-            }
+70-            blocks.push((header_line, name, body.join("\n")));
+[0m
+[0m$ [0mgrep -n 'fn opens_a_block' -A 25 tests/redblue_suite_test.rs
+32:fn opens_a_block(line: &str) -> bool {
+33-    let first = line.split_whitespace().next().unwrap_or("");
+34-    BLOCK_OPENERS.contains(&first)
+35-}
+36-
+37-/// A test block starts at a `test "..."` header line and ends at the `end` that
+38-/// matches it. Nested `if`/`for`/`try`/`object`/`to` blocks inside a test carry
+39-/// their own `end`, so the body is read with a depth counter.
+40-fn test_blocks(source: &str) -> Vec<(usize, String, String)> {
+41-    let lines: Vec<&str> = source.lines().collect();
+42-    let mut blocks = Vec::new();
+43-    let mut i = 0;
+44-
+45-    while i < lines.len() {
+46-        let trimmed = lines[i].trim();
+47-        if let Some(rest) = trimmed.strip_prefix("test ") {
+48-            let name = rest.trim().trim_matches('"').to_string();
+49-            let header_line = i + 1;
+50-            let mut body = Vec::new();
+51-            let mut depth = 1usize;
+52-            i += 1;
+53-            while i < lines.len() && depth > 0 {
+54-                let line = lines[i];
+55-                let t = line.trim();
+56-                if opens_a_block(t) {
+57-                    depth += 1;
+[0m
+[0m$ [0mgrep -n 'BLOCK_OPENERS' -A 15 tests/redblue_suite_test.rs | head -25
+28:const BLOCK_OPENERS: [&str; 9] = [
+29-    "test", "if", "for", "repeat", "while", "try", "object", "to", "module",
+30-];
+31-
+32-fn opens_a_block(line: &str) -> bool {
+33-    let first = line.split_whitespace().next().unwrap_or("");
+34:    BLOCK_OPENERS.contains(&first)
+35-}
+36-
+37-/// A test block starts at a `test "..."` header line and ends at the `end` that
+38-/// matches it. Nested `if`/`for`/`try`/`object`/`to` blocks inside a test carry
+39-/// their own `end`, so the body is read with a depth counter.
+40-fn test_blocks(source: &str) -> Vec<(usize, String, String)> {
+41-    let lines: Vec<&str> = source.lines().collect();
+42-    let mut blocks = Vec::new();
+43-    let mut i = 0;
+44-
+45-    while i < lines.len() {
+46-        let trimmed = lines[i].trim();
+47-        if let Some(rest) = trimmed.strip_prefix("test ") {
+48-            let name = rest.trim().trim_matches('"').to_string();
+49-            let header_line = i + 1;
+[0m
+The harness's block-opener list predates `unless`. Adding it (the harness silently truncates any test body containing `unless`).
+[0m← [0mEdit tests/redblue_suite_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/redblue_suite_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/redblue_suite_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/redblue_suite_test.rs
+@@ -24,10 +24,10 @@
+ }
+ 
+ /// Keywords that open a Redblue block and are closed by `end`. `else`,
+ /// `catch`, `finally` and `until` continue an open block and add no depth.
+-const BLOCK_OPENERS: [&str; 9] = [
+-    "test", "if", "for", "repeat", "while", "try", "object", "to", "module",
++const BLOCK_OPENERS: [&str; 10] = [
++    "test", "if", "unless", "for", "repeat", "while", "try", "object", "to", "module",
+ ];
+ 
+ fn opens_a_block(line: &str) -> bool {
+     let first = line.split_whitespace().next().unwrap_or("");
+
+[0m
+[0m← [0mEdit tests/redblue_suite_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/redblue_suite_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/redblue_suite_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/redblue_suite_test.rs
+@@ -34,10 +34,13 @@
+     BLOCK_OPENERS.contains(&first)
+ }
+ 
+ /// A test block starts at a `test "..."` header line and ends at the `end` that
+-/// matches it. Nested `if`/`for`/`try`/`object`/`to` blocks inside a test carry
+-/// their own `end`, so the body is read with a depth counter.
++/// matches it. Nested `if`/`unless`/`for`/`try`/`object`/`to` blocks inside a
++/// test carry their own `end`, so the body is read with a depth counter. Every
++/// keyword in [`BLOCK_OPENERS`] must be listed: a missing one makes the counter
++/// reach zero at the inner `end` and silently truncate the body, which reads as
++/// "the block has no assertion" rather than as a harness bug.
+ fn test_blocks(source: &str) -> Vec<(usize, String, String)> {
+     let lines: Vec<&str> = source.lines().collect();
+     let mut blocks = Vec::new();
+     let mut i = 0;
+
+[0m
+[0m$ [0mcargo test --test redblue_suite_test 2>&1 | tail -6
+test every_test_block_carries_an_assertion ... ok
+test edge_suite_reports_at_least_40_redblue_tests ... ok
+test edge_suite_runs_no_skipped_tests ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+[0m
+[0m$ [0mgrep -rn '"while"' src/ tests/ --include=*.rs | grep -v '^src/vm.rs\|^src/parser.rs' | head -20
+src/lexer.rs:31:    ("while", TokenKind::While),
+src/repl/completer.rs:28:                "while".to_string(),
+src/repl/mod.rs:206:               || s.ends_with("while")
+src/bytecode/vm.rs:328:            _ => (false, "while"),
+tests/loop_bounds_test.rs:176:        ("while", "set i to 0\nwhile i is 5\n    set i to i + 1\nend"),
+tests/loop_bounds_test.rs:201:            "while",
+tests/loop_bounds_test.rs:225:            "while",
+tests/loop_bounds_test.rs:307:        ("while", "set i to 5\nwhile i is 0\n    say \"never\"\nend"),
+tests/redblue_suite_test.rs:29:    "test", "if", "unless", "for", "repeat", "while", "try", "object", "to", "module",
+tests/bytecode_test.rs:515:        ("set i to 0\nwhile i is 1\n    say i\nend\n", "while"),
+[0m
+[0m$ [0mgrep -rn 'keyword' src/lsp.rs | head -10; ls editor/ 2>/dev/null; grep -rn 'unless' src/lsp.rs src/testing/*.rs 2>/dev/null | head
+193:/// The word-boundary alternation that matches every keyword, as a regex source
+195:pub fn keyword_pattern() -> String {
+231:/// Rendered rather than hand-written so the keyword set comes straight from the
+264:        r#"{{"name":"keyword.control.redblue","match":{}}}"#,
+265:        escape_json(&keyword_pattern())
+272:        r#"{"name":"keyword.operator.redblue","match":"==|!=|<=|>=|<|>|\\+|-|\\*|/|%"}"#
+[0m
+[0m$ [0msed -n '195,220p' src/repl/mod.rs; echo "=== completer ==="; sed -n '18,45p' src/repl/completer.rs
+self.multiline_buffer.push(input.to_string());
+            }
+            return;
+        }
+
+        let needs_multiline = matches!(
+            input,
+            s if s.ends_with("then")
+               || s.ends_with("end")
+               || s.ends_with("to")
+               || s.ends_with("else")
+               || s.ends_with("while")
+               || s.ends_with("repeat")
+        );
+
+        if needs_multiline {
+            self.multiline_buffer.push(input.to_string());
+            self.in_multiline = true;
+            return;
+        }
+
+        self.execute_code(input);
+    }
+
+    fn execute_code(&mut self, code: &str) {
+        let result = self.run_code(code);
+=== completer ===
+                "end".to_string(),
+                "when".to_string(),
+                "unless".to_string(),
+                "for".to_string(),
+                "each".to_string(),
+                "in".to_string(),
+                "from".to_string(),
+                "to".to_string(),
+                "by".to_string(),
+                "times".to_string(),
+                "while".to_string(),
+                "repeat".to_string(),
+                "until".to_string(),
+                "break".to_string(),
+                "skip".to_string(),
+                "return".to_string(),
+                "give back".to_string(),
+                "say".to_string(),
+                "print".to_string(),
+                "ask".to_string(),
+                "try".to_string(),
+                "catch".to_string(),
+                "finally".to_string(),
+                "and".to_string(),
+                "or".to_string(),
+                "not".to_string(),
+                "mod".to_string(),
+                "yes".to_string(),
+[0m
+All other surfaces already handle `unless`. Running the full gate suite.
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check && echo "GATE1 fmt: PASS"
+GATE1 fmt: PASS
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -4
+[1m[92m    Checking[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.13s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tee ./target/tmp/test2.log | grep -E 'FAILED|panicked' | head; grep '^test result' ./target/tmp/test2.log | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "TOTAL passed:", p, "failed:", f}'
+TOTAL passed: 590 failed: 0
+[0m
+[0m$ [0mcargo test --doc 2>&1 | tail -4; echo "=== examples/modules ==="; fail=0; for f in examples/*.rb modules/*.rb; do cargo run -q --bin rb -- run "$f" >/dev/null 2>&1 || { echo "FAIL $f"; fail=1; }; done; echo "examples+modules fail=$fail"
+test src/bytecode/mod.rs - bytecode (line 12) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+=== examples/modules ===
+examples+modules fail=0
+[0m
+[0m$ [0mls rbops/ 2>&1; echo "---"; git ls-files | grep -i 'verify.sh\|rbops/' | head
+ls: cannot access 'rbops/': No such file or directory
+---
+[0m
+Gate 4 — `rbops/verify.sh` is not present in this checkout. Let me confirm and record it honestly.
+[0m$ [0mgit status --short; echo "=== new ignores/skips/suppressions in diff ==="; git diff | grep -E '^\+' | grep -E '#\[ignore\]|// skip|allow\(clippy::' || echo "none"
+M src/analyzer.rs
+ M src/bytecode/codegen.rs
+ M src/formatter.rs
+ M src/linter.rs
+ M src/parser.rs
+ M src/vm.rs
+ M tests/redblue_suite_test.rs
+ M tests/test_control_flow.rb
+?? tests/unless_test.rs
+=== new ignores/skips/suppressions in diff ===
+none
+[0m
+[0m$ [0mgit diff --stat; echo "=== new test count ==="; grep -c '^#\[test\]' tests/unless_test.rs; grep -c 'fn edge_' tests/unless_test.rs; echo "=== redblue blocks added ==="; git diff tests/test_control_flow.rb | grep -c '^+test '
+src/analyzer.rs             | 11 +++++++++++
+ src/bytecode/codegen.rs     | 10 ++++++++++
+ src/formatter.rs            |  9 +++++++++
+ src/linter.rs               |  4 ++++
+ src/parser.rs               | 43 +++++++++++++++++++++++++++++++++++++++++++
+ src/vm.rs                   | 11 +++++++++++
+ tests/redblue_suite_test.rs | 11 +++++++----
+ tests/test_control_flow.rb  | 28 +++++++++++++++++++++++++++-
+ 8 files changed, 122 insertions(+), 5 deletions(-)
+=== new test count ===
+15
+10
+=== redblue blocks added ===
+3
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/test_control_flow.rb'
+s=open(p).read()
+s=s.replace('    expect caught to be "error"\nend\ntest "control: unless','    expect caught to be "error"\nend\n\ntest "control: unless')
+open(p,'w').write(s)
+PY
+git diff --stat tests/test_control_flow.rb
+tests/test_control_flow.rb | 29 ++++++++++++++++++++++++++++-
+ 1 file changed, 28 insertions(+), 1 deletion(-)
+[0m
+[0m$ [0mgit diff tests/test_control_flow.rb | head -12 | cat -A | grep -n '^-' | head -3
+3:--- a/tests/test_control_flow.rb$
+9:-end$
+[0m
+[0m$ [0mcargo fmt --all -- --check && echo "fmt PASS" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -2 && cargo test --all-targets 2>&1 | tee ./target/tmp/t3.log | grep -E 'FAILED' | head; grep '^test result' ./target/tmp/t3.log | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed:", p, "failed:", f}'
+fmt PASS
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.08s
+passed: 590 failed: 0
+[0m
+Now writing the report.
+[0m← [0mWrite phases/phase-030/REPORT.md
+Wrote file successfully.
+[0m
+[0m$ [0mgrep -n 'unclosed_unless\|unclosed-unclosed' phases/phase-030/REPORT.md
+49:| unclosed `unless` rejected by `rb lint` and `rb diagnostics` as an error, matching `if` | yes — `edge_an_unclosed_unless_is_rejected_by_the_linter_as_an_error`, `edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error`; both CLI paths emit `Expected End but got Eof`, byte-identical to the `if` equivalent |
+70:| `edge_an_unclosed_unclosed_unless_is_rejected_by_the_linter_as_an_error` | tooling — asserts a failure is produced by `rb lint` |
+71:| `edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error` | tooling — asserts `Severity::Error` and the line |
+[0m
+[0m← [0mEdit phases/phase-030/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-030/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-030/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-030/REPORT.md
+@@ -66,9 +66,9 @@
+ | `edge_unless_nests_inside_if_and_unless` | nesting — `unless` in `if`, both conditions |
+ | `edge_unless_without_end_is_a_spanned_parser_error` | **malformed_input** — asserts a failure, 4 sources, message names `End` |
+ | `edge_unless_with_a_missing_then_is_a_spanned_parser_error` | malformed_input — asserts a failure, message names `Then` |
+ | `edge_unless_rejects_else_because_its_body_has_no_alternative` | malformed_input — asserts a failure, no silently dropped branch |
+-| `edge_an_unclosed_unclosed_unless_is_rejected_by_the_linter_as_an_error` | tooling — asserts a failure is produced by `rb lint` |
++| `edge_an_unclosed_unless_is_rejected_by_the_linter_as_an_error` | tooling — asserts a failure is produced by `rb lint` |
+ | `edge_an_unclosed_unless_is_rejected_by_diagnostics_as_an_error` | tooling — asserts `Severity::Error` and the line |
+ | `unless_compiles_and_runs_the_same_on_both_vms` | the codegen branch I added; 6 conditions incl. `not` |
+ | `edge_unless_whose_body_never_runs_still_exits_its_block` | bytecode jump target must be ≤ the block's instruction count |
+ 
+
+[0m
+[0m← [0mWrite phases/phase-030/FINDINGS.md
+Wrote file successfully.
+[0m
+Now the FINDINGS.md for the out-of-scope items.
+Final verification of all gates and the DoD.
+[0m$ [0mcargo fmt --all -- --check && echo "GATE fmt: PASS"; cargo clippy --all-targets -- -D warnings 2>&1 | grep -E 'warning|error' || echo "GATE clippy: PASS"; cargo test --all-targets 2>&1 | grep '^test result' | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "GATE test:", p, "passed,", f, "failed"}'
+GATE fmt: PASS
+GATE clippy: PASS
+GATE test: 590 passed, 0 failed
+[0m
+[0m$ [0mrm -rf ./target/tmp/bytecode-test ./target/tmp/bytecode-vm-test ./target/tmp/*.rb ./target/tmp/*.log 2>/dev/null; git status --short; echo "=== untouched dirs ==="; git status --short .github rbops .opencode 2>/dev/null || echo "none touched"
+M src/analyzer.rs
+ M src/bytecode/codegen.rs
+ M src/formatter.rs
+ M src/linter.rs
+ M src/parser.rs
+ M src/vm.rs
+ M tests/redblue_suite_test.rs
+ M tests/test_control_flow.rb
+?? phases/phase-030/
+?? tests/unless_test.rs
+=== untouched dirs ===
+[0m
+[0m$ [0mprintf 'unless no then say "x"\nend\n' > ./target/tmp/d1.rb; cargo run -q --bin rb -- run ./target/tmp/d1.rb; echo "exit=$?"
+printf 'unless yes then say "x"\nend\n' > ./target/tmp/d2.rb; o=$(cargo run -q --bin rb -- run ./target/tmp/d2.rb); echo "exit=$? output='$o'"
+printf 'unless no then\n    say "a"\n' > ./target/tmp/d3.rb; cargo run -q --bin rb -- lint ./target/tmp/d3.rb; cargo run -q --bin rb -- diagnostics ./target/tmp/d3.rb
+Error: IoError: No such file or directory (os error 2)
+exit=1
+exit=0 output=''
+Error: line 3: Syntax error: Expected End but got Eof
+[{"line":3,"column":1,"severity":"error","message":"Expected End but got Eof"}]
+[0m
+The two calls raced on the scratch dir. Re-verifying cleanly:
+[0m$ [0mmkdir -p ./target/tmp && printf 'unless no then say "x"\nend\n' > ./target/tmp/d1.rb && printf 'unless yes then say "x"\nend\n' > ./target/tmp/d2.rb
+echo "--- unless no ---"; cargo run -q --bin rb -- run ./target/tmp/d1.rb; echo "exit=$?"
+echo "--- unless yes ---"; o=$(cargo run -q --bin rb -- run ./target/tmp/d2.rb); echo "exit=$? output='$o'"
+--- unless no ---
+x
+exit=0
+--- unless yes ---
+exit=0 output=''
+[0m
+[0m$ [0mrm -f ./target/tmp/d1.rb ./target/tmp/d2.rb ./target/tmp/d3.rb; git status --short; ls phases/phase-030/
+M src/analyzer.rs
+ M src/bytecode/codegen.rs
+ M src/formatter.rs
+ M src/linter.rs
+ M src/parser.rs
+ M src/vm.rs
+ M tests/redblue_suite_test.rs
+ M tests/test_control_flow.rb
+?? phases/phase-030/
+?? tests/unless_test.rs
+FINDINGS.md
+REPORT.md
+[0m
+DONE
+
+**Reproduced:** `ParserError: Unexpected token Unless` — `src/lexer.rs:25` emits the token, `src/parser.rs` had zero `TokenKind::Unless` arms.
+
+**Implemented** `Statement::Unless { condition, body }` across `src/parser.rs` (new `parse_unless()`, added to `opens_block()` so `MAX_BLOCK_DEPTH` bounds it), `src/vm.rs`, `src/analyzer.rs`, `src/linter.rs`, `src/formatter.rs`, `src/bytecode/codegen.rs`. Matches `docs/GRAMMAR.md:220` exactly: required `then`, no `else`. Codegen uses `Not` + `JumpIfFalse` because no `JumpIfTrue` exists.
+
+**Tests:** 15 `#[test]` in new `tests/unless_test.rs` + 3 Redblue blocks. Each class proven able to fail by mutation — inverting the VM condition gives 6 failures; deleting the codegen `Not` gives `the bytecode VM printed ["body"] for unless yes, expected []`.
+
+**One thing I fixed in passing and flagged:** `tests/redblue_suite_test.rs:28` kept a hand-written block-keyword list that omitted `unless`, so the harness silently truncated any test body containing it and wrongly reported "has no assertion". I couldn't add a Redblue-level test for this feature without fixing it. Residual class recorded in FINDINGS.md.
+
+**Gates:** `cargo fmt --check` pass · `cargo clippy --all-targets -- -D warnings` pass, zero warnings · `cargo test --all-targets` **590 passed, 0 failed** · `cargo test --doc` 1 passed · all `examples/*.rb` and `modules/*.rb` exit 0.
+
+**Gate 4 was not run: `rbops/` does not exist in this checkout** (`ls rbops/` → no such directory; `git ls-files | grep rbops/` → empty), and my instructions forbid looking for the pipeline elsewhere. REPORT.md records it as NOT RUN rather than claiming a pass.
