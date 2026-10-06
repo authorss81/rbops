@@ -1,0 +1,25 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Fixing the contract gap — now auditing the phase-019 diff for hidden defects.
+[0m→ [0mRead src/bytecode/opcode.rs
+[0m→ [0mRead src/bytecode/codegen.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/vm.rs
+I spotted a risky NOP overload that could corrupt try handling — now digging deeper to confirm the failure modes.
+[0m→ [0mRead docs/BYTECODE.md[90m [offset=160, limit=80][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [offset=2073][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1319][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [limit=120][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1940, limit=65][0m
+FINDINGS:
+1. [BLOCKER] src/bytecode/vm.rs:1004 — `Opcode::Nop` pops whatever handler is on top, and the failure path resumes AT the closing `NOP` (`set_ip(frame, target)` at line 1842), so after an inner-`try` failure is handled the inner `NOP` pops/runs the *outer* handler early: outer `finally` runs before the rest of the outer protected code and the outer region loses protection — fix by resuming past the closer (`target + 1`) or tagging each handler with its end offset so `NOP` only closes its own region
+2. [BLOCKER] src/bytecode/vm.rs:1926 — `end_try_after` treats *every* `NOP` as a region end; the comment that "the nesting count is what tells the two apart" is false — depth distinguishes nested closers, not filler vs closer — so a hand-crafted `.rbc` with a filler `NOP` inside protected code truncates the region on the failure path (and the success path at line 1004 does the same with no depth check at all) — fix with a distinct end-of-try marker/operand instead of overloading byte 0
+3. [BLOCKER] src/bytecode/vm.rs:1947 — bytecode `import` has no already-loaded set and re-compiles/runs the module on every import, so `import MathUtils` twice re-runs `DECLARE_CONST` and fails with `Constant 'PI' is already declared`, while tree-walker `Vm::load_module` at src/vm.rs:374 returns early as a no-op — fix by tracking loaded modules like the tree-walker does
+4. [MAJOR] src/bytecode/vm.rs:1325 — `store` calls `refuse_constant_rebind` *before* the loop-variable site check, contradicting its own comment that the refusal "is skipped on the loop-variable path" and diverging from src/vm.rs:507 where `set_var` writes a live local without refusal — `constant X to 1` + `for each X in [1,2]` shadows on the tree-walker but fails on bytecode — fix by moving the refusal after the `site` early-return so only the non-loop `bind` path refuses
+5. [MAJOR] tests/bytecode_vm_test.rs:2181 — `edge_a_nop_outside_a_try_does_not_run_an_enclosing_finally` claims "the filler `NOP` the program itself compiles to between the two `set`s" but `src/bytecode/codegen.rs:416` is the only `Nop` emission, so the program contains no interior `NOP` and the test cannot fail for the claimed reason — fix by hand-building a chunk with an interior `NOP` or dropping the false claim
+6. [MINOR] src/bytecode/vm.rs:1943 — `import` doc says "Only the `set` statements are kept" but `compile_module` at line 1991 keeps `Set | Constant` — fix the doc to match the code
+7. [MINOR] src/vm.rs:387 — `load_module` re-reads/re-parses the file via `module_program(path)?` after `module_bindings` at line 378 already read/parsed it, so a second IO/parse can fail after partial bindings were installed (TOCTOU) — fix by reusing the already-parsed program
+REVIEW VERDICT: FINDINGS 7
