@@ -340,15 +340,31 @@ cmd_run() {
   # and the phase got worse than starting clean.
   local resumed=0
   if in_project git rev-parse --verify -q "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
-    # Fresh clone + recovery strictly ahead of main means fast-forward, no
-    # conflicts possible. If it somehow fails, continue from clean main rather
-    # than wedging the run.
+    # Fast-forward first: cheap and conflict-free.
     if in_project git merge --no-edit --ff-only "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
       log "resumed from previous attempt (rbops-recovery/$phase)"
       touch "$(marker "$phase" .recovered)"
       resumed=1
+    elif in_project git merge --no-edit -m "merge recovered $phase into current main" \
+              "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
+      # Diverged but mergeable. This happens as soon as ANY other phase lands
+      # after a phase fails, so it is the common case, not the exotic one.
+      log "resumed from previous attempt (rbops-recovery/$phase, merged over newer main)"
+      touch "$(marker "$phase" .recovered)"
+      resumed=1
+    elif in_project git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+      # Conflicted. Hand the resolution to the agent rather than throwing the
+      # work away: phase-019's recovery held a 5629-line bytecode VM, and
+      # starting clean would mean re-deriving all of it. The gate still decides
+      # whether the resolved tree is any good.
+      log "resumed from previous attempt (rbops-recovery/$phase) WITH UNRESOLVED CONFLICTS"
+      in_project git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/    conflict: /' | head -10
+      touch "$(marker "$phase" .recovered)"
+      touch "$(marker "$phase" .conflict)"
+      resumed=1
     else
-      log "recovery branch present but would not fast-forward — starting clean"
+      in_project git merge --abort 2>/dev/null || true
+      log "recovery branch present but not usable — starting clean"
     fi
   fi
   if [ "$resumed" -eq 0 ] \
@@ -410,6 +426,28 @@ TPL
     # failed — otherwise it repeats the same failure. The prior REPORT.md names
     # the failing checks; the gate output below is quoted from the last run.
     if [ -f "$(marker "$phase" .recovered)" ]; then
+      if [ -f "$(marker "$phase" .conflict)" ]; then
+        cat <<TPL
+
+---
+## RESUMED WORK, WITH UNRESOLVED MERGE CONFLICTS — fix these first
+Your tree is the previous attempt's work merged onto newer \`main\`, and the merge
+did not resolve cleanly. Files containing conflict markers (\`<<<<<\`, \`=======\`,
+\`>>>>>>>\`) are already on disk:
+
+$(in_project git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^  - /')
+
+Before anything else:
+1. Open each conflicted file and resolve every marker.
+2. Keep BOTH intents. \`main\` has moved since the attempt was parked - usually a
+   new phase landed - so its version may contain work the attempt never saw.
+   Do not resolve by taking one side wholesale.
+3. Then continue and finish the phase as described below.
+
+The gate decides whether the resolved tree is acceptable. A conflict left
+unresolved will fail it.
+TPL
+      fi
       cat <<TPL
 
 ---

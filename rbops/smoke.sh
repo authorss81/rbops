@@ -60,8 +60,9 @@ build_fixture() {
 
   for d in "$PIPE" "$PROJ"; do
     ( cd "$d" && git init -q -b main . \
-      && git -c user.email=t@t -c user.name=t add -A \
-      && git -c user.email=t@t -c user.name=t commit -qm init ) >/dev/null 2>&1
+      && git config user.email t@t && git config user.name t \
+      && git add -A \
+      && git commit -qm init ) >/dev/null 2>&1
   done
 }
 
@@ -467,6 +468,62 @@ fi
 # attempt the gate evaluated. When both exist the complete one must win — a
 # stale WIP outranking it once made a retry inherit a broken tree and the
 # phase came out worse than starting clean.
+build_fixture >/dev/null; use_stubs
+# A recovery branch DIVERGED from main: both moved on. --ff-only cannot merge
+# that, and the old code then logged "starting clean" and silently discarded
+# phase-019's 5629-line bytecode VM. Divergence is the COMMON case - any other
+# phase landing after a failure causes it.
+( cd "$PROJ" \
+  && git checkout -q -b recovered \
+  && printf '// recovery side\n' >> src/vm.rs \
+  && git add -A && git commit -qm "recovered work" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git checkout -q main \
+  && printf '// main moved on\n' >> src/vm.rs \
+  && git add -A && git commit -qm "main moved on" ) >/dev/null 2>&1
+# The recovery commit MUST be made on its own branch. Committed while HEAD was
+# `main`, it would advance main and the ref would equal main's tip — the sanity
+# check below caught exactly that, which is the point of having it.
+# Sanity: the recovery tip must NOT be a descendant of main, or nothing is being
+# tested. (Getting this fixture wrong is how a check passes for the wrong reason.)
+if git -C "$PROJ" merge-base --is-ancestor origin/rbops-recovery/phase-001 HEAD 2>/dev/null; then
+  no "fixture is not actually diverged — recovery is already on main, nothing tested"
+else
+  ok "fixture is genuinely diverged (recovery is not a descendant of main)"
+fi
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+if printf '%s' "$out" | grep -q "resumed from previous attempt"; then
+  ok "a DIVERGED recovery branch is resumed, not discarded"
+else
+  no "the diverged recovery branch was dropped"; printf '%s' "$out" | grep -E 'recovery|clean' | head -3 | sed 's/^/      /'
+fi
+if printf '%s' "$out" | grep -q "starting clean"; then
+  no "it started clean and threw the work away"
+else
+  ok "it did not fall back to a clean start"
+fi
+# Both sides must survive the merge.
+if grep -q "recovery side" "$PROJ/src/vm.rs" && grep -q "main moved on" "$PROJ/src/vm.rs"; then
+  ok "both sides of the divergence are present after the merge"
+else
+  no "the merge dropped one side"
+fi
+# And the fast-forward case must still work — the merge path is an addition, not
+# a replacement.
+build_fixture >/dev/null; use_stubs
+( cd "$PROJ" \
+  && printf '// recovered work from attempt 1\n' >> src/vm.rs \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+if printf '%s' "$out" | grep -q "resumed from previous attempt"; then
+  ok "the fast-forward path still resumes"
+else
+  no "the fast-forward path regressed"
+fi
+
+# Precedence: with both a WIP and a recovery ref, the COMPLETE attempt wins.
 build_fixture >/dev/null; use_stubs
 ( cd "$PROJ" \
   && printf '// WIP: interrupted, does not compile\n#[ignore]\nfn half_done() {}\n' >> src/vm.rs \
