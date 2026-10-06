@@ -152,6 +152,47 @@ jobs:
           "$HOME/.opencode/bin/opencode" --version
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
 
+      - name: Give the agents their permissions
+        run: |
+          set -uo pipefail
+          # dispatch runs opencode with `--dir` pointing at the redblue checkout,
+          # and opencode resolves config from its working directory upward. The
+          # redblue clone has no opencode.json, so rbops/opencode.json was never
+          # read and every agent ran on DEFAULT permissions. The consequences were
+          # silent and severe:
+          #
+          #   ! permission requested: external_directory (.../modules/*); auto-rejecting
+          #   Error: The user rejected permission to use this specific tool call.
+          #
+          # phase-020 burned an attempt because its agent could not run its own
+          # verification commands. It is the same root cause as `--agent reviewer`
+          # resolving to nothing: config not visible from the working directory.
+          #
+          # The global config at ~/.config/opencode/opencode.json applies
+          # regardless of --dir, so this is the only place a permission can be set
+          # that reaches an agent. It deliberately carries NO agent definitions:
+          # the reviewer and auditor contracts are inlined into each request by
+          # dispatch (rbops/agents/*.md), so defining them here too would
+          # duplicate ~7KB of instructions per call.
+          mkdir -p "$HOME/.config/opencode"
+          cat > "$HOME/.config/opencode/opencode.json" <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "default_agent": "build",
+            "permission": {
+              "external_directory": { "**": "allow" },
+              "bash": "allow",
+              "edit": "allow",
+              "webfetch": "allow"
+            }
+          }
+          JSON
+          echo "::notice::wrote global opencode config (permissions apply regardless of --dir)"
+          # The config must still be valid JSON, or opencode may ignore it and we
+          # would be back to silent defaults.
+          python3 -c "import json,sys; json.load(open('$HOME/.config/opencode/opencode.json'))" \
+            || { echo "::error::global opencode config is not valid JSON"; exit 1; }
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
