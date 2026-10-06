@@ -36,6 +36,35 @@ Independently verify the pipeline's own integrity, because a compromised gate is
 - Does `phases/*/REPORT.md` claim a gate result that verify.sh does not actually run?
 Any finding here is severity BLOCKER and goes to phases.json first.
 
+### 3a. Re-check the exact failure modes that have already happened
+
+These are not hypothetical. Each of them shipped, and each was invisible until
+something else broke. Re-verify every one, every audit:
+
+1. **No checkpoint commits on redblue `main`.** Six
+   `rbops: phase-NNN checkpoint <ts>` commits were ancestors of main, carrying
+   unreviewed code, because the resume path did a real merge of `rbops-wip/*`.
+   Run `git log --oneline main | grep checkpoint`. Any hit is a BLOCKER.
+2. **No unreviewed work on `main`.** For each phase with a commit on main, the
+   phase should be `.done`. A phase whose code is merged but which is not
+   `.done` shipped without the reviewer. Report which, and why.
+3. **The gate really reads the manifest.** `verify.sh` once read every threshold
+   through `'"$JQ"'`, a single-quoted string containing the literal characters
+   `"$JQ"` — bash does not expand it, so each read failed and a hardcoded
+   fallback answered. Prove a read works: change nothing, but confirm that a
+   deliberately impossible floor makes the gate fail with THAT floor in the
+   message. If it still reports the default, the manifest is decorative.
+4. **Every manifest phase has a `PROMPT.md`, and every implementation phase
+   declares `must_touch`.** 11 phases once landed in the manifest with no
+   prompt and were unrunnable.
+5. **Every agent has its permissions.** opencode resolves config from its
+   working directory, and dispatch runs it with `--dir` at the redblue clone.
+   Confirm a global `~/.config/opencode/opencode.json` exists, or every agent
+   silently runs on defaults and cannot run its own commands.
+
+Report each as OK or BROKEN with the command that shows it. A safety audit that
+repeats last audit's findings without re-running anything is worthless.
+
 ## Step 3b — CHECK BOOTSTRAP READINESS. Do not infer it.
 
 You measure DEFECTS. That is not the same question as "is the language big
@@ -139,5 +168,30 @@ AUDIT: measured=<n files> tests=<n> untested_modules=<n> clippy=<n>
 AUDIT: promises_checked=<n> gaps_found=<n>
 AUDIT: phases_created=<n> ids=<comma list or none>
 AUDIT: next_phase=<the id you expect to run next, or none>
+AUDIT: integrity=<comma list of the 3a checks that are BROKEN, or none>
+AUDIT: bootstrap_reachable=<yes|no> unmet=<n> blocking=<ids or none>
+AUDIT: consecutive_unreachable_audits=<n> re_scope_needed=<yes|no>
 ```
+
+### The last three lines are a guard, not decoration
+
+The auditor has no notion of "enough". Left alone it extends the queue forever
+and nobody notices it has drifted, because every individual audit looks
+productive. So state reachability explicitly, every time:
+
+- `bootstrap_reachable=yes` means every item in every `bootstrap_requires` list
+  verified at runtime. Otherwise `no`, and `blocking=` names what stops it.
+- Count consecutive unreachable audits by grepping your own prior reports:
+
+      grep -l 'bootstrap_reachable=no' docs/audits/*.md | wc -l
+
+- At **two or more**, set `re_scope_needed=yes`. That is the signal for a human:
+  either the bootstrap floor is wrong, or the language needs work no phase has
+  been written for yet. Do NOT resolve it by quietly widening `bootstrap_requires`
+  — that is how the floor stops meaning anything.
+
+Never cap or suppress your own findings to make the queue drain. A defect you do
+not record does not go away; it comes back as a mystery failure that costs far
+more to diagnose than the phase would have. An honest long queue is cheaper than
+a short one with a hidden deficit.
 
