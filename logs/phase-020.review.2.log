@@ -2,31 +2,39 @@
 [0m
 > build · muse-spark-1.3-contributor-free
 [0m
-Round-2 review: hunting what the green gate still misses.
-[0m→ [0mRead tests/differential_test.rs
-[0m→ [0mRead tests/property_test.rs
-[0m→ [0mRead tests/common/corpus.rs
+Hunting the phase-020 gaps — verifying the green gate against the contract.
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead phases/phase-020/FINDINGS.md
+[0m→ [0mRead src/bytecode/codegen.rs
+Initial pass flags possible divergences — now digging into the harness and corpus.
 [0m→ [0mRead tests/common/vm.rs
-[0m→ [0mRead tests/common/rng.rs
-[0m→ [0mRead src/error.rs
-[0m→ [0mRead tests/common/shrink.rs
+[0m→ [0mRead tests/common/corpus.rs
+[0m→ [0mRead tests/differential_test.rs
 [0m→ [0mRead tests/common/generator.rs
-First pass shows the value comparison may be vacuous — now verifying the remaining details.
-[0m→ [0mRead corpus/0192-runtime_errors-08.rb
-[0m→ [0mRead corpus/0192-runtime_errors-08.expected
-[0m✱ [0mGrep "fn.*length|Length.*=>|say.*return|Ok\(Value::Nothing"[90m in src · 25 matches[0m
-[0m→ [0mRead src/vm.rs[90m [limit=160, offset=540][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [limit=80, offset=800][0m
-[0m✱ [0mGrep "fn run_isolated|fn run\(|ExprStatement|Statement::Expr"[90m in src · 13 matches[0m
-[0m→ [0mRead src/vm.rs[90m [limit=60, offset=390][0m
-[0m→ [0mRead src/bytecode/codegen.rs[90m [limit=40, offset=155][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [limit=40, offset=545][0m
-[0m✱ [0mGrep ""length"|length\(.*Value|fn.*length"[90m in src · 5 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=50, offset=235][0m
-[0m→ [0mRead src/runtime.rs[90m [limit=40, offset=265][0m
+[0m→ [0mRead tests/common/shrink.rs
+[0m→ [0mRead tests/common/rng.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1290][0m
+Core harness logic looks sound — now checking for blind spots in value and error handling.
+[0m→ [0mRead src/value.rs
+[0m→ [0mRead corpus/value-tails-0001.rb
+[0m→ [0mRead corpus/value-tails-0001.expected
+[0m→ [0mRead tests/common/mod.rs
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|\[.*\]"[90m in tests/common · 100 matches[0m
+[0m→ [0mRead phases/phase-020/REPORT.md[90m [limit=80][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=904, limit=35][0m
+[0m→ [0mRead corpus/numeric-boundary-0006.expected
+[0m→ [0mRead corpus/stdlib-0015.expected
+[0m✱ [0mGrep "fn resolve_max_|RB_MAX|env::var.*MAX|MAX_CALL_DEPTH|MAX_STEPS|MAX_ITERATIONS"[90m in src/vm.rs · 36 matches[0m
+Spotted several structural weaknesses — now pinning down exact locations for the verdict.
+[0m→ [0mRead tests/differential_test.rs[90m [offset=238, limit=20][0m
+[0m→ [0mRead src/vm.rs[90m [offset=60, limit=55][0m
+[0m→ [0mRead tests/common/generator.rs[90m [offset=627, limit=32][0m
+[0m→ [0mRead tests/common/generator.rs[90m [offset=800, limit=35][0m
 FINDINGS:
-1. [BLOCKER] tests/property_test.rs:154 — `random_statement` has no arm emitting a bare expression tail, so every generated `Ok` program ends in `set`/`say`/`if`/`repeat` whose value is `nothing` (cf. src/vm.rs:397) — the cross-VM value agreement is vacuous while phases/phase-020/FINDINGS.md §4 records `set t to 5 / say t / t` as `Ok("5")` on one VM and `Ok("nothing")` on the other, and REPORT.md claims 199 `nothing` values are "not a gap" — add a value-bearing tail arm and a corpus family ending in an expression, and assert `tree_walk == bytecode` on it instead of only `tree_walk` vs `.expected` as in tests/differential_test.rs:379.
-2. [MAJOR] tests/property_test.rs:117 — `typed_expression` for `Kind::Text` returns `(length(left) + length(left))`, a `Number`, contradicting the `random_statement` contract at tests/property_test.rs:144 that `n`/`t`/`b` keep their types — `set t to <number>` followed by `say length(t)` faults via src/runtime.rs:273, injecting accidental type faults instead of the deliberate `random_fault` mix — return `Text` here (e.g. `("" + ...)` or a text join) so the typed invariant holds.
-3. [MINOR] tests/property_test.rs:537 — `candidate.remove(index)` iterates byte indices `0..minimal.len()`, panicking on a non-char-boundary for any multibyte minimal (generator literals include `é`/`🎉` at tests/property_test.rs:138), aborting the test binary instead of failing — iterate `minimal.char_indices().map(|(i,_)| i)` as tests/common/shrink.rs:67 does with `chars`.
-4. [MINOR] tests/common/shrink.rs:54 — `candidate.join("\n")` drops a trailing newline (`str::lines` discards it), so every line-based candidate differs from source at EOF and EOF-span cases (`lines+1`, unterminated blocks) shrink against altered input — preserve the terminator (`if source.ends_with('\n') { joined.push('\n') }`).
-REVIEW VERDICT: FINDINGS 4
+1. [BLOCKER] tests/differential_test.rs:242 — `the_checked_in_corpus_is_the_one_the_generator_produces` never reads `corpus/` and only asserts `generated.len() >= 200`, so it passes even if the checked-in corpus differs, is stale, or disagrees between VMs — a test that cannot fail for its titled property — fix by loading `corpus::corpus()` and asserting the on-disk name+source set equals `generator::corpus_programs()`.
+2. [MAJOR] tests/common/vm.rs:108 — `Outcome.result` is `value.to_string()`, and src/value.rs:194 displays `Text(s)` raw while src/value.rs:184 displays `Nothing` as `nothing`, so `Number(5)` vs `Text("5")` and `Nothing` vs `Text("nothing")` compare equal and a type-confusion divergence is invisible — fix by comparing typed `Value` (or `format!("{:?}", value)`) instead of `Display`.
+3. [MAJOR] tests/common/vm.rs:42 — `failure_of` explicitly drops position and tests/common/corpus.rs:309 `compare` only checks `label: message` plus output, so a line/column regression on either VM is never compared — fix by recording `Error::span()` in `.expected` and asserting it in `compare`/`every_corpus_program_agrees_between_the_two_vms`.
+4. [MAJOR] tests/common/generator.rs:825 — the "expression tail" assertion checks `s.lines().any(...)` for any non-`set`/`say`/`end`/`for each` line, which `if ...`/`repeat ...` lines already satisfy, so it passes with zero bare-expression tails — fix by checking the last non-empty line of each program is a bare expression for some seed.
+5. [MAJOR] src/vm.rs:77 — `resolve_max_iterations`/`resolve_max_steps`/`resolve_max_call_depth` read `REDBLUE_*` env and tests/common/vm.rs:125 `bytecode()` uses `BytecodeVm::new()` (env-dependent), so corpus/determinism/differential outcomes change with env and the gate is env-coupled — fix by constructing both VMs with fixed limits (`with_max_steps`/`with_max_iterations`/`with_max_call_depth`) in the harness.
+6. [MAJOR] tests/differential_test.rs:477 — `edge_every_seed_produces_a_distinct_program` requires 320/320 distinct programs despite a tiny statement grammar and 6 fixed fault-tail strings, so a benign collision fails the gate and the current pass is luck — fix by asserting a high distinct ratio (e.g. >= 95%) rather than 100%.
+REVIEW VERDICT: FINDINGS 6
