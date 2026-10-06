@@ -451,8 +451,11 @@ out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
   || no "expected deferral, got $rc"
 [ -f "$PIPE/phases/phase-001/.recovered" ] \
   && ok ".recovered marker written" || no ".recovered marker missing"
-( cd "$PROJ" && git log --oneline -1 | grep -q "attempt 1" ) \
-  && ok "the preserved commit is in the tree" || no "preserved work not merged"
+if grep -q 'recovered work from attempt 1' "$PROJ/src/vm.rs" 2>/dev/null; then
+  ok "the preserved commit's content is in the tree"
+else
+  no "preserved work not merged"
+fi
 if grep -q "RESUMED WORK" "$PIPE"/logs/phase-001.ctx 2>/dev/null; then
   ok "the agent was told what it inherited"
 else
@@ -540,7 +543,7 @@ if printf '%s' "$out" | grep -q "resumed from previous attempt"; then
 else
   no "neither resume path logged"
 fi
-if printf '%s' "$out" | grep -q "merging WIP checkpoint"; then
+if printf '%s' "$out" | grep -q "squashing WIP checkpoint"; then
   no "the partial WIP checkpoint was merged over the complete attempt"
 else
   ok "the partial WIP checkpoint was not merged"
@@ -556,7 +559,7 @@ build_fixture >/dev/null; use_stubs
   && git update-ref "refs/remotes/origin/rbops-wip/phase-001" HEAD \
   && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
 out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
-if printf '%s' "$out" | grep -q "merging WIP checkpoint" \
+if printf '%s' "$out" | grep -q "squashing WIP checkpoint" \
    && grep -q "wip only" "$PROJ/src/vm.rs"; then
   ok "with only a WIP ref, the checkpoint is still resumed"
 else
@@ -1384,6 +1387,65 @@ while read -r id; do
 done < "$T/fa.txt"
 [ -z "$fa_missing" ] && ok "every exempt phase explains the exemption in its prompt" \
   || no "prompts omitting the exemption:$fa_missing"
+
+# =========================================================== 26. no checkpoint ancestry
+head_ "26. main never inherits checkpoint commits"
+# Six `rbops: phase-NNN checkpoint <ts>` commits are ancestors of redblue main
+# today, carrying unreviewed code. The cause was the resume path doing a REAL
+# `git merge` of rbops-wip/* inside the project clone, whose branch is main: the
+# merge recorded both parents, so the checkpoint commits became ancestors, and
+# the next successful push shipped them. Preserved work must be adopted by
+# CONTENT, not by importing a history of half-finished snapshots.
+build_fixture >/dev/null; use_stubs
+# A WIP branch made only of checkpoint commits, as the real one is.
+( cd "$PROJ" \
+  && printf '// half-finished work\n' >> src/vm.rs \
+  && TREE=$(git add -A >/dev/null 2>&1; git write-tree) \
+  && C=$(git commit-tree "$TREE" -p HEAD -m "rbops: phase-001 checkpoint 1700000000") \
+  && git update-ref "refs/remotes/origin/rbops-wip/phase-001" "$C" \
+  && git reset -q --hard HEAD ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+# `if ... fi` cannot be chained with &&, so each check stands alone.
+if ( cd "$PROJ" && git log --oneline ) | grep -q 'checkpoint 1700000000'; then
+  no "a checkpoint commit is in main's history"
+else
+  ok "the checkpoint commit is NOT in main's history"
+fi
+if ( cd "$PROJ" && git log --oneline ) | grep -q 'adopt WIP checkpoint'; then
+  ok "the work was adopted as a single-parent commit on main"
+else
+  no "no adopt commit — the WIP work may have been dropped"
+fi
+if grep -q 'half-finished work' "$PROJ/src/vm.rs" 2>/dev/null; then
+  ok "the WIP work itself was still applied"
+else
+  no "the WIP work was lost"
+fi
+# And the same must hold for a recovery branch, whose history can also contain
+# checkpoint merges from an earlier attempt.
+build_fixture >/dev/null; use_stubs
+# Build the checkpoint commit straight from the existing tree, so main's worktree
+# and index are never touched. Staging changes on main before branching makes
+# `git checkout rec` carry them across and the fixture stops meaning anything.
+( cd "$PROJ" \
+  && C=$(git commit-tree "$(git write-tree)" -p HEAD -m "rbops: phase-001 checkpoint 1700000001") \
+  && git branch rec "$C" \
+  && git checkout -q rec \
+  && printf '// real work\n' >> src/vm.rs \
+  && git add -A && git commit -qm "agent work" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git checkout -q main ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+if ( cd "$PROJ" && git log --oneline ) | grep -q 'checkpoint 1700000001'; then
+  no "a recovery branch dragged a checkpoint into main"
+else
+  ok "a recovery branch's checkpoint ancestry stays out of main"
+fi
+if grep -q 'real work' "$PROJ/src/vm.rs" 2>/dev/null; then
+  ok "the recovery branch's real work WAS adopted"
+else
+  no "the recovery branch's work was lost"
+fi
 
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"

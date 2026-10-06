@@ -340,19 +340,23 @@ cmd_run() {
   # and the phase got worse than starting clean.
   local resumed=0
   if in_project git rev-parse --verify -q "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
-    # Fast-forward first: cheap and conflict-free.
-    if in_project git merge --no-edit --ff-only "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
-      log "resumed from previous attempt (rbops-recovery/$phase)"
+    # --squash, never a real merge. A real `git merge` records BOTH parents, and
+    # when the preserved work came from a WIP checkpoint that branch's history is
+    # full of `rbops: phase-NNN checkpoint <ts>` commits. Merging it into the
+    # project clone's `main` made those checkpoints ancestors of main, and the
+    # next successful push shipped them: six of them are in redblue's history
+    # today, carrying unreviewed code. A squash stages the same content and
+    # commits it with main as the only parent, so the work is adopted and the
+    # checkpoint ancestry never reaches main.
+    #
+    # --squash also covers the fast-forward case, so this is one path, not two.
+    if in_project git merge --squash --no-edit "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
+      in_project git commit -q -m "resume $phase: adopt preserved work" >/dev/null 2>&1 || true
+      log "resumed from previous attempt (rbops-recovery/$phase, squashed onto main)"
       touch "$(marker "$phase" .recovered)"
       resumed=1
-    elif in_project git merge --no-edit -m "merge recovered $phase into current main" \
-              "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
-      # Diverged but mergeable. This happens as soon as ANY other phase lands
-      # after a phase fails, so it is the common case, not the exotic one.
-      log "resumed from previous attempt (rbops-recovery/$phase, merged over newer main)"
-      touch "$(marker "$phase" .recovered)"
-      resumed=1
-    elif in_project git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    elif in_project git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
+         || grep -qE '^(<<<<<<<|=======$|>>>>>>>)' "$PROJECT_DIR"/src/*.rs 2>/dev/null; then
       # Conflicted. Hand the resolution to the agent rather than throwing the
       # work away: phase-019's recovery held a 5629-line bytecode VM, and
       # starting clean would mean re-deriving all of it. The gate still decides
@@ -364,14 +368,24 @@ cmd_run() {
       resumed=1
     else
       in_project git merge --abort 2>/dev/null || true
+      in_project git reset -q --hard HEAD 2>/dev/null || true
       log "recovery branch present but not usable — starting clean"
     fi
   fi
   if [ "$resumed" -eq 0 ] \
      && in_project git rev-parse --verify -q "origin/rbops-wip/$phase" >/dev/null 2>&1; then
-    log "merging WIP checkpoint for $phase (partial work from a timeout)"
-    in_project git merge --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1 || true
-    touch "$(marker "$phase" .checkpoint)"
+    log "squashing WIP checkpoint for $phase (partial work from a timeout)"
+    # --squash here too, for the same reason: rbops-wip/* is nothing but
+    # checkpoint commits, and merging it for real is what put six of them into
+    # redblue main.
+    if in_project git merge --squash --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1; then
+      in_project git commit -q -m "resume $phase: adopt WIP checkpoint" >/dev/null 2>&1 || true
+      touch "$(marker "$phase" .checkpoint)"
+    else
+      in_project git merge --abort 2>/dev/null || true
+      in_project git reset -q --hard HEAD 2>/dev/null || true
+      log "WIP checkpoint would not apply cleanly — continuing from main"
+    fi
   fi
   {
     # The brief comes FIRST and is deliberately blunt. A weak model given a
