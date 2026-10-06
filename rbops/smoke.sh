@@ -1447,6 +1447,82 @@ else
   no "the recovery branch's work was lost"
 fi
 
+# =========================================================== 27. argv budget
+head_ "27. a large review context is capped, never passed raw"
+# run_agent passes the whole prompt as ONE argv string, and one string over
+# 128KB (MAX_ARG_STRLEN) fails execve with E2BIG no matter how small the total
+# is. A comment in dispatch.sh once claimed ~2MB (ARG_MAX) was safe; every
+# review of a large phase then died with
+# "/usr/bin/timeout: Argument list too long". phase-020's review was the proof.
+
+# (a) a 200KB uncommitted diff must be capped with markers, and the request must
+# stay under the 100KB budget. It must stay UNCOMMITTED: cmd_review captures
+# base at its own start, so anything committed beforehand is already in base and
+# the reviewed diff is empty — asserting on that would test nothing.
+build_fixture >/dev/null; use_stubs
+awk 'BEGIN{for(i=0;i<8000;i++)print "// filler line to inflate the diff beyond any argv budget, line " i}' >> "$PROJ/src/vm.rs"
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+cat <<'BODY'
+I checked the diff against the report and the gates.
+FINDINGS: none
+REVIEW VERDICT: CLEAN
+BODY
+echo "review done"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$(R)"
+if grep -q 'truncated:' "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null; then
+  ok "the oversize diff is capped with truncation markers"
+else
+  no "a 200KB diff went to the model uncapped"
+fi
+ctx_bytes="$(wc -c < "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null || echo 999999)"
+if [ "$ctx_bytes" -lt 100000 ]; then
+  ok "the request stays under the 100KB budget ($ctx_bytes bytes)"
+else
+  no "the request is $ctx_bytes bytes — over budget"
+fi
+case "$out" in
+  *"explicit CLEAN"*) ok "a capped CLEAN review still approves" ;;
+  *) no "capping broke the verdict path"; printf '%s\n' "$out" | tail -3 | sed 's/^/      /' ;;
+esac
+if grep -q 'File list (always complete' "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null; then
+  ok "the file list stays complete even when content is capped"
+else
+  no "no complete file list alongside the capped content"
+fi
+
+# (b) content that is STILL over budget after capping must defer loudly, not
+# crash with E2BIG. 25 untracked 16KB files cap at 8KB each = 200KB.
+build_fixture >/dev/null; use_stubs
+for i in $(seq 1 25); do
+  yes 'filler text line for argv budget test' | head -n 400 > "$PROJ/tests/big$i.txt" 2>/dev/null
+done
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+echo "this model call must never happen"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$(R)"
+case "$out" in
+  *"over the 100KB argv budget"*) ok "an uncappable request is refused loudly" ;;
+  *) no "no refusal for an over-budget request"; printf '%s\n' "$out" | tail -3 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"model chain unusable"*) ok "refusal defers without consuming an attempt" ;;
+  *) no "refusal did not take the defer path" ;;
+esac
+marker phase-001 .deferred && ok ".deferred written on refusal" || no ".deferred missing on refusal"
+marker phase-001 .attempts && no "an attempt was consumed by a refusal" || ok "no attempt consumed by a refusal"
+if grep -q 'Argument list too long' "$PIPE"/logs/phase-001.review.1.log 2>/dev/null; then
+  no "E2BIG still reached execve"
+else
+  ok "no E2BIG anywhere in the review log"
+fi
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

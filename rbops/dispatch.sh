@@ -148,6 +148,24 @@ bump()   { # bump <phase> <file>
   mkdir -p "$(dirname "$f")"; printf '%s' "$((n+1))" > "$f"
 }
 read_n() { local f; f="$(marker "$1" "$2")"; [ -f "$f" ] && tr -cd '0-9' < "$f" || printf '0'; }
+# Emit stdin capped at $1 bytes, with an honest marker when truncated.
+# run_agent passes the whole prompt as ONE argv string, and one string over
+# 128KB (MAX_ARG_STRLEN) fails execve with E2BIG regardless of the total size.
+# The review context bundles full diffs, so a large phase blows past that; the
+# markers below are what keep a truncation visible instead of silent.
+emit_capped() { # emit_capped <bytes> <label>
+  local cap="$1" label="$2" tmp total
+  tmp="$(mktemp)"
+  cat > "$tmp"
+  total="$(wc -c < "$tmp")"
+  if [ "$total" -le "$cap" ]; then
+    cat "$tmp"
+  else
+    head -c "$cap" "$tmp"
+    printf '\n[... truncated: %s of %s bytes shown for %s — full tree available in the clone ...]\n' "$cap" "$total" "$label"
+  fi
+  rm -f "$tmp"
+}
 
 # ------------------------------------------------------------------- selection
 # Priority:  1) .deferred (retry, cheapest continuity)
@@ -225,14 +243,18 @@ run_agent() {
   local prompt_file="${1:-}"; shift || true
   : > "$logfile"
   local m code pre post growth msg IFS=,
-  # ARG_MAX on Linux is ~2MB; AGENTS.md + PROMPT.md is ~25KB, so a positional
-  # message is safe. Guard anyway so a runaway ctx fails loudly, not obscurely.
+  # The real limit is MAX_ARG_STRLEN: one argv string over 128KB fails execve
+  # with E2BIG no matter how small the total is. A comment here once claimed a
+  # positional message was safe up to ~2MB (ARG_MAX); that confused the total
+  # with the per-string limit, and every review of a large phase died with
+  # "/usr/bin/timeout: Argument list too long". Guard far below it so a runaway
+  # ctx fails loudly, not obscurely.
   msg=""
   if [ -n "$prompt_file" ] && [ -f "$prompt_file" ]; then
     local bytes; bytes="$(wc -c < "$prompt_file")"
-    if [ "$bytes" -gt 500000 ]; then
-      log "prompt file is ${bytes} bytes — refusing to pass it as argv"
-      return 2
+    if [ "$bytes" -gt 100000 ]; then
+      log "prompt file is ${bytes} bytes — over the 100KB argv budget, deferring"
+      return 75
     fi
     msg="$(cat "$prompt_file")"
   fi
@@ -602,15 +624,32 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
         || printf '!! THE REVIEWER CONTRACT IS MISSING. Treat this review as INVALID.\n'
       printf -- '\n---\n\n'
       printf '## Change set for phase %s\n\n' "$phase"
-      printf '## 1. Committed changes (%s..HEAD)\n\n```diff\n' "$base"
-      in_project git diff --no-color "$base"..HEAD 2>/dev/null || printf '(none)\n'
+      printf '### File list (always complete — content below may be capped)\n\n```\n'
+      in_project git diff --no-color --numstat "$base"..HEAD 2>/dev/null || printf '(none committed)\n'
+      in_project git diff --no-color --numstat 2>/dev/null || printf '(none uncommitted)\n'
+      printf '```\n\n## 1. Committed changes (%s..HEAD)\n\n```diff\n' "$base"
+      in_project git diff --no-color "$base"..HEAD 2>/dev/null | emit_capped 40000 'committed diff' || printf '(none)\n'
       printf '```\n\n## 2. Uncommitted tracked changes\n\n```diff\n'
-      in_project git diff --no-color 2>/dev/null || printf '(none)\n'
-      printf '```\n\n## 3. Untracked files (full contents)\n\n'
+      in_project git diff --no-color 2>/dev/null | emit_capped 20000 'uncommitted diff' || printf '(none)\n'
+      printf '```\n\n## 3. Untracked files (capped at 8KB each)\n\n'
+      # git collapses a wholly-untracked directory to ONE `?? dir/` line. Without
+      # expansion the reviewer sees `(unreadable)` for every new file in a new
+      # directory — exactly where a phase like bootstrap/ puts its work.
       in_project git status --porcelain 2>/dev/null | grep '^??' | sed 's/^?? //' | while read -r f; do
-        printf -- '--- %s\n```\n' "$f"
-        cat "$PROJECT_DIR/$f" 2>/dev/null || printf '(unreadable)\n'
-        printf '```\n'
+        if [ -d "$PROJECT_DIR/$f" ]; then
+          find "$PROJECT_DIR/$f" -type f | sort | while read -r gf; do
+            rel="${gf#$PROJECT_DIR/}"
+            printf -- '--- %s\n```\n' "$rel"
+            emit_capped 8000 "untracked file $rel" < "$gf"
+            printf '```\n'
+          done
+        elif [ -f "$PROJECT_DIR/$f" ]; then
+          printf -- '--- %s\n```\n' "$f"
+          emit_capped 8000 "untracked file $f" < "$PROJECT_DIR/$f"
+          printf '```\n'
+        else
+          printf -- '--- %s\n(unreadable)\n' "$f"
+        fi
       done
       printf '\n## 4. The phase REPORT.md\n\n'
       cat "$RBOPS_ROOT/phases/$phase/REPORT.md" 2>/dev/null || printf '(missing)\n'
@@ -622,6 +661,8 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     local rc_round=$?
     if [ "$rc_round" = "75" ]; then
       log "review round $round: model chain unusable — deferring, no attempt consumed"
+      bump "$phase" .deferred_attempts
+      touch "$(marker "$phase" .deferred)"
       return 42
     fi
 
@@ -637,10 +678,13 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     # A review that cannot be parsed must not be able to approve anything.
     local rlog="$LOG_DIR/$phase.review.$round.log"
     local has_sev has_clean has_verdict blocking
-    has_sev="$(grep -coE '\[(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\]|\*\*?(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL|MAJOR):' "$rlog" 2>/dev/null || echo 0)"
-    has_clean="$(grep -ciE 'FINDINGS: *none|REVIEW VERDICT: *CLEAN' "$rlog" 2>/dev/null || echo 0)"
-    has_verdict="$(grep -ciE '^[[:space:]]*REVIEW VERDICT: *(CLEAN|FINDINGS)' "$rlog" 2>/dev/null || echo 0)"
-    blocking="$(grep -coE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL):' "$rlog" 2>/dev/null || echo 0)"
+    # NOTE: no `|| echo 0` here. `grep -c` already prints 0 on no match (and
+    # exits 1 doing it), so `|| echo 0` would append a SECOND line and leave
+    # "0\n0" in the variable, which breaks every `[ ... -gt 0 ]` below.
+    has_sev="$(grep -coE '\[(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\]|\*\*?(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL|MAJOR):' "$rlog" 2>/dev/null)"; has_sev="${has_sev:-0}"
+    has_clean="$(grep -ciE 'FINDINGS: *none|REVIEW VERDICT: *CLEAN' "$rlog" 2>/dev/null)"; has_clean="${has_clean:-0}"
+    has_verdict="$(grep -ciE '^[[:space:]]*REVIEW VERDICT: *(CLEAN|FINDINGS)' "$rlog" 2>/dev/null)"; has_verdict="${has_verdict:-0}"
+    blocking="$(grep -coE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL):' "$rlog" 2>/dev/null)"; blocking="${blocking:-0}"
 
     if [ "$blocking" -gt 0 ]; then
       log "review round $round: $blocking blocking finding(s) - fixing"
