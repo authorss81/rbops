@@ -1,0 +1,17 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Adversarial review underway — hunting the break/skip diff for hidden faults.
+[0m→ [0mRead tests/loop_control_test.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=250, offset=1450][0m
+[0m→ [0mRead tests/test_loop_control.rb
+[0m→ [0mRead tests/test_lists.rb
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=350, offset=1250][0m
+FINDINGS:
+1. [BLOCKER] src/vm.rs:672 — `Statement::If` runs each branch as a plain `for stmt in then_branch/else_branch { execute_statement }` with no `loop_control` check, so `break`/`skip` followed by more statements in the same `if` block still executes them (e.g. `if c then break; say "leaked" end` prints) while `run_iteration_body` at src/vm.rs:407 only stops between top-level body statements — concrete fix: check and propagate `loop_control.take()` inside `If`/`execute_statements` branches and abort the block.
+2. [BLOCKER] src/vm.rs:800 — `Statement::Try` runs body/catch/finally via `execute_statements` at src/vm.rs:866 which never checks `loop_control`, so `try break; say "x" end` inside a loop still runs `say`, and a `break` inside a `try` body does not abort the rest of that protected region — concrete fix: make `execute_statements` stop and bubble the pending `Break`/`Skip` signal like `run_iteration_body` does.
+3. [BLOCKER] src/vm.rs:402 — `run_iteration_body` does `push_scope()` then `execute_statement(stmt)?` with no `pop_scope` on the `Err` path, and the pending `loop_control` flag at src/vm.rs:409 is only `take()`n on success, so any error after a raised signal (e.g. `try { break } finally { fail }`) leaks both the per-turn scope and a stale `Break`/`Skip` that the next loop's first turn will spuriously consume — concrete fix: pop the scope and clear/save `loop_control` on the failing path (and save/restore it in `call_user_function` at src/vm.rs:1165 alongside `loop_depth`).
+4. [BLOCKER] src/bytecode/vm.rs:1563 — `abandon_handlers` pops to `frames[frame].handler_base`, i.e. every handler in the frame, so a `break`/`skip` inside `try { for each ... { break } ... }` drops and runs the `finally` of the outer `try` that encloses the loop even though execution stays inside its protected region, while the tree-walker keeps it installed — the existing `break inside a try` test only covers `try`-inside-loop, never loop-inside-`try` — concrete fix: pop only handlers installed inside the loop body being left.
+REVIEW VERDICT: FINDINGS 4
