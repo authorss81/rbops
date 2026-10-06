@@ -426,6 +426,23 @@ TPL
         printf '\n### Previous REPORT.md (do not trust its gate claims — verify them)\n\n```\n'
         cat "$RBOPS_ROOT/phases/$phase/REPORT.md"
         printf '\n```\n'
+      else
+        # phase-019 spent three attempts and ~30 minutes re-running an 8-minute
+        # model to produce 5629 lines of bytecode VM with 461 green tests, and
+        # failed all three times for exactly one reason: it never wrote
+        # REPORT.md, so the gate refused a phase with no report. The work was
+        # preserved and fine; only the paperwork was missing. Without this line
+        # the resumed agent gets "fix exactly what failed" and no report to read,
+        # so it cannot know the failure was paperwork rather than code.
+        printf '\n### THE PRIOR ATTEMPT HAD NO REPORT.md — that alone failed the phase\n\n'
+        printf 'The gate rejects a phase with no REPORT.md, whatever else it achieves.\n'
+        printf 'Your code may already be correct and complete. Do NOT rewrite it.\n\n'
+        printf 'Your first and cheapest job is to WRITE %s/phases/%s/REPORT.md\n' "$PROJECT_DIR" "$phase"
+        printf 'describing the work already in the tree, following AGENTS.md section 4\n'
+        printf 'exactly: the "What changed", "Tests added", "Gates" and\n'
+        printf '"Known gaps / follow-ups" sections, with real evidence rows.\n'
+        printf 'Report the test counts you actually observe. Do not claim a gate you\n'
+        printf 'did not run. Only then consider whether the work itself needs changes.\n'
       fi
     fi
   } > "$LOG_DIR/$phase.ctx"
