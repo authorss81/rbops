@@ -36,6 +36,41 @@ Independently verify the pipeline's own integrity, because a compromised gate is
 - Does `phases/*/REPORT.md` claim a gate result that verify.sh does not actually run?
 Any finding here is severity BLOCKER and goes to phases.json first.
 
+## Step 3b — CHECK BOOTSTRAP READINESS. Do not infer it.
+
+You measure DEFECTS. That is not the same question as "is the language big
+enough to host a compiler", and you will never answer the second one by
+stumbling across TODO comments.
+
+A phase in the manifest may carry `bootstrap_requires`: concrete capabilities
+with file:line evidence, e.g.
+
+    "bootstrap_requires": [
+      "comparison operators lex and compare - verified absent: say 1 == 1 raises LexerError",
+      "`break` exits its loop - verified absent: Statement::Break is a TODO no-op"
+    ]
+
+For every such list:
+
+1. Run each requirement's own command. Do NOT read the code and conclude it
+   works — verify it at runtime. A declared-but-unused token, enum variant or
+   struct field is this codebase's signature defect: phase-001 found
+   `Expr::Expect` declared in the parser with no construction site. An audit
+   that called `==` working because `TokenKind::Equal` exists is wrong;
+   `say 1 == 1` raising `LexerError: Unexpected character '='` is the fact.
+2. If a requirement is unmet and no phase covers it, CREATE a phase for it with
+   the failing command in `finding`. That is the point of this step: the
+   bootstrap phase's dependency list is maintained by hand and goes stale, so
+   this is what keeps it honest as you add phases.
+3. If a requirement is ALREADY met, say so in your report. Do not create a phase
+   for work that is done.
+4. If a requirement cannot be verified, say that explicitly instead of assuming
+   it holds.
+
+A language that cannot compare values, cannot `break` out of a loop and has no
+modules cannot host a compiler written in itself. Say that plainly in your
+report when it is true — it is the most useful thing you can tell anyone.
+
 ## Step 4 — GENERATE PHASES. Append to rbops/phases.json.
 
 For each finding, append an object with EXACTLY this shape:

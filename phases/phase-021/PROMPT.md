@@ -6,7 +6,7 @@
 |---|---|
 | Severity | `major` |
 | Risk | `critical` |
-| Depends on | phase-020, phase-025, phase-028, phase-030, phase-031, phase-034 |
+| Depends on | phase-020, phase-025, phase-028, phase-030, phase-031, phase-034, phase-026, phase-027 |
 | Timeout | 600 min |
 | Must change | `src/ or bootstrap/` |
 
