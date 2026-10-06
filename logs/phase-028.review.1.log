@@ -1,0 +1,43 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Adversarial review underway — hunting for fake completions and silent failures in the range-loop diff.
+[0m→ [0mRead src/value.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/parser.rs
+[0m→ [0mRead src/bytecode/vm.rs
+First pass looks structurally sound — now probing the parser edge cases and dual-VM agreement.
+[0m→ [0mRead tests/for_range_test.rs[90m [limit=120][0m
+[0m→ [0mRead tests/numeric_edge_test.rs
+[0m✱ [0mGrep "ForRange"[90m 25 matches[0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=190, limit=110][0m
+[0m→ [0mRead src/linter.rs[90m [offset=235, limit=40][0m
+[0m→ [0mRead src/formatter.rs[90m [offset=270, limit=60][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=230, limit=90][0m
+[0m✱ [0mGrep "\bBy\b|\"by\"|KEYWORDS"[90m 28 matches[0m
+[0m→ [0mRead tests/for_range_test.rs[90m [offset=120, limit=250][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1300, limit=220][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=1, limit=120][0m
+[0m→ [0mRead tests/for_range_test.rs[90m [offset=370, limit=210][0m
+Spotted a dead token variant and a possible parser blind spot — now verifying whether they're reachable defects.
+[0m→ [0mRead SPEC.md[90m [offset=375, limit=50][0m
+[0m✱ [0mGrep "TokenKind::By"[90m 2 matches[0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1271, limit=30][0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=140, limit=60][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=300, limit=80][0m
+[0m✱ [0mGrep "range-with-non-numeric-bounds|range-backwards|range-with-a-step|range-of-one"[90m 9 matches[0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=143, limit=60][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [offset=420, limit=80][0m
+[0m✱ [0mGrep "fn run_corpus|compare|both VMs|tree.*bytecode|BytecodeVm.*Vm|Vm.*BytecodeVm"[90m 100 matches[0m
+The cross-VM comparison looks functional — now checking for untested error paths and span precision.
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [offset=35, limit=85][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [offset=1563, limit=80][0m
+FINDINGS:
+1. [MAJOR] src/bytecode/vm.rs:186 — counter-overflow is raised before the body runs (`take` advances via `finite_number` and returns `Err` before yielding the value), while the tree-walker binds the current value and runs the body first (src/vm.rs:647 binds via `Value::number`, src/vm.rs:655 advances after the body) — for `for each i from 1e308 to 1.5e308 by 1e308` the tree VM prints the finite value then errors, the bytecode VM errors with no output, so output+error diverge while the differential corpus (which compares both) contains no overflow case and `edge_a_step_that_overflows_the_counter_is_a_runtime_error` asserts only the tree VM's message — concrete fix: advance the bytecode counter after the body (or check before binding in both) so both agree, and add the overflow source to the differential corpus asserting equal output and equal failure.
+2. [MAJOR] src/parser.rs:785 — `parse_loop_body` imposes no header terminator, so trailing tokens after a complete range header are parsed as body statements instead of a `ParserError`: `for each i from 1 to 10 by 5 by 6` treats the second `by 6` as body, and `for each i from 1 to 3 foo` (with `foo` bound) silently runs with no-op body reads — the phase claims malformed-input coverage but no `edge_*` test covers trailing tokens after a valid header — concrete fix: require newline/`end` after the optional step before `parse_loop_body`, and add `edge_a_second_by_after_the_step_is_a_parser_error` (would settle it: that source must fail to parse).
+3. [MINOR] src/bytecode/vm.rs:187 — `take` returns `Value::Number(value)` for the loop value unchecked (and src/bytecode/vm.rs:151 `peek` builds `Value::Number(*current)` unchecked), while the tree-walker binds each turn through `Value::number` (src/vm.rs:647); unreachable from Redblue source today only because every evaluated number passes the finite gate, but the "one definition, two callers" claim is incomplete and a non-finite `current` (host-built `Value`, crafted chunk) would bind an illegal loop variable in one VM and error in the other — concrete fix: check the yielded value with `finite_number`/`Value::number` in `take` as well as the advanced counter.
+4. [MINOR] tests/for_range_test.rs:528 — `a_range_variable_does_not_collide_with_an_outer_binding` builds a Rust-side `HashMap`, inserts `"i"`, and asserts on it (tests/for_range_test.rs:528-530,543-547), which the loop never touches, so those assertions cannot fail regardless of interpreter behavior and pad the determinism row — concrete fix: delete the `HashMap` lines and keep only the VM output assertion.
+5. [STYLE] src/parser.rs:772 — `at_range_step_marker` matches `TokenKind::By`, but the lexer never emits it (`by` is absent from `KEYWORDS`, src/lexer.rs:14-69, and `keyword()` at src/lexer.rs:316 only produces table kinds), so the arm is dead code added by this phase — concrete fix: remove the `TokenKind::By` arm and keep only the positional `Identifier("by")` check.
+REVIEW VERDICT: FINDINGS 5
