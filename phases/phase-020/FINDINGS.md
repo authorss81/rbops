@@ -1,276 +1,170 @@
 # phase-020 — FINDINGS
 
-Five defects in `src/`, found by the harness this phase added rather than by
-reading the code. Four were out of this phase's declared area
-(`must_touch: ["tests/"]`) and are recorded for the auditor to promote. **§4 is
-the exception: it was fixed in round 2**, because the round-2 review asked for
-`tree_walk == bytecode` asserted on a program ending in an expression and no
-change confined to `tests/` can make that true while the two VMs disagree. Two
-further entries are not in `src/`: §4b is three broken arms in the property
-generator, and §6 is about the phase contract itself.
+Work that belongs to another phase. Nothing here was done, because AGENTS.md §1
+rule 7 says another phase's work is recorded rather than smuggled into this one,
+and rule 8 says not to widen scope. Each item is anchored to a file:line that was
+actually read.
 
-Each carries the exact command that reproduces it. Every reproduction is a
-program the corpus deliberately avoids generating, because a corpus that
-records a missing feature as though it were the specification is worse than a
-smaller corpus — with one exception now that §4 is fixed: the `values` family
-generates programs that end in a bare expression on purpose, because that shape
-is the specification, not the defect.
+## 1. The two VMs disagreed about what a program is worth — **fixed here**
 
----
-
-## 1. MAJOR — `return` / `give back` inside a nested block does not return
-
-A `return` inside an `if`, `while`, `repeat` or `for each` evaluates its
-expression and then throws the value away. The enclosing function carries on and
-returns whatever its last statement produced.
+This is the one item that *was* fixed, and fixing it is a deliberate departure
+from the phase's declared `must_touch: ["tests/"]`. It is called out here because
+the decision belongs to the auditor.
 
 ```
-$ printf 'to f(n)\n    if n is 0 then\n        give back 1\n    end\n    give back 2\nend\nsay f(0)\n' > /tmp/ret.rb
-$ cargo run --bin rb -- run /tmp/ret.rb
-2                      <- the function returned 2; it must return 1
+$ cargo run --bin rb -- run /dev/stdin   # conceptually:
+set t to 5
+say t
+t
+  tree-walking VM: Ok("5")
+  bytecode VM:    Ok("nothing")
 ```
 
-`return` inside a loop, which is the common case:
+`src/bytecode/vm.rs:916` threw the last frame's value away unless the frame was a
+*call*, so the top-level frame — which is not a call — always answered `nothing`.
+`src/vm.rs:397` (`Vm::run`) keeps the value of its last statement, so the two
+disagreed on every program ending in a bare expression.
+
+Two further leaks became visible the moment the value stopped being discarded:
+
+- `src/bytecode/vm.rs:1526` — `SET_PROPERTY` popped the value but not the
+  receiver, though `docs/BYTECODE.md:180` says it "pops a value and an object"
+  and that "a statement leaves nothing behind". A program ending in
+  `set r.a to 2` was worth a record.
+- `src/bytecode/codegen.rs:104` — `statements` treated the last statement of
+  *every* block as value-bearing, so `if n is 1 then / 7 / end` left `7` on the
+  enclosing frame's operand stack. A block statement is worth nothing whatever
+  its body produced.
+
+All three are fixed, in 22 lines and 54 lines respectively, and each fix is
+mutation-checked (see `REPORT.md`). The reason it is in this phase: the
+definition of done is a *differential* harness, and a harness that cannot
+compare what a program is worth on both VMs is not a differential harness. The
+alternative was to route around the divergence — compare printed lines only — and
+a corpus that routes around a divergence has not tested it.
+
+This matters for S3 specifically: two VMs that disagree about a program's value
+make a byte-identical fixed point vacuous, because "identical" would then have
+two meanings.
+
+## 2. `Expr::InterpolatedText` is unreachable from Redblue source
+
+`src/parser.rs:56` declares the variant; `src/vm.rs:830`, `src/analyzer.rs:388`,
+`src/linter.rs:373`, `src/formatter.rs:542` and `src/bytecode/codegen.rs:525` all
+handle it. **No parser path constructs it.** `say "n is {n}"` prints `n is {n}`
+with the braces intact, and `examples/hello.rb:12` does exactly that:
 
 ```
-$ printf 'to g()\n    set i to 0\n    while i is not 3\n        set i to i + 1\n        if i is 2 then\n            return i\n        end\n    end\n    return 99\nend\nsay g()\n' > /tmp/ret2.rb
-$ cargo run --bin rb -- run /tmp/ret2.rb
-99                     <- the function ran to the end and returned 99
+$ printf 'set n to 2\nsay "n is {n}"\n' > /tmp/i.rb && cargo run -q --bin rb -- run /tmp/i.rb
+n is {n}
 ```
 
-Mechanism, two lines of it:
+`AGENTS.md` §2 lists "trailing-comma and `{interp}` string syntax" as an
+invariant, so this is a **spec drift**: `SPEC.md` and `examples/hello.rb` promise
+interpolation and the parser does not do it. It belongs to a grammar phase, not to
+a test-harness phase, and the corpus deliberately records the *actual* behaviour
+rather than the promised one — a corpus is a record of what the interpreter does,
+and a phase that "fixed" it would change 264 recorded expectations.
 
-- `src/vm.rs:688` — `Statement::Return(expr) | Statement::GiveBack(expr)` is
-  *an expression*, not an unwind: it evaluates `expr` and yields the value.
-- `src/vm.rs:586` — `Statement::If` runs the chosen branch with
-  `for stmt in then_branch { self.execute_statement(stmt)?; }` and then yields
-  `Value::Nothing`, discarding what the branch produced. `Statement::ForEach`
-  (`src/vm.rs:609`), `Statement::Repeat` (`src/vm.rs:660`), `Statement::While`
-  (`src/vm.rs:673`) and `Statement::Object` (`src/vm.rs:776`) do the same.
+Note that `tests/bytecode_test.rs:1373` already records the variant as
+unreachable, so this is known, not new. What is new is that it is a documented
+invariant that does not hold.
 
-So an early return can only work as the *last* statement of a function body.
-Everything else — a guard clause, a loop that has found its answer — silently
-does the wrong thing.
+## 3. `<`, `>`, `<=`, `>=` and `!`/`&&` are lexed as errors
 
-The bytecode VM has the same shape (`src/bytecode/vm.rs:1572`, `call_named`, and
-`Opcode::Return` at `src/bytecode/vm.rs:1152`), and `src/bytecode/codegen.rs:292`
-emits the return into the branch's own instruction list with no unwind edge, so
-both VMs agree on the wrong answer. The differential corpus cannot catch this:
-agreement is not correctness. It was caught by writing `fact` in the obvious
-way and watching it recurse to the depth limit.
-
----
-
-## 2. MAJOR — the registered `Value::Builtin` stdlib is not callable
-
-`abs`, `floor`, `ceil`, `round`, `sqrt`, `pow`, `sin`, `cos`, `tan`, `log`,
-`exp`, `uppercase`, `lowercase`, `trim`, `split`, `join`, `push`, `pop`,
-`shift`, `map`, `filter`, `reduce`, `is_text`, `is_list`, `to_text`, `to_list`
-and others are all registered as globals — and none of them can be called from
-Redblue source.
+`src/lexer.rs:142` declares `TokenKind::Less` and `Greater`, and
+`src/parser.rs:1250`+ consumes them — but the lexer never produces them:
 
 ```
-$ printf 'say abs(-3)\n' > /tmp/abs.rb
-$ cargo run --bin rb -- run /tmp/abs.rb
-Error: RuntimeError: Unknown function 'abs'
-
-$ printf 'say uppercase("hi")\n' > /tmp/up.rb
-$ cargo run --bin rb -- run /tmp/up.rb
-Error: RuntimeError: Unknown function 'uppercase'
+$ printf 'say 1 < 2\n' > /tmp/l.rb && cargo run -q --bin rb -- run /tmp/l.rb
+Error: LexerError: Unexpected character '<'
+$ printf 'say 1 is less than 2\n' > /tmp/l2.rb && cargo run -q --bin rb -- run /tmp/l2.rb
+Error: AnalyzerError: Unknown variable 'less' (Unknown variable 'than')
 ```
 
-Mechanism:
+`docs/GRAMMAR.md` §1.5 lists all of them (`<`, `<=`, `>`, `>=`, `&&`, `!`, and
+`is less than` as spelled words). So is any of the six comparison or logical
+operators the spec promises. The corpus uses `is`, `is not`, `and`, `or` and
+`not`, which is what the interpreter actually accepts.
 
-- `src/stdlib.rs:22` (and every `globals.insert(... Value::Builtin ...)` after
-  it) binds the name to `Value::Builtin("name")`.
-- `src/vm.rs:870`, `Vm::call`, asks `runtime::builtin` first, and then matches
-  `Some(Value::Function(..))` only. A `Value::Builtin` global reaches the `_`
-  arm and becomes `Unknown function '<name>'`.
-- `src/bytecode/vm.rs:1572`, `call_named`, has the identical shape, so both VMs
-  fail the same way — no divergence, just a stdlib nobody can reach.
-- `src/stdlib.rs:210`, `builtin_function`, *is* the implementation, and it is
-  never called by either VM. Its only callers are
-  `tests/numeric_edge_test.rs:390,395,400` — so `sqrt` has a passing unit test
-  and no reachable path from the language.
+A grammar phase, not a test phase. Recorded with the line numbers so it does not
+have to be re-found.
 
-`runtime::builtin` (`src/runtime.rs:263`) implements a disjoint and much smaller
-set by name (`say`, `length`, `type_of`, `input`, `random`, `files_*`,
-`time_*`, `json_*`, `csv_*`, `network_*`, `expect`, `assert`, `console_*`).
-Everything the contract in `AGENTS.md` lists under *Math Functions* and *Text
-Functions* is therefore unreachable, which is also why this phase's corpus
-generator had to be restricted to `length` and `type_of`.
-
----
-
-## 3. MAJOR — `break` and `skip` are no-ops
+## 4. Trailing tokens on a line are silently accepted
 
 ```
-$ printf 'set total to 0\nfor each x in [1, 2, 3]\n    if x is 2 then\n        break\n    end\n    set total to total + x\nend\nsay total\n' > /tmp/brk.rb
-$ cargo run --bin rb -- run /tmp/brk.rb
-6                      <- the loop ran to the end; breaking at 2 gives 1
+$ printf 'say 1 2 3\n' > /tmp/t.rb && cargo run -q --bin rb -- run /tmp/t.rb
+1
 ```
 
-`src/vm.rs:680` and `src/vm.rs:684`:
+`say 1 2 3` prints `1` and the *program* is worth `3`. `docs/GRAMMAR.md` puts one
+statement on a line, so `2` and `3` should be refused. This is a grammar question
+rather than a divergence — both VMs agree on the wrong answer — and fixing it
+would change what programs parse, so it needs a phase that says so.
 
-```rust
-Statement::Break => {
-    // TODO: Implement proper control flow
-    Ok(Value::Nothing)
-}
-Statement::Skip => {
-    // TODO: Implement proper control flow
-    Ok(Value::Nothing)
-}
-```
-
-`skip` has the same fate — a `for each` that prints every element skipped none.
-
-This is **not** a divergence: the bytecode VM deliberately agrees.
-`src/bytecode/codegen.rs:282` emits `Opcode::Break`, and
-`src/bytecode/vm.rs:1495` `break_loop` is a no-op whose doc comment says why —
-"the two VMs disagreeing about what a program means is worse than a language
-feature being unfinished". So the gap is a missing language feature, agreed on
-by both implementations, and phase-019 recorded it. It is repeated here because
-`AGENTS.md` §3.2 asks for the resource/state row to be justified, and because
-this phase's `loop_forms` family has to route around it: its loops are bounded
-by a counter, not by `break`, and `tests/common/generator.rs` says so at
-`loop_forms`.
-
----
-
-## 4. MAJOR — FIXED IN ROUND 2 — trailing tokens after an expression are silently accepted, and the two VMs then disagree
+## 5. `give back` inside a conditional does not return, so recursion cannot terminate
 
 ```
-$ printf 'say 1 2 3\n' > /tmp/trailing.rb
-$ cargo run --bin rb -- run /tmp/trailing.rb
-1                      <- `2 3` is parsed as two more expression statements
-
-$ cargo run --bin rb -- compile /tmp/trailing.rb -o /tmp/trailing.rbc
-$ cargo run --bin rb -- vm /tmp/trailing.rbc
-1                      <- same output ...
+to down(n)
+    if n is 0 then
+        give back 0
+    end
+    give back down(n - 1) + 1
+end
+say down(3)
+  → RuntimeError: Maximum call depth of 1000 reached while calling 'down'
 ```
 
-but the two disagree on what the program *returned*, which is what
-`rb run`/`rb vm` compare in the harness:
+`src/bytecode/vm.rs:1560` documents the bytecode half of it ("`return` is an
+ordinary statement in Redblue, not an escape") and both VMs agree, so no
+differential harness can catch it: it is a limitation of the language, not a
+divergence. The consequence for this phase is that the `functions` corpus family
+cannot contain a *terminating* recursion — only iteration-as-recursion (a function
+called from a loop) and a closure returned from a closure, which is what it holds.
+Both VMs do have a call-depth limit and both stop at the same one.
+
+A `give back` phase. Pre-existing on the tree-walking VM.
+
+## 6. A module's functions are unreachable from Redblue source
+
+`modules/MathUtils.rb` declares `to circle_area(radius)`, and
+`examples/` never calls it. `MathUtils.circle_area(5)` does not resolve. Carried
+from `phases/phase-019/FINDINGS.md` §5, unchanged here: it is a module-phase
+concern and it is not a divergence.
+
+## 7. The documented standard library is unreachable, so the corpus is narrower than the language
+
+`src/stdlib.rs` registers ~30 builtins (`abs`, `uppercase`, `split`, `map`,
+`reduce`, …). Only `length` and `type_of` are callable from Redblue source in the
+language as it stands, which is why the `stdlib` family holds those two and
+nothing else. "The corpus proves the two VMs agree" is therefore a claim about the
+subset of the language that works. Carried from `phases/phase-019/FINDINGS.md`.
+
+## 8. `break` and `skip` are no-ops
 
 ```
-tree: Outcome { output: ["1"], result: Ok("3") }
-byte: Outcome { output: ["1"], result: Ok("nothing") }
+set i to 0
+repeat 3 times
+    set i to i + 1
+    break
+end
+say i        → 3, not 1
 ```
 
-The tree-walking VM yields the last expression statement's value as the
-program's value; the bytecode VM yields `nothing`. Two implementations of the
-same source disagreeing about the program's value is precisely the class of
-defect that makes an S3 byte-identical fixed point meaningless, and it is the
-one thing this phase's differential runner exists to catch.
+`src/bytecode/vm.rs:1505` and `:1511` both say so outright. Both VMs agree, so the
+differential harness cannot catch it either.
 
-The tree-walking half is `src/parser.rs`, whose statement loop keeps consuming
-tokens after a complete statement rather than refusing a line that holds two.
-`docs/GRAMMAR.md` and `SPEC.md` both put one statement on a line.
+## 9. `rbops/verify.sh` is not present in this checkout
 
-### Fixed — the VM half only
+There is no `rbops/` directory at all — only `.github/workflows/ci.yml`, which is
+off limits to this phase. The task instructions also say the pipeline that
+dispatched the phase lives outside the checkout and is not to be inspected, so it
+could not be recovered from there. The fourth gate therefore **was not run**, and
+`REPORT.md` says so rather than claiming it passed. In its place the
+backwards-compatibility check `AGENTS.md` §2 names was run: all eight
+`examples/*.rb` and `modules/*.rb` run clean, and the whole pre-existing suite
+still passes.
 
-The reproduction above is a one-line program ending in a bare expression, which
-is well formed on its own line; it is the *value* divergence that is fixed, not
-the trailing-token grammar. Three changes, all in `src/bytecode/`:
-
-- `src/bytecode/vm.rs:893` — `unwind_frame` threw the last frame's value away
-  unless the frame had been entered by a call. The last frame is not a
-  statement, it *is* the program, so its value is what the program is worth —
-  the rule `src/vm.rs:397` already applies. `codegen.rs:181` already declined to
-  `POP` a trailing expression for this reason; this is where the value it leaves
-  is picked up.
-- `src/bytecode/vm.rs:1518` — `set_property` popped the value but not the
-  receiver, though `docs/BYTECODE.md:180` says `SET_PROPERTY` "pops a value and
-  an object" and that a statement leaves nothing behind. The leak was invisible
-  while the top-level frame discarded whatever it finished with, and appeared as
-  soon as it stopped: a program ending in `set r.a to 2` was worth a record.
-- `src/bytecode/codegen.rs:107,145` — only a block whose value is read (`main`,
-  `Function`, `Method`) may leave a value behind. `set n to 1 / if n is 1 then /
-  7 / end` is worth `nothing`, and `if`'s branch was leaving `7` on the enclosing
-  frame's operand stack. The `values` corpus family found this one.
-
-The parser still accepts trailing tokens, which is the remaining half of this
-finding and is a grammar question rather than a divergence.
-
----
-
-## 4b. MINOR — the property generator had three arms that produced broken source
-
-Found in round 2 by `edge_a_generated_program_only_faults_on_a_fault_that_was_injected`,
-which asserts the invariant the generator's own doc comment claims: the only
-failures in the generated corpus are the ones `random_fault` injected. All three
-are recorded because each was invisible for the same reason — a broken arm
-produces a *failure*, and every property in `tests/property_test.rs` accepts
-failures as outcomes.
-
-- `random_statement`'s conditional arm wrote `if b is yes` with no `then`, so a
-  sixth of the generated corpus was a `ParserError` — *"Expected Then but got
-  Say"*. The parser requires `then` (`src/parser.rs`, and the `control_flow`
-  corpus family writes it).
-- `typed_expression`'s `Kind::Text` arm `({left} + " {left}")` spliced
-  expression *source* into a quoted literal, so any `left` carrying a quote broke
-  the literal open: `(("a b c" + "-") + " ("a b c" + "-")")` is a `LexerError`.
-- `typed_expression`'s `Kind::Text` arm `(length(left) + length(left))` returned a
-  `Number` against `random_statement`'s contract that `t` holds text, so
-  `set t to <lengths>` faulted at `say length(t)`. Text plus a number is itself a
-  `RuntimeError`, so the length cannot be folded into a text expression at all.
-
-All three are fixed in `tests/property_test.rs` and all three are
-mutation-checked — see REPORT.md §Round 2.
-
----
-
-## 5. MINOR — documented comparison operators and a `for … from … to` loop do not exist
-
-`SPEC.md:273`, `SPEC.md:277`, `SPEC.md:278`, `SPEC.md:288` and
-`docs/GRAMMAR.md:97-98`, `:378`, `:380`, `:472` all document `is greater than`,
-`is greater than or equal to`, `>` and `>=`. Neither the word forms nor the
-symbols reach the lexer:
-
-```
-$ printf 'say 1 > 2\n' > /tmp/gt.rb
-$ cargo run --bin rb -- run /tmp/gt.rb
-Error: LexerError: Unexpected character '>'
-
-$ printf 'if 1 is greater than 0 then\n    say "yes"\nend\n' > /tmp/gt2.rb
-$ cargo run --bin rb -- run /tmp/gt2.rb
-Error: ParserError: Expected Then but got Identifier("than")
-```
-
-`docs/GRAMMAR.md:481` documents `for each i from 1 to 10`, and
-`src/parser.rs:141` carries a `Statement::ForRange` variant for it with the
-comment `// for each i from 1 to 10 ... end` — but nothing constructs that
-variant (`grep -n ForRange src/parser.rs` finds the declaration and nothing
-else), so it is dead code and the documented loop cannot be written. The parser
-requires `for each x in <expr>` and no other form
-(`src/parser.rs:738`, `Expected 'each' after 'for'`, and the
-`self.expect(&TokenKind::In)` at `src/parser.rs:715`).
-
-Either the docs or the parser is wrong. This phase's generators use `is` and
-`is not`, which do exist (`tests/test_control_flow.rb:106`).
-
----
-
-## 6. The phase contract's fourth gate does not exist in this checkout
-
-```
-$ ./rbops/verify.sh phase-020
-bash: ./rbops/verify.sh: No such file or directory
-$ ls
-AGENTS.md  Cargo.toml  corpus  docs  examples  modules  phases  src  target  tests  tooling
-```
-
-There is no `rbops/` directory in the project checkout at all, and the task
-instructions say the pipeline that dispatched this phase lives elsewhere. The
-three gates that do exist were run and are green; see REPORT.md §Gates. In the
-fourth gate's place the examples and modules are run, which is what AGENTS.md §2
-names as the backwards-compatibility check. In their
-place the examples and modules were run directly, because `AGENTS.md` §2 names
-them as the backwards-compatibility check:
-
-```
-$ for f in examples/*.rb modules/*.rb; do rb run "$f" >/dev/null || echo "FAIL $f"; done
-```
-
-All 8 run clean.
+The auditor should decide whether `verify.sh` is expected to be vendored into the
+checkout. If it is, its absence is an infrastructure defect that will silently
+skip a gate on every phase in this pipeline.
