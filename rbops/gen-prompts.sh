@@ -48,6 +48,12 @@ render() {
   deps="$(printf '%s' "$p"    | "$JQ" -r 'if (.depends_on|length)==0 then "_none_" else (.depends_on|join(", ")) end')"
   tmo="$(printf '%s' "$p"     | "$JQ" -r '.timeout_min // 120')"
   accepts="$(printf '%s' "$p" | "$JQ" -r '.accept[] | "- [ ] \(.)"')"
+  # must_touch and failure_assert are gate rules the agent can fail on. The
+  # manifest carried them but the prompt did not, so an agent reading only its
+  # brief could not know it had to change src/ at all - the one requirement that
+  # stops a phase being "tests plus prose".
+  must="$(printf '%s' "$p"    | "$JQ" -r 'if (.must_touch // []) | length > 0 then (.must_touch | join(" or ")) else "" end')"
+  failmode="$(printf '%s' "$p" | "$JQ" -r '.failure_assert // "required"')"
   edge_rows="$("$JQ" -r '.test_policy.edge_matrix[] | "- [ ] \(.) — covered / N/A + why"' "$PHASES")"
 
   [ -n "$id" ] || return 1
@@ -60,7 +66,35 @@ render() {
     printf '| Risk | `%s` |\n' "$risk"
     printf '| Depends on | %s |\n' "$deps"
     printf '| Timeout | %s min |\n' "$tmo"
+    if [ -n "$must" ]; then
+      printf '| Must change | `%s` |\n' "$must"
+    fi
   } > "$out"
+
+  if [ -n "$must" ]; then
+    cat >> "$out" <<EOF
+
+## You must change \`$must\`
+
+This phase declares \`must_touch: [$must]\`. The gate fails the phase unless at
+least one changed file falls under it. Writing tests, documentation or a report
+is not enough — if you finish without touching that area, the phase fails on
+exactly that check.
+
+EOF
+  fi
+
+  if [ "$failmode" = "not_applicable" ]; then
+    cat >> "$out" <<'EOF'
+## The failure-assertion rule does not apply here
+
+This phase declares `failure_assert: not_applicable`, so the gate does NOT
+require a test asserting that a failure is produced. Your subsystem reports
+problems as diagnostics or emits documents, so there is no `Result::Err` to
+assert on. Every other test rule still applies in full.
+
+EOF
+  fi
 
   cat >> "$out" <<'EOF'
 

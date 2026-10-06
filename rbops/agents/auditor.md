@@ -62,10 +62,40 @@ Rules:
 - Max 12 phases per audit. Prefer 4 excellent ones over 12 vague ones.
 - Order `depends_on` so that unblocking work comes first.
 
-## Step 5 — VALIDATE.
+## Step 5 — GENERATE THE PROMPTS. A phase without one cannot run.
+
+`cmd_run` dies on a missing prompt:
+
+    [ -f "$prompt" ] || die "no PROMPT.md for $phase — an undeclared prompt is not a phase"
+
+So a phase in `phases.json` with no `phases/<id>/PROMPT.md` is not a phase; it is
+a queue entry that kills its own run. The first audit appended 11 phases and
+created none of their prompts, so `validate` failed with 11 missing-prompt errors
+and all 11 were unrunnable until someone regenerated them by hand.
+
+After appending to `phases.json`, do this for EVERY phase you created:
+
+    mkdir -p phases/<id>
+    JQ=$HOME/lbin/jq bash rbops/gen-prompts.sh     # or: jq bash rbops/gen-prompts.sh
+
+`gen-prompts.sh` is the single source of truth for prompt shape — it renders the
+evidence, goal, acceptance criteria, `must_touch` and `failure_assert` from the
+manifest entry. Do not hand-write a prompt; you will omit a rule the gate
+enforces, which is precisely how `must_touch` went missing from the briefs while
+sitting correctly in the manifest.
+
+Then verify every phase in the manifest has a prompt, and say so in your report:
+
+    for f in $(jq -r '.phases[].id' rbops/phases.json); do
+      [ -f "phases/$f/PROMPT.md" ] || echo "MISSING PROMPT: $f"
+    done
+
+That loop must print nothing. If it prints anything, the audit is incomplete.
+
+## Step 6 — VALIDATE.
 Run `jq empty rbops/phases.json`. If it fails, `git checkout -- rbops/phases.json` and report failure. Never leave the manifest invalid.
 
-Then write `docs/audits/audit-<YYYY-MM-DD>.md` with the Step 1 measurements, the Step 2 table, the Step 3 safety result, and the phases you created.
+Then write `docs/audits/audit-<YYYY-MM-DD>.md` with the Step 1 measurements, the Step 2 table, the Step 3 safety result, the phases you created, and the missing-prompt check from Step 5.
 
 ## Report
 End with:

@@ -8,6 +8,15 @@
 | Risk | `high` |
 | Depends on | phase-001, phase-002, phase-003, phase-004, phase-005, phase-006, phase-007, phase-008, phase-010, phase-011, phase-013 |
 | Timeout | 300 min |
+| Must change | `src/` |
+
+## You must change `src/`
+
+This phase declares `must_touch: [src/]`. The gate fails the phase unless at
+least one changed file falls under it. Writing tests, documentation or a report
+is not enough — if you finish without touching that area, the phase fails on
+exactly that check.
+
 
 ## Evidence — verified finding
 
