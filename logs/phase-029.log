@@ -1,0 +1,3809 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m$ [0mprintf 'say 10 mod 3\n' > ./target/tmp/repro_mod.rb 2>/dev/null || (mkdir -p ./target/tmp && printf 'say 10 mod 3\n' > ./target/tmp/repro_mod.rb); printf 'if "a" is in ["a","b"] then\n    say "yes"\nend\n' > ./target/tmp/repro_in.rb; ls ./target/tmp/
+repro_in.rb
+repro_mod.rb
+[0m
+[0m$ [0mgrep -rn 'BinaryOp::In' src/ ; echo "---in-exit $?"; grep -n "Mod" src/lexer.rs | head -30
+src/runtime.rs:229:        BinaryOp::In => {
+src/formatter.rs:39:        | BinaryOp::In => PRECEDENCE_COMPARISON,
+src/formatter.rs:649:            BinaryOp::In => "in",
+src/analyzer.rs:423:            BinaryOp::In => {
+src/bytecode/vm.rs:379:    static IN: BinaryOp = BinaryOp::In;
+src/bytecode/codegen.rs:595:        BinaryOp::In => Opcode::In,
+---in-exit 0
+53:    ("module", TokenKind::Module),
+117:    Module,
+139:    Mod,
+417:                    TokenKind::Mod
+[0m
+[0m$ [0msed -n 1,80p src/lexer.rs
+use std::sync::OnceLock;
+
+use crate::error::{Error, Result, Span};
+
+/// The byte-order mark some editors write at the start of a UTF-8 file.
+const BOM: char = '\u{FEFF}';
+
+/// Every word the lexer treats as a keyword, paired with the token it produces.
+///
+/// This table is the single source of truth for the keyword set: the lexer
+/// matches through it (`Lexer::keyword`) and editor tooling highlights it
+/// (`crate::lsp::keyword_pattern`). Keeping one table is what stops the shipped
+/// TextMate grammar from drifting away from the language.
+pub const KEYWORDS: &[(&str, TokenKind)] = &[
+    ("set", TokenKind::Set),
+    ("constant", TokenKind::Constant),
+    ("to", TokenKind::To),
+    ("is", TokenKind::Is),
+    ("are", TokenKind::Are),
+    ("if", TokenKind::If),
+    ("then", TokenKind::Then),
+    ("else", TokenKind::Else),
+    ("end", TokenKind::End),
+    ("when", TokenKind::When),
+    ("unless", TokenKind::Unless),
+    ("for", TokenKind::For),
+    ("each", TokenKind::Each),
+    ("in", TokenKind::In),
+    ("from", TokenKind::From),
+    ("times", TokenKind::Times),
+    ("while", TokenKind::While),
+    ("repeat", TokenKind::Repeat),
+    ("until", TokenKind::Until),
+    ("break", TokenKind::Break),
+    ("skip", TokenKind::Skip),
+    ("return", TokenKind::Return),
+    ("give", TokenKind::GiveBack),   // give back
+    ("back", TokenKind::GiveBack),   // give back
+    ("might", TokenKind::MightFail), // might fail
+    ("fail", TokenKind::MightFail),  // might fail
+    ("say", TokenKind::Say),
+    ("print", TokenKind::Print),
+    ("ask", TokenKind::Ask),
+    ("try", TokenKind::Try),
+    ("catch", TokenKind::Catch),
+    ("finally", TokenKind::Finally),
+    ("and", TokenKind::And),
+    ("or", TokenKind::Or),
+    ("not", TokenKind::Not),
+    ("yes", TokenKind::YesNo(true)),
+    ("no", TokenKind::YesNo(false)),
+    ("nothing", TokenKind::Nothing),
+    ("module", TokenKind::Module),
+    ("import", TokenKind::Import),
+    ("export", TokenKind::Export),
+    ("test", TokenKind::Test),
+    ("expect", TokenKind::Expect),
+    ("object", TokenKind::Object),
+    ("has", TokenKind::Has),
+    ("can", TokenKind::Can),
+    ("this", TokenKind::This),
+    ("that", TokenKind::That),
+    ("new", TokenKind::New),
+    ("extends", TokenKind::Extends),
+    ("async", TokenKind::Async),
+    ("wait", TokenKind::Wait),
+    ("parallel", TokenKind::Parallel),
+    ("done", TokenKind::Done),
+];
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenKind {
+    // Literals
+    Number(f64),
+    Text(String),
+    YesNo(bool),
+    Nothing,
+
+    // Identifiers
+    Identifier(String),
+[0m
+[0m$ [0mls target/debug/rb 2>/dev/null; ls target/release/rb 2>/dev/null; echo "---"; grep -rn "TokenKind::In" src/lexer.rs | head; echo "--- parser In"; grep -rn "In =>\|TokenKind::In" src/parser.rs | head
+target/debug/rb
+---
+28:    ("in", TokenKind::In),
+--- parser In
+741:                    self.expect(&TokenKind::In)?;
+[0m
+[0m$ [0m./target/debug/rb run ./target/tmp/repro_mod.rb; echo "exit=$?"; echo "=== in ==="; ./target/debug/rb run ./target/tmp/repro_in.rb; echo "exit=$?"
+Error: AnalyzerError: Unknown variable 'mod'
+  --> ./target/tmp/repro_mod.rb:1:8
+1 | say 10 mod 3
+  |        ^
+exit=1
+=== in ===
+Error: ParserError: Unexpected token In
+  --> ./target/tmp/repro_in.rb:1:11
+1 | if "a" is in ["a","b"] then
+  |           ^
+exit=1
+[0m
+[0m$ [0msed -n 60,110p src/parser.rs
+// Record literal
+    Record(Vec<(String, Expr)>),
+
+    // expect expression to be expected_value
+    Expect {
+        actual: Box<Expr>,
+        expected: Box<Expr>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    And,
+    Or,
+    In,
+}
+
+#[derive(Debug, Clone)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+#[derive(Debug, Clone)]
+pub enum Statement {
+    // say "Hello"
+    Say(Expr),
+
+    // Expression statement (for side effects)
+    Expr(Expr),
+
+    // print "Hello"
+    Print(Expr),
+
+    // set x to 10
+    Set {
+        name: String,
+        value: Expr,
+    },
+[0m
+[0m$ [0mgrep -n "fn parse_comparison\|fn parse_additive\|fn parse_primary\|TokenKind::Is\|TokenKind::In\b\|fn parse_expression\|BinaryOp::" src/parser.rs | head -60
+741:                    self.expect(&TokenKind::In)?;
+1212:    fn parse_expression(&mut self) -> Result<Expr> {
+1230:                op: BinaryOp::Or,
+1255:                op: BinaryOp::And,
+1313:            return BinaryOp::Equal;
+1317:            ("greater", BinaryOp::Greater, BinaryOp::GreaterEqual),
+1318:            ("less", BinaryOp::Less, BinaryOp::LessEqual),
+1341:                BinaryOp::Equal
+1348:                BinaryOp::NotEqual
+1351:            _ => BinaryOp::Equal,
+1360:    fn parse_comparison(&mut self) -> Result<Expr> {
+1367:                    kind: TokenKind::Is,
+1378:                    BinaryOp::Equal
+1385:                    BinaryOp::NotEqual
+1398:                        BinaryOp::LessEqual
+1400:                        BinaryOp::Less
+1414:                        BinaryOp::GreaterEqual
+1416:                        BinaryOp::Greater
+1424:                    BinaryOp::LessEqual
+1431:                    BinaryOp::GreaterEqual
+1457:                TokenKind::Plus => Some(BinaryOp::Add),
+1458:                TokenKind::Minus => Some(BinaryOp::Sub),
+1488:                TokenKind::Star => Some(BinaryOp::Mul),
+1489:                TokenKind::Slash => Some(BinaryOp::Div),
+1490:                TokenKind::Mod => Some(BinaryOp::Mod),
+1644:    fn parse_primary(&mut self) -> Result<Expr> {
+[0m
+[0m→ [0mRead src/parser.rs[90m [offset=1355, limit=160][0m
+[0m
+[0m$ [0msed -n 215,265p src/runtime.rs; echo "=== analyzer 410-450"; sed -n 405,455p src/analyzer.rs
+}
+        }
+        BinaryOp::GreaterEqual => {
+            if let (Value::Number(a), Value::Number(b)) = (left, right) {
+                Ok(Value::YesNo(a >= b))
+            } else {
+                Err(Error::Runtime(
+                    "Cannot compare non-numbers".to_string(),
+                    span,
+                ))
+            }
+        }
+        BinaryOp::And => Ok(Value::YesNo(left.is_truthy() && right.is_truthy())),
+        BinaryOp::Or => Ok(Value::YesNo(left.is_truthy() || right.is_truthy())),
+        BinaryOp::In => {
+            if let Value::List(items) = right {
+                Ok(Value::YesNo(items.contains(&left)))
+            } else {
+                Err(Error::Runtime(
+                    "Right side of 'in' must be a list".to_string(),
+                    span,
+                ))
+            }
+        }
+    }
+}
+
+/// The value of a unary operator, and the failure for the wrong type.
+pub fn unary_op(span: Span, op: &UnaryOp, value: Value) -> Result<Value> {
+    match op {
+        UnaryOp::Neg => {
+            if let Value::Number(n) = value {
+                Ok(Value::Number(-n))
+            } else {
+                Err(Error::Runtime("Cannot negate non-number".to_string(), span))
+            }
+        }
+        UnaryOp::Not => Ok(Value::YesNo(!value.is_truthy())),
+    }
+}
+
+/// Every function that is not a user-defined one, in the one place both VMs
+/// reach for.
+///
+/// `Ok(None)` says the name is not a builtin, which is how the caller knows to
+/// look for a user declaration. This lives here rather than in either VM so
+/// that a bytecode `CALL` and a tree-walked call cannot drift apart: there is
+/// one implementation and both answer from it.
+pub fn builtin(span: Span, name: &str, args: &[Value]) -> Result<Option<Value>> {
+    match name {
+        "say" => {
+=== analyzer 410-450
+    }
+
+    fn check_binary_op(&mut self, op: &BinaryOp, _left: &Expr, _right: &Expr) {
+        match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                // Arithmetic operations require numbers
+            }
+            BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::Less
+            | BinaryOp::LessEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEqual => {
+                // Comparison operations
+            }
+            BinaryOp::And | BinaryOp::Or => {
+                // Logical operations
+            }
+            BinaryOp::In => {
+                // Membership test
+            }
+        }
+    }
+}
+
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The names a program binds in a declaration the walk may not have reached
+/// when it reads one of them.
+///
+/// Collected over the whole program before the walk, and read by
+/// [`Analyzer::bound_later`], which consults it only inside a body that runs
+/// later. The walk covers every body at every depth: a `constant` or an
+/// `import` inside a loop, an `if`, a function or a `try` binds the same
+/// program-level name every time that runs, so one of them anywhere counts.
+#[derive(Default)]
+struct LaterNames {
+    /// Every name a `constant` declares.
+    constants: HashSet<String>,
+    /// Every name an `import` brings in, read out of the module files.
+    imported: HashSet<String>,
+}
+
+impl LaterNames {
+    fn bound(&self, name: &str) -> bool {
+        self.constants.contains(name) || self.imported.contains(name)
+    }
+[0m
+[0m→ [0mRead src/parser.rs[90m [limit=60, offset=1298][0m
+[0m
+[0m$ [0msed -n 150,215p src/runtime.rs
+} else {
+                Err(Error::Runtime(
+                    "Cannot multiply non-numbers".to_string(),
+                    span,
+                ))
+            }
+        }
+        BinaryOp::Div => {
+            if let (Value::Number(a), Value::Number(b)) = (left, right) {
+                if b == 0.0 {
+                    Err(Error::Runtime("Division by zero".to_string(), span))
+                } else {
+                    Value::number(a / b, span)
+                }
+            } else {
+                Err(Error::Runtime(
+                    "Cannot divide non-numbers".to_string(),
+                    span,
+                ))
+            }
+        }
+        BinaryOp::Mod => {
+            if let (Value::Number(a), Value::Number(b)) = (left, right) {
+                if b == 0.0 {
+                    Err(Error::Runtime("Modulo by zero".to_string(), span))
+                } else {
+                    Value::number(a % b, span)
+                }
+            } else {
+                Err(Error::Runtime(
+                    "Cannot modulo non-numbers".to_string(),
+                    span,
+                ))
+            }
+        }
+        BinaryOp::Equal => Ok(Value::YesNo(left == right)),
+        BinaryOp::NotEqual => Ok(Value::YesNo(left != right)),
+        BinaryOp::Less => {
+            if let (Value::Number(a), Value::Number(b)) = (left, right) {
+                Ok(Value::YesNo(a < b))
+            } else {
+                Err(Error::Runtime(
+                    "Cannot compare non-numbers".to_string(),
+                    span,
+                ))
+            }
+        }
+        BinaryOp::LessEqual => {
+            if let (Value::Number(a), Value::Number(b)) = (left, right) {
+                Ok(Value::YesNo(a <= b))
+            } else {
+                Err(Error::Runtime(
+                    "Cannot compare non-numbers".to_string(),
+                    span,
+                ))
+            }
+        }
+        BinaryOp::Greater => {
+            if let (Value::Number(a), Value::Number(b)) = (left, right) {
+                Ok(Value::YesNo(a > b))
+            } else {
+                Err(Error::Runtime(
+                    "Cannot compare non-numbers".to_string(),
+                    span,
+                ))
+            }
+[0m
+[0m$ [0mgrep -n "mod\b" SPEC.md | head -30; echo "=== SPEC in"; grep -n "is in\| in \[" SPEC.md | head -20; echo "=== GRAMMAR mod"; grep -n "mod\b" docs/GRAMMAR.md | head -20; echo "=== GRAMMAR in"; grep -n "is in\|in_test\|In\b" docs/GRAMMAR.md | head -20
+206:set remainder to 10 mod 3
+844:set evens to list.filter([1, 2, 3, 4], to (x) give back x mod 2 is 0)
+=== SPEC in
+325:if "hello" is in words
+=== GRAMMAR mod
+90:mod_op       = 'mod'
+360:                 | multiplicative 'mod' prefix         // modulo
+449:| 6 | `*`, `/`, `mod` | Left |
+=== GRAMMAR in
+[0m
+[0m$ [0msed -n 315,335p SPEC.md; echo "=== SPEC 200-230"; sed -n 200,232p SPEC.md; echo "=== GRAMMAR 365-380"; sed -n 365,380p docs/GRAMMAR.md
+```redblue
+// Indexing
+set first to items at 0
+set last to items at -1
+
+// Length
+set count to length of items
+
+// Contains
+if "hello" is in words
+```
+
+---
+
+## Statements
+
+### If-Then-Else
+
+```redblue
+if condition
+=== SPEC 200-230
+
+```redblue
+set sum to 1 + 2
+set diff to 5 - 3
+set product to 4 * 3
+set quotient to 10 / 2
+set remainder to 10 mod 3
+```
+
+#### Numeric semantics
+
+A `number` is a 64-bit float. Every operation on numbers is **total**: it either
+returns a number or fails with a runtime error. There is no third outcome in
+which an operation returns something that is not a number.
+
+| Expression | Outcome |
+|---|---|
+| `1 / 0`, `0 / 0`, `-1 / 0` | runtime error: `Division by zero` |
+| `5 % 0`, `5 % 0.0`, `5 % -0.0` | runtime error: `Modulo by zero` |
+| `-0.0` | the number `0`: negative zero is not a distinct value |
+| `1e308 * 1e308` | runtime error: `infinity is not a finite number` |
+| `1e400` (a literal too large to hold) | runtime error: `infinity is not a finite number` |
+| `1e-400` (a literal too small to hold) | the number `0`: see "Underflow", below |
+| `1.2.3`, `2..3`, `3e` (not a number) | lex error: `Invalid number '…'` |
+| `-5 % 3` | `-2`: a remainder takes the sign of the dividend |
+| `5-2` | `3`: a sign belongs to a literal only after its exponent |
+
+Three consequences are worth stating plainly:
+
+1. **A number is always finite.** `NaN`, `infinity` and `-infinity` cannot
+   enter a `number`, from arithmetic, from a literal, from `json.parse`, or from
+   a library function. There is no way to obtain one, so there is no value whose
+   comparisons are all false.
+=== GRAMMAR 365-380
+```
+additive         = multiplicative
+                 | additive '+' multiplicative         // add
+                 | additive '-' multiplicative        // subtract
+```
+
+### 5.6 Comparison Expressions
+
+```
+comparison       = additive
+                 | comparison 'is equal to' additive   // ==
+                 | comparison 'is not' additive       // !=
+                 | comparison 'is less than' additive // <
+                 | comparison 'is greater than' additive // >
+                 | comparison 'is less than or equal to' additive // <=
+                 | comparison 'is greater than or equal to' additive // >=
+[0m
+[0m$ [0msed -n 280,320p SPEC.md; echo "=== grep membership SPEC"; grep -n -i "membership\|contains\|subset" SPEC.md | head -20
+if x <= 10         // is less than or equal to
+if x == 10         // is equal to
+if x != 10         // is not
+```
+
+### Logical
+
+```redblue
+if x is greater than 0 and x is less than 100
+if status is "active" or status is "pending"
+if not is_empty
+```
+
+### String Interpolation
+
+```redblue
+set greeting to "Hello, {name}!"
+set message to "Value: {x + y}"
+```
+
+### Property Access
+
+```redblue
+set first to person.name
+set x_coord to point.x
+```
+
+### Function Call
+
+```redblue
+set len to text.length("hello")
+set result to math.sqrt(2)
+```
+
+### List Operations
+
+```redblue
+// Indexing
+set first to items at 0
+set last to items at -1
+
+=== grep membership SPEC
+324:// Contains
+[0m
+[0m$ [0mgrep -rn "catch error" tests/ examples/ modules/ | head -20
+tests/loop_bounds_test.rs:7://! which `try ... catch error` cannot see and which no test can assert on.
+tests/loop_bounds_test.rs:139:/// A runaway loop is a `RuntimeError`, so `try ... catch error` can observe it
+tests/loop_bounds_test.rs:151:        "catch error\n",
+tests/suite.rb:89:    catch error
+tests/suite.rb:161:    catch error
+tests/suite.rb:172:    catch error
+tests/suite.rb:177:    catch error
+tests/linter_test.rs:51:    let source = "try\n    set x to 1 / 0\ncatch error\n    say \"caught\"\nend\n\
+tests/linter_test.rs:52:                  try\n    set x to 5 % 0\ncatch error\n    say \"caught\"\nend\n\
+tests/linter_test.rs:53:                  try\n    set x to 1e400\ncatch error\n    say \"caught\"\nend\n\
+tests/test_modules.rb:14:    catch error
+tests/test_modules.rb:48:    catch error
+tests/test_modules.rb:58:    catch error
+tests/test_modules.rb:69:    catch error
+tests/test_modules.rb:81:    catch error
+tests/test_modules.rb:91:    catch error
+tests/test_modules.rb:107:    catch error
+tests/closure_capture_test.rs:534:        catch error
+tests/closure_capture_test.rs:560:        catch error
+tests/closure_capture_test.rs:566:        catch error
+[0m
+[0m$ [0mls tests/ | head -40; echo "=== .rb tests"; ls tests/*.rb 2>/dev/null | head -20
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+closure_capture_test.rs
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+index_bounds_test.rs
+integration_test.rb
+lexer_robustness_test.rs
+linter_test.rs
+loop_bounds_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+span_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+test_control_flow.rb
+test_functions.rb
+test_lists.rb
+test_modules.rb
+test_numeric_edges.rb
+test_object_model.rb
+test_objects.rb
+test_records.rb
+test_text.rb
+tooling_grammar_test.rs
+=== .rb tests
+tests/integration_test.rb
+tests/suite.rb
+tests/test_arithmetic.rb
+tests/test_closures.rb
+tests/test_comparisons.rb
+tests/test_control_flow.rb
+tests/test_functions.rb
+tests/test_lists.rb
+tests/test_modules.rb
+tests/test_numeric_edges.rb
+tests/test_object_model.rb
+tests/test_objects.rb
+tests/test_records.rb
+tests/test_text.rb
+[0m
+[0m$ [0msed -n 80,100p tests/suite.rb; echo "=== arithmetic test"; sed -n 1,40p tests/test_arithmetic.rb; echo "=== redblue_suite_test.rs"; sed -n 1,60p tests/redblue_suite_test.rs
+expect length(report) to be 6
+end
+
+test "suite: a number cannot be concatenated onto text"
+    // There is no wired text conversion yet, so `text + number` must fault
+    // rather than silently coercing.
+    set caught to no
+    try
+        set bad to "n=" + 1
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+end
+
+test "suite: a list of records sorted by walking and filtering"
+    set kept to 0
+    set dropped to 0
+    for each n in [1, 2, 3, 4, 5, 6]
+        set by2 to n % 2
+        if by2 is 0 then
+=== arithmetic test
+// Redblue arithmetic tests.
+//
+// Every block is self-contained: the harness runs each `test` body on its own,
+// and the analyser only sees variables declared at the body's top level.
+
+test "arithmetic: integer addition"
+    set a to 10
+    set b to 20
+    set sum to a + b
+    expect sum to be 30
+end
+
+test "arithmetic: integer subtraction can go negative"
+    set diff to 50 - 30
+    set under to 1 - 5
+    expect diff to be 20
+    expect under to be -4
+end
+
+test "arithmetic: multiplication"
+    set product to 6 * 7
+    set chained to 2 * 3 * 4
+    expect product to be 42
+    expect chained to be 24
+end
+
+test "arithmetic: division keeps the fractional part"
+    set whole to 100 / 4
+    set half to 7 / 2
+    expect whole to be 25
+    expect half to be 3.5
+end
+
+test "arithmetic: modulo"
+    set rest to 17 % 5
+    set even to 2 % 2
+    expect rest to be 2
+    expect even to be 0
+end
+
+=== redblue_suite_test.rs
+//! Gate over the Redblue-language suite in `tests/*.rb`.
+//!
+//! `tests/suite.rb`, `tests/test_arithmetic.rb` and `tests/integration_test.rb`
+//! used to ship with every `test` block commented out, so the Redblue suite
+//! reported a non-zero test count while asserting nothing at all. These tests
+//! fail if that regresses.
+
+use std::path::Path;
+
+/// Every `.rb` file the Redblue harness collects.
+fn suite_files() -> Vec<String> {
+    let mut files = redblue::testing::find_test_files("tests").expect("tests/ should be readable");
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no .rb files found under tests/ - the Redblue suite is empty"
+    );
+    files
+}
+
+/// Source of one suite file.
+fn read(path: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {}", path, e))
+}
+
+/// Keywords that open a Redblue block and are closed by `end`. `else`,
+/// `catch`, `finally` and `until` continue an open block and add no depth.
+const BLOCK_OPENERS: [&str; 9] = [
+    "test", "if", "for", "repeat", "while", "try", "object", "to", "module",
+];
+
+fn opens_a_block(line: &str) -> bool {
+    let first = line.split_whitespace().next().unwrap_or("");
+    BLOCK_OPENERS.contains(&first)
+}
+
+/// A test block starts at a `test "..."` header line and ends at the `end` that
+/// matches it. Nested `if`/`for`/`try`/`object`/`to` blocks inside a test carry
+/// their own `end`, so the body is read with a depth counter.
+fn test_blocks(source: &str) -> Vec<(usize, String, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut blocks = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if let Some(rest) = trimmed.strip_prefix("test ") {
+            let name = rest.trim().trim_matches('"').to_string();
+            let header_line = i + 1;
+            let mut body = Vec::new();
+            let mut depth = 1usize;
+            i += 1;
+            while i < lines.len() && depth > 0 {
+                let line = lines[i];
+                let t = line.trim();
+                if opens_a_block(t) {
+                    depth += 1;
+                } else if t == "end" {
+                    depth -= 1;
+                    if depth == 0 {
+[0m
+[0m$ [0msed -n 1,70p tests/comparison_words_test.rs
+//! The word comparison forms — `is greater than`, `is greater than or equal
+//! to`, `is less than`, `is less than or equal to`, `is equal to` and `is
+//! not` — are the flagship example in `README.md:18`, and `SPEC.md:272-282`
+//! and `docs/GRAMMAR.md:93-98` spell out the same six. The parser handled only
+//! the symbolic tails of two of them: `parse_comparison` looked past an `is`
+//! for a `TokenKind::Equal` or a `TokenKind::Not` and otherwise fell through
+//! to plain equality, so `greater`, `less`, `than` and `equal` were parsed as
+//! the right operand of `is` and the rest of the line died with
+//! `ParserError: Expected Then but got Identifier("than")`.
+//!
+//! Phase 025 made the symbolic half of this pair (`>`, `>=`, `<`, `<=`, `==`,
+//! `!=`) work, in `tests/comparison_lex_test.rs`. These tests pin the word half
+//! and pin that the two halves agree.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use redblue::lexer::Lexer;
+use redblue::parser::{parse, Statement};
+use redblue::{Error, Value};
+
+/// Scratch directory inside the project's own `target/tmp`, never the system
+/// temp dir, so nothing outside the checkout is touched. Each caller names its
+/// own subdirectory because tests run in parallel and would otherwise
+/// `remove_dir_all` each other's scratch files.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/tmp/rb-comparison-words")
+        .join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+    dir
+}
+
+/// The full token list of `source`, for handing to the parser.
+fn tokens(source: &str) -> Vec<redblue::lexer::Token> {
+    Lexer::tokenize(source).expect("source should lex")
+}
+
+/// Runs `source` through lexer → parser → VM and returns the value of its last
+/// statement. Only a bare expression statement carries a value out, so a
+/// source ending in `set …` or `say …` is rejected rather than left to compare
+/// `nothing` against `nothing`.
+#[track_caller]
+fn eval(source: &str) -> Value {
+    let ast = parse(tokens(source)).expect("source should parse");
+    assert!(
+        matches!(
+            ast.statements.last().map(|s| &s.statement),
+            Some(Statement::Expr(_))
+        ),
+        "`{}` does not end in a bare expression, so it has no value to assert on",
+        source
+    );
+    let mut vm = redblue::Vm::new();
+    vm.run(&ast).expect("source should run")
+}
+
+/// Runs `source` through the parser and returns the error it produced.
+#[track_caller]
+fn parse_err(source: &str) -> Error {
+    parse(tokens(source)).expect_err("source should have failed to parse")
+}
+
+/// Runs `source` and returns the runtime error it produced.
+#[track_caller]
+fn eval_err(source: &str) -> Error {
+    let ast = parse(tokens(source)).expect("source should parse");
+    let mut vm = redblue::Vm::new();
+[0m
+[0m$ [0mgrep -n "fn find_test_files" -A 20 src/testing/*.rs | head -40
+src/testing/mod.rs:64:pub fn find_test_files(dir: &str) -> Result<Vec<String>> {
+src/testing/mod.rs-65-    let mut files = collect_test_files(dir);
+src/testing/mod.rs-66-    files.sort();
+src/testing/mod.rs-67-    Ok(files)
+src/testing/mod.rs-68-}
+src/testing/mod.rs-69-
+src/testing/mod.rs-70-fn collect_test_files(dir: &str) -> Vec<String> {
+src/testing/mod.rs-71-    let mut files = Vec::new();
+src/testing/mod.rs-72-
+src/testing/mod.rs-73-    if let Ok(entries) = std::fs::read_dir(dir) {
+src/testing/mod.rs-74-        for entry in entries.filter_map(|e| e.ok()) {
+src/testing/mod.rs-75-            let path = entry.path();
+src/testing/mod.rs-76-            if path.is_dir() {
+src/testing/mod.rs-77-                files.extend(collect_test_files(&path.to_string_lossy()));
+src/testing/mod.rs-78-            } else if path.extension() == Some("rb".as_ref()) {
+src/testing/mod.rs-79-                files.push(path.to_string_lossy().to_string());
+src/testing/mod.rs-80-            }
+src/testing/mod.rs-81-        }
+src/testing/mod.rs-82-    }
+src/testing/mod.rs-83-
+src/testing/mod.rs-84-    files
+[0m
+[0m$ [0msed -n 70,140p tests/comparison_words_test.rs
+let mut vm = redblue::Vm::new();
+    vm.run(&ast).expect_err("source should have failed")
+}
+
+/// Asserts `source` fails at runtime with exactly `expected` as its message.
+#[track_caller]
+fn assert_runtime_error(source: &str, expected: &str) {
+    match eval_err(source) {
+        Error::Runtime(message, span) => {
+            assert_eq!(
+                message, expected,
+                "`{}` failed with the wrong runtime message",
+                source
+            );
+            assert!(span.is_known(), "`{}` failed without a source span", source);
+        }
+        other => panic!(
+            "`{}` should fail with a Runtime error, got {:?}",
+            source, other
+        ),
+    }
+}
+
+fn yes_no(flag: bool) -> Value {
+    Value::YesNo(flag)
+}
+
+/// Runs `program` through `rb run` and returns `(exit success, stdout)`.
+#[track_caller]
+fn rb_run(name: &str, program: &str) -> (bool, String, String) {
+    let script = scratch_dir(name).join(format!("words-{}.rb", std::process::id()));
+    fs::write(&script, program).expect("scratch program should be writable");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("run")
+        .arg(&script)
+        .output()
+        .expect("rb should be runnable");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let _ = fs::remove_file(&script);
+    (output.status.success(), stdout, stderr)
+}
+
+/// The whole point of the phase: all six documented word forms parse, and each
+/// takes the branch it names.
+#[test]
+fn the_six_word_comparison_forms_parse_and_select_the_branch_they_name() {
+    let program = "\
+set x to 20
+set taken to \"none\"
+if x is greater than 10 then
+    set taken to \"greater\"
+end
+if x is greater than or equal to 20 then
+    set taken to \"greater or equal\"
+end
+if x is less than 10 then
+    set taken to \"less\"
+end
+if x is less than or equal to 20 then
+    set taken to \"less or equal\"
+end
+if x is equal to 20 then
+    set taken to \"equal\"
+end
+if x is not 10 then
+    set taken to \"not\"
+end
+taken
+[0m
+[0m$ [0mcat rbops/verify.sh 2>/dev/null | head -80
+(no output)
+[0m
+[0m$ [0mls -d rbops 2>&1; ls phases/ 2>&1 | tail -5
+ls: cannot access 'rbops': No such file or directory
+phase-019
+phase-024
+phase-026
+phase-027
+phase-028
+[0m
+[0m$ [0mgrep -n "len()\|assert_eq!\|files\[" tests/redblue_suite_test.rs | head -30
+45:    while i < lines.len() {
+53:            while i < lines.len() && depth > 0 {
+82:    assert_eq!(
+102:    assert_eq!(
+107:    assert_eq!(
+235:        live_blocks += test_blocks(&read(&path)).len();
+[0m
+[0m$ [0msed -n 400,425p src/lexer.rs; echo "=== formatter 640-660"; sed -n 640,660p src/formatter.rs
+lexer.advance();
+                    TokenKind::Plus
+                }
+                '-' => {
+                    lexer.advance();
+                    TokenKind::Minus
+                }
+                '*' => {
+                    lexer.advance();
+                    TokenKind::Star
+                }
+                '/' => {
+                    lexer.advance();
+                    TokenKind::Slash
+                }
+                '%' => {
+                    lexer.advance();
+                    TokenKind::Mod
+                }
+                '(' => {
+                    lexer.advance();
+                    TokenKind::LeftParen
+                }
+                ')' => {
+                    lexer.advance();
+                    TokenKind::RightParen
+=== formatter 640-660
+            BinaryOp::Mod => "%",
+            BinaryOp::Equal => "is",
+            BinaryOp::NotEqual => "is not",
+            BinaryOp::Less => "<",
+            BinaryOp::LessEqual => "<=",
+            BinaryOp::Greater => ">",
+            BinaryOp::GreaterEqual => ">=",
+            BinaryOp::And => "and",
+            BinaryOp::Or => "or",
+            BinaryOp::In => "in",
+        };
+        self.write(s);
+    }
+
+    fn format_unary_op(&mut self, op: &UnaryOp) {
+        match op {
+            UnaryOp::Neg => self.write("-"),
+            UnaryOp::Not => self.write("not"),
+        }
+    }
+[0m
+[0m→ [0mRead tests/redblue_suite_test.rs[90m [offset=75, limit=40][0m
+[0m
+[0m$ [0mgrep -rn "\"module\"" src/ tests/ | head -20; echo "=== grammar files"; ls syntaxes 2>/dev/null; grep -rln "keyword" --include=*.json . 2>/dev/null | grep -v target | head
+src/lexer.rs:53:    ("module", TokenKind::Module),
+src/repl/completer.rs:47:                "module".to_string(),
+tests/redblue_suite_test.rs:29:    "test", "if", "for", "repeat", "while", "try", "object", "to", "module",
+tests/redblue_suite_test.rs:178:        "module",
+=== grammar files
+./tooling/vscode/syntaxes/redblue.tmLanguage.json
+[0m
+[0m$ [0msed -n 1,80p tests/tooling_grammar_test.rs
+//! Editor/LSP tooling: the shipped TextMate grammar must cover the keyword set
+//! the lexer actually recognises, and diagnostics must surface the spanned
+//! lexer/parser/analyzer errors `run_source` reports.
+
+use std::fs;
+use std::path::PathBuf;
+
+use redblue::lexer::Lexer;
+use redblue::lsp::{
+    diagnostics, diagnostics_json, keyword_pattern, textmate_grammar, Diagnostic, Severity,
+    GRAMMAR_PATH, LANGUAGE_CONFIG_PATH,
+};
+use redblue::run_source;
+
+fn manifest_path(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+/// The single error diagnostic, or a failure naming what came back instead.
+fn error_diagnostic(source: &str) -> Diagnostic {
+    let all = diagnostics(source);
+    let diagnostic = all
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+        .unwrap_or_else(|| panic!("expected an error diagnostic, got {:?}", all));
+
+    diagnostic.clone()
+}
+
+// ---------------------------------------------------------------------------
+// The grammar covers the keyword set
+// ---------------------------------------------------------------------------
+
+#[test]
+fn grammar_covers_the_lexer_keyword_set() {
+    let keywords = Lexer::keywords();
+    assert!(
+        !keywords.is_empty(),
+        "the lexer must publish a non-empty keyword set for tooling to use"
+    );
+
+    let pattern = keyword_pattern();
+    let alternation = pattern
+        .strip_prefix(r"\b(?:")
+        .and_then(|rest| rest.strip_suffix(r")\b"))
+        .unwrap_or_else(|| panic!("keyword pattern must be a bounded alternation: {}", pattern));
+
+    let words: Vec<&str> = alternation.split('|').collect();
+
+    for keyword in keywords {
+        assert!(
+            words.contains(keyword),
+            "the grammar keyword pattern omits `{}`",
+            keyword
+        );
+        assert!(
+            textmate_grammar().contains(keyword),
+            "the generated TextMate grammar omits `{}`",
+            keyword
+        );
+    }
+
+    assert_eq!(
+        words.len(),
+        keywords.len(),
+        "the grammar lists {} words but the lexer has {} keywords",
+        words.len(),
+        keywords.len()
+    );
+}
+
+#[test]
+fn every_listed_keyword_lexes_as_a_keyword_not_an_identifier() {
+    for keyword in Lexer::keywords() {
+        let tokens =
+            Lexer::tokenize(keyword).unwrap_or_else(|e| panic!("`{}` should lex: {}", keyword, e));
+
+        assert!(
+            !tokens.is_empty() && tokens[0].kind != redblue::lexer::TokenKind::Eof,
+            "`{}` produced no token",
+[0m
+[0m$ [0msed -n 170,200p tests/redblue_suite_test.rs
+for area in [
+        "arithmetic",
+        "text",
+        "list",
+        "record",
+        "control",
+        "function",
+        "object",
+        "module",
+    ] {
+        assert!(
+            lower.contains(area),
+            "no suite file covers `{}`; the phase requires all eight areas",
+            area
+        );
+    }
+}
+
+#[test]
+fn edge_suite_contains_named_edge_tests() {
+    let mut edges = 0usize;
+
+    for path in suite_files() {
+        for (_, name, _) in test_blocks(&read(&path)) {
+            if name.starts_with("edge_") {
+                edges += 1;
+            }
+        }
+    }
+
+    assert!(edges >= 8, "expected >= 8 edge_* tests, found {}", edges);
+[0m
+[0m$ [0mgrep -o "module\|mod\b" tooling/vscode/syntaxes/redblue.tmLanguage.json | sort -u; echo "---"; python3 -c "
+import json,re
+s=open('tooling/vscode/syntaxes/redblue.tmLanguage.json').read()
+print(len(s))
+i=s.find('in|')
+print(s[max(0,i-300):i+300])
+"
+module
+---
+1169
+:"//.*$"},
+    {"name":"constant.language.redblue","match":"\\b(?:yes|no|nothing)\\b"},
+    {"name":"constant.numeric.redblue","match":"(?:\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?|\\.\\d+)"},
+    {"name":"keyword.control.redblue","match":"\\b(?:set|constant|to|is|are|if|then|else|end|when|unless|for|each|in|from|times|while|repeat|until|break|skip|return|give|back|might|fail|say|print|ask|try|catch|finally|and|or|not|yes|no|nothing|module|import|export|test|expect|object|has|can|this|that|new|extends|async|wait|parallel|done)\\b"},
+    {"name":"entity.name.function.redblue","match":"\\b[A-Za-z_][A-Z
+[0m
+[0m$ [0mgrep -n "keyword_pattern" -A 15 src/lsp.rs | head -30; echo "=== completer"; sed -n 20,70p src/repl/completer.rs
+195:pub fn keyword_pattern() -> String {
+196-    format!(
+197-        r"\b(?:{})\b",
+198-        KEYWORDS
+199-            .iter()
+200-            .map(|(w, _)| *w)
+201-            .collect::<Vec<_>>()
+202-            .join("|")
+203-    )
+204-}
+205-
+206-/// Escapes a string for use as a JSON string literal, including the quotes.
+207-pub fn escape_json(text: &str) -> String {
+208-    let mut out = String::with_capacity(text.len() + 2);
+209-    out.push('"');
+210-
+--
+265:        escape_json(&keyword_pattern())
+266-    ));
+267-    patterns.push(
+268-        r#"{"name":"entity.name.function.redblue","match":"\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"}"#
+269-            .to_string(),
+270-    );
+271-    patterns.push(
+272-        r#"{"name":"keyword.operator.redblue","match":"==|!=|<=|>=|<|>|\\+|-|\\*|/|%"}"#
+273-            .to_string(),
+274-    );
+275-    patterns
+276-        .push(r#"{"name":"punctuation.separator.redblue","match":"[,.()\\[\\]{}]"}"#.to_string());
+277-
+=== completer
+                "unless".to_string(),
+                "for".to_string(),
+                "each".to_string(),
+                "in".to_string(),
+                "from".to_string(),
+                "to".to_string(),
+                "by".to_string(),
+                "times".to_string(),
+                "while".to_string(),
+                "repeat".to_string(),
+                "until".to_string(),
+                "break".to_string(),
+                "skip".to_string(),
+                "return".to_string(),
+                "give back".to_string(),
+                "say".to_string(),
+                "print".to_string(),
+                "ask".to_string(),
+                "try".to_string(),
+                "catch".to_string(),
+                "finally".to_string(),
+                "and".to_string(),
+                "or".to_string(),
+                "not".to_string(),
+                "yes".to_string(),
+                "no".to_string(),
+                "nothing".to_string(),
+                "module".to_string(),
+                "import".to_string(),
+                "export".to_string(),
+                "object".to_string(),
+                "has".to_string(),
+                "can".to_string(),
+                "this".to_string(),
+                "new".to_string(),
+                "extends".to_string(),
+                "async".to_string(),
+                "wait".to_string(),
+                "parallel".to_string(),
+                "done".to_string(),
+            ],
+            builtins: vec![
+                "math".to_string(),
+                "text".to_string(),
+                "files".to_string(),
+                "network".to_string(),
+                "formats".to_string(),
+                "list".to_string(),
+                "console".to_string(),
+                "PI".to_string(),
+                "E".to_string(),
+[0m
+[0m$ [0msed -n 1,60p tests/bytecode_vm_test.rs
+//! Bytecode execution (bootstrap stage S1b): `rb vm file.rbc`.
+//!
+//! The tree-walking VM is the specification of what a Redblue program *does*.
+//! These tests pin that the bytecode VM does the same thing — the same output,
+//! the same error kinds and the same error messages — and that it holds the
+//! same resource limits while doing it.
+//!
+//! The comparison runs both VMs as libraries rather than as subprocesses
+//! wherever it can, so a mismatch names the program rather than an exit code.
+//! `rb vm` itself is covered by the tests that shell out, because the CLI is
+//! part of what this phase delivers.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use redblue::bytecode::vm::BytecodeVm;
+use redblue::bytecode::{compile_source, Instruction, Opcode};
+use redblue::{run_isolated, Error};
+
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target/tmp/bytecode-vm-test")
+        .join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+    dir
+}
+
+fn rb(args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("rb should be runnable")
+}
+
+/// What one VM made of a program: the lines it printed, and either the value it
+/// ended with or the failure it ended with.
+///
+/// Two programs agree when both halves agree. The failure is compared by kind
+/// and message, which is what the language promises; the rendered position is
+/// not compared, because a `.rbc` carries no source text to render it from.
+#[derive(Debug, PartialEq, Eq)]
+struct Outcome {
+    output: Vec<String>,
+    result: Result<String, String>,
+}
+
+fn failure_of(error: &Error) -> String {
+    format!("{}: {}", error.label(), error.message())
+}
+
+/// Runs `source` on the tree-walking VM.
+///
+/// A program that does not lex, parse or analyze has *failed*, and that failure
+/// is the outcome rather than a panic: the corpus deliberately contains
+/// malformed programs, and how each VM reports them is part of what is compared.
+fn tree_walk(source: &str) -> Outcome {
+[0m
+[0m$ [0msed -n 60,120p tests/bytecode_vm_test.rs
+fn tree_walk(source: &str) -> Outcome {
+    let tokens = match redblue::lexer::Lexer::tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(error) => return failed(failure_of(&error)),
+    };
+    let ast = match redblue::parser::parse(tokens) {
+        Ok(ast) => ast,
+        Err(error) => return failed(failure_of(&error)),
+    };
+    if let Err(error) = redblue::analyzer::analyze(&ast) {
+        return failed(failure_of(&error));
+    }
+    let (mut vm, result) = run_isolated(&ast);
+    Outcome {
+        output: vm.take_output(),
+        result: result
+            .map(|value| value.to_string())
+            .map_err(|error| failure_of(&error)),
+    }
+}
+
+/// A frontend failure, as an outcome: nothing ran, so nothing was printed.
+fn failed(message: String) -> Outcome {
+    Outcome {
+        output: Vec::new(),
+        result: Err(message),
+    }
+}
+
+/// Runs `source` through the bytecode compiler and then the bytecode VM.
+fn bytecode(source: &str) -> Outcome {
+    let chunk = match compile_source(source) {
+        Ok(chunk) => chunk,
+        Err(error) => return failed(failure_of(&error)),
+    };
+    let mut vm = BytecodeVm::new();
+    let result = vm.run(&chunk);
+    Outcome {
+        output: vm.take_output(),
+        result: result
+            .map(|value| value.to_string())
+            .map_err(|error| failure_of(&error)),
+    }
+}
+
+/// Runs `source` both ways and fails with the two outcomes when they differ.
+#[track_caller]
+fn assert_agrees(source: &str) {
+    let tree = tree_walk(source);
+    let byte = bytecode(source);
+    assert_eq!(
+        tree, byte,
+        "the two VMs disagree\n--- source ---\n{source}--- tree ---\n{tree:?}\n--- bytecode ---\n{byte:?}\n"
+    );
+}
+
+/// Programs read from disk that this test cannot compare, named rather than
+/// detected.
+///
+/// A differential test is only worth anything if it is deterministic, and one of
+/// these prints the wall clock, so its two runs differ by a second however
+[0m
+[0m← [0mWrite tests/mod_in_test.rs
+Wrote file successfully.
+[0m
+Now writing the failing test.
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -316,24 +316,22 @@
+ /// `is in` is a comparison, so it sits at comparison precedence: it binds
+ /// tighter than `and`/`or` and looser than arithmetic.
+ #[test]
+ fn is_in_keeps_comparison_precedence() {
+-    for (word, symbol) in [
+-        ("1 + 1 is in [1, 2]", "1 + 1 in_list_symbol"),
+-        ("2 * 3 is in [6, 7]", "2 * 3 in_list_symbol"),
+-        ("1 is in [1, 2] and 3 is in [3]", "chained_symbol"),
+-    ] {
+-        if symbol.contains("in_list_symbol") {
+-            assert_eq!(
+-                eval(word),
+-                yes_no(true),
+-                "`{}` should see the arithmetic result",
+-                word
+-            );
+-        } else {
+-            assert_eq!(eval(word), yes_no(true), "`{}`", word);
+-        }
+-    }
++    // Arithmetic binds tighter, so the left operand is the computed value.
++    assert_eq!(eval("1 + 1 is in [1, 2]"), yes_no(true));
++    assert_eq!(eval("2 * 3 is in [6, 7]"), yes_no(true));
++    assert_eq!(eval("2 * 3 is in [5, 6]"), yes_no(false));
++
++    // A parenthesised operand is the same value.
++    assert_eq!(eval("(1 + 1) is in [2]"), yes_no(true));
++
++    // `and` binds looser, so the membership test is the whole left operand.
++    assert_eq!(eval("1 is in [1, 2] and 3 is in [3]"), yes_no(true));
++    assert_eq!(eval("1 is in [9] and 3 is in [3]"), yes_no(false));
++
++    // The comparison words on both sides of `in` are unaffected.
++    assert_eq!(eval("length of [1] is in [1]"), yes_no(true));
+ }
+ 
+ /// A bare `is` is still equality, and a word that merely starts with `in` is
+ /// still an identifier. Adding the `in` branch must not swallow either.
+
+[0m
+[0m$ [0mgrep -n "pub fn new" -B5 -A 10 src/error.rs | head -40; echo "=== record literal parse"; grep -n 'LeftBrace' src/parser.rs | head
+9-    pub line: usize,
+10-    pub column: usize,
+11-}
+12-
+13-impl Span {
+14:    pub fn new(line: usize, column: usize) -> Self {
+15-        Self { line, column }
+16-    }
+17-
+18-    /// A position that is not attached to any source text. Only for failures
+19-    /// that happen before a token exists, such as a module file that cannot be
+20-    /// read.
+21-    pub fn unknown() -> Self {
+22-        Self { line: 0, column: 0 }
+23-    }
+24-
+=== record literal parse
+1206:                | Some(TokenKind::LeftBrace)
+1709:            TokenKind::LeftBrace => {
+[0m
+[0m$ [0msed -n 1705,1730p src/parser.rs; echo "=== Token struct"; grep -n "pub struct Token" -A 8 src/lexer.rs
+self.leave_nesting(1);
+                self.expect(&TokenKind::RightBracket)?;
+                Ok(Expr::List(items))
+            }
+            TokenKind::LeftBrace => {
+                self.advance();
+                let mut fields = Vec::new();
+
+                self.enter_nesting()?;
+                while self.current().map(|t| &t.kind) != Some(&TokenKind::RightBrace)
+                    && self.current().map(|t| &t.kind) != Some(&TokenKind::Eof)
+                {
+                    let key = match self.current() {
+                        Some(Token {
+                            kind: TokenKind::Identifier(name),
+                            ..
+                        }) => {
+                            let n = name.clone();
+                            self.advance();
+                            n
+                        }
+                        _ => {
+                            return Err(Error::Parser(
+                                "Expected field name".to_string(),
+                                self.span(),
+                            ))
+=== Token struct
+164:pub struct Token {
+165-    pub kind: TokenKind,
+166-    pub line: usize,
+167-    pub column: usize,
+168-}
+169-
+170-impl Token {
+171-    pub fn new(kind: TokenKind, line: usize, column: usize) -> Self {
+172-        Self { kind, line, column }
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -144,16 +144,10 @@
+ fn mod_is_a_keyword_and_not_an_identifier() {
+     assert_eq!(
+         tokens("mod"),
+         vec![
+-            Token {
+-                kind: TokenKind::Mod,
+-                span: redblue::error::Span::new(1, 1, 3)
+-            },
+-            Token {
+-                kind: TokenKind::Eof,
+-                span: redblue::error::Span::new(1, 4, 3)
+-            },
++            Token::new(TokenKind::Mod, 1, 1),
++            Token::new(TokenKind::Eof, 1, 4),
+         ],
+         "`mod` must lex as the modulo operator, not as an identifier"
+     );
+ 
+
+[0m
+[0m← [0mWrite tests/test_mod_in.rb
+Wrote file successfully.
+[0m
+Now the Redblue-level test blocks, then run to watch it fail.
+[0m$ [0mcargo test --test mod_in_test 2>&1 | tail -60
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0369][0m[1m: binary operation `==` cannot be applied to type `Vec<Token>`[0m
+   [1m[94m--> [0mtests/mod_in_test.rs:145:5
+    [1m[94m|[0m
+[1m[94m145[0m [1m[94m|[0m [1m[91m/[0m     assert_eq!(
+[1m[94m146[0m [1m[94m|[0m [1m[91m|[0m         tokens("mod"),
+[1m[94m147[0m [1m[94m|[0m [1m[91m|[0m         vec![
+[1m[94m148[0m [1m[94m|[0m [1m[91m|[0m             Token::new(TokenKind::Mod, 1, 1),
+[1m[94m...[0m   [1m[91m|[0m
+[1m[94m151[0m [1m[94m|[0m [1m[91m|[0m         "`mod` must lex as the modulo operator, not as an identifier"
+[1m[94m152[0m [1m[94m|[0m [1m[91m|[0m     );
+    [1m[94m|[0m [1m[91m|[0m     [1m[91m^[0m
+    [1m[94m|[0m [1m[91m|[0m     [1m[91m|[0m
+    [1m[94m|[0m [1m[91m|_____Vec<Token>[0m
+    [1m[94m|[0m       [1m[91mVec<Token>[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: `Token` does not implement `PartialEq`
+   [1m[94m--> [0msrc/lexer.rs:164:1
+    [1m[94m|[0m
+[1m[94m164[0m [1m[94m|[0m pub struct Token {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^^^[0m [1m[92m`Token` is defined in another crate[0m
+
+[1mFor more information about this error, try `rustc --explain E0369`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "mod_in_test") due to 1 previous error
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -141,16 +141,18 @@
+ /// this the parser never sees a `TokenKind::Mod` and the analyzer reports
+ /// `Unknown variable 'mod'`.
+ #[test]
+ fn mod_is_a_keyword_and_not_an_identifier() {
++    let lexed = tokens("mod");
+     assert_eq!(
+-        tokens("mod"),
+-        vec![
+-            Token::new(TokenKind::Mod, 1, 1),
+-            Token::new(TokenKind::Eof, 1, 4),
+-        ],
++        lexed
++            .iter()
++            .map(|t| t.kind.clone())
++            .collect::<Vec<_>>(),
++        vec![TokenKind::Mod, TokenKind::Eof],
+         "`mod` must lex as the modulo operator, not as an identifier"
+     );
++    assert_eq!((lexed[0].line, lexed[0].column), (1, 1), "`mod` span");
+ 
+     // The keyword is published to editor tooling, which is asserted by
+     // `tooling_grammar_test::grammar_covers_the_lexer_keyword_set`.
+     assert!(
+
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -19,9 +19,9 @@
+ use std::process::Command;
+ 
+ use redblue::bytecode::vm::BytecodeVm;
+ use redblue::bytecode::compile_source;
+-use redblue::lexer::{Lexer, Token, TokenKind};
++use redblue::lexer::{Lexer, TokenKind};
+ use redblue::parser::{parse, Statement};
+ use redblue::{Error, Value};
+ 
+ // ---------------------------------------------------------------------------
+
+[0m
+[0m$ [0mcargo test --test mod_in_test 2>&1 | tail -70
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0425][0m[1m: cannot find type `Token` in this scope[0m
+  [1m[94m--> [0mtests/mod_in_test.rs:40:32
+   [1m[94m|[0m
+[1m[94m40[0m [1m[94m|[0m fn tokens(source: &str) -> Vec<Token> {
+   [1m[94m|[0m                                [1m[91m^^^^^[0m [1m[91mnot found in this scope[0m
+   [1m[94m|[0m
+[1m[96mhelp[0m: you might be missing a type parameter
+   [1m[94m|[0m
+[1m[94m40[0m [1m[94m| [0mfn tokens[92m<Token>[0m(source: &str) -> Vec<Token> {
+   [1m[94m|[0m          [92m+++++++[0m
+
+[1mFor more information about this error, try `rustc --explain E0425`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "mod_in_test") due to 1 previous error
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -36,9 +36,9 @@
+     fs::create_dir_all(&dir).expect("scratch dir should be creatable");
+     dir
+ }
+ 
+-fn tokens(source: &str) -> Vec<Token> {
++fn tokens(source: &str) -> Vec<redblue::lexer::Token> {
+     Lexer::tokenize(source).unwrap_or_else(|e| panic!("source should lex: {}", e))
+ }
+ 
+ /// Runs `source` on the tree-walking VM and returns the value of its last
+
+[0m
+[0m$ [0mcargo test --test mod_in_test 2>&1 | tail -80
+2: mod_in_test::eval::{closure#1}
+   3: <core::result::Result<redblue::value::Value, redblue::error::Error>>::unwrap_or_else::<mod_in_test::eval::{closure#1}>
+   4: mod_in_test::eval
+   5: mod_in_test::assert_both_vms_agree
+   6: mod_in_test::the_word_mod_computes_the_documented_remainder
+   7: mod_in_test::the_word_mod_computes_the_documented_remainder::{closure#0}
+   8: <mod_in_test::the_word_mod_computes_the_documented_remainder::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- the_word_mod_keeps_multiplicative_precedence stdout ----
+
+thread 'the_word_mod_keeps_multiplicative_precedence' (5602) panicked at tests/mod_in_test.rs:60:37:
+`10 mod 2 + 1` should run: RuntimeError: Unknown variable 'mod'
+  --> 1:4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: mod_in_test::eval::{closure#1}
+   3: <core::result::Result<redblue::value::Value, redblue::error::Error>>::unwrap_or_else::<mod_in_test::eval::{closure#1}>
+   4: mod_in_test::eval
+   5: mod_in_test::the_word_mod_keeps_multiplicative_precedence
+   6: mod_in_test::the_word_mod_keeps_multiplicative_precedence::{closure#0}
+   7: <mod_in_test::the_word_mod_keeps_multiplicative_precedence::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- the_word_mod_and_the_symbol_percent_agree_on_every_operand stdout ----
+
+thread 'the_word_mod_and_the_symbol_percent_agree_on_every_operand' (5600) panicked at tests/mod_in_test.rs:60:37:
+`10 mod 3` should run: RuntimeError: Unknown variable 'mod'
+  --> 1:4
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: mod_in_test::eval::{closure#1}
+   3: <core::result::Result<redblue::value::Value, redblue::error::Error>>::unwrap_or_else::<mod_in_test::eval::{closure#1}>
+   4: mod_in_test::eval
+   5: mod_in_test::the_word_mod_and_the_symbol_percent_agree_on_every_operand
+   6: mod_in_test::the_word_mod_and_the_symbol_percent_agree_on_every_operand::{closure#0}
+   7: <mod_in_test::the_word_mod_and_the_symbol_percent_agree_on_every_operand::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- is_in_takes_the_branch_it_names stdout ----
+
+thread 'is_in_takes_the_branch_it_names' (5596) panicked at tests/mod_in_test.rs:305:5:
+`is in` program failed: Error: ParserError: Unexpected token In
+  --> /home/runner/work/rbops/rbops/redblue/target/tmp/rb-mod-in/is-in-branches/program.rb:4:11
+4 | if "a" is in words then
+  |           ^
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: mod_in_test::is_in_takes_the_branch_it_names
+   3: mod_in_test::is_in_takes_the_branch_it_names::{closure#0}
+   4: <mod_in_test::is_in_takes_the_branch_it_names::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_empty_list_haystack_contains_nothing
+    edge_empty_text_haystack_is_a_runtime_error
+    edge_membership_in_a_record_or_a_number_is_a_caught_runtime_error
+    edge_modulo_by_zero_is_a_caught_runtime_error
+    edge_modulo_rejects_non_numbers
+    edge_needle_of_the_wrong_type_answers_no_rather_than_failing
+    edge_nested_and_unicode_haystacks_are_compared_structurally
+    edge_nothing_needle_matches_only_nothing
+    edge_singleton_haystack_matches_only_its_one_element
+    is_before_a_partial_in_word_still_tests_equality
+    is_in_keeps_comparison_precedence
+    is_in_takes_the_branch_it_names
+    mod_is_a_keyword_and_not_an_identifier
+    the_word_forms_run_on_the_bytecode_vm_too
+    the_word_mod_and_the_symbol_percent_agree_on_every_operand
+    the_word_mod_computes_the_documented_remainder
+    the_word_mod_keeps_multiplicative_precedence
+
+test result: FAILED. 0 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test mod_in_test`
+[0m
+[0m← [0mEdit src/lexer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lexer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lexer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lexer.rs
+@@ -46,8 +46,9 @@
+ ("finally", TokenKind::Finally),
+ ("and", TokenKind::And),
+ ("or", TokenKind::Or),
+ ("not", TokenKind::Not),
++("mod", TokenKind::Mod),
+ ("yes", TokenKind::YesNo(true)),
+ ("no", TokenKind::YesNo(false)),
+ ("nothing", TokenKind::Nothing),
+ ("module", TokenKind::Module),
+
+[0m
+Red for the right reasons. Now the smallest fix.
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -1346,8 +1346,15 @@
+         }) => {
+             self.advance();
+             BinaryOp::NotEqual
+         }
++        Some(Token {
++            kind: TokenKind::In,
++            ..
++        }) => {
++            self.advance();
++            BinaryOp::In
++        }
+         // "is" alone means equality
+         _ => BinaryOp::Equal,
+     }
+ }
+
+[0m
+[0m← [0mEdit src/repl/completer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
+@@ -40,8 +40,9 @@
+ "finally".to_string(),
+ "and".to_string(),
+ "or".to_string(),
+ "not".to_string(),
++"mod".to_string(),
+ "yes".to_string(),
+ "no".to_string(),
+ "nothing".to_string(),
+ "module".to_string(),
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import io
+p='tooling/vscode/syntaxes/redblue.tmLanguage.json'
+s=io.open(p,encoding='utf-8').read()
+assert '|not|yes|no|nothing|module|' in s
+s=s.replace('|not|yes|no|nothing|module|','|not|mod|yes|no|nothing|module|',1)
+io.open(p,'w',encoding='utf-8').write(s)
+print('ok')
+EOF
+ok
+[0m
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -1299,14 +1299,16 @@
+ }
+ 
+ /// Reads the comparison operator that follows an `is`, in either its word
+ /// form (`is greater than or equal to`) or its symbolic one (`is =`,
+-/// `is not`). Bare `is` is equality.
++/// `is not`). Bare `is` is equality; `is in` is membership.
+ ///
+ /// A word only counts as an operator when the *whole* phrase is there: a
+ /// variable named `greater` or `than` still compares for equality, so
+ /// nothing is consumed on a partial match and the rest of the line is
+-/// parsed exactly as it was before this phase.
++/// parsed exactly as it was before this phase. `in` needs no such guard
++/// because it is a keyword: it cannot name a variable, so nothing that used
++/// to parse as `is <variable>` can be mistaken for `is in`.
+ fn parse_is_operator(&mut self) -> BinaryOp {
+     if self.is_word_ahead(0, "equal") && matches!(self.current_at(1), Some(TokenKind::To)) {
+         self.advance();
+         self.advance();
+
+[0m
+[0m$ [0mcargo test --test mod_in_test 2>&1 | tail -60
+thread 'is_in_keeps_comparison_precedence' (5785) panicked at tests/mod_in_test.rs:319:5:
+assertion `left == right` failed
+  left: YesNo(true)
+ right: YesNo(false)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::value::Value, redblue::value::Value>
+   4: mod_in_test::is_in_keeps_comparison_precedence
+   5: mod_in_test::is_in_keeps_comparison_precedence::{closure#0}
+   6: <mod_in_test::is_in_keeps_comparison_precedence::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- the_word_forms_run_on_the_bytecode_vm_too stdout ----
+
+thread 'the_word_forms_run_on_the_bytecode_vm_too' (5788) panicked at tests/mod_in_test.rs:463:5:
+assertion `left == right` failed
+  left: Nothing
+ right: Number(1.0)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::value::Value, redblue::value::Value>
+   4: mod_in_test::the_word_forms_run_on_the_bytecode_vm_too
+   5: mod_in_test::the_word_forms_run_on_the_bytecode_vm_too::{closure#0}
+   6: <mod_in_test::the_word_forms_run_on_the_bytecode_vm_too::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- the_word_mod_computes_the_documented_remainder stdout ----
+
+thread 'the_word_mod_computes_the_documented_remainder' (5791) panicked at tests/mod_in_test.rs:178:5:
+assertion `left == right` failed: bytecode VM: `10 mod 3`
+  left: Nothing
+ right: Number(1.0)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::value::Value, redblue::value::Value>
+   4: mod_in_test::assert_both_vms_agree
+   5: mod_in_test::the_word_mod_computes_the_documented_remainder
+   6: mod_in_test::the_word_mod_computes_the_documented_remainder::{closure#0}
+   7: <mod_in_test::the_word_mod_computes_the_documented_remainder::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_modulo_by_zero_is_a_caught_runtime_error
+    edge_nothing_needle_matches_only_nothing
+    is_before_a_partial_in_word_still_tests_equality
+    is_in_keeps_comparison_precedence
+    mod_is_a_keyword_and_not_an_identifier
+    the_word_forms_run_on_the_bytecode_vm_too
+    the_word_mod_computes_the_documented_remainder
+
+test result: FAILED. 10 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[91merror[0m: test failed, to rerun pass `--test mod_in_test`
+[0m
+[0m$ [0mcargo test --test mod_in_test 2>&1 | head -120
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.05s
+[1m[92m     Running[0m tests/mod_in_test.rs (target/debug/deps/mod_in_test-8d75561d740a9858)
+
+running 17 tests
+test edge_empty_text_haystack_is_a_runtime_error ... ok
+test edge_modulo_rejects_non_numbers ... ok
+test edge_needle_of_the_wrong_type_answers_no_rather_than_failing ... ok
+test edge_nested_and_unicode_haystacks_are_compared_structurally ... ok
+test edge_membership_in_a_record_or_a_number_is_a_caught_runtime_error ... ok
+test edge_singleton_haystack_matches_only_its_one_element ... ok
+test edge_empty_list_haystack_contains_nothing ... ok
+test edge_nothing_needle_matches_only_nothing ... FAILED
+test edge_modulo_by_zero_is_a_caught_runtime_error ... FAILED
+test is_in_keeps_comparison_precedence ... FAILED
+test mod_is_a_keyword_and_not_an_identifier ... FAILED
+test is_before_a_partial_in_word_still_tests_equality ... FAILED
+test the_word_forms_run_on_the_bytecode_vm_too ... FAILED
+test the_word_mod_computes_the_documented_remainder ... FAILED
+test the_word_mod_and_the_symbol_percent_agree_on_every_operand ... ok
+test the_word_mod_keeps_multiplicative_precedence ... ok
+test is_in_takes_the_branch_it_names ... ok
+
+failures:
+
+---- edge_nothing_needle_matches_only_nothing stdout ----
+
+thread 'edge_nothing_needle_matches_only_nothing' (5834) panicked at tests/mod_in_test.rs:388:5:
+assertion `left == right` failed
+  left: YesNo(false)
+ right: YesNo(true)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::value::Value, redblue::value::Value>
+   4: mod_in_test::edge_nothing_needle_matches_only_nothing
+   5: mod_in_test::edge_nothing_needle_matches_only_nothing::{closure#0}
+   6: <mod_in_test::edge_nothing_needle_matches_only_nothing::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- edge_modulo_by_zero_is_a_caught_runtime_error stdout ----
+
+thread 'edge_modulo_by_zero_is_a_caught_runtime_error' (5824) panicked at tests/mod_in_test.rs:265:5:
+the caught error should name `Modulo by zero`, got "error\n"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: mod_in_test::edge_modulo_by_zero_is_a_caught_runtime_error
+   3: mod_in_test::edge_modulo_by_zero_is_a_caught_runtime_error::{closure#0}
+   4: <mod_in_test::edge_modulo_by_zero_is_a_caught_runtime_error::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- is_in_keeps_comparison_precedence stdout ----
+
+thread 'is_in_keeps_comparison_precedence' (5837) panicked at tests/mod_in_test.rs:319:5:
+assertion `left == right` failed
+  left: YesNo(true)
+ right: YesNo(false)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::value::Value, redblue::value::Value>
+   4: mod_in_test::is_in_keeps_comparison_precedence
+   5: mod_in_test::is_in_keeps_comparison_precedence::{closure#0}
+   6: <mod_in_test::is_in_keeps_comparison_precedence::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- mod_is_a_keyword_and_not_an_identifier stdout ----
+
+thread 'mod_is_a_keyword_and_not_an_identifier' (5839) panicked at tests/mod_in_test.rs:166:9:
+assertion `left == right` failed: `module` must stay an identifier
+  left: Module
+ right: Identifier("module")
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::lexer::TokenKind, redblue::lexer::TokenKind>
+   4: mod_in_test::mod_is_a_keyword_and_not_an_identifier
+   5: mod_in_test::mod_is_a_keyword_and_not_an_identifier::{closure#0}
+   6: <mod_in_test::mod_is_a_keyword_and_not_an_identifier::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- is_before_a_partial_in_word_still_tests_equality stdout ----
+
+thread 'is_before_a_partial_in_word_still_tests_equality' (5836) panicked at tests/mod_in_test.rs:336:5:
+assertion `left == right` failed
+  left: YesNo(false)
+ right: YesNo(true)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::value::Value, redblue::value::Value>
+   4: mod_in_test::is_before_a_partial_in_word_still_tests_equality
+   5: mod_in_test::is_before_a_partial_in_word_still_tests_equality::{closure#0}
+   6: <mod_in_test::is_before_a_partial_in_word_still_tests_equality::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- the_word_forms_run_on_the_bytecode_vm_too stdout ----
+
+thread 'the_word_forms_run_on_the_bytecode_vm_too' (5841) panicked at tests/mod_in_test.rs:463:5:
+assertion `left == right` failed
+  left: Nothing
+ right: Number(1.0)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<redblue::value::Value, redblue::value::Value>
+   4: mod_in_test::the_word_forms_run_on_the_bytecode_vm_too
+   5: mod_in_test::the_word_forms_run_on_the_bytecode_vm_too::{closure#0}
+   6: <mod_in_test::the_word_forms_run_on_the_bytecode_vm_too::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- the_word_mod_computes_the_documented_remainder stdout ----
+
+thread 'the_word_mod_computes_the_documented_remainder' (5843) panicked at tests/mod_in_test.rs:178:5:
+assertion `left == right` failed: bytecode VM: `10 mod 3`
+[0m
+[0m$ [0msed -n 300,325p tests/mod_in_test.rs; echo "=== suite.rb catch error usage"; sed -n 85,100p tests/suite.rb; sed -n 155,182p tests/suite.rb
+end
+say hit
+say miss
+";
+    let (ok, stdout, stderr) = rb_run("is-in-branches", program);
+    assert!(ok, "`is in` program failed: {}", stderr);
+    assert_eq!(stdout.trim(), "yes\nno", "`is in` chose the wrong branches");
+
+    assert_eq!(eval("1 is in [1, 2, 3]"), yes_no(true));
+    assert_eq!(eval("4 is in [1, 2, 3]"), yes_no(false));
+}
+
+/// `is in` is a comparison, so it sits at comparison precedence: it binds
+/// tighter than `and`/`or` and looser than arithmetic.
+#[test]
+fn is_in_keeps_comparison_precedence() {
+    // Arithmetic binds tighter, so the left operand is the computed value.
+    assert_eq!(eval("1 + 1 is in [1, 2]"), yes_no(true));
+    assert_eq!(eval("2 * 3 is in [6, 7]"), yes_no(true));
+    assert_eq!(eval("2 * 3 is in [5, 6]"), yes_no(false));
+
+    // A parenthesised operand is the same value.
+    assert_eq!(eval("(1 + 1) is in [2]"), yes_no(true));
+
+    // `and` binds looser, so the membership test is the whole left operand.
+    assert_eq!(eval("1 is in [1, 2] and 3 is in [3]"), yes_no(true));
+=== suite.rb catch error usage
+    // rather than silently coercing.
+    set caught to no
+    try
+        set bad to "n=" + 1
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+end
+
+test "suite: a list of records sorted by walking and filtering"
+    set kept to 0
+    set dropped to 0
+    for each n in [1, 2, 3, 4, 5, 6]
+        set by2 to n % 2
+        if by2 is 0 then
+    set work to 0
+    try
+        repeat 5 times
+            set work to work + 2
+        end
+        set bad to 1 / 0
+    catch error
+        set work to work + 100
+    end
+    expect work to be 110
+end
+
+test "edge_suite_two_independent_failures_are_both_reported"
+    set first to no
+    set second to no
+    try
+        set bad to 1 / 0
+    catch error
+        set first to yes
+    end
+    try
+        set bad to 1 + "x"
+    catch error
+        set second to yes
+    end
+    expect first to be yes
+    expect second to be yes
+end
+[0m
+[0m$ [0mprintf 'set a to nothing is in [nothing]\nsay a\nset b to [nothing]\nlength of b\nsay b\n' > ./target/tmp/t1.rb; cargo run -q --bin rb -- run ./target/tmp/t1.rb
+Error: AnalyzerError: Unknown variable 'length'
+Unknown variable 'of'
+  --> ./target/tmp/t1.rb:4:1
+4 | length of b
+  | ^
+[0m
+[0m$ [0mprintf 'set a to nothing is in [nothing]\nsay a\nsay nothing is in [nothing]\nset l to [nothing]\nif nothing is in l then\n  say yes\nend\n' > ./target/tmp/t1.rb; cargo run -q --bin rb -- run ./target/tmp/t1.rb; echo "==="; printf 'try\n set bad to 10 mod 0\ncatch error\n say "caught"\n say bad\nend\n' > ./target/tmp/t2.rb; cargo run -q --bin rb -- run ./target/tmp/t2.rb
+yes
+yes
+yes
+===
+Error: RuntimeError: Unknown variable 'bad'
+  --> ./target/tmp/t2.rb:5:2
+5 |  say bad
+  |  ^
+[0m
+[0m$ [0mgrep -n "TokenKind::Nothing" src/parser.rs | head -20
+1202:                | Some(TokenKind::Nothing)
+1672:            TokenKind::Nothing => {
+[0m
+[0m$ [0msed -n 1190,1215p src/parser.rs
+Ok(Some(Statement::Expr(Expr::Expect {
+            actual: Box::new(actual),
+            expected: Box::new(expected),
+        })))
+    }
+
+    fn is_expression_start(&self) -> bool {
+        matches!(
+            self.current().map(|t| &t.kind),
+            Some(TokenKind::Number(_))
+                | Some(TokenKind::Text(_))
+                | Some(TokenKind::YesNo(_))
+                | Some(TokenKind::Nothing)
+                | Some(TokenKind::Identifier(_))
+                | Some(TokenKind::LeftParen)
+                | Some(TokenKind::LeftBracket)
+                | Some(TokenKind::LeftBrace)
+                | Some(TokenKind::Not)
+                | Some(TokenKind::Minus)
+        )
+    }
+
+    fn parse_expression(&mut self) -> Result<Expr> {
+        self.parse_or()
+    }
+[0m
+[0m$ [0mmkdir -p ./target/tmp && cat > ./target/tmp/dbg.rs <<'EOF'
+fn main() {
+    for src in ["nothing is in [nothing]", "nothing is in [1]", "1 is in [1]"] {
+        let toks = redblue::lexer::Lexer::tokenize(src).unwrap();
+        let ast = redblue::parser::parse(toks).unwrap();
+        let mut vm = redblue::Vm::new();
+        let r = vm.run(&ast);
+        println!("{:?} => {:?}", src, r);
+    }
+}
+EOF
+echo skip
+skip
+[0m
+[0m$ [0mgrep -n "pub fn run" -A 30 src/vm.rs | head -60
+123:pub fn run_isolated(program: &Program) -> (Vm, Result<Value>) {
+124-    let limit = resolve_max_call_depth();
+125-    let program = program.clone();
+126-    let builder = std::thread::Builder::new()
+127-        .name("redblue-vm".to_string())
+128-        .stack_size(limit.saturating_mul(STACK_BYTES_PER_CALL));
+129-
+130-    let joined = match builder.spawn(move || {
+131-        let mut vm = Vm::new();
+132-        let result = vm.run(&program);
+133-        (vm, result)
+134-    }) {
+135-        Ok(handle) => handle.join(),
+136-        Err(e) => {
+137-            return (
+138-                Vm::new(),
+139-                Err(Error::Io(format!(
+140-                    "Cannot start the interpreter thread: {}",
+141-                    e
+142-                ))),
+143-            );
+144-        }
+145-    };
+146-
+147-    match joined {
+148-        Ok(result) => result,
+149-        Err(_) => (
+150-            Vm::new(),
+151-            Err(Error::Runtime(
+152-                "The interpreter thread stopped unexpectedly".to_string(),
+153-                Span::unknown(),
+--
+398:    pub fn run(&mut self, program: &Program) -> Result<Value> {
+399-        let mut result = Value::Nothing;
+400-
+401-        for statement in &program.statements {
+402-            result = self.execute_statement(statement)?;
+403-        }
+404-
+405-        // Print collected output
+406-        for line in &self.output {
+407-            println!("{}", line);
+408-        }
+409-
+410-        Ok(result)
+411-    }
+412-
+413-    fn push_scope(&mut self) {
+414-        self.locals.push(CapturedScope::new());
+415-    }
+416-
+417-    fn pop_scope(&mut self) {
+418-        self.locals.pop();
+419-    }
+420-
+421-    /// Builds the function value for a declaration, closing over every local
+422-    /// scope that is live where the declaration is executed.
+423-    ///
+424-    /// The capture is a copy taken at declaration time, so a variable the
+425-    /// function reads is the value it had where the function was written, and
+[0m
+[0m→ [0mRead tests/mod_in_test.rs[90m [offset=380, limit=18][0m
+[0m
+[0m$ [0mprintf 'set l to [nothing]\nsay l\nsay list.length(l)\nset m to [nothing, 2]\nsay list.length(m)\nset n to nothing is in [nothing]\nsay n\n' > ./target/tmp/t3.rb; cargo run -q --bin rb -- run ./target/tmp/t3.rb
+Error: AnalyzerError: Unknown variable 'list'
+Unknown variable 'list'
+  --> ./target/tmp/t3.rb:3:1
+3 | say list.length(l)
+  | ^
+[0m
+[0m$ [0mprintf 'set l to [nothing]\nsay l\nset m to [nothing, 2]\nsay m\nset n to nothing is in [nothing]\nsay n\nset p to nothing is in m\nsay p\n' > ./target/tmp/t3.rb; cargo run -q --bin rb -- run ./target/tmp/t3.rb
+[nothing]
+[nothing, 2]
+yes
+yes
+[0m
+[0m$ [0mprintf 'set q to 1 is in [nothing, 2]\nsay q\nset q2 to 2 is in [nothing, 2]\nsay q2\nset q3 to 2 is in [nothing, 2, 3]\nsay q3\nset q4 to 1 is in [1, 2]\nsay q4\nset q5 to 1 is in [nothing, 1]\nsay q5\n' > ./target/tmp/t4.rb; cargo run -q --bin rb -- run ./target/tmp/t4.rb
+no
+yes
+yes
+yes
+yes
+[0m
+[0m$ [0mprintf 'set a to 1 is in [nothing, 2, 1]\nsay a\nset b to [nothing, 2, 1]\nsay 1 is in b\nset c to [nothing, 2]\nsay c\nsay 1 is in c\nsay 2 is in c\n' > ./target/tmp/t5.rb; cargo run -q --bin rb -- run ./target/tmp/t5.rb
+yes
+yes
+[nothing, 2]
+no
+yes
+[0m
+[0m$ [0mgrep -n "Catch" src/parser.rs | head -20; echo "=== vm error binding"; grep -rn "error_message\|\"message\"\|Catch =>" src/vm.rs src/runtime.rs | head -20
+1058:        while self.current().map(|t| &t.kind) != Some(&TokenKind::Catch)
+1073:            kind: TokenKind::Catch,
+=== vm error binding
+[0m
+[0m$ [0msed -n 1050,1085p src/parser.rs; echo "=== Statement Catch"; grep -n "Catch" -A 6 src/parser.rs | sed -n 1,40p
+}))
+    }
+
+    fn parse_try(&mut self) -> Result<Option<Statement>> {
+        self.advance(); // consume 'try'
+        self.skip_newlines();
+
+        let mut body = Vec::new();
+        while self.current().map(|t| &t.kind) != Some(&TokenKind::Catch)
+            && self.current().map(|t| &t.kind) != Some(&TokenKind::Finally)
+            && self.current().map(|t| &t.kind) != Some(&TokenKind::End)
+            && self.current().map(|t| &t.kind) != Some(&TokenKind::Eof)
+        {
+            if let Some(stmt) = self.parse_statement()? {
+                body.push(stmt);
+            }
+            self.skip_newlines();
+        }
+
+        let mut catch_var = None;
+        let mut catch_body = Vec::new();
+
+        if let Some(Token {
+            kind: TokenKind::Catch,
+            ..
+        }) = self.current()
+        {
+            self.advance();
+            if let Some(Token {
+                kind: TokenKind::Identifier(name),
+                ..
+            }) = self.current()
+            {
+                catch_var = Some(name.clone());
+                self.advance();
+            }
+=== Statement Catch
+1058:        while self.current().map(|t| &t.kind) != Some(&TokenKind::Catch)
+1059-            && self.current().map(|t| &t.kind) != Some(&TokenKind::Finally)
+1060-            && self.current().map(|t| &t.kind) != Some(&TokenKind::End)
+1061-            && self.current().map(|t| &t.kind) != Some(&TokenKind::Eof)
+1062-        {
+1063-            if let Some(stmt) = self.parse_statement()? {
+1064-                body.push(stmt);
+--
+1073:            kind: TokenKind::Catch,
+1074-            ..
+1075-        }) = self.current()
+1076-        {
+1077-            self.advance();
+1078-            if let Some(Token {
+1079-                kind: TokenKind::Identifier(name),
+[0m
+[0m$ [0mgrep -n "Try" -A 30 src/vm.rs | sed -n 1,60p
+719:            Statement::Try {
+720-                body,
+721-                catch_var,
+722-                catch_body,
+723-                finally_body,
+724-            } => {
+725-                let result = self.execute_statements(body);
+726-
+727-                // A catch is PRESENT whenever the parser saw one, which is not the
+728-                // same as catch_var being Some: `catch` with no name binding parses
+729-                // to catch_var == None with a non-empty body. Testing the Option
+730-                // therefore (a) never ran a bare catch and (b) fell through to
+731-                // `Ok(Value::Nothing)` below, silently swallowing the error. A
+732-                // swallowed error is the interpreter lying about what happened.
+733-                let has_catch = catch_var.is_some() || !catch_body.is_empty();
+734-
+735-                match (result, has_catch) {
+736-                    (Err(_), true) => {
+737-                        self.push_scope();
+738-                        if let Some(var) = catch_var {
+739-                            self.declare(var);
+740-                            self.set_var(var, Value::Text("error".to_string()))?;
+741-                        }
+742-                        for stmt in catch_body {
+743-                            self.execute_statement(stmt)?;
+744-                        }
+745-                        self.pop_scope();
+746-                    }
+747-                    // No catch to handle it: propagate rather than discard.
+748-                    (Err(e), false) => return Err(e),
+749-                    (Ok(_), _) => {}
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='tests/mod_in_test.rs'
+s=io.open(p,encoding='utf-8').read()
+
+def rep(a,b):
+    global s
+    assert a in s, a[:70]
+    s=s.replace(a,b,1)
+
+rep('''    // A prefix that merely starts with `mod` is still an identifier, so adding
+    // the keyword cannot swallow `module` or `modify`.
+    for word in ["module", "modify", "modern", "modulo"] {
+        assert_eq!(
+            tokens(word)[0].kind,
+            TokenKind::Identifier(word.to_string()),
+            "`{}` must stay an identifier",
+            word
+        );
+    }''',
+'''    // A word that merely starts with `mod` is unaffected: `module` keeps its own
+    // keyword and the rest stay identifiers, so reserving `mod` swallowed
+    // nothing.
+    assert_eq!(tokens("module")[0].kind, TokenKind::Module);
+    for word in ["modify", "modern", "modulo", "mode", "moved"] {
+        assert_eq!(
+            tokens(word)[0].kind,
+            TokenKind::Identifier(word.to_string()),
+            "`{}` must stay an identifier",
+            word
+        );
+    }''')
+
+rep('''/// Runs `source` through the bytecode compiler and VM, for the differential
+/// check: the word forms must behave the same on both engines.
+#[track_caller]
+fn eval_bytecode(source: &str) -> Value {
+    let chunk = compile_source(source)
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", source, e));
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk)
+        .unwrap_or_else(|e| panic!("`{}` should run as bytecode: {}", source, e))
+}
+
+#[track_caller]
+fn assert_both_vms_agree(source: &str, expected: Value) {
+    let tree = eval(source);
+    let byte = eval_bytecode(source);
+    assert_eq!(tree, expected, "tree-walking VM: `{}`", source);
+    assert_eq!(byte, expected, "bytecode VM: `{}`", source);
+}''',
+'''/// Runs `source` through the bytecode compiler and VM and returns what it
+/// printed, so the two engines can be compared on observable behaviour. The
+/// bytecode VM does not carry a bare expression's value out of `run`, so the
+/// comparison is made over printed output rather than over a return value.
+#[track_caller]
+fn say_on_both_vms(name: &str, source: &str) -> String {
+    let _ = eval(&format!("say {}", source));
+
+    let chunk = compile_source(&format!("say {}", source))
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", source, e));
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk)
+        .unwrap_or_else(|e| panic!("`{}` should run as bytecode: {}", source, e));
+    vm.take_output()
+        .join("\\n")
+        .trim()
+        .to_string()
+}
+
+#[track_caller]
+fn assert_both_vms_say(name: &str, source: &str, expected: &str) {
+    let printed = say_on_both_vms(name, source);
+    assert_eq!(printed, expected, "`{}` on either engine", source);
+}''')
+
+rep('''    assert_both_vms_agree("10 mod 3", number(1.0));
+    assert_both_vms_agree("10 % 3", number(1.0));
+
+    // It also parses inside a statement, which is how SPEC.md spells it.
+    let program = "\\
+set remainder to 10 mod 3
+say remainder
+";
+    let (ok, stdout, stderr) = rb_run("mod-in-set", program);
+    assert!(ok, "`set remainder to 10 mod 3` failed: {}", stderr);
+    assert_eq!(stdout.trim(), "1", "`mod` should print 1");''',
+'''    assert_eq!(eval("10 mod 3"), number(1.0));
+    assert_eq!(eval("10 % 3"), number(1.0));
+    assert_both_vms_say("mod-remainder", "10 mod 3", "1");
+
+    // It also parses inside a statement, which is how SPEC.md spells it.
+    let program = "\\
+set remainder to 10 mod 3
+say remainder
+say 10 % 3
+";
+    let (ok, stdout, stderr) = rb_run("mod-in-set", program);
+    assert!(ok, "`set remainder to 10 mod 3` failed: {}", stderr);
+    assert_eq!(
+        stdout.trim(),
+        "1\\n1",
+        "`mod` and `%` must print the same remainder"
+    );''')
+
+rep('''    assert_eq!(eval("2 * 3 is in [5, 6]"), yes_no(false));''',
+'''    assert_eq!(eval("2 * 3 is in [5, 7]"), yes_no(false));''')
+
+rep('''    assert_eq!(eval("set inside to 5\\n\\"inside\\" is inside"), yes_no(true));
+    assert_eq!(eval("set inside to 5\\n\\"other\\" is inside"), yes_no(false));''',
+'''    assert_eq!(
+        eval("set inside to \\"inside\\"\\n\\"inside\\" is inside"),
+        yes_no(true)
+    );
+    assert_eq!(
+        eval("set inside to \\"inside\\"\\n\\"other\\" is inside"),
+        yes_no(false)
+    );''')
+
+rep('''    // And the language can observe it, so it is a catchable error rather than a
+    // fatal one.
+    let program = "\\
+set caught to \\"\\"
+try
+    set bad to 10 mod 0
+catch error
+    set caught to error
+end
+say caught
+";
+    let (ok, stdout, stderr) = rb_run("mod-zero", program);
+    assert!(ok, "`10 mod 0` inside try/catch should be caught: {}", stderr);
+    assert!(
+        stdout.contains("Modulo by zero"),
+        "the caught error should name `Modulo by zero`, got {:?}",
+        stdout
+    );''',
+'''    // And the language can observe it, so it is a catchable error rather than a
+    // fatal one: the program exits 0 and the catch clause runs. The exact
+    // message is pinned above, on the error itself.
+    let program = "\\
+set caught to no
+try
+    set bad to 10 mod 0
+catch failure
+    set caught to failure
+end
+say caught
+";
+    let (ok, stdout, stderr) = rb_run("mod-zero", program);
+    assert!(ok, "`10 mod 0` inside try/catch should be caught: {}", stderr);
+    assert_eq!(stdout.trim(), "error", "the catch clause should have run");''')
+
+rep('''    assert_eq!(eval("nothing is in [nothing, 2]"), yes_no(true));''',
+'''    assert_eq!(eval("1 is in [nothing, 2]"), yes_no(false));
+    assert_eq!(eval("1 is in [nothing, 1]"), yes_no(true));
+    assert_eq!(eval("nothing is in [nothing, 1]"), yes_no(true));''')
+
+rep('''#[test]
+fn the_word_forms_run_on_the_bytecode_vm_too() {
+    assert_eq!(eval_bytecode("10 mod 3"), number(1.0));
+    assert_eq!(eval_bytecode("1 is in [1, 2]"), yes_no(true));
+    assert_eq!(eval_bytecode("3 is in [1, 2]"), yes_no(false));
+
+    let chunk = compile_source("say 10 mod 3").expect("`mod` should compile to bytecode");
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk).expect("bytecode should run");
+    assert_eq!(vm.take_output(), vec!["1".to_string()]);
+}''',
+'''#[test]
+fn the_word_forms_run_on_the_bytecode_vm_too() {
+    assert_both_vms_say("bytecode-mod", "10 mod 3", "1");
+    assert_both_vms_say("bytecode-mod-zero", "10 mod 0 % 1", "0");
+    assert_both_vms_say("bytecode-in", "1 is in [1, 2]", "yes");
+    assert_both_vms_say("bytecode-in-miss", "3 is in [1, 2]", "no");
+    assert_both_vms_say("bytecode-in-empty", "1 is in []", "no");
+
+    // The failure is catchable on the bytecode engine too, with the same
+    // message the tree-walking VM gives.
+    let chunk = compile_source("try\\n set bad to 10 mod 0\\ncatch failure\\n say \\"caught\\"\\nend")
+        .expect("`mod` by zero should compile to bytecode");
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk).expect("bytecode should run");
+    assert_eq!(vm.take_output(), vec!["caught".to_string()]);
+
+    let chunk = compile_source("say \\"a\\" is in 5").expect("`is in` should compile to bytecode");
+    let mut vm = BytecodeVm::new();
+    let error = vm.run(&chunk).expect_err("`is in` over a number must fail");
+    assert_eq!(error.label(), "RuntimeError");
+    assert_eq!(error.message(), "Right side of 'in' must be a list");
+}''')
+
+io.open(p,'w',encoding='utf-8').write(s)
+print("ok")
+PY
+Traceback (most recent call last):
+  File "<stdin>", line 153, in <module>
+  File "<stdin>", line 7, in rep
+AssertionError:     assert_eq!(eval("nothing is in [nothing, 2]"), yes_no(true));
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n 'nothing, 2' tests/mod_in_test.rs
+388:    assert_eq!(eval("1 is in [nothing, 2]"), yes_no(true));
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "pub fn label\|pub fn message\|pub fn is_known" src/error.rs
+25:    pub fn is_known(&self) -> bool {
+69:    pub fn label(&self) -> &'static str {
+84:    pub fn message(&self) -> &str {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='tests/mod_in_test.rs'
+s=io.open(p,encoding='utf-8').read()
+
+def rep(a,b):
+    global s
+    assert a in s, "MISSING: "+a[:80]
+    s=s.replace(a,b,1)
+
+rep('''    // A prefix that merely starts with `mod` is still an identifier, so adding
+    // the keyword cannot swallow `module` or `modify`.
+    for word in ["module", "modify", "modern", "modulo"] {
+        assert_eq!(
+            tokens(word)[0].kind,
+            TokenKind::Identifier(word.to_string()),
+            "`{}` must stay an identifier",
+            word
+        );
+    }''',
+'''    // A word that merely starts with `mod` is unaffected: `module` keeps its own
+    // keyword and the rest stay identifiers, so reserving `mod` swallowed
+    // nothing.
+    assert_eq!(tokens("module")[0].kind, TokenKind::Module);
+    for word in ["modify", "modern", "modulo", "mode", "moved"] {
+        assert_eq!(
+            tokens(word)[0].kind,
+            TokenKind::Identifier(word.to_string()),
+            "`{}` must stay an identifier",
+            word
+        );
+    }''')
+
+rep('''/// Runs `source` through the bytecode compiler and VM, for the differential
+/// check: the word forms must behave the same on both engines.
+#[track_caller]
+fn eval_bytecode(source: &str) -> Value {
+    let chunk = compile_source(source)
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", source, e));
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk)
+        .unwrap_or_else(|e| panic!("`{}` should run as bytecode: {}", source, e))
+}
+
+#[track_caller]
+fn assert_both_vms_agree(source: &str, expected: Value) {
+    let tree = eval(source);
+    let byte = eval_bytecode(source);
+    assert_eq!(tree, expected, "tree-walking VM: `{}`", source);
+    assert_eq!(byte, expected, "bytecode VM: `{}`", source);
+}''',
+'''/// What `expr` prints on each engine: what it wrote out, or `!` when it failed.
+///
+/// The bytecode VM does not carry a bare expression's value out of `run`, so
+/// the two engines are compared over observable behaviour — what they print —
+/// rather than over a return value that only one of them produces.
+fn printed(tree: Vec<String>, byte: Vec<String>, expr: &str) -> String {
+    assert_eq!(
+        tree, byte,
+        "the two engines printed differently for `{}`",
+        expr
+    );
+    let joined = tree.join("\\n");
+    if joined.is_empty() {
+        "!".to_string()
+    } else {
+        joined
+    }
+}
+
+/// Runs `say expr` on both engines and asserts both printed `expected`.
+#[track_caller]
+fn assert_both_say(expr: &str, expected: &str) {
+    let program = format!("say {}", expr);
+
+    let ast = parse(tokens(&program)).unwrap_or_else(|e| panic!("`{}` should parse: {}", expr, e));
+    let (mut tree_vm, tree_result) = run_isolated(&ast);
+    let tree_output = tree_vm.take_output();
+    tree_result.unwrap_or_else(|e| panic!("`{}` should run: {}", expr, e));
+
+    let chunk = compile_source(&program)
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", expr, e));
+    let mut byte_vm = BytecodeVm::new();
+    let byte_output = byte_vm
+        .run(&chunk)
+        .map(|_| byte_vm_output(&mut byte_vm))
+        .unwrap_or_else(|e| panic!("`{}` should run as bytecode: {}", expr, e));
+
+    assert_eq!(
+        printed(tree_output, byte_output, expr),
+        expected,
+        "`{}`",
+        expr
+    );
+}
+
+fn byte_vm_output(vm: &mut BytecodeVm) -> Vec<String> {
+    vm.take_output()
+}
+
+/// Runs `source` on both engines and asserts both fail with `expected`.
+#[track_caller]
+fn assert_both_fail(source: &str, expected: &str) {
+    let ast = parse(tokens(source)).unwrap_or_else(|e| panic!("`{}` should parse: {}", source, e));
+    let (_, tree_result) = run_isolated(&ast);
+    let chunk = compile_source(source)
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", source, e));
+    let mut byte_vm = BytecodeVm::new();
+    let byte_result = byte_vm.run(&chunk);
+
+    for (engine, result) in [("tree-walking", tree_result), ("bytecode", byte_result)] {
+        let error = result.expect_err(&format!("`{}` should fail on {}", source, engine));
+        assert_eq!(error.label(), "RuntimeError", "`{}` on {}", source, engine);
+        assert_eq!(error.message(), expected, "`{}` on {}", source, engine);
+    }
+}''')
+
+rep('''    assert_both_vms_agree("10 mod 3", number(1.0));
+    assert_both_vms_agree("10 % 3", number(1.0));
+
+    // It also parses inside a statement, which is how SPEC.md spells it.
+    let program = "\\
+set remainder to 10 mod 3
+say remainder
+";
+    let (ok, stdout, stderr) = rb_run("mod-in-set", program);
+    assert!(ok, "`set remainder to 10 mod 3` failed: {}", stderr);
+    assert_eq!(stdout.trim(), "1", "`mod` should print 1");''',
+'''    assert_eq!(eval("10 mod 3"), number(1.0));
+    assert_eq!(eval("10 % 3"), number(1.0));
+    assert_both_say("10 mod 3", "1");
+
+    // It also parses inside a statement, which is how SPEC.md spells it.
+    let program = "\\
+set remainder to 10 mod 3
+say remainder
+say 10 % 3
+";
+    let (ok, stdout, stderr) = rb_run("mod-in-set", program);
+    assert!(ok, "`set remainder to 10 mod 3` failed: {}", stderr);
+    assert_eq!(
+        stdout.trim(),
+        "1\\n1",
+        "`mod` and `%` must print the same remainder"
+    );''')
+
+rep('''    assert_eq!(eval("2 * 3 is in [5, 6]"), yes_no(false));''',
+'''    assert_eq!(eval("2 * 3 is in [5, 7]"), yes_no(false));''')
+
+rep('''    assert_eq!(eval("set inside to 5\\n\\"inside\\" is inside"), yes_no(true));
+    assert_eq!(eval("set inside to 5\\n\\"other\\" is inside"), yes_no(false));''',
+'''    assert_eq!(
+        eval("set inside to \\"inside\\"\\n\\"inside\\" is inside"),
+        yes_no(true)
+    );
+    assert_eq!(
+        eval("set inside to \\"inside\\"\\n\\"other\\" is inside"),
+        yes_no(false)
+    );''')
+
+rep('''    // And the language can observe it, so it is a catchable error rather than a
+    // fatal one.
+    let program = "\\
+set caught to \\"\\"
+try
+    set bad to 10 mod 0
+catch error
+    set caught to error
+end
+say caught
+";
+    let (ok, stdout, stderr) = rb_run("mod-zero", program);
+    assert!(ok, "`10 mod 0` inside try/catch should be caught: {}", stderr);
+    assert!(
+        stdout.contains("Modulo by zero"),
+        "the caught error should name `Modulo by zero`, got {:?}",
+        stdout
+    );''',
+'''    assert_both_fail("10 mod 0", "Modulo by zero");
+
+    // And the language can observe it, so it is a catchable error rather than a
+    // fatal one: the program exits 0 and the catch clause runs. The message
+    // itself is pinned above and by `assert_both_fail`.
+    let program = "\\
+set caught to no
+try
+    set bad to 10 mod 0
+catch failure
+    set caught to failure
+end
+say caught
+";
+    let (ok, stdout, stderr) = rb_run("mod-zero", program);
+    assert!(ok, "`10 mod 0` inside try/catch should be caught: {}", stderr);
+    assert_eq!(stdout.trim(), "error", "the catch clause should have run");''')
+
+rep('''    assert_eq!(eval("nothing is in [nothing, 2]"), yes_no(true));''',
+'''    assert_eq!(eval("1 is in [nothing, 2]"), yes_no(false));
+    assert_eq!(eval("1 is in [nothing, 1]"), yes_no(true));
+    assert_eq!(eval("nothing is in [nothing, 1]"), yes_no(true));''')
+
+rep('''#[test]
+fn the_word_forms_run_on_the_bytecode_vm_too() {
+    assert_eq!(eval_bytecode("10 mod 3"), number(1.0));
+    assert_eq!(eval_bytecode("1 is in [1, 2]"), yes_no(true));
+    assert_eq!(eval_bytecode("3 is in [1, 2]"), yes_no(false));
+
+    let chunk = compile_source("say 10 mod 3").expect("`mod` should compile to bytecode");
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk).expect("bytecode should run");
+    assert_eq!(vm.take_output(), vec!["1".to_string()]);
+}''',
+'''#[test]
+fn the_word_forms_run_on_the_bytecode_vm_too() {
+    assert_both_say("10 mod 3", "1");
+    assert_both_say("1 is in [1, 2]", "yes");
+    assert_both_say("3 is in [1, 2]", "no");
+    assert_both_say("1 is in []", "no");
+    assert_both_say("\\"a\\" is in [\\"a\\", \\"b\\"]", "yes");
+
+    assert_both_fail("10 mod 0", "Modulo by zero");
+    assert_both_fail("\\"a\\" is in 5", "Right side of 'in' must be a list");
+
+    // The modulo failure is catchable on the bytecode engine too.
+    let chunk =
+        compile_source("try\\n set bad to 10 mod 0\\ncatch failure\\n say \\"caught\\"\\nend")
+            .expect("`mod` by zero should compile to bytecode");
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk).expect("bytecode should run");
+    assert_eq!(vm.take_output(), vec!["caught".to_string()]);
+}''')
+
+io.open(p,'w',encoding='utf-8').write(s)
+print("ok")
+PY
+Traceback (most recent call last):
+  File "<stdin>", line 196, in <module>
+  File "<stdin>", line 7, in rep
+AssertionError: MISSING:     assert_eq!(eval("nothing is in [nothing, 2]"), yes_no(true));
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='tests/mod_in_test.rs'
+s=io.open(p,encoding='utf-8').read()
+a='    assert_eq!(eval("1 is in [nothing, 2]"), yes_no(true));'
+b='''    assert_eq!(eval("1 is in [nothing, 2]"), yes_no(false));
+    assert_eq!(eval("1 is in [nothing, 1]"), yes_no(true));
+    assert_eq!(eval("nothing is in [nothing, 1]"), yes_no(true));'''
+assert a in s
+s=s.replace(a,b,1)
+io.open(p,'w',encoding='utf-8').write(s)
+print('ok')
+PY
+ok
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='tests/mod_in_test.rs'
+s=io.open(p,encoding='utf-8').read()
+
+def rep(a,b):
+    global s
+    assert a in s, "MISSING: "+a[:80]
+    s=s.replace(a,b,1)
+
+rep('''    // A prefix that merely starts with `mod` is still an identifier, so adding
+    // the keyword cannot swallow `module` or `modify`.
+    for word in ["module", "modify", "modern", "modulo"] {
+        assert_eq!(
+            tokens(word)[0].kind,
+            TokenKind::Identifier(word.to_string()),
+            "`{}` must stay an identifier",
+            word
+        );
+    }''',
+'''    // A word that merely starts with `mod` is unaffected: `module` keeps its own
+    // keyword and the rest stay identifiers, so reserving `mod` swallowed
+    // nothing.
+    assert_eq!(tokens("module")[0].kind, TokenKind::Module);
+    for word in ["modify", "modern", "modulo", "mode", "moved"] {
+        assert_eq!(
+            tokens(word)[0].kind,
+            TokenKind::Identifier(word.to_string()),
+            "`{}` must stay an identifier",
+            word
+        );
+    }''')
+
+rep('''/// Runs `source` through the bytecode compiler and VM, for the differential
+/// check: the word forms must behave the same on both engines.
+#[track_caller]
+fn eval_bytecode(source: &str) -> Value {
+    let chunk = compile_source(source)
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", source, e));
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk)
+        .unwrap_or_else(|e| panic!("`{}` should run as bytecode: {}", source, e))
+}
+
+#[track_caller]
+fn assert_both_vms_agree(source: &str, expected: Value) {
+    let tree = eval(source);
+    let byte = eval_bytecode(source);
+    assert_eq!(tree, expected, "tree-walking VM: `{}`", source);
+    assert_eq!(byte, expected, "bytecode VM: `{}`", source);
+}''',
+'''/// Runs `say expr` on both engines and asserts both printed `expected`.
+///
+/// The bytecode VM does not carry a bare expression's value out of `run`, so
+/// the engines are compared over observable behaviour — what they print —
+/// rather than over a return value only one of them produces.
+#[track_caller]
+fn assert_both_say(expr: &str, expected: &str) {
+    let program = format!("say {}", expr);
+
+    let ast =
+        parse(tokens(&program)).unwrap_or_else(|e| panic!("`{}` should parse: {}", expr, e));
+    let (mut tree_vm, tree_result) = run_isolated(&ast);
+    let tree_output = tree_vm.take_output();
+    tree_result.unwrap_or_else(|e| panic!("`{}` should run: {}", expr, e));
+
+    let chunk = compile_source(&program)
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", expr, e));
+    let mut byte_vm = BytecodeVm::new();
+    let byte_result = byte_vm.run(&chunk);
+    let byte_output = byte_vm.take_output();
+    byte_result.unwrap_or_else(|e| panic!("`{}` should run as bytecode: {}", expr, e));
+
+    assert_eq!(
+        tree_output, byte_output,
+        "the two engines printed differently for `{}`",
+        expr
+    );
+    assert_eq!(tree_output.join("\\n"), expected, "`{}`", expr);
+}
+
+/// Runs `source` on both engines and asserts both fail with `expected`.
+#[track_caller]
+fn assert_both_fail(source: &str, expected: &str) {
+    let ast = parse(tokens(source)).unwrap_or_else(|e| panic!("`{}` should parse: {}", source, e));
+    let (_, tree_result) = run_isolated(&ast);
+    let chunk = compile_source(source)
+        .unwrap_or_else(|e| panic!("`{}` should compile to bytecode: {}", source, e));
+    let byte_result = BytecodeVm::new().run(&chunk);
+
+    for (engine, result) in [("tree-walking", tree_result), ("bytecode", byte_result)] {
+        let error = result.expect_err(&format!("`{}` should fail on {}", source, engine));
+        assert_eq!(error.label(), "RuntimeError", "`{}` on {}", source, engine);
+        assert_eq!(error.message(), expected, "`{}` on {}", source, engine);
+    }
+}''')
+
+rep('''    assert_both_vms_agree("10 mod 3", number(1.0));
+    assert_both_vms_agree("10 % 3", number(1.0));
+
+    // It also parses inside a statement, which is how SPEC.md spells it.
+    let program = "\\
+set remainder to 10 mod 3
+say remainder
+";
+    let (ok, stdout, stderr) = rb_run("mod-in-set", program);
+    assert!(ok, "`set remainder to 10 mod 3` failed: {}", stderr);
+    assert_eq!(stdout.trim(), "1", "`mod` should print 1");''',
+'''    assert_eq!(eval("10 mod 3"), number(1.0));
+    assert_eq!(eval("10 % 3"), number(1.0));
+    assert_both_say("10 mod 3", "1");
+
+    // It also parses inside a statement, which is how SPEC.md spells it.
+    let program = "\\
+set remainder to 10 mod 3
+say remainder
+say 10 % 3
+";
+    let (ok, stdout, stderr) = rb_run("mod-in-set", program);
+    assert!(ok, "`set remainder to 10 mod 3` failed: {}", stderr);
+    assert_eq!(
+        stdout.trim(),
+        "1\\n1",
+        "`mod` and `%` must print the same remainder"
+    );''')
+
+rep('''    assert_eq!(eval("2 * 3 is in [5, 6]"), yes_no(false));''',
+'''    assert_eq!(eval("2 * 3 is in [5, 7]"), yes_no(false));''')
+
+rep('''    assert_eq!(eval("set inside to 5\\n\\"inside\\" is inside"), yes_no(true));
+    assert_eq!(eval("set inside to 5\\n\\"other\\" is inside"), yes_no(false));''',
+'''    assert_eq!(
+        eval("set inside to \\"inside\\"\\n\\"inside\\" is inside"),
+        yes_no(true)
+    );
+    assert_eq!(
+        eval("set inside to \\"inside\\"\\n\\"other\\" is inside"),
+        yes_no(false)
+    );''')
+
+rep('''    // And the language can observe it, so it is a catchable error rather than a
+    // fatal one.
+    let program = "\\
+set caught to \\"\\"
+try
+    set bad to 10 mod 0
+catch error
+    set caught to error
+end
+say caught
+";
+    let (ok, stdout, stderr) = rb_run("mod-zero", program);
+    assert!(ok, "`10 mod 0` inside try/catch should be caught: {}", stderr);
+    assert!(
+        stdout.contains("Modulo by zero"),
+        "the caught error should name `Modulo by zero`, got {:?}",
+        stdout
+    );''',
+'''    assert_both_fail("10 mod 0", "Modulo by zero");
+
+    // And the language can observe it, so it is a catchable error rather than a
+    // fatal one: the program exits 0 and the catch clause runs. The message
+    // itself is pinned by `assert_both_fail` above.
+    let program = "\\
+set caught to no
+try
+    set bad to 10 mod 0
+catch failure
+    set caught to failure
+end
+say caught
+";
+    let (ok, stdout, stderr) = rb_run("mod-zero", program);
+    assert!(ok, "`10 mod 0` inside try/catch should be caught: {}", stderr);
+    assert_eq!(stdout.trim(), "error", "the catch clause should have run");''')
+
+rep('''#[test]
+fn the_word_forms_run_on_the_bytecode_vm_too() {
+    assert_eq!(eval_bytecode("10 mod 3"), number(1.0));
+    assert_eq!(eval_bytecode("1 is in [1, 2]"), yes_no(true));
+    assert_eq!(eval_bytecode("3 is in [1, 2]"), yes_no(false));
+
+    let chunk = compile_source("say 10 mod 3").expect("`mod` should compile to bytecode");
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk).expect("bytecode should run");
+    assert_eq!(vm.take_output(), vec!["1".to_string()]);
+}''',
+'''#[test]
+fn the_word_forms_run_on_the_bytecode_vm_too() {
+    assert_both_say("10 mod 3", "1");
+    assert_both_say("1 is in [1, 2]", "yes");
+    assert_both_say("3 is in [1, 2]", "no");
+    assert_both_say("1 is in []", "no");
+    assert_both_say("\\"a\\" is in [\\"a\\", \\"b\\"]", "yes");
+
+    assert_both_fail("10 mod 0", "Modulo by zero");
+    assert_both_fail("\\"a\\" is in 5", "Right side of 'in' must be a list");
+
+    // The modulo failure is catchable on the bytecode engine too.
+    let chunk =
+        compile_source("try\\n set bad to 10 mod 0\\ncatch failure\\n say \\"caught\\"\\nend")
+            .expect("`mod` by zero should compile to bytecode");
+    let mut vm = BytecodeVm::new();
+    vm.run(&chunk).expect("bytecode should run");
+    assert_eq!(vm.take_output(), vec!["caught".to_string()]);
+}''')
+
+io.open(p,'w',encoding='utf-8').write(s)
+print("ok")
+PY
+ok
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -21,9 +21,9 @@
+ use redblue::bytecode::vm::BytecodeVm;
+ use redblue::bytecode::compile_source;
+ use redblue::lexer::{Lexer, TokenKind};
+ use redblue::parser::{parse, Statement};
+-use redblue::{Error, Value};
++use redblue::{run_isolated, Error, Value};
+ 
+ // ---------------------------------------------------------------------------
+ // Harness
+ // ---------------------------------------------------------------------------
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='tests/test_mod_in.rb'
+s=io.open(p,encoding='utf-8').read()
+a='''test "edge_mod: a zero divisor is caught, not fatal"
+    set caught to no
+    set message to ""
+    try
+        set bad to 10 mod 0
+    catch error
+        set caught to yes
+        set message to error
+    end
+    expect caught to be yes
+    expect contains(message, "Modulo by zero") to be yes
+end'''
+b='''test "edge_mod: a zero divisor is caught, not fatal"
+    set caught to no
+    try
+        set bad to 10 mod 0
+    catch failure
+        set caught to failure
+    end
+    expect caught to be "error"
+end'''
+assert a in s
+s=s.replace(a,b,1)
+io.open(p,'w',encoding='utf-8').write(s)
+print('ok')
+PY
+cargo test --test mod_in_test 2>&1 | tail -50
+ok
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.30s
+[1m[92m     Running[0m tests/mod_in_test.rs (target/debug/deps/mod_in_test-8d75561d740a9858)
+
+running 17 tests
+test edge_empty_text_haystack_is_a_runtime_error ... ok
+test edge_modulo_rejects_non_numbers ... ok
+test edge_needle_of_the_wrong_type_answers_no_rather_than_failing ... ok
+test edge_nested_and_unicode_haystacks_are_compared_structurally ... ok
+test edge_empty_list_haystack_contains_nothing ... ok
+test edge_modulo_by_zero_is_a_caught_runtime_error ... ok
+test edge_nothing_needle_matches_only_nothing ... ok
+test is_before_a_partial_in_word_still_tests_equality ... ok
+test edge_singleton_haystack_matches_only_its_one_element ... ok
+test mod_is_a_keyword_and_not_an_identifier ... ok
+test edge_membership_in_a_record_or_a_number_is_a_caught_runtime_error ... ok
+test the_word_mod_and_the_symbol_percent_agree_on_every_operand ... ok
+test is_in_keeps_comparison_precedence ... FAILED
+test is_in_takes_the_branch_it_names ... ok
+test the_word_mod_keeps_multiplicative_precedence ... ok
+test the_word_forms_run_on_the_bytecode_vm_too ... ok
+test the_word_mod_computes_the_documented_remainder ... ok
+
+failures:
+
+---- is_in_keeps_comparison_precedence stdout ----
+
+thread 'is_in_keeps_comparison_precedence' (6358) panicked at tests/mod_in_test.rs:60:37:
+`length of [1] is in [1]` should run: RuntimeError: Unknown variable 'of'
+  --> 1:8
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: mod_in_test::eval::{closure#1}
+   3: <core::result::Result<redblue::value::Value, redblue::error::Error>>::unwrap_or_else::<mod_in_test::eval::{closure#1}>
+   4: mod_in_test::eval
+   5: mod_in_test::is_in_keeps_comparison_precedence
+   6: mod_in_test::is_in_keeps_comparison_precedence::{closure#0}
+   7: <mod_in_test::is_in_keeps_comparison_precedence::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    is_in_keeps_comparison_precedence
+
+test result: FAILED. 16 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[91merror[0m: test failed, to rerun pass `--test mod_in_test`
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -358,10 +358,12 @@
+     // `and` binds looser, so the membership test is the whole left operand.
+     assert_eq!(eval("1 is in [1, 2] and 3 is in [3]"), yes_no(true));
+     assert_eq!(eval("1 is in [9] and 3 is in [3]"), yes_no(false));
+ 
+-    // The comparison words on both sides of `in` are unaffected.
+-    assert_eq!(eval("length of [1] is in [1]"), yes_no(true));
++    // Subtraction binds tighter too, and a negative result is still just a
++    // number to compare.
++    assert_eq!(eval("3 - 5 is in [-2, 0]"), yes_no(true));
++    assert_eq!(eval("3 - 5 is in [2]"), yes_no(false));
+ }
+ 
+ /// A bare `is` is still equality, and a word that merely starts with `in` is
+ /// still an identifier. Adding the `in` branch must not swallow either.
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test mod_in_test 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.31s
+[1m[92m     Running[0m tests/mod_in_test.rs (target/debug/deps/mod_in_test-8d75561d740a9858)
+
+running 17 tests
+test edge_empty_text_haystack_is_a_runtime_error ... ok
+test edge_modulo_rejects_non_numbers ... ok
+test edge_needle_of_the_wrong_type_answers_no_rather_than_failing ... ok
+test edge_nested_and_unicode_haystacks_are_compared_structurally ... ok
+test edge_nothing_needle_matches_only_nothing ... ok
+test edge_singleton_haystack_matches_only_its_one_element ... ok
+test edge_empty_list_haystack_contains_nothing ... ok
+test edge_membership_in_a_record_or_a_number_is_a_caught_runtime_error ... ok
+test edge_modulo_by_zero_is_a_caught_runtime_error ... ok
+test is_before_a_partial_in_word_still_tests_equality ... ok
+test mod_is_a_keyword_and_not_an_identifier ... ok
+test is_in_keeps_comparison_precedence ... ok
+test the_word_mod_and_the_symbol_percent_agree_on_every_operand ... ok
+test the_word_forms_run_on_the_bytecode_vm_too ... ok
+test the_word_mod_keeps_multiplicative_precedence ... ok
+test is_in_takes_the_branch_it_names ... ok
+test the_word_mod_computes_the_documented_remainder ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+Green. Now the formatter round-trip problem I predicted, plus the full suite.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'set hit to yes\nif "a" is in ["a", "b"] then\n    say "yes"\nend\n' > ./target/tmp/fmt_in.rb && ./target/debug/rb format --check ./target/tmp/fmt_in.rb; echo "check-exit=$?"; ./target/debug/rb format ./target/tmp/fmt_in.rb && cat ./target/tmp/fmt_in.rb
+File would be reformatted
+check-exit=1
+set hit to yes
+if "a" in ["a", "b"] then
+    say "yes"
+end
+set hit to yes
+if "a" is in ["a", "b"] then
+    say "yes"
+end
+[0m
+[0m← [0mEdit src/formatter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/formatter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/formatter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/formatter.rs
+@@ -645,9 +645,12 @@
+         BinaryOp::Greater => ">",
+         BinaryOp::GreaterEqual => ">=",
+         BinaryOp::And => "and",
+         BinaryOp::Or => "or",
+-        BinaryOp::In => "in",
++        // `in` has no symbol of its own, and `x in list` does not parse:
++        // membership is reached through `is`, so the formatter must write
++        // the `is` back or the formatted source stops being Redblue.
++        BinaryOp::In => "is in",
+     };
+     self.write(s);
+ }
+ 
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'set hit to yes\nif "a" is in ["a", "b"] then\n    say "yes"\nend\n' > ./target/tmp/fmt_in.rb && cargo run -q --bin rb -- format --check ./target/tmp/fmt_in.rb; echo "check-exit=$?"; printf 'set hit to yes\nif "a" is in ["a", "b"] then\n    say "yes"\nend\n' > ./target/tmp/fmt2.rb && cargo run -q --bin rb -- run ./target/tmp/fmt2.rb
+check-exit=0
+yes
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | tail -60
+test edge_csv_argument_of_the_wrong_type_is_an_error ... ok
+test edge_csv_row_index_out_of_bounds_is_a_clean_error ... ok
+test edge_csv_ragged_rows_keep_their_own_cells ... ok
+test edge_csv_empty_text_and_a_blank_line ... ok
+test edge_csv_unterminated_quote_is_an_error ... ok
+test edge_files_paths_that_name_nothing_readable_are_errors ... ok
+test edge_empty_file_reads_as_empty_text ... ok
+test edge_files_unreadable_file_is_an_error_when_unprivileged ... ok
+test edge_json_argument_of_the_wrong_type_is_an_error ... ok
+test edge_files_argument_of_the_wrong_type_is_an_error ... ok
+test edge_json_control_characters_are_escaped_on_write ... ok
+test edge_files_read_of_a_missing_file_is_a_catchable_error ... ok
+test edge_json_duplicate_key_keeps_the_last_value ... ok
+test edge_json_missing_field_is_nothing_and_present_field_is_not ... ok
+test edge_json_malformed_input_is_an_error ... ok
+test edge_json_singleton_and_scalar_values ... ok
+test edge_json_numeric_boundaries ... ok
+test files_append_creates_then_appends ... ok
+test edge_unknown_json_escape_is_an_error_not_silent_corruption ... ok
+test files_copy_and_rename_move_content ... ok
+test files_exists_and_delete_bracket_a_files_life ... ok
+test files_lines_splits_lines_and_keeps_blank_ones ... ok
+test files_handles_a_path_with_spaces ... ok
+test files_paths_are_relative_to_the_working_directory_and_not_confined ... ok
+test files_write_then_read_round_trips_in_a_temp_dir ... ok
+test json_round_trips_nesting_unicode_and_empty_containers ... ok
+test json_stringify_keeps_field_order ... ok
+test json_record_keys_are_escaped_when_written ... ok
+test json_unicode_text_survives_stringify_unchanged ... ok
+test json_unicode_escape_decodes_to_its_character ... ok
+test edge_network_rejects_an_argument_that_is_not_a_url ... ok
+test network_timeouts_are_published_and_bounded ... ok
+test edge_network_get_to_a_black_holed_address_gives_up ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+
+[1m[92m     Running[0m tests/tooling_grammar_test.rs (target/debug/deps/tooling_grammar_test-eabf9ef8a5c8b24d)
+
+running 18 tests
+test diagnostics_json_is_a_well_formed_array_of_located_entries ... ok
+test diagnostics_surface_a_spanned_analyzer_error ... ok
+test diagnostics_lint_the_ast_they_already_parsed ... ok
+test diagnostics_report_linter_findings_as_warnings ... ok
+test diagnostics_surface_a_spanned_lexer_error ... ok
+test edge_diagnostic_columns_count_characters_not_bytes ... ok
+test diagnostics_surface_a_spanned_parser_error ... ok
+test edge_diagnostic_json_escapes_a_message_containing_quotes_and_newlines ... ok
+test edge_escape_json_escapes_quotes_backslashes_controls_and_unicode ... ok
+test edge_empty_source_produces_no_diagnostics ... ok
+test every_listed_keyword_lexes_as_a_keyword_not_an_identifier ... ok
+test grammar_orders_strings_before_comments_and_comments_before_operators ... ok
+test grammar_highlights_the_comment_marker_the_lexer_accepts ... ok
+test grammar_covers_the_lexer_keyword_set ... ok
+test shipped_grammar_file_is_valid_json_with_a_redblue_scope ... ok
+test shipped_grammar_file_matches_the_generator ... ok
+test shipped_language_configuration_uses_the_lexers_comment_marker ... ok
+test unused_variable_warnings_come_out_in_a_stable_name_order ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -E "^test result|FAILED|^error|panicked" | head -40
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.82s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -484,8 +484,50 @@
+     );
+     assert_eq!(stdout.trim(), "3", "both wrong haystacks should be caught");
+ }
+ 
++/// The formatter has to write `in` back the way the parser reads it, or
++/// `rb format` turns a valid program into one that no longer parses. `mod` has
++/// a symbol, so it may legitimately normalise to `%`.
++#[test]
++fn edge_the_formatter_round_trips_the_word_forms() {
++    for (name, program) in [
++        (
++            "is-in",
++            "if \"a\" is in [\"a\", \"b\"] then\n    say \"yes\"\nend\n",
++        ),
++        ("mod", "set m to 10 mod 3\nsay m\n"),
++    ] {
++        let (ok, _, stderr) = rb_run(
++            &format!("fmt-{}-check", name),
++            &format!("// {}\n", program),
++        );
++        assert!(ok, "the {} program should run: {}", name, stderr);
++
++        let (ok, stdout, stderr) = rb_run(
++            &format!("fmt-{}-run", name),
++            &format!("{}{}", "", program),
++        );
++        assert!(ok, "`rb run` on the {} program failed: {}", name, stderr);
++        assert!(!stdout.is_empty(), "`{}` printed nothing", name);
++    }
++
++    // The formatted source must still parse, and must still mean the same thing.
++    let formatted = redblue::formatter::format("if \"a\" is in [\"a\"] then\nsay 1\nend\n")
++        .expect("source should format");
++    let formatted = formatted.expect("format should produce output");
++    assert!(
++        formatted.contains("is in"),
++        "the formatter must write membership back as `is in`, got {:?}",
++        formatted
++    );
++    let ast = parse(tokens(&formatted))
++        .unwrap_or_else(|e| panic!("formatted source should parse: {}", e));
++    let mut vm = redblue::Vm::new();
++    vm.run(&ast).expect("formatted source should run");
++    assert_eq!(vm.take_output(), vec!["1".to_string()]);
++}
++
+ /// Nested and unicode haystacks: membership is structural equality all the way
+ /// down, and text comparison is by code point.
+ #[test]
+ fn edge_nested_and_unicode_haystacks_are_compared_structurally() {
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "pub fn format" -A 6 src/formatter.rs | head -20; grep -n "redblue::formatter::" tests/formatter_test.rs | head -5
+131:    pub fn format(&mut self, source: &str) -> Result<String, String> {
+132-        let tokens = Lexer::tokenize(source).map_err(|e| format!("Lexer error: {}", e))?;
+133-
+134-        let mut parser = crate::parser::Parser::new(tokens);
+135-        let program = parser.parse().map_err(|e| format!("Parser error: {}", e))?;
+136-
+137-        self.indent = 0;
+--
+728:pub fn format(source: &str) -> Result<String, String> {
+729-    let mut formatter = Formatter::new();
+730-    formatter.format(source)
+731-}
+4:use redblue::formatter::{self, Formatter};
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -489,42 +489,39 @@
+ /// `rb format` turns a valid program into one that no longer parses. `mod` has
+ /// a symbol, so it may legitimately normalise to `%`.
+ #[test]
+ fn edge_the_formatter_round_trips_the_word_forms() {
+-    for (name, program) in [
+-        (
+-            "is-in",
+-            "if \"a\" is in [\"a\", \"b\"] then\n    say \"yes\"\nend\n",
+-        ),
+-        ("mod", "set m to 10 mod 3\nsay m\n"),
+-    ] {
+-        let (ok, _, stderr) = rb_run(
+-            &format!("fmt-{}-check", name),
+-            &format!("// {}\n", program),
+-        );
+-        assert!(ok, "the {} program should run: {}", name, stderr);
+-
+-        let (ok, stdout, stderr) = rb_run(
+-            &format!("fmt-{}-run", name),
+-            &format!("{}{}", "", program),
+-        );
+-        assert!(ok, "`rb run` on the {} program failed: {}", name, stderr);
+-        assert!(!stdout.is_empty(), "`{}` printed nothing", name);
+-    }
+-
+-    // The formatted source must still parse, and must still mean the same thing.
+-    let formatted = redblue::formatter::format("if \"a\" is in [\"a\"] then\nsay 1\nend\n")
++    // `in` has no symbol of its own, so the formatter has to write the `is`
++    // back: emitting a bare `in` would turn a valid program into one that no
++    // longer parses. `mod` has `%`, so normalising to it is fine.
++    let formatted = formatter::format("if \"a\" is in [\"a\"] then\nsay 1\nend\n")
+         .expect("source should format");
+-    let formatted = formatted.expect("format should produce output");
+     assert!(
+         formatted.contains("is in"),
+         "the formatter must write membership back as `is in`, got {:?}",
+         formatted
+     );
++
+     let ast = parse(tokens(&formatted))
+         .unwrap_or_else(|e| panic!("formatted source should parse: {}", e));
+     let mut vm = redblue::Vm::new();
+     vm.run(&ast).expect("formatted source should run");
++    assert_eq!(
++        vm.take_output(),
++        vec!["1".to_string()],
++        "the formatted program must still run the same branch"
++    );
++
++    let formatted = formatter::format("say 10 mod 3\n")
++        .expect("source should format");
++    assert!(
++        !formatted.contains("mod"),
++        "`mod` has a symbol, so the formatter may normalise it, got {:?}",
++        formatted
++    );
++    let ast = parse(tokens(&formatted)).expect("formatted `mod` should parse");
++    let mut vm = redblue::Vm::new();
++    vm.run(&ast).expect("formatted `mod` should run");
+     assert_eq!(vm.take_output(), vec!["1".to_string()]);
+ }
+ 
+ /// Nested and unicode haystacks: membership is structural equality all the way
+
+[0m
+[0m← [0mEdit tests/mod_in_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs
+@@ -19,8 +19,9 @@
+ use std::process::Command;
+ 
+ use redblue::bytecode::vm::BytecodeVm;
+ use redblue::bytecode::compile_source;
++use redblue::formatter;
+ use redblue::lexer::{Lexer, TokenKind};
+ use redblue::parser::{parse, Statement};
+ use redblue::{run_isolated, Error, Value};
+ 
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test mod_in_test 2>&1 | tail -35
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.32s
+[1m[92m     Running[0m tests/mod_in_test.rs (target/debug/deps/mod_in_test-8d75561d740a9858)
+
+running 18 tests
+test edge_empty_text_haystack_is_a_runtime_error ... ok
+test edge_modulo_rejects_non_numbers ... ok
+test edge_needle_of_the_wrong_type_answers_no_rather_than_failing ... ok
+test edge_nested_and_unicode_haystacks_are_compared_structurally ... ok
+test edge_modulo_by_zero_is_a_caught_runtime_error ... ok
+test edge_membership_in_a_record_or_a_number_is_a_caught_runtime_error ... ok
+test edge_nothing_needle_matches_only_nothing ... ok
+test edge_empty_list_haystack_contains_nothing ... ok
+test edge_the_formatter_round_trips_the_word_forms ... ok
+test edge_singleton_haystack_matches_only_its_one_element ... ok
+test is_before_a_partial_in_word_still_tests_equality ... ok
+test mod_is_a_keyword_and_not_an_identifier ... ok
+test is_in_keeps_comparison_precedence ... ok
+test the_word_mod_and_the_symbol_percent_agree_on_every_operand ... ok
+test is_in_takes_the_branch_it_names ... ok
+test the_word_forms_run_on_the_bytecode_vm_too ... ok
+test the_word_mod_keeps_multiplicative_precedence ... ok
+test the_word_mod_computes_the_documented_remainder ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m→ [0mRead SPEC.md[90m [limit=10, offset=321][0m
+Now the SPEC correction and the gates.
+[0m
+[0m← [0mEdit SPEC.md
+Index: /home/runner/work/rbops/rbops/redblue/SPEC.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/SPEC.md
++++ /home/runner/work/rbops/rbops/redblue/SPEC.md
+@@ -324,8 +324,14 @@
+ // Contains
+ if "hello" is in words
+ ```
+ 
++`is in` tests **list membership**: the right side must be a `list`, and the
++answer is `yes` when the left side equals one of its elements by value. There
++is no substring form — `x is in "abc"` is a runtime error
++`Right side of 'in' must be a list`, not a search — and no `is not in`;
++write `if not (x is in haystack)`.
++
+ ---
+ 
+ ## Statements
+ 
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n 355,375p docs/GRAMMAR.md
+```
+multiplicative   = prefix
+                 | multiplicative '*' prefix           // multiply
+                 | multiplicative '/' prefix           // divide
+                 | multiplicative 'mod' prefix         // modulo
+```
+
+### 5.5 Additive Expressions
+
+```
+additive         = multiplicative
+                 | additive '+' multiplicative         // add
+                 | additive '-' multiplicative        // subtract
+```
+
+### 5.6 Comparison Expressions
+
+```
+comparison       = additive
+                 | comparison 'is equal to' additive   // ==
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n 371,390p docs/GRAMMAR.md
+### 5.6 Comparison Expressions
+
+```
+comparison       = additive
+                 | comparison 'is equal to' additive   // ==
+                 | comparison 'is not' additive       // !=
+                 | comparison 'is less than' additive // <
+                 | comparison 'is greater than' additive // >
+                 | comparison 'is less than or equal to' additive // <=
+                 | comparison 'is greater than or equal to' additive // >=
+                 | comparison 'in' additive           // in (contains)
+```
+
+### 5.7 Logical AND Expressions
+
+```
+logical_and      = comparison
+                 | logical_and 'and' comparison       // &&
+```
+[0m
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -377,9 +377,9 @@
+                  | comparison 'is less than' additive // <
+                  | comparison 'is greater than' additive // >
+                  | comparison 'is less than or equal to' additive // <=
+                  | comparison 'is greater than or equal to' additive // >=
+-                 | comparison 'in' additive           // in (contains)
++                 | comparison 'is in' additive         // in (list membership)
+ ```
+ 
+ ### 5.7 Logical AND Expressions
+ 
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check 2>&1 | head -40
+Diff in /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs:18:
+ use std::path::{Path, PathBuf};
+ use std::process::Command;
+ 
+-use redblue::bytecode::vm::BytecodeVm;
+ use redblue::bytecode::compile_source;
++use redblue::bytecode::vm::BytecodeVm;
+ use redblue::formatter;
+ use redblue::lexer::{Lexer, TokenKind};
+ use redblue::parser::{parse, Statement};
+Diff in /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs:58:
+         source
+     );
+     let mut vm = redblue::Vm::new();
+-    vm.run(&ast).unwrap_or_else(|e| panic!("`{}` should run: {}", source, e))
++    vm.run(&ast)
++        .unwrap_or_else(|e| panic!("`{}` should run: {}", source, e))
+ }
+ 
+ /// Runs `source` and returns the runtime error it produced.
+Diff in /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs:124:
+ fn assert_both_say(expr: &str, expected: &str) {
+     let program = format!("say {}", expr);
+ 
+-    let ast =
+-        parse(tokens(&program)).unwrap_or_else(|e| panic!("`{}` should parse: {}", expr, e));
++    let ast = parse(tokens(&program)).unwrap_or_else(|e| panic!("`{}` should parse: {}", expr, e));
+     let (mut tree_vm, tree_result) = run_isolated(&ast);
+     let tree_output = tree_vm.take_output();
+     tree_result.unwrap_or_else(|e| panic!("`{}` should run: {}", expr, e));
+Diff in /home/runner/work/rbops/rbops/redblue/tests/mod_in_test.rs:172:
+ fn mod_is_a_keyword_and_not_an_identifier() {
+     let lexed = tokens("mod");
+     assert_eq!(
+-        lexed
+-            .iter()
+-            .map(|t| t.kind.clone())
+-            .collect::<Vec<_>>(),
++        lexed.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+         vec![TokenKind::Mod, TokenKind::Eof],
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN"
+FMT CLEAN
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | tail -40
+[1m[92m    Checking[0m tokio-util v0.7.19
+[1m[92m    Checking[0m want v0.3.2
+[1m[92m    Checking[0m idna_adapter v1.2.2
+[1m[92m    Checking[0m httparse v1.10.1
+[1m[92m    Checking[0m http-body v0.4.6
+[1m[92m    Checking[0m socket2 v0.5.10
+[1m[92m    Checking[0m h2 v0.3.27
+[1m[92m    Checking[0m native-tls v0.2.18
+[1m[92m    Checking[0m futures-channel v0.3.34
+[1m[92m    Checking[0m httpdate v1.0.3
+[1m[92m    Checking[0m tower-service v0.3.3
+[1m[92m    Checking[0m tokio-native-tls v0.3.1
+[1m[92m    Checking[0m idna v1.1.0
+[1m[92m    Checking[0m aho-corasick v1.1.5
+[1m[92m    Checking[0m regex-syntax v0.8.11
+[1m[92m    Checking[0m serde v1.0.229
+[1m[92m    Checking[0m scopeguard v1.2.0
+[1m[92m    Checking[0m simdutf8 v0.1.5
+[1m[92m    Checking[0m base64 v0.21.7
+[1m[92m    Checking[0m ryu v1.0.23
+[1m[92m    Checking[0m core_detect v1.0.0
+[1m[92m    Checking[0m rustls-pemfile v1.0.4
+[1m[92m    Checking[0m encoding_rs v0.8.42
+[1m[92m    Checking[0m serde_urlencoded v0.7.1
+[1m[92m    Checking[0m url v2.5.8
+[1m[92m    Checking[0m regex-automata v0.4.18
+[1m[92m    Checking[0m num-traits v0.2.19
+[1m[92m    Checking[0m hyper v0.14.32
+[1m[92m    Checking[0m ipnet v2.12.2
+[1m[92m    Checking[0m iana-time-zone v0.1.65
+[1m[92m    Checking[0m mime v0.3.17
+[1m[92m    Checking[0m sync_wrapper v0.1.2
+[1m[92m    Checking[0m chrono v0.4.45
+[1m[92m    Checking[0m zmij v1.0.23
+[1m[92m    Checking[0m serde_json v1.0.151
+[1m[92m    Checking[0m regex v1.13.1
+[1m[92m    Checking[0m hyper-tls v0.5.0
+[1m[92m    Checking[0m reqwest v0.11.27
+[1m[92m    Checking[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 9.14s
+[0m
+Clippy clean. Full suite + examples check.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -E "^test result|FAILED|panicked|^error" | sort | uniq -c | sort -rn
+2 test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+      1 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+      1 test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+      1 test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+      1 test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+      1 test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.53s
+      1 test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.73s
+      1 test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+      1 test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+      1 test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+      1 test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+      1 test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+      1 test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+      1 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+      1 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+      1 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+      1 test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+      1 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && fail=0; for f in examples/*.rb modules/*.rb; do out=$(./target/debug/rb run "$f" 2>&1); if [ $? -ne 0 ]; then echo "FAIL $f: $(echo "$out" | head -2 | tr '\n' ' ')"; fail=1; fi; done; echo "any-fail=$fail"
+any-fail=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --doc 2>&1 | tail -8; echo "=== lint new rb"; ./target/debug/rb lint tests/test_mod_in.rb; echo "lint-exit=$?"; echo "=== fmt check"; ./target/debug/rb format --check tests/test_mod_in.rb; echo "fmt-exit=$?"
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.05s
+[1m[92m   Doc-tests[0m redblue
+
+running 1 test
+test src/bytecode/mod.rs - bytecode (line 12) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+=== lint new rb
+Warning: line 25: Unused variable: 'bad'
+Warning: line 80: Unused variable: 'a'
+Warning: line 85: Unused variable: 'b'
+lint-exit=0
+=== fmt check
+File would be reformatted
+fmt-exit=1
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for f in tests/suite.rb tests/test_arithmetic.rb tests/test_lists.rb; do ./target/debug/rb format --check "$f" >/dev/null 2>&1; echo "$f fmt-exit=$?"; done; echo "=== lint suite"; ./target/debug/rb lint tests/suite.rb 2>&1 | head -5
+tests/suite.rb fmt-exit=1
+tests/test_arithmetic.rb fmt-exit=1
+tests/test_lists.rb fmt-exit=1
+=== lint suite
+Warning: line 88: Unused variable: 'bad'
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ./target/debug/rb test tests/test_mod_in.rb 2>&1 | tail -20
+.........
+[32mTest Results: 9 total, 9 passed, 0 failed, 0 skipped (100.0% success)[0m
+Duration: 0ms
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git status --short && echo "---" && git diff --stat
+M SPEC.md
+ M docs/GRAMMAR.md
+ M src/formatter.rs
+ M src/lexer.rs
+ M src/parser.rs
+ M src/repl/completer.rs
+ M tooling/vscode/syntaxes/redblue.tmLanguage.json
+?? tests/mod_in_test.rs
+?? tests/test_mod_in.rb
+---
+ SPEC.md                                         |  6 ++++++
+ docs/GRAMMAR.md                                 |  2 +-
+ src/formatter.rs                                |  5 ++++-
+ src/lexer.rs                                    |  1 +
+ src/parser.rs                                   | 13 +++++++++++--
+ src/repl/completer.rs                           |  1 +
+ tooling/vscode/syntaxes/redblue.tmLanguage.json |  2 +-
+ 7 files changed, 25 insertions(+), 5 deletions(-)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -rn '\bmod\b' --include=*.rb . | grep -v '^./target' | head -20; echo "exit=$?"; ls bootstrap 2>/dev/null | head
+./tests/test_mod_in.rb:3:// `mod` and `is in` are documented in SPEC.md:206 and SPEC.md:325 but were not
+./tests/test_mod_in.rb:5:// `AnalyzerError: Unknown variable 'mod'` and
+./tests/test_mod_in.rb:9:test "mod: the word form computes the documented remainder"
+./tests/test_mod_in.rb:10:    set remainder to 10 mod 3
+./tests/test_mod_in.rb:15:test "mod: the word form and the symbol agree on the sign of the dividend"
+./tests/test_mod_in.rb:16:    set word to -5 mod 3
+./tests/test_mod_in.rb:25:        set bad to 10 mod 0
+./tests/test_mod_in.rb:35:        set bad to 10 mod "2"
+exit=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n '"mod"\|`mod`' README.md docs/*.md 2>/dev/null | head; echo "---invariants"; ls phases/INVARIANTS.md 2>/dev/null && grep -n "mod\b" phases/INVARIANTS.md | head
+docs/GRAMMAR.md:449:| 6 | `*`, `/`, `mod` | Left |
+---invariants
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n 443,455p docs/GRAMMAR.md
+|------------|-------------|---------------|
+| 1 | `or` | Left |
+| 2 | `and` | Left |
+| 3 | `is`, `is not`, `in` | Left |
+| 4 | `<`, `<=`, `>`, `>=` | Left |
+| 5 | `+`, `-` | Left |
+| 6 | `*`, `/`, `mod` | Left |
+| 7 | `not`, unary `-` | Right |
+| 8 | `of` | Left |
+| 9 | property access, call, index | Left |
+
+---
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='docs/GRAMMAR.md'
+s=io.open(p,encoding='utf-8').read()
+pairs=[("| 3 | `is`, `is not`, `in` | Left |","| 3 | `is`, `is not`, `is in` | Left |"),
+       ("| 6 | `*`, `/`, `mod` | Left |","| 6 | `*`, `/`, `mod`, `%` | Left |")]
+for a,b in pairs:
+    assert a in s, a
+    s=s.replace(a,b,1)
+io.open(p,'w',encoding='utf-8').write(s)
+print('ok')
+PY
+sed -n 355,362p docs/GRAMMAR.md
+ok
+
+```
+multiplicative   = prefix
+                 | multiplicative '*' prefix           // multiply
+                 | multiplicative '/' prefix           // divide
+                 | multiplicative 'mod' prefix         // modulo
+```
+[0m
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -356,9 +356,9 @@
+ ```
+ multiplicative   = prefix
+                  | multiplicative '*' prefix           // multiply
+                  | multiplicative '/' prefix           // divide
+-                 | multiplicative 'mod' prefix         // modulo
++                 | multiplicative 'mod' prefix         // modulo (same as '%')
+ ```
+ 
+ ### 5.5 Additive Expressions
+ 
+
+[0m
+[0m← [0mWrite phases/phase-029/FINDINGS.md
+Wrote file successfully.
+[0m
+Now FINDINGS.md and REPORT.md.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff --stat && echo "--- new files lines:" && wc -l tests/mod_in_test.rs tests/test_mod_in.rb
+SPEC.md                                         |  6 ++++++
+ docs/GRAMMAR.md                                 |  8 ++++----
+ src/formatter.rs                                |  5 ++++-
+ src/lexer.rs                                    |  1 +
+ src/parser.rs                                   | 13 +++++++++++--
+ src/repl/completer.rs                           |  1 +
+ tooling/vscode/syntaxes/redblue.tmLanguage.json |  2 +-
+ 7 files changed, 28 insertions(+), 8 deletions(-)
+--- new files lines:
+  563 tests/mod_in_test.rs
+   96 tests/test_mod_in.rb
+  659 total
+[0m
+[0m← [0mWrite phases/phase-029/REPORT.md
+Wrote file successfully.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -oP '^test result: ok\. \K[0-9]+(?= passed)' | paste -sd+ | bc
+575
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git stash -q -u && cargo test --all-targets 2>&1 | grep -oP '^test result: ok\. \K[0-9]+(?= passed)' | paste -sd+ | bc; git stash pop -q; git status --short
+557
+ M SPEC.md
+ M docs/GRAMMAR.md
+ M src/formatter.rs
+ M src/lexer.rs
+ M src/parser.rs
+ M src/repl/completer.rs
+ M tooling/vscode/syntaxes/redblue.tmLanguage.json
+?? phases/phase-029/
+?? tests/mod_in_test.rs
+?? tests/test_mod_in.rb
+[0m
+[0m← [0mEdit phases/phase-029/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-029/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-029/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-029/REPORT.md
+@@ -150,9 +150,9 @@
+ | Gate | Result |
+ |---|---|
+ | `cargo fmt --all -- --check` | pass — no diff |
+ | `cargo clippy --all-targets -- -D warnings` | pass — 0 warnings, `Finished dev profile in 9.14s` |
+-| `cargo test --all-targets` | pass — 29 binaries, **523 passed, 0 failed, 0 ignored**, 0 skipped |
++| `cargo test --all-targets` | pass — 29 binaries, **575 passed, 0 failed, 0 ignored**, 0 skipped (557 before this phase, so +18 — the 9 new Redblue `test` blocks run inside `edge_suite_reports_at_least_40_redblue_tests`, which is unchanged and green) |
+ | `cargo test --doc` | pass — 1 passed, 0 failed |
+ | `./rbops/verify.sh phase-029` | **NOT RUN — `rbops/` does not exist in this checkout** (`ls -d rbops` → `ls: cannot access 'rbops': No such file or directory`). Reported honestly rather than claimed. The three cargo gates above are what I could run. |
+ 
+ Zero new `#[ignore]`, `// skip` or `allow(clippy::` suppressions. Zero
+
+[0m
+[0m← [0mEdit phases/phase-029/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-029/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-029/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-029/REPORT.md
+@@ -155,10 +155,11 @@
+ | `cargo test --doc` | pass — 1 passed, 0 failed |
+ | `./rbops/verify.sh phase-029` | **NOT RUN — `rbops/` does not exist in this checkout** (`ls -d rbops` → `ls: cannot access 'rbops': No such file or directory`). Reported honestly rather than claimed. The three cargo gates above are what I could run. |
+ 
+ Zero new `#[ignore]`, `// skip` or `allow(clippy::` suppressions. Zero
+-newly-failing pre-existing tests: every one of the 505 tests that existed before
+-this phase still passes, unmodified.
++newly-failing pre-existing tests: measured by stashing the phase's changes and
++re-running the suite, 557 tests passed before and 557 of those same 557 still
++pass after, with the 18 new ones added on top.
+ 
+ ### Examples and modules
+ 
+ `examples/*.rb` and `modules/*.rb` all exit 0 (loop run against
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='phases/phase-029/REPORT.md'
+s=io.open(p,encoding='utf-8').read()
+pairs=[("`edge_nested_and_unicode_haystacks_are_compared_structurally`:\n  accented Latin, CJK, emoji, a combining-mark pair that must **not** match, and\n  RTL Arabic.",
+        "`edge_nested_and_unicode_haystacks_are_compared_structurally`:\n  accented Latin (`\"héllo\"`), CJK (`\"日本\"`), an emoji (`\"👍\"`), a combining-mark\n  pair that must **not** match (`\"é\"` vs `\"è\"`), and RTL Arabic (`\"مرحبا\"`).")]
+for a,b in pairs:
+    assert a in s, a[:60]
+    s=s.replace(a,b,1)
+io.open(p,'w',encoding='utf-8').write(s)
+print('ok')
+PY
+ok
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "FMT pass" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -3
+FMT pass
+[1m[92m    Checking[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.57s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -cE "^test result: ok\." && cargo test --all-targets 2>&1 | grep -E "FAILED|panicked|^error" | head; echo "no-fail-above"; fail=0; for f in examples/*.rb modules/*.rb; do ./target/debug/rb run "$f" >/dev/null 2>&1 || { echo "FAIL $f"; fail=1; }; done; echo "examples-fail=$fail"; rm -rf ./target/tmp/t1.rb ./target/tmp/t2.rb ./target/tmp/t3.rb ./target/tmp/t4.rb ./target/tmp/t5.rb ./target/tmp/fmt_in.rb ./target/tmp/fmt2.rb ./target/tmp/dbg.rb ./target/tmp/repro_mod.rb ./target/tmp/repro_in.rb
+27
+no-fail-above
+examples-fail=0
+[0m
+Done.
+
+**Reproduced** (exact wrong output):
+- `say 10 mod 3` → `AnalyzerError: Unknown variable 'mod'`, exit 1
+- `if "a" is in ["a","b"] then` → `ParserError: Unexpected token In`, exit 1
+
+**Fix** (`src/` touched, 4 files +25/−5):
+- `src/lexer.rs:44` — `("mod", TokenKind::Mod)` in `KEYWORDS`
+- `src/parser.rs:1343` — `parse_is_operator` consumes `TokenKind::In` → `BinaryOp::In`
+- `src/formatter.rs:649` — `BinaryOp::In` formats as `is in`, not `in`. `in` does not parse, so `rb format` was turning a valid program into one that no longer lexed. Caught by the new round-trip test.
+- `src/repl/completer.rs` + `tooling/vscode/syntaxes/redblue.tmLanguage.json` — keep the published keyword sets in step (asserted by `tooling_grammar_test`)
+
+Plus `SPEC.md` (defines `is in` as list-only, matching what the runtime has always done) and `docs/GRAMMAR.md` (its production said `'in'`, which never parsed).
+
+**Tests**: `tests/mod_in_test.rs` (18 `#[test]`, 9 `edge_*`) and `tests/test_mod_in.rb` (9 Redblue blocks, 5 `edge_*`). Zero-divisor and wrong-haystack cases assert caught `RuntimeError`s with exact messages, on both VMs.
+
+**Gates**: `cargo fmt --check` pass · `cargo clippy --all-targets -D warnings` pass, 0 warnings · `cargo test --all-targets` 575 passed / 0 failed (557 before, so +18; no pre-existing test touched) · `cargo test --doc` 1 passed · all of `examples/` and `modules/` exit 0.
+
+**`./rbops/verify.sh phase-029` was NOT RUN — `rbops/` does not exist in this checkout** (`ls -d rbops` → no such file or directory). Not claimed as passing.
+
+`REPORT.md` and `FINDINGS.md` are in `phases/phase-029/`. Three follow-ups recorded, the notable one: `catch <name>` binds the literal text `"error"` (`src/vm.rs:740`), so a Redblue program cannot observe *which* error it caught.
+
+DONE
