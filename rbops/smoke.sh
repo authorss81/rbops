@@ -1803,7 +1803,10 @@ esac
 # and passes on the fix.
 build_fixture >/dev/null; use_stubs
 for i in $(seq 1 700); do printf 'x\n' > "$PROJ/tests/f$i.txt" 2>/dev/null; done
-( cd "$PROJ" && git status --porcelain | sed -n '1,20p' | sed 's/^/    /' ) > "$T/inv.out" 2>&1
+# The exact yml pipeline, including -uall: without it git collapses the 700
+# files (tests/ holds nothing tracked in the fixture) to a single `?? tests/`
+# line and the sample shows 1 line for 700 files.
+( cd "$PROJ" && git status --porcelain -uall | sed -n '1,20p' | sed 's/^/    /' ) > "$T/inv.out" 2>&1
 inv_rc=$?
 # NOTE: no `|| echo 0` after this grep -c — that idiom prints a second line on
 # no-match (grep -c prints 0 AND exits 1), leaving "0\n0" and breaking the
