@@ -1523,6 +1523,236 @@ else
   ok "no E2BIG anywhere in the review log"
 fi
 
+# =========================================================== 28. normalize + scratch
+head_ "28. the pipeline normalizes formatting and rejects scratch files"
+# phase-020 failed the gate on `cargo fmt --check` alone after a 50-minute
+# model run, with a leftover tests/zz_probe.rs on top. Formatting is a
+# 30-second deterministic fix; burning a whole attempt on it is pure waste.
+# So cmd_run normalizes before judging, and the gate rejects scratch files
+# outright (a formatted scratch file would otherwise ship).
+build_fixture >/dev/null; use_stubs
+# fmt-aware stub cargo: --check fails iff double-spaces remain under src/ or
+# tests/; write mode collapses them (the test's normalization). Everything
+# else behaves like the standard stub.
+cat > "$STUB/cargo" <<'EOS'
+#!/usr/bin/env bash
+sub=""
+has_check=0
+for a in "$@"; do
+  case "$a" in fmt|clippy|test|build|check) sub="$a" ;; esac
+  case "$a" in --check) has_check=1 ;; esac
+done
+case " $STUB_FAIL " in *" $sub "*) echo "error: stub $sub" >&2; exit 101;; esac
+case "$sub" in
+  test) echo "test result: ok. 12 passed; 0 failed; 0 ignored" ;;
+  fmt)
+    if [ "$has_check" -eq 1 ]; then
+      if grep -rn '  ' src/ tests/ 2>/dev/null; then exit 101; else exit 0; fi
+    else
+      grep -rl '  ' src/ tests/ 2>/dev/null | while read -r f; do sed -i 's/  */ /g' "$f"; done
+      exit 0
+    fi ;;
+esac
+exit 0
+EOS
+chmod +x "$STUB/cargo"
+# Stub agent: standard report + tests, plus one deliberately unformatted line.
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+dir="."; msg=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir) dir="$2"; shift 2 ;;
+    --model|--agent|--title) shift 2 ;;
+    *) msg="$1"; shift ;;
+  esac
+done
+printf '%s' "$msg" > "$(dirname "$0")/../last-prompt.txt"
+case "$msg" in
+  *"Review phase"*|*"Review request"*)
+      echo "FINDINGS: none" ;;
+  *)
+      mkdir -p "$dir/phases/$PHASE_UNDER_TEST"
+      cat > "$dir/phases/$PHASE_UNDER_TEST/REPORT.md" <<'RPT'
+# Phase report
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| src/vm.rs | +8 −0 | new tests |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_expect_mismatch | failure |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+RPT
+      cat >> "$dir/src/vm.rs" <<'TST'
+#[test]
+fn edge_empty() { assert!(true); }
+#[test]
+fn test_a() { assert!(true); }
+#[test]
+fn test_b() { assert!(true); }
+#[test]
+fn test_c() { assert!(true); }
+#[test]
+fn test_d() { assert!(true); }
+#[test]
+fn test_e() { let r: Result<(),()> = Err(()); assert!(r.is_err()); }
+fn badly_formatted(  ){  assert!(true);  }
+TST
+      echo "agent wrote a report and 7 tests into $dir" ;;
+esac
+echo "padding to satisfy the minimum-output check ......................."
+echo "padding ................................................................"
+EOS
+chmod +x "$STUB/opencode"
+out="$(D run phase-001 | strip)"
+case "$out" in
+  *"normalize: cargo fmt reformatted"*) ok "pipeline normalizes an unformatted tree before judging" ;;
+  *) no "normalize did not fire"; printf '%s\n' "$out" | grep -iE 'normalize|fmt' | head -3 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"FAIL cargo fmt"*) no "gate still failed fmt after normalize" ;;
+  *) ok "no fmt failure after normalize" ;;
+esac
+case "$out" in
+  *"VERIFY PASS"*) ok "gate passes once normalized" ;;
+  *) no "gate did not pass after normalize"; printf '%s\n' "$out" | grep -E 'FAIL' | head -4 | sed 's/^/      /' ;;
+esac
+# Control: the gate itself still judges formatting. Same messy tree, but
+# verify.sh invoked directly (bypassing cmd_run's normalize) must fail fmt.
+build_fixture >/dev/null; use_stubs
+cat > "$STUB/cargo" <<'EOS'
+#!/usr/bin/env bash
+sub=""
+has_check=0
+for a in "$@"; do
+  case "$a" in fmt|clippy|test|build|check) sub="$a" ;; esac
+  case "$a" in --check) has_check=1 ;; esac
+done
+case " $STUB_FAIL " in *" $sub "*) echo "error: stub $sub" >&2; exit 101;; esac
+case "$sub" in
+  test) echo "test result: ok. 12 passed; 0 failed; 0 ignored" ;;
+  fmt)
+    if [ "$has_check" -eq 1 ]; then
+      if grep -rn '  ' src/ tests/ 2>/dev/null; then exit 101; else exit 0; fi
+    else
+      grep -rl '  ' src/ tests/ 2>/dev/null | while read -r f; do sed -i 's/  */ /g' "$f"; done
+      exit 0
+    fi ;;
+esac
+exit 0
+EOS
+chmod +x "$STUB/cargo"
+cat >> "$PROJ/src/vm.rs" <<'TST'
+#[test]
+fn edge_empty() { assert!(true); }
+#[test]
+fn test_a() { assert!(true); }
+#[test]
+fn test_b() { assert!(true); }
+#[test]
+fn test_c() { assert!(true); }
+#[test]
+fn test_d() { assert!(true); }
+#[test]
+fn test_e() { let r: Result<(),()> = Err(()); assert!(r.is_err()); }
+fn badly_formatted(  ){  assert!(true);  }
+TST
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase report
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| src/vm.rs | +8 −0 | new tests |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_expect_mismatch | failure |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+out="$( ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+case "$out" in
+  *"FAIL cargo fmt"*) ok "gate still fails unformatted code when normalize is bypassed" ;;
+  *) no "gate no longer judges formatting on its own" ;;
+esac
+# Scratch files: a phase carrying tests/zz_probe.rs must fail, with the file
+# named. Control without it must pass.
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase report
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| tests/probe.rb | +9 −0 | redblue tests |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_empty list is rejected | out of bounds |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+cat > "$PROJ/tests/probe.rb" <<'EOR'
+test "edge_empty list is rejected"
+    try
+        set x to empty[0]
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+
+test "edge_out_of_bounds index"
+    try
+        set y to [1, 2, 3][9]
+    catch error
+        set caught2 to yes
+    end
+    expect caught2 to be yes
+EOR
+printf '// debugging scratch, not phase work\nfn probe_tmp() {}\n' > "$PROJ/tests/zz_probe.rs"
+out="$( ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+case "$out" in
+  *"scratch/probe files in the diff"*zz_probe.rs*) ok "scratch file fails the gate and is named" ;;
+  *) no "scratch file slipped through"; printf '%s\n' "$out" | grep -iE 'scratch|FAIL' | head -3 | sed 's/^/      /' ;;
+esac
+rm -f "$PROJ/tests/zz_probe.rs"
+out="$( ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+case "$out" in
+  *"VERIFY PASS"*) ok "same tree passes once the scratch file is gone" ;;
+  *) no "tree still fails without the scratch file"; printf '%s\n' "$out" | grep -E 'FAIL' | head -4 | sed 's/^/      /' ;;
+esac
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then
