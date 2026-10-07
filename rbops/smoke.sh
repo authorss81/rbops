@@ -640,7 +640,7 @@ cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
 ## What changed
 | File | Lines | What |
 |---|---|---|
-| tests/probe.rb | +14 −0 | redblue edge + failure tests |
+| tests/sample.rb | +14 −0 | redblue edge + failure tests |
 
 ## Tests added
 | Test | Edge class covered |
@@ -656,7 +656,7 @@ cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
 ## Known gaps / follow-ups
 - none
 EOR
-printf '%s' "$RB_PASS" > "$PROJ/tests/probe.rb"
+printf '%s' "$RB_PASS" > "$PROJ/tests/sample.rb"
 # `git diff HEAD` cannot see an untracked file, and a new test file starts
 # untracked — stage it or the gate correctly reports "no changed files".
 V() { ( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
@@ -678,7 +678,7 @@ esac
 # Now the cheater check: same file, edge_ naming and catch/error both removed.
 # The rules must still bite, or the fix above was a loosening, not a fix.
 printf 'test "list basics"\n    set x to [1, 2, 3]\n    expect length(x) to be 3\n' \
-  > "$PROJ/tests/probe.rb"
+  > "$PROJ/tests/sample.rb"
 out="$(V)"
 case "$out" in
   *"no test named edge_"*) ok "un-named test still fails the edge_* rule" ;;
@@ -694,7 +694,7 @@ case "$out" in
 esac
 # And the anchored catch must not be buyable from a string literal or prose.
 printf 'test "edge_catch_error is mentioned in the docs"\n    set note to "catch error"\n    expect note to be "catch error"\n' \
-  > "$PROJ/tests/probe.rb"
+  > "$PROJ/tests/sample.rb"
 out="$(V)"
 case "$out" in
   *"no test asserts a failure"*) ok "'catch error' as string data cannot buy a pass" ;;
@@ -845,7 +845,7 @@ cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
 ## What changed
 | File | Lines | What |
 |---|---|---|
-| tests/probe.rb | +9 −0 | redblue tests |
+| tests/sample.rb | +9 −0 | redblue tests |
 
 ## Tests added
 | Test | Edge class covered |
@@ -878,7 +878,7 @@ test "edge_out_of_bounds index is a clean error"
     end
     expect caught2 to be yes
 '
-printf '%s' "$RB_TESTS" > "$PROJ/tests/probe.rb"
+printf '%s' "$RB_TESTS" > "$PROJ/tests/sample.rb"
 V() { ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
         JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ); }
 
@@ -919,7 +919,7 @@ case "$out" in
   *) no "a test-only phase was blocked" ;;
 esac
 # Several acceptable areas: touching ANY one is enough.
-( cd "$PROJ" && git checkout -- tests/probe.rb 2>/dev/null; printf '%s' "$RB_TESTS" > "$PROJ/tests/probe.rb" )
+( cd "$PROJ" && git checkout -- tests/sample.rb 2>/dev/null; printf '%s' "$RB_TESTS" > "$PROJ/tests/sample.rb" )
 set_mt '["src/", "modules/"]'
 mkdir -p "$PROJ/modules"; printf '// a module fix\n' >> "$PROJ/modules/SuiteKit.rb"
 out="$(V)"
@@ -956,7 +956,7 @@ cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
 ## What changed
 | File | Lines | What |
 |---|---|---|
-| tests/probe.rb | +14 −0 | redblue tests |
+| tests/sample.rb | +14 −0 | redblue tests |
 
 ## Tests added
 | Test | Edge class covered |
@@ -973,7 +973,7 @@ cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
 EOR
 set_tf() { "$JQ" '.test_policy.min_redblue_tests='"$1" "$PIPE/rbops/phases.json" > "$PIPE/t.json" \
             && mv "$PIPE/t.json" "$PIPE/rbops/phases.json"; }
-cat > "$PROJ/tests/probe.rb" <<'EOR'
+cat > "$PROJ/tests/sample.rb" <<'EOR'
 test "edge_empty list is rejected"
     try
         set x to empty[0]
@@ -1201,7 +1201,7 @@ EOR
 set_fa() { "$JQ" --argjson v "$1" '.phases |= map(if .id=="phase-001" then .failure_assert=$v else . end)' \
              "$PIPE/rbops/phases.json" > "$PIPE/f.json" && mv "$PIPE/f.json" "$PIPE/rbops/phases.json"; }
 # A linter-shaped test: asserts the diagnostic count. No is_err, no should_panic.
-cat > "$PROJ/tests/probe.rb" <<'EOR'
+cat > "$PROJ/tests/sample.rb" <<'EOR'
 test "edge_warns_on_unused_variable"
     set total to 1
     expect total to be 1
@@ -1235,7 +1235,7 @@ case "$out" in
 esac
 # And the other mandatory rules must still bite under the declaration - the
 # exemption is for the failure check ONLY.
-rm -f "$PROJ/tests/probe.rb"
+rm -f "$PROJ/tests/sample.rb"
 out="$(V)"
 case "$out" in
   *"no test named edge_"*) ok "the edge_* rule still applies under the exemption" ;;
@@ -1706,7 +1706,7 @@ cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
 ## What changed
 | File | Lines | What |
 |---|---|---|
-| tests/probe.rb | +9 −0 | redblue tests |
+| tests/sample.rb | +9 −0 | redblue tests |
 
 ## Tests added
 | Test | Edge class covered |
@@ -1721,7 +1721,7 @@ cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
 ## Known gaps / follow-ups
 - none
 EOR
-cat > "$PROJ/tests/probe.rb" <<'EOR'
+cat > "$PROJ/tests/sample.rb" <<'EOR'
 test "edge_empty list is rejected"
     try
         set x to empty[0]
