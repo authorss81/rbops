@@ -166,6 +166,23 @@ emit_capped() { # emit_capped <bytes> <label>
   fi
   rm -f "$tmp"
 }
+# Normalize formatting before judging. `cargo fmt` is deterministic and
+# semantic-neutral: it cannot change what the code does, only how it looks.
+# An unformatted tree used to fail the whole gate on `cargo fmt --check` —
+# phase-020 burned a 50-minute model run plus a 2.5-hour job on exactly that,
+# with a leftover scratch file on top. Formatting here does not weaken the
+# gate: verify.sh still runs `fmt --check`, which now verifies a normalized
+# tree instead of discovering the agent skipped a step. Logged visibly so the
+# REPORT's gate table stays honest about who ran what.
+normalize_tree() {
+  if in_project cargo fmt --all -- --check >/dev/null 2>&1; then
+    log "normalize: tree already formatted — no-op"
+  elif in_project cargo fmt --all >/dev/null 2>&1; then
+    log "normalize: cargo fmt reformatted the tree (agent left it unformatted)"
+  else
+    log "normalize: cargo fmt failed — leaving tree as the agent left it"
+  fi
+}
 
 # ------------------------------------------------------------------- selection
 # Priority:  1) .deferred (retry, cheapest continuity)
@@ -571,6 +588,7 @@ done
   fi
 
   # --- THE GATE -------------------------------------------------------------
+  normalize_tree
   log "running verify gate for $phase"
   RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" RBOPS_BASE_REF="$base" "$VERIFY" "$phase"
   code=$?
@@ -733,6 +751,14 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       fi
     done < "$cited"
     if [ -s "$before" ]; then log "fix round $round: $(wc -l < "$cited") file(s) cited by the findings"; fi
+    # Scope snapshot: how many lines does this fix round add to the phase?
+    # A single BLOCKER fix that adds ~1000 lines is not a fix, it is a rewrite
+    # wearing a fix's clothes — phase-020 grew +990/+1118 lines per round while
+    # test count barely moved (+10 total). Visibility only, never a gate: a big
+    # fix can be legitimate, but an ever-growing diff across rounds is how scope
+    # creep hides inside a passing gate.
+    local added_before
+    added_before="$(in_project git diff --numstat "$base" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
 
     log "applying review fixes"
     local fctx="$LOG_DIR/$phase.fix.$round.ctx"
@@ -773,9 +799,16 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       fi
       log "fix round $round: $touched cited file(s) actually changed"
     fi
+    local added_after fix_delta
+    added_after="$(in_project git diff --numstat "$base" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+    fix_delta=$((added_after - added_before))
+    if [ "$fix_delta" -gt 500 ]; then
+      log "fix round $round added ${fix_delta} lines to the phase diff — disproportionate for a fix round? scope check only, not failing on this"
+    fi
     rm -f "$cited" "$before" "$after"
 
     # --- re-gate after fixes. Mandatory. -----------------------------------
+    normalize_tree
     log "re-running verify gate after review fixes"
     if RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" RBOPS_BASE_REF="$base" "$VERIFY" "$phase"; then
       log "gate still green after fixes"

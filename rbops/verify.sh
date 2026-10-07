@@ -138,11 +138,23 @@ ok "forbidden-path scan done"
 # `#[ignore]` contains that token inside a string literal, and the gate
 # blocked a phase for containing the word it was testing against.
 if git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null \
-   | grep -nE '^\+[[:space:]]*(#\[ignore|#\[allow\((clippy|dead_code)|//[[:space:]]*skip\b)' \
-   | head -20; then
+  | grep -nE '^\+[[:space:]]*(#\[ignore|#\[allow\((clippy|dead_code)|//[[:space:]]*skip\b)' \
+  | head -20; then
   bad "gate-weakening construct added (#[ignore], // skip, allow(clippy::...)) — see AGENTS.md rule 2"
 else
   ok "no gate-weakening constructs added"
+fi
+
+# 2b2. scratch and probe files must not land in the diff. phase-020 left
+# tests/zz_probe.rs — a debugging scratch file — in the tree, and the gate only
+# caught it incidentally via formatting. A formatted scratch file would have
+# shipped. Patterns are deliberately narrow (prefixes and junk extensions, not
+# substrings) so a legitimately-named file cannot trip this.
+_scratch="$(printf '%s\n' "$CHANGED" | grep -iE '(^|/)(zz_[^/]*|[^/]*probe[^/]*|[^/]*scratch[^/]*)$|\.(tmp|bak|orig|swp)$|~$' || true)"
+if [ -n "$_scratch" ]; then
+  bad "scratch/probe files in the diff — remove them, they are not phase work: $(printf '%s' "$_scratch" | tr '\n' ' ' | head -c 300)"
+else
+  ok "no scratch files"
 fi
 
 # 2c. minimum substance
