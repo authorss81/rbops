@@ -96,6 +96,141 @@ process down with it on ordinary user input.
 Each fix was checked by taking it back out and watching the tests that name it
 fail; the numbers are in "Tests added" below.
 
+## Round 4 review
+
+The reviewer found one BLOCKER and two MAJORs. The BLOCKER is a block the round-1
+fix missed; one of the MAJORs is the same defect in a second block, and the other
+is FINDINGS §9, which did not hold up under the check the review asked for.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | **BLOCKER** `src/vm.rs` `Statement::Unless` ran its body as a plain `for stmt in body { execute_statement }`, so `break`/`skip` in an `unless` body did not stop the rest of that body — the tree VM printed the statement after the `break` where the bytecode VM, whose `unless` body compiles into the enclosing block, jumped over it. It was the only block in the file still run that way; the `if` branches were converted in round 1. | The body runs through `run_block`, like every other block. |
+| 2 | **MAJOR** `src/vm.rs` `declare_module` ran the module body through a loop that consulted the failure and not the signal, and `BytecodeVm::module` gave the module's frame no `loop_owner`, so a `break` in a module body written in a loop leaked the rest of the body on the tree VM and was **refused** (`'break' is only valid inside a loop`) on the bytecode one. | A module body runs where the declaration is written, so it is inside that loop exactly as an `object` body is — the function-body exemption is for a body that runs when it is called, and this one does not. The tree body goes through the block rule and publishes nothing when a jump leaves it; `module` records the loop it was written inside, and `unwind_frames_above` rolls the module back the way a failed body is rolled back. |
+| 3 | **MAJOR** `src/bytecode/vm.rs` `discard_frames_above` dropped an `object` body abandoned by failure without registering the type, where `Vm::declare_object` registers it before running the trailing statements (FINDINGS §9). | The premise does not reproduce — the compiler splits an `object` body into a declaration block and the enclosing block, so a failure in the trailing statements happens with the type already registered on both VMs — and what *was* wrong in those lines is fixed: `truncate(frame.pending_base)` already drops the abandoned body's own entry, so the `pop` after it took the **enclosing** body's entry whenever the frame's base was above zero, which is what a `has` default that opens a declaration produces. FINDINGS §9 records the rule both VMs already follow, with the program that shows the old claim was stale. |
+
+Fix 2 uncovered a third defect, which is the same rule seen from the other side and
+is fixed with it: a `finally` a jump passes through has to run *after* the frames
+the jump crossed are finished, because that is the order the tree-walking VM
+unwinds in — the signal passes out through one block at a time. The bytecode VM ran
+every crossed `finally` first and finished the frames afterwards, so a `set` in a
+`finally` written around a module declaration landed in the module's scope instead
+of the program's and was lost with it (`tf` against `t`). `abandon_handlers` now
+finishes the frames above each handler's own frame before running that handler's
+`finally`; `unwind_frames_above`'s loop body is the one-frame `finish_top_frame`.
+
+## Round 5 review
+
+The reviewer found one BLOCKER and two MAJORs. The BLOCKER is a scope removed
+twice; one MAJOR is a test gap that is closed here, and the other is a language
+question the specification does not answer, which FINDINGS §14 records with the
+program that shows today's behaviour instead of changing it in a review round.
+A race in the corpus harness turned up while re-running the gates and is fixed
+with them (FINDINGS §15).
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | **BLOCKER** `src/bytecode/vm.rs` `run_catch` pushed a scope for the `catch` body, pointed the catch frame's `locals_base` at it — and popped it *again* after driving the frame. Every path that pops a frame already truncates `locals` to that base, so a `catch` took two scopes and the second was the **enclosing** frame's: a `try`/`catch` inside a function body left the function without its parameter scope, and every name it read or assigned afterwards was `Unknown variable 'x'`. | The `pop()` is gone; the truncate is the whole rule, and it already covers all three ways the body can end. A top-level program never showed it — its names live in globals — and a loop's variable never showed it either, because that binding is not in `locals`. FINDINGS §13. |
+| 2 | **MAJOR** a `skip` in a `test` or `object` body written inside a loop had no test on either VM — only the `break` shape did — and `Skip` through `LoopOwner` is a different instruction reaching the same lookup by a different path. | Four new pins: `a_skip_in_a_test_body_advances_the_loop_the_test_is_written_in` and `a_skip_in_an_object_body_advances_the_loop_the_declaration_is_written_in` in `tests/loop_control_test.rs`, `edge_both_vms_advance_the_loop_for_a_skip_in_a_test_or_an_object_body` for the two VMs together, and the two `test` blocks in `tests/test_loop_control.rb` plus two corpus programs the both-VMs differential reads. |
+| 3 | **MAJOR** a `try`/`catch`/`finally` whose `catch` fails skips that `try`'s `finally` on both VMs, which the review read as contradicting `SPEC.md:464`'s "a `finally` is still owed on the way out". | **Not changed, and the reason is that the premise does not reproduce.** `SPEC.md:464` is about an *abrupt exit* — a `break` or a `skip` passing through a protected region is not a failure, and both VMs run that `finally`, which §6 and §12 pin. A `catch` that itself fails *is* a failure, and nothing in `SPEC.md` or `docs/GRAMMAR.md` says what a `finally` is owed after one; changing it needs three decisions the spec does not make (whether, which failure propagates when both fail, and what an abrupt exit out of that `finally` names). Both VMs already agree, so the differential is green either way. FINDINGS §14 records it with the program, the same call §10 records about `for each i from a to b`. |
+
+Finding 1's fix is a deletion, and its tests were watched failing without it:
+`edge_a_catch_body_gives_back_only_the_scope_it_pushed` goes red, and **2 of 407**
+programs in the both-VMs corpus disagree, one of them `tests/test_control_flow.rb`.
+Finding 2's coverage was checked the same way: taking the ownership fallback out of
+`skip_loop` alone — the one line, so that `skip` no longer asks the frame what loop
+it was written inside — turns **5 of 407** programs red, three of them the `catch`,
+`finally` and `test` bodies that already had them.
+
+## Round 6 review
+
+The reviewer found three BLOCKERs, all in the `finally` and the iteration cap, and
+all three were live: the first two are the two halves of one promise the language
+makes in `SPEC.md`'s "Finally" and neither engine kept on both paths, and the
+third is a `skip` the cap never saw. Fixing them uncovered two more defects that
+were only unreachable *because* the first two were broken, both in the same two
+functions; FINDINGS §16 has the transcripts and the reasoning.
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | **BLOCKER** `src/vm.rs` `Statement::Try` returned `Err(failure)` **above** the `run_finally_body` call whenever the parser had found no `catch`, so a `try` with only a `finally` — the form `SPEC.md`'s "Finally" section documents, and the one where the cleanup is wanted most — skipped its cleanup on the failing path. The bytecode VM ran the cleanup there, so the two engines disagreed about which promise to keep. | The `finally` runs first and the failure is propagated after it, which is also what makes the failure the *enclosing* `try`'s to catch rather than this one's. `SPEC.md` and `docs/GRAMMAR.md` now say the order. |
+| 2 | **BLOCKER** `src/bytecode/vm.rs` `handle_failure` answered `Ok(true)` — "handled" — for a handler with no `catch`: it ran the `finally` and resumed past the marked `NOP`. `try / set bad to 1 + "one" / end / say "after"` printed `after` and exited 0 on the bytecode VM and failed on the tree-walking one. A program that had failed ran to its end reporting success. | The search **loops**: a handler with no `catch` runs the `finally` it is owed and the search carries on from what is left, which is what the tree-walking VM's `?` reaches. Only a search that runs out of handlers answers `false`. Two things the loop needed, both fixed with it: a body that failed and was taken by a handler *outside* the region spends the original failure (so `true` where the handler stack has lost an enclosing one), and `end_try_after` now scans from the `TRY` rather than from the failing instruction, because a handler reached by skipping an inner `try` used to stop at that inner region and resume inside the protected code it had left. |
+| 3 | **BLOCKER** `src/bytecode/vm.rs` `turn_over_to` (`SKIP`) jumps a `while` to its `top`, stepping over the backward `JUMP` that charges a turn — and unlike a sequence loop, a `while` has no `STORE` at its `top` to charge with. So a `while` that skipped every turn spent no iterations at all and was stopped by the ten-million-statement step budget, where the tree-walking VM reports `Maximum of N iterations`. | `turn_over_to` charges the turn it starts when the loop is a `while`, and clears the exit flag when that charge fails — the way `prepare_exit` reports a `finally` that could not run. |
+
+The fourth change was not in the review and was found by the test written for
+finding 3: a cap of N was N turns on the tree-walking VM and N + 1 on the
+bytecode one, because that VM charges a `while`'s turn at the *end* of the previous
+one and draws the loop's entry when it turns over rather than before it — so a
+`while` under a cap of 3 ran four turns of body on the bytecode VM and three on the
+other. Fixed by starting a `while`'s entry at one turn (an entry is drawn when the
+loop turns over or an exit leaves it, which is after the turn it is leaving has
+run), which is the same up-front charge the tree-walking VM makes and the one
+finding 3's fix had to match.
+
+Every fix here was watched failing with it taken back out, and each was taken out
+alone:
+
+| Taken out | What goes red |
+|---|---|
+| the `if !has_catch` branch in `src/vm.rs` | **3 of 411** programs: the corpus program `try/a-failure-with-nothing-around-it-stops-the-program-after-the-finally` (the tree no longer prints `cleaned`) and the two `test` blocks this round added to `tests/test_control_flow.rb` |
+| the `continue` in `handle_failure` | **4 of 411** programs: the three `try/…` corpus programs added for findings 1 and 2, and `tests/test_control_flow.rb` again |
+| the charge in `turn_over_to` | `edge_a_cap_counts_turns_on_both_vms_and_a_skipped_turn_is_one` and `edge_a_while_that_skips_every_turn_is_stopped_by_the_iteration_cap`, the second quoting the review's own symptom — the bytecode VM reporting `Step budget of 10000000` where the tree reports `Maximum of 5 iterations` |
+| `iterations: usize::from(!site.iterator)` | `edge_a_cap_counts_turns_on_both_vms_and_a_skipped_turn_is_one`: a cap of 1 allowed 2 turns of a `while` |
+
+The cap is invisible to the corpus, which runs at the published million and cannot
+lower it from inside a program, so this round added
+`tree_walk_capped`/`bytecode_capped`/`assert_agrees_capped` — the same
+comparison the both-VMs corpus makes, at a cap a test can reach — and
+`edge_a_skip_in_a_while_is_charged_as_one_iteration` in `tests/loop_control_test.rs`
+for the tree-walking VM alone, which is where the rule was already right.
+
+## Merge resolution — the resumed tree
+
+This round was not a review round. The parked attempt came back merged onto a newer
+`main`, and the merge left nine conflict hunks across two files. Every hunk was a
+**disjoint** addition on the two sides rather than a disagreement about the same
+lines, so each was resolved by keeping both, and no round-3 code was dropped.
+
+| File | Conflict | Both intents kept |
+|---|---|---|
+| `src/vm.rs` `Statement::ForRange` | `main` had replaced the range loop with `expect_range_number` / `range_has_next` / `finite_number` and run the body as a plain statement list; the attempt had wrapped the same loop in `run_iteration` over the older `while i <= end`. | `main`'s numerics — a signed step, an overflow check on the stepped value, and a named error for a non-number bound — **and** the attempt's `run_iteration` call, which is what makes a `break`/`skip` in a range body leave the loop and releases the loop variable on every path. The result is `main`'s loop with one turn of the body run through `run_iteration`. `tests/for_range_test.rs` (31 tests, including the descending and fractional steps `main` added) and the five range tests of this phase are both green, which is the check that neither side was lost. |
+| `src/bytecode/vm.rs` `pending_objects` | `main` had already made it a `Vec` for the `has`-default case; the attempt had made it a `Vec` for nested `object` bodies. | One field, and one doc comment naming **both** reasons: a `has` field's `default` is compiled as an expression and can open a declaration of its own, and an `object` body can nest inside another's. |
+| `src/bytecode/vm.rs` `finish_object` | `main` had the `name: &str` parameter and the message `Object '<name>' lost its declaration before its body finished`; the attempt had the no-parameter form and the parent-chain rationale. | `main`'s signature and its better message, with the attempt's `resolve_object`/`object_is_declared` rationale and behaviour. The second call site — `discard_frames_above`, added by `main` — now passes the block's name, so the panic-free report reaches that path too. |
+| `src/bytecode/vm.rs` `BytecodeVm::run` | `main` cleared `pending_objects` here and printed `self.output` under `self.echo`; the attempt reset `abrupt_exit` and mapped `drive`'s `Exit` away. | Both. The `pending_objects.clear()` stays, `abrupt_exit = false` is reset beside it, the result is still `drive(0).map(|_| ())` and the printing is still gated on `self.echo`. |
+| `src/bytecode/vm.rs` struct fields / `new()` | `main` added `echo`; the attempt added `abrupt_exit`, `handling_failure` and `deferred_bindings`. | All four fields, initialised in `new()`. |
+| `src/bytecode/vm.rs` `unwind_frame` / `discard_frames_above` | `main` truncated `self.loops` and had the module-body rollback; the attempt called `unwind_loops`, which is that truncation plus the bindings each abandoned loop gave back. | `unwind_loops` is called; the module-body rollback `main` added is untouched above it. |
+| `src/bytecode/vm.rs` `DEF_OBJECT` | `main` set `pending_base`; the attempt set `new_frame.loop_owner`. | Both fields, and the attempt's comment about reading the owner before the advance. |
+
+### One thing the merge turned up that no round had
+
+Making the two statements work moved two **corpus goldens**, and phase-020 had left a
+test that pinned the old no-op deliberately — `corpus::KNOWN_DEFECT_PROGRAMS` and
+`edge_a_break_and_a_skip_are_pinned_as_the_defect_they_are`, whose own comment said
+"The day either engine implements `break`, this fails and the two goldens are expected
+to change". So this is the day, and the tree went red on three tests:
+
+- `every_corpus_program_prints_what_its_expected_file_records` and
+  `edge_regenerating_the_corpus_reproduces_the_checked_in_one_byte_for_byte` —
+  `corpus/loop-forms-0012.expected` recorded `found` / `after`, the no-op's output;
+  the loop now ends on its first turn and prints `after`. The golden was regenerated
+  with the harness's own `RB_WRITE_CORPUS=1` path (which writes to
+  `target/tmp/differential-refreshed`, never to `corpus/`) and copied over, so it is
+  byte-for-byte what the generator produces. `loop-forms-0013` prints `2` / `after`
+  either way and did not move.
+- `edge_a_break_and_a_skip_are_pinned_as_the_defect_they_are` — **rewritten, not
+  deleted**, and stronger than what it replaced. The table it iterated,
+  `KNOWN_DEFECT_PROGRAMS`, is now `BREAK_AND_SKIP_PROGRAMS`, and instead of two names
+  and a prose reason it carries **the lines the fix produces** (`["after"]` and
+  `["2", "after"]`). The test asserts those exact lines on **both** engines, so a
+  golden edited back to the no-op's output fails instead of passing quietly — which
+  the old test, comparing each engine only with its own golden, would not have caught.
+  It keeps the same shape: the programs exist, each holds a keyword, each completes,
+  both engines agree, and the count floor of 2 is still asserted.
+
+That is a third file outside the phase's own test set to touch, and the honest
+reason is the same as the one the phase already gave for `src/bytecode/vm.rs`: the
+fix changes what a program *means*, and a golden that recorded the old meaning had to
+move with it.
+
 ## What changed
 
 | File | Lines | What |
@@ -115,6 +250,25 @@ fail; the numbers are in "Tests added" below.
 | `tests/loop_control_test.rs` | round 3, +238 | `range_loop` and the five tests that run `break`, `skip`, the stepped form and the empty range through `Statement::ForRange` on both VMs, plus the two tests pinning that neither jump takes an operand |
 | `tests/bytecode_vm_test.rs` | round 3, +160 | four named tests for the nested-declaration fix and twelve `object/…` corpus programs for its shapes, all compared across both VMs |
 | `SPEC.md`, `docs/GRAMMAR.md` | round 3 | `skip_statement` loses the operand it never had, and both files say neither `break` nor `skip` takes one |
+| `src/vm.rs` | merge round | the range loop keeps `main`'s signed step, `expect_range_number` and `finite_number` overflow check, and runs one turn through `run_iteration` — `main`'s loop with the phase's control flow on top |
+| `src/bytecode/vm.rs` | merge round | the nine conflict hunks resolved with both sides kept: `echo` beside `abrupt_exit`/`handling_failure`/`deferred_bindings`, `pending_objects.clear()` beside the `abrupt_exit` reset, `unwind_loops` for both of `main`'s `loops.truncate` sites, `finish_object(&name)` at the `discard_frames_above` call site `main` added, and `pending_base` beside `loop_owner` in `DEF_OBJECT` |
+| `corpus/loop-forms-0012.expected` | merge round, −1 | regenerated: the loop now ends on its first turn, so the no-op's `found` line is gone and the file records `after` |
+| `tests/common/corpus.rs` | merge round, +16 −26 | `KNOWN_DEFECT_PROGRAMS` becomes `BREAK_AND_SKIP_PROGRAMS`, carrying the lines the fix produces |
+| `tests/differential_test.rs` | merge round, +33 −22 | `edge_a_break_and_a_skip_are_pinned_as_the_defect_they_are` becomes `edge_a_break_and_a_skip_leave_the_loop_on_both_engines`, pinning those lines on both engines |
+| `tests/common/generator.rs` | merge round, +6 −6 | the comment beside the two `break`/`skip` corpus programs, which said the goldens record a no-op |
+| `src/vm.rs` | round 4, +33 −8 | `Statement::Unless` runs its body through `run_block`; `declare_module` stops at a pending signal, publishes nothing when one is left, and unregisters the module — the same rollback its failure path already had |
+| `src/bytecode/vm.rs` | round 4, +54 −13 | `module` records the loop the declaration is written inside; `unwind_frames_above` rolls a module body back; `abandon_handlers` finishes the frames above each handler's own frame before running that handler's `finally`, with `finish_top_frame` split out of `unwind_frames_above`'s loop; `discard_frames_above` drops the abandoned body's own declaration and only its own |
+| `SPEC.md`, `docs/GRAMMAR.md`, `docs/BYTECODE.md` | round 4 | the loop a statement is written inside now says `module` (and an `unless` body) beside `catch`, `finally`, `test` and `object`; a module body is in the loop it is written in and inherits the function-body exemption from a function it is written in; the crossed-block ordering, and what finishing a module body leaves behind, are written down for a second VM to match |
+| `tests/loop_control_test.rs` | round 4, +9 tests | `unless` bodies × `break`/`skip` × `for each`/`while`, and the module-body matrix: the two jumps, the abandoned module, the two refusals and the `finally` ordering — the last two compared on **both** VMs |
+| `tests/object_model_test.rs` | round 4, +4 tests | a declaration opened by a `has` default, abandoned by a `catch` and by success, and the two ends of the registration rule FINDINGS §9 asks about |
+| `tests/test_loop_control.rb` | round 4, +8 blocks | the same shapes in Redblue, which the bytecode corpus runs on **both** VMs |
+| `tests/bytecode_vm_test.rs` | round 4, +14 corpus programs | two `unless`, seven `module` and five `object` programs, each compared across both VMs |
+| `src/bytecode/vm.rs` | round 5, −3 +11 | `run_catch` stops popping the scope it pushed: the frame's own `locals_base` truncate already gives it back, and the extra removal took the enclosing function's scope with it (FINDINGS §13) |
+| `tests/loop_control_test.rs` | round 5, +3 tests | a `skip` in a `test` body and in an `object` body — the two blocks with a frame of their own that had a `break` test and no `skip` one — and the pair compared across both VMs |
+| `tests/bytecode_vm_test.rs` | round 5, +3 corpus programs, +1 test | the two `skip` programs, one `catch`-in-a-function program, and `edge_a_catch_body_gives_back_only_the_scope_it_pushed` |
+| `tests/bytecode_vm_test.rs` | round 5, +34 | a `static CORPUS_WALK` mutex held by the three tests that walk the corpus: `examples/files.rb` writes files by relative path, so two walks at once read each other's residue and reported a disagreement about the filesystem as one about the two VMs (FINDINGS §15) |
+| `tests/test_control_flow.rb` | round 5, +1 block | `edge: a catch leaves the function body it was written in alone`, which the bytecode corpus runs on both VMs |
+| `tests/test_loop_control.rb` | round 5, +2 blocks | the two `skip` shapes, so the differential runs them on both VMs |
 
 ### Why `src/bytecode/vm.rs` is in this phase
 
@@ -190,13 +344,50 @@ Round 2 adds three more, all from FINDINGS §6:
   `finally` that cleans up one thing and not the other is not a cleanup. A
   `break` written in a `finally` ends the statements after it in that block and
   still names the loop already being left.
+- **Every block stops at the signal, `unless` bodies included** (round 4). An
+  `unless` body is a block by the same argument as an `if` branch: the statements
+  after a `break` in it are part of the turn the signal stopped. It was the one
+  block left running its statements one at a time, and the bytecode VM — which
+  compiles an `unless` body inline, so its jump goes over the rest — disagreed.
+- **A module body is inside the loop it is written in** (round 4). It runs where
+  the declaration is written, which is the whole of `SPEC.md`'s rule ("the loop is
+  the one *around* the statement, wherever the statement was written") and the same
+  answer an `object` body gets. The function-body exemption is for a body that runs
+  when it is *called*, and a module body is not that; a module declared inside a
+  function body inherits the exemption, because it is written inside one. A body a
+  jump leaves publishes nothing and declares nothing — the rollback its failure
+  path already had on both sides — so a later `module` of that name is a fresh
+  declaration and a later `import` of it is a miss.
+- **The crossed blocks are finished one at a time** (round 4). The tree-walking VM
+  passes the signal out through one block at a time, so a `finally` written inside
+  a block that is still on the stack runs while that block's scope is live, and a
+  `finally` written around all of them runs once they are gone. The bytecode VM ran
+  all of them first and finished the frames afterwards, which is observable wherever
+  a crossed block holds a scope the `finally` can see — a module body, whose scope
+  is still live while a `finally` around the declaration ran, so a `set` there went
+  into the module and died with it.
+- **A `finally` is owed however its region is left, and a `try` with no `catch` is
+  not a handler** (round 6). The cleanup runs on the way out of a region that
+  *failed* — which is what left the thing to clean up — and the failure is
+  reported after it rather than instead of it, so it is the enclosing `try`'s to
+  catch and the program's own to stop with. The tree-walking VM returned above
+  `run_finally_body` on that path and skipped the cleanup; the bytecode VM ran the
+  cleanup and then answered "handled" and resumed past the region's `NOP`, so a
+  program that had failed ran to its end reporting success. `SPEC.md`'s "Finally"
+  section and `docs/GRAMMAR.md` say the order.
+- **A cap is a number of turns, on both engines, and a skipped turn is a turn**
+  (round 6). The tree-walking VM charges at the top of every turn. The bytecode VM
+  charged a `while`'s turn at the backward `JUMP` that ends the previous one — so a
+  cap of N was N + 1 turns there, and its first turn was free — and `SKIP` steps
+  over that jump, so a `while` that skipped every turn spent nothing at all and was
+  stopped by the step budget rather than the cap.
 
 ## Tests added
 
-`tests/loop_control_test.rs`, 38 tests. The "Fails without" column names what
+`tests/loop_control_test.rs`, 59 tests. The "Fails without" column names what
 each round-1 test fails on when its fix is taken back out — every one of them was
-watched failing, and each of the four findings has at least one. The round-2 tests
-are in their own table below.
+watched failing, and each of the four findings has at least one. The round-2,
+round-3, round-4, round-5 and round-6 tests are in their own tables below.
 
 | Test | Edge class covered | Fails without |
 |---|---|---|
@@ -279,6 +470,14 @@ what was watched failing.
 | `edge_neither_break_nor_skip_takes_an_operand` | malformed_input for the jumps: `skip 1` and `break 1` are a jump and a separate statement, which is what `docs/GRAMMAR.md` now says | — (pins the behaviour the corrected grammar describes; a document has no code to fail) |
 | `edge_a_skip_leaves_the_statements_after_it_unreached` | the block rule applied to a body that is a single statement | round 1's block fix |
 
+### Merge-round test change
+
+One test changed, and it changed in the direction of asserting more.
+
+| Test | Edge class covered | Fails without |
+|---|---|---|
+| `edge_a_break_and_a_skip_leave_the_loop_on_both_engines` (was `edge_a_break_and_a_skip_are_pinned_as_the_defect_they_are`) | boundary: the two corpus programs that write these statements, on **both** engines, against the exact lines `["after"]` and `["2", "after"]` rather than against their own goldens | `corpus/loop-forms-0012.expected` written back to the no-op's `found` / `after` — watched failing, `left: ["found", "after"]` against `right: ["after"]` |
+
 ### The two corrected `tests/test_lists.rb` tests
 
 Both were rewritten, not deleted. Their names changed because the old names
@@ -294,33 +493,177 @@ assert `total is 3`:
 assertions and a clean run of the file, so the correction cannot be reverted by
 editing the numbers back.
 
+### Round 4 tests
+
+`tests/loop_control_test.rs` grew by nine, `tests/object_model_test.rs` by four,
+`tests/test_loop_control.rb` by eight `test` blocks and `tests/bytecode_vm_test.rs`
+by fourteen corpus programs. The last column is what was watched failing with each
+fix taken back out, counted over the Rust tests in the row's file.
+
+| Test | Edge class covered | Fails without |
+|---|---|---|
+| `a_break_in_an_unless_body_does_not_run_the_statements_after_it` | round 4, finding 1: the statement after the `break`, and the one after the `unless` | `Statement::Unless` running its body as a plain statement list |
+| `a_skip_in_an_unless_body_leaves_the_statements_after_it_unreached` | the `skip` companion, with the rest of the turn after the `unless` counted too | the same |
+| `edge_both_vms_answer_the_same_for_break_and_skip_in_an_unless_body` | the finding itself: `break` and `skip` in a `for each` and in a `while`, plus an `unless` whose body never runs, through **both** VMs | the same |
+| `a_break_in_a_module_body_inside_a_loop_leaves_that_loop` | round 4, finding 2: the loop stops, and neither the rest of the module body nor the rest of the turn runs | the module body consulting only the failure |
+| `edge_a_skip_in_a_module_body_advances_the_loop_it_is_written_in` | the `skip` companion over three turns | the same |
+| `edge_a_module_body_left_by_a_break_publishes_nothing_and_declares_nothing` | state: the abandoned module is not declared, so a later `import` is a miss | the same |
+| `edge_a_break_in_a_module_body_outside_a_loop_is_refused` | **asserts a failure**: in no loop at all, and inside a function body called from a loop, with the caller's loop surviving — the module-body counterpart of the function-body exemption | `BytecodeVm::module` recording a loop owner, which would make the second case a jump |
+| `edge_a_finally_around_a_module_declaration_runs_after_its_scope_is_gone` | ordering: the `finally` written around the declaration runs once the module's scope is gone, so its `set` is a name of the program | `abandon_handlers` running the crossed `finally` bodies before finishing the crossed frames |
+| `edge_both_vms_answer_the_same_for_a_jump_in_a_module_body` | the finding itself: all seven module shapes, through **both** VMs | `BytecodeVm::module` recording a loop owner (refuses five of the seven) |
+| `edge_object_a_declaration_opened_by_a_has_default_a_failure_abandons_only_its_own` | round 4, finding 3: a `has` default that opens a declaration a `catch` then abandons — the enclosing body still registers | `discard_frames_above`'s extra `pop` (the bytecode VM answers `'has a' is only valid inside an object declaration`) |
+| `edge_object_a_declaration_opened_by_a_has_default_that_succeeds_registers_both` | the same shape with nothing failing | — (guards the shape the four above count on) |
+| `edge_object_an_object_body_left_through_a_failure_has_registered_its_type` | FINDINGS §9: a failure *after* the declarations leaves the type declared on both VMs | — (the premise no longer holds; this pins what does) |
+| `edge_object_an_object_body_whose_declaration_failed_registers_nothing` | the other end: a failure *in* a `has` default leaves the name unbound | — (the guard for the row above) |
+| `tests/test_loop_control.rb` — 8 `test` blocks | the same matrix in Redblue, run by `rb test` **and** by the bytecode corpus on both VMs | each fix, with the blocks above |
+| `tests/bytecode_vm_test.rs` — 14 corpus programs | two `unless`, seven `module` (three loop forms, the abandoned module, the `finally` ordering, the two refusals) and five `object` (the two `has`-default shapes and the three ends of the registration rule), each compared across both VMs | each fix; without the `unless` fix 3 of 404 programs disagree, without the module fix 6, without the interleave 2, without the `pop` fix 1 |
+
+### Round 5 tests
+
+`tests/loop_control_test.rs` grew by three, `tests/bytecode_vm_test.rs` by three
+corpus programs and one named test, `tests/test_loop_control.rb` by two `test`
+blocks and `tests/test_control_flow.rb` by one. All five of the round's programs
+were watched failing with the fix taken back out.
+
+| Test | Edge class covered | Fails without |
+|---|---|---|
+| `edge_a_catch_body_gives_back_only_the_scope_it_pushed` | round 5, finding 1: a parameter and a name declared before the `try`, both read after the `catch` — plus the other end, that the `catch`'s own binding still dies with its body | the extra `pop` in `run_catch` (the bytecode VM answers `Unknown variable 'x'`) |
+| `try/a-catch-inside-a-function-body-leaves-the-calls-own-scope-alone` (corpus program) | the same shape as a whole program, compared across both VMs | the same — one of the 2 programs that disagree |
+| `edge: a catch leaves the function body it was written in alone` (`tests/test_control_flow.rb`) | the same, in Redblue, which the bytecode corpus reads and so runs on both VMs | the same |
+| `a_skip_in_a_test_body_advances_the_loop_the_test_is_written_in` | round 5, finding 2: a `test` body with a `skip` on its second turn — the block never ran and neither did the `.` after it, and the loop ran all three turns | the ownership fallback in `skip_loop` |
+| `a_skip_in_an_object_body_advances_the_loop_the_declaration_is_written_in` | the `object` body beside it, with the declaration made under a guard so the loop can go on to a second and third turn | the same |
+| `edge_both_vms_advance_the_loop_for_a_skip_in_a_test_or_an_object_body` | the finding itself: both shapes through **both** VMs, each printing a `leaked` line that must not appear | the same (5 of 407 programs disagree, one of them `tests/test_loop_control.rb`) |
+| `tests/test_loop_control.rb` — 2 `test` blocks | `loop control: a skip in a test body advances the loop the test is written in` and `…in an object body…`, so the differential runs both shapes on both VMs | the same |
+| `flow/a-skip-in-a-test-body-inside-a-loop-advances-the-turn`, `flow/a-skip-in-an-object-body-inside-a-loop-advances-the-turn` (corpus programs) | one per shape, each compared across both VMs | the same |
+
+### Round 6 tests
+
+`tests/bytecode_vm_test.rs` grew by four corpus programs and six named tests,
+`tests/loop_control_test.rs` by two, and `tests/test_control_flow.rb` by three
+`test` blocks. The three corpus programs and the `.rb` blocks are read by the
+both-VMs differential, so every one of them ran on **both** engines.
+
+| Test | Edge class covered | Fails without |
+|---|---|---|
+| `try/a-failure-with-nothing-around-it-stops-the-program-after-the-finally` (corpus program) | finding 1 at its sharpest: nothing is written around the `try`, so the golden records the `say` the `finally` made *and* the `RuntimeError` that stopped the program — the tree ran the cleanup and failed, the bytecode VM ran the cleanup and carried on | the `if !has_catch` branch in `src/vm.rs` |
+| `try/a-finally-runs-on-the-way-out-of-a-failure-with-no-catch` (corpus program) | the same rule with an enclosing `catch`, so the result is a completion: `fc`, not `f` | both — this is the corpus program that shows the tree's answer changing |
+| `try/a-try-with-no-catch-hands-the-failure-to-the-try-around-it` (corpus program) | finding 2 with no `finally` in the way: the outer `catch` must run, and the `set reached to "yes"` after the inner `try` must not | the `continue` in `handle_failure`, and on its own the `end_try_after` fix — the bytecode VM prints `yes`, having resumed inside the protected region |
+| `try/a-failing-finally-inside-a-try-with-no-catch-is-the-one-that-propagates` (corpus program) | which of two failures leaves: the two say different things, so the recorded message says it is the cleanup's | — (it pins the behaviour the two VMs agree on today; the tree side of it is asserted below) |
+| `edge_a_failing_finally_is_the_failure_a_try_with_no_catch_reports` | the same, asserted rather than recorded: `Division by zero` is reported, `non-numbers` is not, and nothing after the `try` ran | a change that propagated the protected region's own failure instead |
+| `edge_a_break_in_a_catch_around_a_catch_less_try_leaves_the_loop_and_cleans_up` | the two halves of `prepare_exit` where the crossed `try` has only a `finally`: the loop is left **and** the cleanup ran on both turns | the ownership work, if the `try` it crosses stops being a handler |
+| `edge_a_catch_less_try_does_not_stop_the_loop_it_is_written_in` | a `try` with neither `catch` nor `finally`, written inside a loop: the loop keeps turning and the program stops with the failure rather than swallowing it | the `continue` in `handle_failure` |
+| `edge_a_cap_counts_turns_on_both_vms_and_a_skipped_turn_is_one` | findings 3 and the off-by-one beside it: every loop form, plain, `skip`ped and `break`ing, under caps of 1, 3 and 4, asserting the number of turns each cap allows on **both** VMs | the `turn_over_to` charge, and `iterations: usize::from(!site.iterator)` |
+| `edge_a_while_that_skips_every_turn_is_stopped_by_the_iteration_cap` | the review's own symptom, stated as an assertion: the per-loop cap stops it, not the step budget | the `turn_over_to` charge |
+| `edge_a_break_stops_the_loop_at_the_same_turn_on_both_vms` | the other end: a `break` on the first turn is one turn whatever the cap, and the first turn of a `while` is the one whose entry does not exist until the exit needs it | the `iterations` seed |
+| `edge_a_skip_in_a_while_is_charged_as_one_iteration` (`tests/loop_control_test.rs`) | the same on the tree-walking VM, where the rule was already right — the gap the review named, since `edge_a_skip_is_charged_as_one_iteration` beside it only covered `repeat` | nothing on this VM; it is the statement of the rule the bytecode half was brought back to |
+| `edge_a_break_on_the_first_turn_of_a_while_is_one_turn` (`tests/loop_control_test.rs`) | the `break` half of the same accounting on the tree-walking VM | — |
+| `tests/test_control_flow.rb` — 3 `test` blocks | `edge: a finally is owed when there is no catch to handle the failure`, `edge: a try with no catch hands the failure to the one around it` and `edge: a failing finally still leaves the outer try to catch the failure`, so the differential runs all three shapes on both VMs | the `if !has_catch` branch, and the `continue` |
+
 ## Gates
+
+Re-run after round 6's fixes, on the tree as it now stands.
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --all -- --check` | pass, no diff |
 | `cargo clippy --all-targets -- -D warnings` | pass, zero warnings |
-| `cargo test --all-targets` | 552 passed, 0 failed, 0 ignored (24 binaries) |
+| `cargo test --all-targets` | **817 passed, 0 failed, 0 ignored** (31 binaries) |
 | `./rbops/verify.sh phase-025` | **not run — `rbops/` is not in this checkout** |
 
-The first three were re-run after the round-3 fixes; the count moved from 532 to
-552: `tests/loop_control_test.rs` +7, `tests/bytecode_vm_test.rs` +4,
-`tests/object_model_test.rs` +9.
+Round 6's eight tests are the difference between 809 and 817 — six in
+`tests/bytecode_vm_test.rs` and two in `tests/loop_control_test.rs` — and its three
+`test` blocks are the difference between 329 and 332. The other four artifacts are
+corpus programs inside the existing both-VMs test, which counts programs rather
+than tests (407 → 411).
 
-`rbops/` is absent from the working directory (`ls` shows `.github`, `phases`,
-`src`, `tests`, `examples`, `modules`, `target`, and no `rbops/`), so
-`./rbops/verify.sh phase-025` exits `No such file or directory`. The pipeline
-lives outside this checkout and I was instructed not to inspect it. What was run
+`rbops/` is still absent from the working directory, so the fourth gate exits
+`No such file or directory` and the manual substitute below stands.
+
+| Check | Result |
+|---|---|
+| `rb test` (every `.rb` under `tests/`) | 332 run, 332 passed, 0 failed |
+| `./target/debug/rb run examples/*.rb` | 6/6 exit 0 |
+| `./target/debug/rb run modules/*.rb` | 2/2 exit 0 |
+| `tests/loop_bounds_test.rs` | 22 passed, 0 failed |
+| `tests/loop_control_test.rs` | 59 passed, 0 failed |
+| `tests/object_model_test.rs` | 39 passed, 0 failed |
+| `tests/differential_test.rs` | 81 passed, 0 failed |
+| `tests/bytecode_vm_test.rs` (the both-VMs differential) | 58 passed, 0 failed, over a corpus of 411 programs |
+| `tests/for_range_test.rs` | 31 passed, 0 failed |
+| `cargo test --doc` | 1 passed, 0 failed |
+| the reproduction, through the binary | `break` prints `1`, `skip` prints `1` then `3`, `repeat` stops at 3, a `break` in no loop exits 1 with `'break' is only valid inside a loop` |
+
+### Round 5's gates, kept for the count
+
+Re-run after round 5's fixes, on the tree as it then stood.
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass, no diff |
+| `cargo clippy --all-targets -- -D warnings` | pass, zero warnings |
+| `cargo test --all-targets` | **809 passed, 0 failed, 0 ignored** (31 binaries) |
+| `./rbops/verify.sh phase-025` | **not run — `rbops/` is not in this checkout** |
+
+Round 5's four tests are the difference between 805 and 809 — three in
+`tests/loop_control_test.rs` and one in `tests/bytecode_vm_test.rs` — and its three
+`test` blocks are the difference between 326 and 329. Nothing else moved: the other
+four new artifacts are corpus programs inside the existing both-VMs test, which
+counts programs rather than tests (404 → 407).
+
+`rbops/` is still absent from the working directory, so the fourth gate exits
+`No such file or directory` and the manual substitute below stands.
+
+| Check | Result |
+|---|---|
+| `rb test` (every `.rb` under `tests/`) | 329 run, 329 passed, 0 failed |
+| `./target/debug/rb run examples/*.rb` | 6/6 exit 0 |
+| `./target/debug/rb run modules/*.rb` | 2/2 exit 0 |
+| `tests/loop_bounds_test.rs` | 22 passed, 0 failed |
+| `tests/loop_control_test.rs` | 57 passed, 0 failed |
+| `tests/object_model_test.rs` | 39 passed, 0 failed |
+| `tests/differential_test.rs` | 81 passed, 0 failed |
+| `tests/bytecode_vm_test.rs` (the both-VMs differential) | 52 passed, 0 failed, over a corpus of 407 programs |
+| `tests/for_range_test.rs` | 31 passed, 0 failed |
+| `cargo test --doc` | 1 passed, 0 failed |
+| the reproduction, through the binary | `break` prints `1`, `skip` prints `1` then `3`, `repeat` stops at 3, a `break` in no loop exits 1 with `'break' is only valid inside a loop` |
+
+One caveat about the corpus count, recorded because it is a gate fact and not a
+detail: `examples/files.rb` writes files by relative path, so the two tests that
+walk the whole corpus were reading each other's residue when they ran at the same
+time, and one of them reported `examples/files.rb` as a disagreement between the
+VMs (FINDINGS §15). It is serialised now, and the three runs that failed before
+the lock are green after it. A red `a_corpus_of_programs_runs_identically_on_both_vms`
+naming `examples/files.rb` is that, not a difference between the two engines.
+
+The suite count is much larger than the 552 the round-3 round recorded, and none of
+that is this phase: `main` has landed work since, and 240 of the difference are
+tests the merged tree brought with it. What the merge round's own changes account
+for is three — the two corpus tests and the rewritten pin, which are the same three
+the merge turned red before they were fixed. Round 4's own thirteen tests are the
+difference between 792 and 805, and its eight Redblue blocks are the difference
+between 318 and 326.
+
+The counts before round 5 are kept above for the rounds that recorded them;
+everything below is round 5's own re-run. `rbops/` is absent from the working
+directory (`ls` shows `AGENTS.md`, `SPEC.md`, `corpus`, `docs`, `examples`,
+`modules`, `phases`, `src`, `tests`, `target`, and no `rbops/`), so
+`./rbops/verify.sh phase-025` exits `No such file or directory`. The pipeline lives
+outside this checkout and the phase prompt forbids inspecting it. What was run
 instead, by hand, from the same phase prompt:
 
 | Check | Result |
 |---|---|
-| `rb test` (every `.rb` under `tests/`) | 276 run, 276 passed, 0 failed |
+| `rb test` (every `.rb` under `tests/`) | 326 run, 326 passed, 0 failed |
 | `./target/debug/rb run examples/*.rb` | 6/6 exit 0 |
 | `./target/debug/rb run modules/*.rb` | 2/2 exit 0 (`MathUtils.rb` passes as well) |
 | `tests/loop_bounds_test.rs` | 22 passed, 0 failed |
-| `tests/bytecode_vm_test.rs` (both differential tests) | 37 passed, 0 failed, over a corpus of 380 programs |
+| `tests/loop_control_test.rs` | 54 passed, 0 failed |
+| `tests/object_model_test.rs` | 39 passed, 0 failed |
+| `tests/differential_test.rs` | 81 passed, 0 failed, over a corpus of 361 programs |
+| `tests/bytecode_vm_test.rs` (the both-VMs differential) | 51 passed, 0 failed, over a corpus of 404 programs |
+| `tests/for_range_test.rs` | 31 passed, 0 failed |
 | `cargo test --doc` | 1 passed, 0 failed |
+| the reproduction, through the binary | `break` prints `1`, `skip` prints `1` then `3`, `repeat` stops at 3, a `break` in no loop exits 1 with `'break' is only valid inside a loop` |
 
 Beyond the gates, every fix above was checked by taking it back out and watching
 the test that names it fail: the `if`/`try` block fixes take down 13 tests, the
@@ -336,8 +679,33 @@ three of them by panicking inside `src/bytecode/vm.rs` rather than by an asserti
 and `tests/test_object_model.rb` panics under `rb vm` with it. On the tree side,
 taking `Statement::ForRange` off `run_iteration` — first dropping only the `Break`
 check, then running the body as a plain statement list — takes down 3 and 4 of the
-seven new `tests/loop_control_test.rs` tests respectively. The VERIFY gates are
-unaffected by that dance — the fixes are in, not out.
+seven new `tests/loop_control_test.rs` tests respectively. This round's own change
+was checked the same way: restoring `main`'s plain statement list in the range loop
+takes down `a_break_in_a_range_loop_ends_it`,
+`a_skip_in_a_range_loop_advances_to_the_next_value`,
+`edge_break_and_skip_in_a_stepped_range_loop` and
+`edge_both_vms_answer_the_same_for_break_and_skip_in_a_range_loop`. Round 4's four
+fixes were checked the same way, one at a time: putting the `for stmt in body` loop
+back into `Statement::Unless` takes down 3 of the 54 `tests/loop_control_test.rs`
+tests, 2 of the 8 new `test` blocks and **3 of 404** programs in the both-VMs corpus
+(the two new `unless` programs and `tests/test_loop_control.rb`); dropping
+`module_frame.loop_owner` takes down 1 Rust test, 6 of the new `module/…` programs
+and `tests/test_loop_control.rb` again; dropping the one line that finishes the
+crossed frames before a crossed `finally` runs takes down 1 Rust test and **2 of
+404**; and putting the extra `pop` back into `discard_frames_above` turns
+`object/a-declaration-opened-by-a-has-default-a-failure-abandons` red with the
+bytecode VM reporting `'has a' is only valid inside an object declaration`. Round 5's
+were checked the same way: putting the `pop` back into `run_catch` — the whole fix is
+that one line going away — takes down
+`edge_a_catch_body_gives_back_only_the_scope_it_pushed` and makes **2 of 407**
+programs disagree, one of them `tests/test_control_flow.rb`; and taking the
+ownership fallback out of `skip_loop` alone turns **5 of 407** red
+(`flow/a-skip-in-a-catch-body-inside-a-loop-advances-that-loop`,
+`flow/a-skip-in-a-finally-inside-a-loop-advances-the-turn`,
+`flow/a-skip-in-a-test-body-inside-a-loop-advances-the-turn`,
+`module/a-skip-in-a-module-body-inside-a-loop-advances-that-loop` and
+`tests/test_loop_control.rb`) plus the new Rust test. The
+VERIFY gates are unaffected by that dance — the fixes are in, not out.
 
 If `verify.sh` enforces anything beyond these four commands and the examples,
 this phase is unverified on that axis.
@@ -353,10 +721,17 @@ this phase is unverified on that axis.
   one-element list, both statements).
 - **boundary** — covered: `edge_skip_on_the_final_iteration_of_a_for_each` (the
   last value) and `break_leaves_a_for_each_loop` (the first value, index 0);
-  `edge_a_skip_is_charged_as_one_iteration` is exactly-cap / cap+1; round 3 adds
+  `edge_a_skip_is_charged_as_one_iteration` is exactly-cap / cap+1, and round 6
+  takes the same pair to `while` (`edge_a_skip_in_a_while_is_charged_as_one_iteration`
+  in `tests/loop_control_test.rs`) and to both engines at once
+  (`edge_a_cap_counts_turns_on_both_vms_and_a_skipped_turn_is_one`, under caps of
+  1, 3 and 4 for every loop form — plain, `skip`ped and `break`ing); round 3 adds
   `a_break_in_a_range_loop_ends_it` (the loop stops at the value that broke, and
   that value's own turn is gone) and `edge_break_and_skip_in_a_stepped_range_loop`
   (the `by` form, whose stride the two statements do not consult).
+  The merge round keeps that last pair pinned across `main`'s signed-step range
+  loop: restoring its plain statement list takes down all four range tests, and
+  `tests/for_range_test.rs` (31 tests) is green either side of that.
 - **out_of_bounds** — N/A. `break` and `skip` are statements that take no
   operand and index nothing, so they have no out-of-range case of their own. The
   nearest thing — the ends of a `for each` — is the empty-list and final-iteration
@@ -394,7 +769,19 @@ this phase is unverified on that axis.
   `object/three-nested-object-bodies` and in
   `edge_object_a_nested_declaration_may_extend_two_levels_up`, on both VMs, and an
   `object` body written in a loop and left by a `break` in
-  `edge_objects_an_object_body_nested_in_a_loop_can_break_out_of_it`.
+  `edge_objects_an_object_body_nested_in_a_loop_can_break_out_of_it`. Round 4 adds
+  a module declaration nested in a `try` nested in a loop
+  (`module/a-finally-around-a-module-declaration-runs-after-its-scope-is-gone`,
+  on both VMs, where the crossed block is the module and the enclosing one is the
+  `try`), and a declaration opened by a `has` default — which is a declaration
+  nested inside a call nested inside a declaration's own assembly
+  (`object/a-declaration-opened-by-a-has-default-a-failure-abandons`). Round 5 adds
+  the `skip` end of two of those blocks — a `test` body and an `object` body, which
+  had `break` tests and no `skip` ones — in
+  `edge_both_vms_advance_the_loop_for_a_skip_in_a_test_or_an_object_body` and the two
+  corpus programs beside it, and the round-5 BLOCKER's nesting of its own: a `catch`
+  body inside a function body inside a `try` (`try/a-catch-inside-a-function-body-leaves-the-calls-own-scope-alone`,
+  on both VMs).
 - **duplicate_missing_keys** — N/A. `break` and `skip` read no record field, bind
   no name and write no record, so there is no key to duplicate or miss. Record
   key handling is `tests/record_order_test.rs`, untouched by this change.
@@ -412,7 +799,10 @@ this phase is unverified on that axis.
   `edge_neither_break_nor_skip_takes_an_operand` asserts that `skip 1` and
   `break 1` are a jump followed by a separate statement, and
   `edge_a_skip_leaves_the_statements_after_it_unreached` asserts the block rule for
-  a body that is a single statement. Unterminated
+  a body that is a single statement. Round 4 adds the module body's two refusals —
+  `edge_a_break_in_a_module_body_outside_a_loop_is_refused` covers a body written
+  where there is no loop and one written inside a function body called from a loop,
+  both on both VMs. Unterminated
   `end`, stray tokens, BOM and CRLF are lexical/parser concerns owned by
   `tests/lexer_robustness_test.rs` and `tests/parser_hardening_test.rs`, which
   this change does not touch.
@@ -461,6 +851,46 @@ this phase is unverified on that axis.
   tree-walking VM has always given. `docs/GRAMMAR.md` no longer documents an
   operand `skip` never had; `SPEC.md` says in words that neither statement takes
   one.
+- The merge round changed no answer either VM gives. Both sides of every hunk were
+  kept and the resolution is `main`'s behaviour with this phase's control flow on
+  top of it: a range loop still steps backwards on a negative `by`, still refuses a
+  non-number bound by name and still fails rather than looping on an overflowing
+  step, and a bytecode VM that prints still prints only when `echo` is on. The one
+  observable difference this round introduced is the refreshed
+  `corpus/loop-forms-0012.expected`, which is the fix's own output and which the
+  rewritten pin now asserts rather than merely comparing against.
+- Round 4 changed two answers, and both are disagreements rather than behaviour
+  anybody could have been relying on. A `break` or a `skip` in an `unless` body no
+  longer runs the statements after it, on either VM — the bytecode VM already
+  skipped them, so this is the tree-walking VM catching up. And a `break` or a
+  `skip` in a module body written inside a loop is a jump on both VMs, where the
+  bytecode VM used to stop with `'break' is only valid inside a loop` (exit 1) and
+  the tree-walking VM leaked the rest of the body. A module body written where
+  there is no loop, and one inside a function body called from a loop, are refused
+  on both. `SPEC.md`, `docs/GRAMMAR.md` and `docs/BYTECODE.md` now say so.
+- Round 5 changed one answer, on the bytecode VM and in the direction of the tree:
+  a `try`/`catch` inside a function body no longer takes that function's own scope
+  with it, so a program that handles a failure and then uses its own parameter or
+  its own local runs to the end rather than stopping with
+  `RuntimeError: Unknown variable 'x'`. Every program that ran before got a
+  *failure* there, so this is a program the bytecode VM could not run becoming one
+  it can, and a caller reading an exit code sees 0 where it saw 1. The tree-walking
+  VM is untouched: it truncated the catch's scope rather than popping it, which is
+  what this fix makes the bytecode VM do. Nothing else changed — the four new tests
+  pin behaviour both VMs already agreed on, and the corpus lock changes no program's
+  answer, only which test finds it.
+- Round 6 changed three answers, and each is a case where one engine was telling
+  the program something untrue. A `try` with no `catch` **stops the program** on
+  the bytecode VM, where it used to run on past the region and exit 0 — so a
+  caller reading an exit code sees 1 where it saw 0, on a program that had failed.
+  A `try` with only a `finally` now runs that `finally` on the tree-walking VM's
+  failing path, where it used to skip it: a program whose cleanup writes outside
+  the VM now does that write, and one whose cleanup fails reports the cleanup's
+  failure rather than the original. And a `while` under a lowered iteration cap
+  stops one turn earlier on the bytecode VM, so a cap of N is N turns on both
+  engines — and a `while` that skips every turn is stopped by the cap at all,
+  rather than by the program's step budget. Nothing changes for a program that was
+  inside every one of those limits.
 
 ## Known gaps / follow-ups
 
@@ -488,14 +918,20 @@ this phase is unverified on that axis.
   stack rather than one slot, `finish_object` reports rather than panicking, a name
   an open declaration has taken is refused with the tree's message, and a parent
   chain may walk a declaration still being assembled.
-- An `object` body the program leaves through a **failure** is still neither
-  registered nor bound on the bytecode VM, where the tree-walking VM has already
-  registered it. Found in round 3 while writing §8's corpus programs and
-  pre-existing (`git show HEAD:src/bytecode/vm.rs` disagrees on the same program);
-  it has nothing to do with nesting. FINDINGS §9 records why the honest fix needs
-  to know whether a failure landed in a `has` default or after a body's last
-  declaration, which the bytecode VM does not track. No corpus program depends on
-  it.
+- ~~An `object` body the program leaves through a **failure** is still neither
+  registered nor bound on the bytecode VM~~ — **not reproducible; the real defect
+  beside it fixed in round 4.** Recorded as open in FINDINGS §9 and escalated to a
+  MAJOR by the round-4 review. The compiler splits an `object` body into a
+  declaration block and the enclosing block (`src/bytecode/codegen.rs:382`), so a
+  failure in the statements *after* the declarations happens with the type already
+  registered on both VMs — the round-3 program prints `5` on both, and did before
+  this phase. What *was* wrong in `discard_frames_above` is fixed: it truncated
+  `pending_objects` to the frame's recorded height and then popped once more,
+  which took the enclosing body's declaration with it whenever that height was
+  above zero — which is what a `has` default that opens a declaration produces.
+  FINDINGS §9 records the rule both VMs already follow, with the program that
+  reproduces the old failure (`'has a' is only valid inside an object declaration`
+  from `rb vm`).
 - `for each i from a to b [by s]` is documented in `SPEC.md` and
   `docs/GRAMMAR.md` and **cannot be parsed**, so `Statement::ForRange` is
   unreachable from source and the corpus's range programs compare two parse
@@ -505,4 +941,33 @@ this phase is unverified on that axis.
   stepped form and the empty range through it on both VMs. Adding the parser
   production is a language change and belongs to the phase that adds it, the same
   call made above about `repeat … until`.
+- `corpus/loop-forms-0013` records the same lines before and after the fix
+  (`2`, `after`) — a `skip` on the value 2 prints the same line the no-op printed,
+  because the skipped turns in that program print nothing. So its golden did not
+  move, and only `-0012` needed regenerating. Its half of the rewritten pin still
+  asserts the exact lines on both engines, which is why a program whose golden
+  happens not to move is not thereby uncovered.
+- ~~A `catch` takes the enclosing function's scope with it on the bytecode VM~~ —
+  **fixed in round 5.** Recorded by the round-5 review as a BLOCKER and closed
+  here: `run_catch` popped a scope its frame's own truncate had already given back,
+  and the extra removal was the function's. A program with a handled failure and a
+  local or parameter read after the `try` stopped with
+  `RuntimeError: Unknown variable 'x'`; it now prints what the tree-walking VM
+  prints. FINDINGS §13 has the program and the three things that hid the defect.
+- A `finally` is **not** owed when the `catch` that handled the failure itself
+  fails — both VMs stop at the catch's failure and never run the `finally`. Found
+  by the round-5 review and **left as it is**, because `SPEC.md:464`'s "a
+  `finally` is still owed on the way out" is about an *abrupt exit*, which is not a
+  failure and which both VMs already handle, and because nothing in `SPEC.md` or
+  `docs/GRAMMAR.md` says what a `finally` is owed after a failing `catch`. The
+  second half of that question — a `try` whose body fails with **no** `catch` —
+  was a BLOCKER in the round-6 review and is **fixed**: the `finally` is owed
+  however the region is left, it runs before the failure is reported, and the
+  failure is then the enclosing `try`'s to catch or the program's own to stop
+  with. What is left is the failing-`catch` half, and the two questions that go
+  with it: which failure propagates when both the `catch` and the `finally` fail,
+  and what an abrupt exit out of that `finally` names. FINDINGS §14 records the
+  program and today's behaviour on both VMs, so a later phase that decides it can
+  see exactly which programs move. The same call was made about `repeat … until`
+  and about `for each i from a to b`.
 - `./rbops/verify.sh` could not be run in this checkout; see the Gates table.

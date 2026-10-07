@@ -2,18 +2,45 @@
 [0m
 > build · muse-spark-1.3-contributor-free
 [0m
-Round-2 review is underway — hunting for what's still broken in the break/skip fix.
+Round-2 audit underway — hunting the gate-green gaps against the contract.
+[0m→ [0mRead docs/GRAMMAR.md
 [0m→ [0mRead src/vm.rs
-[0m→ [0mRead phases/phase-025/FINDINGS.md
 [0m→ [0mRead src/bytecode/vm.rs
-I see the tree-walker and bytecode VMs still diverge on framed breaks — now digging into the loop-exit machinery to confirm the gaps.
-[0m→ [0mRead src/vm.rs[90m [offset=1243][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1300][0m
-[0m→ [0mRead tests/test_loop_control.rb[90m [limit=60][0m
-[0m→ [0mRead tests/bytecode_vm_test.rs[90m [limit=80][0m
-I've mapped the core divergence — now checking the spec to finalize the verdict.
-[0m→ [0mRead SPEC.md[90m [limit=40, offset=405][0m
+[0m→ [0mRead SPEC.md
+First pass shows the break/skip semantics — now digging for panic paths and spec drift.
+[0m→ [0mRead docs/BYTECODE.md
+[0m→ [0mRead corpus/loop-forms-0012.expected
+[0m→ [0mRead src/vm.rs[90m [offset=1184][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1214][0m
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|unimplemented!"[90m in src · 48 matches[0m
+[0m→ [0mRead tests/common/corpus.rs
+[0m→ [0mRead tests/common/generator.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2365][0m
+[0m→ [0mRead src/error.rs
+[0m→ [0mRead tests/differential_test.rs
+[0m✱ [0mGrep "\[.*\]|\.remove\(|as .*32|/ |% "[90m in src · 100 matches[0m
+Deep in the loop machinery — now verifying the edge cases and error paths.
+[0m→ [0mRead src/value.rs
+[0m→ [0mRead tests/test_lists.rb
+[0m→ [0mRead src/parser.rs[90m [offset=830, limit=140][0m
+[0m✱ [0mGrep "Skip|Break"[90m in src · 40 matches[0m
+[0m→ [0mRead tests/test_object_model.rb
+[0m→ [0mRead tests/test_loop_control.rb
+[0m→ [0mRead tests/bytecode_vm_test.rs
+[0m→ [0mRead src/parser.rs[90m [limit=60, offset=520][0m
+[0m✱ [0mGrep "is_ok\(\)|unwrap_or_default|ignore|should_panic"[90m in tests · 24 matches[0m
+[0m→ [0mRead tests/test_loop_control.rb[90m [limit=30, offset=508][0m
+Core semantics look consistent — now checking whether the new tests actually pin the behavior.
+[0m→ [0mRead tests/redblue_test.rs
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [limit=120, offset=2150][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [limit=120, offset=2620][0m
+[0m✱ [0mGrep "fn .*\(\)|assert|expect|is_ok|is_err"[90m in tests · 100 matches[0m
+[0m→ [0mRead src/vm.rs[90m [limit=70, offset=1046][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=40, offset=290][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=30, offset=455][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=40, offset=600][0m
 FINDINGS:
-1. [BLOCKER] src/bytecode/vm.rs:1599 — `loop_at` searches only `self.frames[frame].sites` of the frame the instruction runs in, so a `break`/`skip` in a `catch`/`finally`/`test`/`object` child frame lexically inside a loop returns `None` and errors (`'break' is only valid inside a loop`), while the tree VM at src/vm.rs:878 honours it because `Statement::Test`/`run_catch_body`/`run_finally_body`/`declare_object` run through `run_block` without clearing `loop_depth` — the two VMs disagree on the same program, admitted in phases/phase-025/FINDINGS.md:100 with a repro, and the differential stays green only by omitting those shapes (phases/phase-025/FINDINGS.md:129) — contradicts the REPORT claim of same semantics — concrete fix: track lexical loop ownership across frames (record owning frame + loop in `Handler`/frame or walk enclosing frames in `loop_at`/`break_loop`/`skip_loop`) and unwind frames to the owning loop, exempting true function-call frames.
-2. [MINOR] SPEC.md:417 — `Break and Skip` section gives only worked examples with no error case, but src/vm.rs:454 adds `'{keyword}' is only valid inside a loop` as a `RuntimeError` (mirrored at src/bytecode/vm.rs:1534) — behaviour the spec does not state, admitted as open in phases/phase-025/FINDINGS.md:143 — concrete fix: add the refusal, its catchability, and the function-body/object-body refusal to SPEC.md:417-433 and docs/GRAMMAR.md:245-246.
-REVIEW VERDICT: FINDINGS 2
+1. [BLOCKER] src/bytecode/vm.rs:2630 — `run_catch` pushes a scope at 2617, drives the catch frame (which already truncates locals to `locals_base` in `unwind_frame` at 1105 / `finish_top_frame` at 2053), then unconditionally `pop()`s again — every `catch` removes two scopes instead of one, corrupting the enclosing function locals while top-level programs mask it because their names live in globals — remove the explicit `pop()` and rely on the truncate, matching tree-walker `run_catch_body` at src/vm.rs:1232 which truncates once with no extra pop.
+2. [MAJOR] src/vm.rs:1128 — `self.run_catch_body(catch_var.as_deref(), catch_body)?;` early-returns on a failing catch so `run_finally_body` at 1131 never runs; bytecode mirrors it at src/bytecode/vm.rs:2522 with `run_catch(...).and_then(|_| run_finally(...))` — a `try/catch/finally` whose catch fails skips the same `try`'s `finally`, contradicting the phase's own "finally is still owed" rule (SPEC.md:464) — capture the catch error, run the finally, then propagate.
+3. [MAJOR] tests/test_loop_control.rb:508 — `a break in an object body leaves the loop` exists but no `skip` in an object body (nor in a `test` body) exists on either VM, and tests/bytecode_vm_test.rs:829 carries only the break shape — the `Skip` path through `LoopOwner`/object-body frames is a new branch with no test on either side — add `loop control: a skip in an object body advances the loop` plus a `flow/a-skip-in-an-object-body` corpus program compared on both VMs.
+REVIEW VERDICT: FINDINGS 3

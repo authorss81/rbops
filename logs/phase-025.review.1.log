@@ -2,16 +2,34 @@
 [0m
 > build · muse-spark-1.3-contributor-free
 [0m
-Adversarial review underway — hunting the break/skip diff for hidden faults.
-[0m→ [0mRead tests/loop_control_test.rs
+Hunting the green gate for what's still broken — digging into the loop-exit changes.
+[0m→ [0mRead .
 [0m→ [0mRead src/vm.rs
-[0m→ [0mRead src/bytecode/vm.rs[90m [limit=250, offset=1450][0m
-[0m→ [0mRead tests/test_loop_control.rb
-[0m→ [0mRead tests/test_lists.rb
-[0m→ [0mRead src/bytecode/vm.rs[90m [limit=350, offset=1250][0m
+[0m→ [0mRead phases/phase-025/FINDINGS.md
+[0m→ [0mRead src/bytecode/vm.rs
+First pass done — now tracing the interpreter paths to verify the fixes hold.
+[0m→ [0mRead src/vm.rs[90m [offset=1200][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1214][0m
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|\[.*\]"[90m in src · 100 matches[0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2377][0m
+[0m✱ [0mGrep "unwrap|expect|panic|unreachable|todo!"[90m in src/vm.rs · 100 matches[0m
+[0m✱ [0mGrep "unwrap|expect|panic|unreachable|todo!"[90m in src/bytecode/vm.rs · 44 matches[0m
+[0m→ [0mRead SPEC.md[90m [offset=440, limit=120][0m
+Spotted a possible gap in conditional handling — now checking the remaining execution paths.
+[0m→ [0mRead docs/GRAMMAR.md[90m [offset=230, limit=60][0m
+[0m✱ [0mGrep "Unless"[90m in src · 12 matches[0m
+[0m→ [0mRead tests/common/corpus.rs
+[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=230, limit=60][0m
+[0m→ [0mRead src/vm.rs[90m [offset=936, limit=30][0m
+[0m→ [0mRead src/parser.rs[90m [offset=780, limit=80][0m
+[0m→ [0mRead tests/loop_control_test.rs[90m [limit=60][0m
+[0m✱ [0mGrep "Break|Skip|loop|Unless"[90m in src/analyzer.rs · 100 matches[0m
+[0m→ [0mRead src/parser.rs[90m [offset=860, limit=50][0m
+[0m✱ [0mGrep "unless|Unless"[90m in tests/loop_control_test.rs · 100 matches[0m
+[0m✱ [0mGrep "unless"[90m in tests/test_loop_control.rb · 100 matches[0m
+[0m→ [0mRead src/vm.rs[90m [offset=639, limit=90][0m
 FINDINGS:
-1. [BLOCKER] src/vm.rs:672 — `Statement::If` runs each branch as a plain `for stmt in then_branch/else_branch { execute_statement }` with no `loop_control` check, so `break`/`skip` followed by more statements in the same `if` block still executes them (e.g. `if c then break; say "leaked" end` prints) while `run_iteration_body` at src/vm.rs:407 only stops between top-level body statements — concrete fix: check and propagate `loop_control.take()` inside `If`/`execute_statements` branches and abort the block.
-2. [BLOCKER] src/vm.rs:800 — `Statement::Try` runs body/catch/finally via `execute_statements` at src/vm.rs:866 which never checks `loop_control`, so `try break; say "x" end` inside a loop still runs `say`, and a `break` inside a `try` body does not abort the rest of that protected region — concrete fix: make `execute_statements` stop and bubble the pending `Break`/`Skip` signal like `run_iteration_body` does.
-3. [BLOCKER] src/vm.rs:402 — `run_iteration_body` does `push_scope()` then `execute_statement(stmt)?` with no `pop_scope` on the `Err` path, and the pending `loop_control` flag at src/vm.rs:409 is only `take()`n on success, so any error after a raised signal (e.g. `try { break } finally { fail }`) leaks both the per-turn scope and a stale `Break`/`Skip` that the next loop's first turn will spuriously consume — concrete fix: pop the scope and clear/save `loop_control` on the failing path (and save/restore it in `call_user_function` at src/vm.rs:1165 alongside `loop_depth`).
-4. [BLOCKER] src/bytecode/vm.rs:1563 — `abandon_handlers` pops to `frames[frame].handler_base`, i.e. every handler in the frame, so a `break`/`skip` inside `try { for each ... { break } ... }` drops and runs the `finally` of the outer `try` that encloses the loop even though execution stays inside its protected region, while the tree-walker keeps it installed — the existing `break inside a try` test only covers `try`-inside-loop, never loop-inside-`try` — concrete fix: pop only handlers installed inside the loop body being left.
-REVIEW VERDICT: FINDINGS 4
+1. [BLOCKER] src/vm.rs:936 — `Statement::Unless` runs its body as a plain `for stmt in body { execute_statement }` without `run_block`/`execute_statements`, so `break`/`skip` inside `unless` does not stop the rest of that body — the statements after it still run on the tree VM while the bytecode VM (inlined `BREAK`/`SKIP` jump) skips them, diverging — route the body through `run_block` like `Statement::If` at src/vm.rs:929 does.
+2. [MAJOR] src/vm.rs:682 — `declare_module` runs the module body via `execute_statement` in a `for stmt in body` loop that only checks `failure`, never `loop_control`, so a `break`/`skip` inside a module body written in a loop leaks the rest of the module body on the tree VM while `BytecodeVm::module` at src/bytecode/vm.rs:2802 sets no `loop_owner` and refuses — run the body through `run_block` and decide whether a module body is inside the caller's loop (like the function-body exemption) so both VMs agree.
+3. [MAJOR] src/bytecode/vm.rs:2547 — `discard_frames_above` drops an `object` body abandoned by failure and pops its pending declaration without registering the type, while `Vm::declare_object` at src/vm.rs:1494 registers the type before running the trailing statements, so tree prints the type and bytecode reports `Unknown variable` (FINDINGS §9, still open, no corpus program covers it) — register the abandoned body the way `unwind_frames_above` does for abrupt exits or align both VMs and pin it with a differential test.
+REVIEW VERDICT: FINDINGS 3
