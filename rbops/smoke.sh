@@ -565,6 +565,39 @@ if printf '%s' "$out" | grep -q "squashing WIP checkpoint" \
 else
   no "a lone WIP checkpoint is ignored"
 fi
+# A long-lived phase accumulates a long report, and the resume block used to
+# quote ALL of it into the implementer context. One real prompt reached 115,675
+# bytes — over the 100KB argv budget — so run_agent refused and the run deferred
+# without ever calling the model. The quoted previous report is now capped like
+# every other unbounded inclusion.
+build_fixture >/dev/null; use_stubs
+( cd "$PROJ" \
+  && printf '// recovered work from attempt 1\n' >> src/vm.rs \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+mkdir -p "$PIPE/phases/phase-001"
+{ printf '# Phase 001 — recovered report\n\n## Gates\n\n| Gate | Result |\n|---|---|---|\n';
+  awk 'BEGIN{for(i=0;i<3000;i++) print "| filler evidence row " i " | pass |"}'; } > "$PIPE/phases/phase-001/REPORT.md"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+[ "$rc" = "42" ] && ok "oversize-report run still defers via the dead model (exit 42)" \
+  || no "expected deferral, got $rc"
+if grep -q 'Previous REPORT.md' "$PIPE"/logs/phase-001.ctx 2>/dev/null; then
+  ok "the previous report section is still present (content kept, not deleted)"
+else
+  no "the previous report section went missing"
+fi
+if grep -q 'truncated:' "$PIPE"/logs/phase-001.ctx 2>/dev/null; then
+  ok "the quoted previous report is capped with a truncation marker"
+else
+  no "a 90KB report went to the model uncapped"
+fi
+ctx_bytes="$(wc -c < "$PIPE"/logs/phase-001.ctx 2>/dev/null || echo 999999)"
+if [ "$ctx_bytes" -lt 100000 ]; then
+  ok "the request stays under the 100KB budget ($ctx_bytes bytes)"
+else
+  no "the request is $ctx_bytes bytes — over budget"
+fi
 
 # =========================================================== 14. honesty
 head_ "14. report honesty is asymmetric: over-claim fails, under-claim warns"

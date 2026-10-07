@@ -515,7 +515,11 @@ and DO NOT rewrite it from scratch. Your job is to finish what is missing:
 TPL
       if [ -f "$RBOPS_ROOT/phases/$phase/REPORT.md" ]; then
         printf '\n### Previous REPORT.md (do not trust its gate claims — verify them)\n\n```\n'
-        cat "$RBOPS_ROOT/phases/$phase/REPORT.md"
+        # Capped: a long-lived phase accumulates a long report (phase-025's
+        # reached 91KB), and quoting all of it pushed the whole prompt over the
+        # 100KB argv budget — the run deferred without ever calling the model.
+        # The agent needs the shape and the latest claims, not the full history.
+        emit_capped 15000 "previous REPORT.md for $phase" < "$RBOPS_ROOT/phases/$phase/REPORT.md"
         printf '\n```\n'
       else
         # phase-019 spent three attempts and ~30 minutes re-running an 8-minute
