@@ -1,0 +1,23 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the still-broken paths in this green-gated REPL pass.
+[0m→ [0mRead src/repl/history.rs
+[0m→ [0mRead src/repl/completer.rs
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/repl/mod.rs
+[0m→ [0mRead src/vm.rs
+I've charted the REPL's core loop and command table — now digging into the end-to-end coverage and remaining edges.
+[0m→ [0mRead tests/repl_test.rs
+[0m→ [0mRead src/vm.rs[90m [offset=1235][0m
+FINDINGS:
+1. [BLOCKER] src/repl/mod.rs:294 — `:load` never executes, only prints byte count, while `print_help` promises `Load and run a file` — help text and `:run` both claim execution, `load_file` just does `read_to_string` + `Loaded N bytes`, and no end-to-end test asserts `:load` runs anything — make `:load` execute via `run_code`/`run_file` in the session VM or fix help to say inspect-only.
+2. [MAJOR] src/repl/history.rs:87 — `reader.lines().map_while(Result::ok)` silently stops at first IO/UTF-8 error and still returns `Ok(())` — a corrupt history file loads truncated with success — iterate `for line in reader.lines()` and propagate with `let line = line?;`.
+3. [MAJOR] src/repl/mod.rs:284 — `for (name, value) in &self.variables` iterates a `HashMap` directly into stdout — nondeterministic order once more than one entry exists, tests only ever put `_` in it — sort names before printing as `user_names` already does.
+4. [MAJOR] src/repl/mod.rs:82 — `Ok(0) => break` on EOF discards `multiline_buffer` silently — `edge_unterminated_block_then_eof_terminates` only asserts `Goodbye!`, so dropped lines pass — report `incomplete block` error before breaking instead of dropping the buffer.
+5. [MAJOR] src/repl/commands.rs:97 — `:ast`, `:tokens`, `:load`, `:save`, `:run`, `:inspect` take only `parts.get(1)`, dropping the rest — `:ast 1 + 1` becomes `Ast("1")`, `:load /tmp/a b.rb` becomes `Load("/tmp/a")`, and `parse_reads_the_whole_alias_table` only checks the variant discriminant so it cannot fail — join the remainder (`parts[1..].join(" ")`) or reject trailing words.
+6. [MAJOR] src/vm.rs:426 — `Vm::user_names` scans only `globals`, but `Statement::Function` binds via `declare`+`set_var` into `locals`, so a `to`-defined function is never offered — comment on `session_names` claims functions are offered — union `locals` scopes into the result.
+7. [MAJOR] src/repl/mod.rs:208 — multiline detector is `ends_with("then"/"end"/"to"/"else"/"while"/"repeat")` substring match — `repeat 3 times` ends in `times`, `to greet(name)` ends in `)`, `for each i from 1 to 10` ends in `10`, so real blocks never trigger, while stray `end` does trigger and swallows all later lines — replace heuristic with parser completeness check or `end`-counting.
+
+REVIEW VERDICT: FINDINGS 7

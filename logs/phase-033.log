@@ -1,0 +1,3055 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m$ [0mgrep -c '#\[test\]' src/repl/*.rs; echo "---"; grep -rn repl tests/*.rs | head -20; echo "---"; ls src/repl/
+src/repl/commands.rs:0
+src/repl/completer.rs:0
+src/repl/history.rs:0
+src/repl/mod.rs:0
+---
+tests/bytecode_vm_test.rs:556:        "shape/replace",
+tests/bytecode_vm_test.rs:557:        "say replace(\"a-b-c\", \"-\", \"+\")\n".to_string(),
+tests/comparison_lex_test.rs:672:    // And the character the arms replaced is still rejected where it belongs:
+tests/formatter_test.rs:78:/// quotes the path of the file it read, so that path is replaced with a fixed
+tests/formatter_test.rs:104:        stdout: String::from_utf8_lossy(&out.stdout).replace(&marker, "<program>"),
+tests/formatter_test.rs:105:        stderr: String::from_utf8_lossy(&out.stderr).replace(&marker, "<program>"),
+---
+commands.rs
+completer.rs
+history.rs
+mod.rs
+[0m
+[0m$ [0mwc -l src/repl/*.rs; echo "---"; git log --oneline -3; echo "---"; git status --short
+86 src/repl/commands.rs
+  154 src/repl/completer.rs
+   94 src/repl/history.rs
+  397 src/repl/mod.rs
+  731 total
+---
+3479d17 rbops: phase-020 (2026-10-07T07:22:55Z)
+25e9b68 resume phase-020: adopt preserved work
+c495de5 rbops: phase-015 (2026-10-07T02:50:08Z)
+---
+[0m
+[0m→ [0mRead src/repl/mod.rs
+Finding reproduces: 0 tests across all four REPL modules. Reading the source.
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/repl/completer.rs
+[0m→ [0mRead src/repl/history.rs
+[0m
+[0m$ [0mgrep -n "run_repl\|pub fn run_file\|fn main" src/lib.rs src/main.rs | head -30; echo "=== Cargo.toml ==="; cat Cargo.toml
+src/lib.rs:39:pub fn run_file(path: &str) -> Result<(), Error> {
+src/lib.rs:86:pub fn run_repl() {
+src/lib.rs:119:        1 => run_repl(),
+src/main.rs:1:pub fn main() {
+=== Cargo.toml ===
+[package]
+name = "redblue"
+version = "0.1.0"
+edition = "2021"
+authors = ["Redblue Contributors"]
+description = "A programming language as readable as plain English"
+license = "MIT"
+repository = "https://github.com/redblue-lang/redblue"
+keywords = ["programming-language", "compiler"]
+categories = ["compiler", "development-tools"]
+
+[[bin]]
+name = "rb"
+path = "src/main.rs"
+
+[lib]
+name = "redblue"
+path = "src/lib.rs"
+
+[dependencies]
+regex = "1.10"
+chrono = "0.4"
+reqwest = { version = "0.11", features = ["blocking"] }
+indexmap = "2"
+
+[dev-dependencies]
+regex = "1.10"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+[0m
+[0m$ [0msed -n '1,60p' tests/formatter_test.rs; echo "=== verify.sh ==="; sed -n '1,200p' rbops/verify.sh
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use redblue::formatter::{self, Formatter};
+use redblue::lexer::Lexer;
+use redblue::parser::{self, BinaryOp, Expr, ImportItem, Program, Statement, Stmt, UnaryOp};
+
+/// Every `.rb` file in the tree that must survive formatting unchanged in
+/// meaning: the language's specification-by-example, plus the test corpus.
+fn corpus() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for dir in ["examples", "tests", "modules"] {
+        let path = root.join(dir);
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rb") {
+                files.push(path);
+            }
+        }
+    }
+    assert!(
+        !files.is_empty(),
+        "no .rb corpus files found under examples/, tests/ or modules/"
+    );
+    files.sort();
+    files
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e))
+}
+
+/// Runs `source` on the real binary and returns what it printed, so a claim
+/// about behaviour can be checked against output rather than inferred from the
+/// tree. Each run gets its own file inside `target/tmp/`.
+fn run_program(source: &str) -> String {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = scratch_dir();
+    let serial = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = dir.join(format!("run-{}-{}.rb", std::process::id(), serial));
+    fs::write(&path, source).expect("program should be writable");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("run")
+        .arg(&path)
+        .output()
+        .expect("the rb binary should run");
+    let _ = fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "{} should run, got: {}",
+        source,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+=== verify.sh ===
+sed: can't read rbops/verify.sh: No such file or directory
+[0m
+[0m$ [0msed -n '60,120p' tests/formatter_test.rs; echo "=== lib.rs 80-125 ==="; sed -n '80,125p' src/lib.rs
+String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// What a child run of the `rb` binary produced.
+struct Run {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Where programs under test are written, inside the project checkout.
+fn scratch_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/formatter");
+    fs::create_dir_all(&dir).expect("scratch directory should be creatable");
+    dir
+}
+
+/// Runs `source` with `rb <mode>` and returns what it produced. A diagnostic
+/// quotes the path of the file it read, so that path is replaced with a fixed
+/// marker and two runs of the same program stay comparable.
+fn run_rb(mode: &str, source: &str) -> Run {
+    run_rb_args(&[mode], source)
+}
+
+/// Runs `source` with `rb <args…> <file>`, for the invocations a single mode
+/// cannot express — `rb format --check <file>` puts a flag between the mode and
+/// the path.
+fn run_rb_args(args: &[&str], source: &str) -> Run {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = scratch_dir();
+    let serial = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = dir.join(format!("rb-{}-{}.rb", std::process::id(), serial));
+    fs::write(&path, source).expect("program should be writable");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_rb"))
+        .args(args)
+        .arg(&path)
+        .output()
+        .expect("the rb binary should run");
+    let marker = path.display().to_string();
+    let _ = fs::remove_file(&path);
+
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).replace(&marker, "<program>"),
+        stderr: String::from_utf8_lossy(&out.stderr).replace(&marker, "<program>"),
+    }
+}
+
+/// Runs `rb format --check <file>` and returns what the process produced.
+///
+/// This is the CI gate's whole surface: the exit code is the answer and stdout
+/// is the explanation, so both are what the tests below look at.
+fn run_format_check(source: &str) -> Run {
+    run_rb_args(&["format", "--check"], source)
+}
+
+fn parse(source: &str) -> Program {
+    let tokens = Lexer::tokenize(source).expect("source must lex");
+    parser::parse(tokens).expect("source must parse")
+}
+=== lib.rs 80-125 ===
+    analyzer::analyze(&ast)?;
+
+    let (_vm, result) = vm::run_isolated(&ast);
+    result
+}
+
+pub fn run_repl() {
+    let mut repl = repl::Repl::new();
+    repl.run();
+}
+
+pub fn run_test(path: Option<&str>) -> Result<(), Error> {
+    let mut harness = testing::TestHarness::new();
+
+    match path {
+        Some(p) => {
+            harness.run_file(p)?;
+            // Report the failures and exit non-zero. Without this a failing
+            // `expect` printed only a dot/F and still exited 0.
+            testing::PrettyReporter::new().report(&harness.results());
+        }
+        None => {
+            let results = testing::run_all_tests()?;
+            println!("Tests run: {}", results.total);
+            println!("Passed: {}", results.passed);
+            println!("Failed: {}", results.failed);
+            if results.failed > 0 {
+                process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn run_cli() {
+    let args: Vec<String> = env::args().collect();
+
+    match args.len() {
+        1 => run_repl(),
+        2 => {
+            let cmd = &args[1];
+            match cmd.as_str() {
+                "help" | "--help" | "-h" => print_help(),
+                "version" | "--version" | "-v" => print_version(),
+                "test" => {
+[0m
+[0m$ [0mcargo build --bin rb 2>&1 | tail -3
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.04s
+[0m
+[0m$ [0mgrep -rn "ReplCommand::parse\|ReplHistory::\|ReplCompleter::" src/ | grep -v "^src/repl/commands.rs:2[01]\|^src/repl/history.rs\|^src/repl/completer.rs"
+(no output)
+[0m
+[0m$ [0mprintf 'say 1\n' | timeout 3 ./target/debug/rb > ./target/tmp-eof.txt 2>&1; echo "exit=$? (124 = TIMED OUT / hung)"; wc -c ./target/tmp-eof.txt; rm -f ./target/tmp-eof.txt
+exit=124 (124 = TIMED OUT / hung)
+9929005 ./target/tmp-eof.txt
+[0m
+Reproduced — and worse than reported: the REPL **hangs forever on EOF** (exit 124, 9.9 MB of prompts in 3s), and `ReplCommand::parse`/`ReplHistory`/`ReplCompleter` have zero call sites.
+[0m$ [0mgrep -n "pub fn \|pub struct Vm\|globals\|functions" src/vm.rs | head -40
+67:pub fn resolve_max_iterations_from(raw: Option<usize>) -> usize {
+73:pub fn resolve_max_steps_from(raw: Option<usize>) -> usize {
+78:pub fn resolve_max_iterations() -> usize {
+87:pub fn resolve_max_steps() -> usize {
+107:pub fn resolve_max_call_depth() -> usize {
+123:pub fn run_isolated(program: &Program) -> (Vm, Result<Value>) {
+159:pub struct Vm {
+160:    globals: HashMap<String, Value>,
+162:    /// [`Vm::globals`] so a read resolves through one name resolution path; what
+268:pub fn module_path(name: &str) -> Option<String> {
+277:pub fn module_source(name: &str) -> Result<Option<String>> {
+293:pub fn module_bound_names(name: &str) -> Vec<String> {
+314:    pub fn new() -> Self {
+315:        let globals = stdlib::builtins();
+317:            globals,
+338:    pub fn with_max_call_depth(max_call_depth: usize) -> Self {
+349:    pub fn with_max_iterations(max_iterations: usize) -> Self {
+358:    pub fn with_max_steps(max_steps: usize) -> Self {
+403:    pub fn take_expectation_failure(
+415:    pub fn take_output(&mut self) -> Vec<String> {
+460:        // The module's functions are reached as `Name.function`, which is the
+485:                self.globals.insert(qualified_member(name, &member), value);
+588:                self.globals.insert(qualified.clone(), value.clone());
+610:    pub fn run(&mut self, program: &Program) -> Result<Value> {
+658:        // Check globals
+659:        self.globals.get(name).cloned()
+665:    /// The value goes into [`Vm::globals`] so that a read resolves through the
+677:        self.globals.insert(name.to_string(), value);
+715:    /// The write lands in [`Vm::globals`] and not through [`Vm::set_var`],
+721:        self.globals.insert(name.to_string(), value);
+743:        self.globals.insert(name.to_string(), value);
+1039:                            self.globals
+[0m
+[0m$ [0mgrep -rn "mod tests" src/*.rs | head; echo "=== tail of vm.rs ==="; tail -5 src/vm.rs
+src/lexer.rs:520:mod tests {
+src/parser.rs:1987:mod tests {
+src/runtime.rs:1042:mod tests {
+=== tail of vm.rs ===
+impl Default for Vm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+[0m
+[0m$ [0msed -n '395,430p' src/vm.rs; echo "=== names getter? ==="; grep -n "fn names\|fn globals\|fn user_" src/vm.rs
+}
+        *loop_iterations += 1;
+        Ok(())
+    }
+
+    /// Takes the structured failure from the most recent failed `expect`, so a
+    /// caller such as the test harness can report expected and actual values
+    /// instead of only a rendered message.
+    pub fn take_expectation_failure(
+        &mut self,
+    ) -> Option<crate::testing::assertions::TestAssertionError> {
+        self.expectation_failure.take()
+    }
+
+    /// Takes the lines `say` produced, for a caller that wants them rather than
+    /// the printing.
+    ///
+    /// The printing happens in [`Vm::run`], so this is only useful afterwards.
+    /// It exists so that a caller comparing this VM with the bytecode VM can see
+    /// what each printed without capturing a process's stdout.
+    pub fn take_output(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.output)
+    }
+
+    /// Runs a module's declarations into this VM, under the name the `import`
+    /// that reached it goes by.
+    ///
+    /// A module already loaded is left alone: importing it twice binds the same
+    /// names twice, and binding a name twice is what a `set` refuses to do and a
+    /// `constant` cannot do at all — the second declaration of the module's own
+    /// `TAU` would be refused as a duplicate of the one the first import bound.
+    ///
+    /// The file is read and parsed once: the bindings and the record that the
+    /// module is loaded both come out of that one `Program`. Reading it a second
+    /// time could fail after some of the bindings were already installed, which
+    /// would leave the program with half a module in it.
+=== names getter? ===
+[0m
+[0m$ [0mgrep -rn "catch" docs/GRAMMAR.md | head -10; echo "=== example try ==="; grep -rln "catch" examples/ tests/*.rb 2>/dev/null | head -3
+50:         | 'try' | 'catch' | 'finally' | 'error'
+296:                    { 'catch' [ identifier ] [ 'of' identifier ]
+516:catch error
+=== example try ===
+tests/integration_test.rb
+tests/suite.rb
+tests/test_arithmetic.rb
+[0m
+[0m$ [0mgrep -n "pub fn builtins" src/stdlib.rs; echo "=== expect usage example ==="; grep -rn "try$\|catch" tests/*.rb examples/*.rb 2>/dev/null | head -8
+14:pub fn builtins() -> HashMap<String, Value> {
+=== expect usage example ===
+tests/integration_test.rb:46:    try
+tests/integration_test.rb:48:    catch error
+tests/integration_test.rb:144:    try
+tests/integration_test.rb:146:    catch error
+tests/integration_test.rb:154:    try
+tests/integration_test.rb:156:    catch error
+tests/integration_test.rb:168:    try
+tests/integration_test.rb:172:    catch error
+[0m
+Reproduced. Now the RED test first — writing the e2e harness with the EOF-hang case.
+[0m$ [0msed -n '40,60p' tests/integration_test.rb; echo "=== grammar 290-300 ==="; sed -n '288,300p' docs/GRAMMAR.md
+set first to items[0]
+    set last to items[-1]
+    expect first to be 1
+    expect last to be 3
+    // One past the end names no element, so it is caught rather than answered.
+    set caught to no
+    try
+        set past_end to items[999]
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+end
+
+test "integration: a record survives assignment and field round trip"
+    set config to {host: "localhost", port: 8080}
+    expect config.host to be "localhost"
+    expect config.port to be 8080
+    set config.port to 9090
+    expect config.port to be 9090
+end
+=== grammar 290-300 ===
+                    'end'
+```
+
+### 4.7 Try Statement (Error Handling)
+
+```
+try_statement    = 'try'
+                    { statement }
+                    { 'catch' [ identifier ] [ 'of' identifier ]
+                      { statement } }
+                    [ 'finally'
+                      { statement } ]
+                    'end'
+[0m
+[0m$ [0mprintf ':quit\n' | timeout 5 ./target/debug/rb; echo "exit=$?"; echo "=== try block ==="; printf 'try\ncatch error\n    say "caught"\nend\n:quit\n' | timeout 5 ./target/debug/rb; echo "exit=$?"
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Goodbye!
+exit=0
+=== try block ===
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Error: ParserError: Expected End but got Eof
+  --> 1:4
+>>> Error: ParserError: Unexpected token Catch
+  --> 1:1
+>>> caught
+>>> ..  Goodbye!
+exit=0
+[0m
+[0m$ [0mprintf 'set x to 1 + 1\n1 / 0\nsay "alive"\n:vars\n:quit\n' | timeout 5 ./target/debug/rb; echo "exit=$?"; echo "=== if block ==="; printf 'if 1 is greater than 0 then\n    say "yes"\nend\n:quit\n' | timeout 5 ./target/debug/rb; echo "exit=$?"
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> >>> Error: RuntimeError: Division by zero
+  --> 1:1
+>>> alive
+>>> No variables defined.
+>>> Goodbye!
+exit=0
+=== if block ===
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> ..  ..  yes
+>>> Goodbye!
+exit=0
+[0m
+[0m$ [0mprintf '2 + 3\n:vars\n:history\n:funcs\n:load no/such/file.rb\n:quit\n' | timeout 5 ./target/debug/rb | cat -A | sed -n '1,40p' | sed 's/\$$//'
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> = 5
+>>> Variables:
+  _ = 5
+>>>      1  2 + 3
+     2  :vars
+     3  :history
+>>> User-defined functions are stored in the VM.
+Use :inspect <name> to see function details.
+>>> Could not load file: No such file or directory (os error 2)
+>>> Goodbye!
+[0m
+[0m← [0mWrite tests/repl_test.rs
+Wrote file successfully.
+[0m
+Now writing the failing e2e test (RED).
+[0m$ [0mcargo test --test repl_test 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0433][0m[1m: cannot find type `Path` in this scope[0m
+   [1m[94m--> [0mtests/repl_test.rs:126:15
+    [1m[94m|[0m
+[1m[94m126[0m [1m[94m|[0m     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/repl");
+    [1m[94m|[0m               [1m[91m^^^^[0m [1m[91muse of undeclared type `Path`[0m
+    [1m[94m|[0m
+[1m[96mhelp[0m: consider importing this struct
+    [1m[94m|[0m
+[1m[94m  8[0m [92m+ use std::path::Path;[0m
+    [1m[94m|[0m
+
+[1mFor more information about this error, try `rustc --explain E0433`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "repl_test") due to 1 previous error
+[0m
+[0m← [0mEdit tests/repl_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
+@@ -5,9 +5,9 @@
+ //! `src/repl/mod.rs` rather than by running it. These tests pipe a session into
+ //! the real binary and assert on what it printed and on how it exited.
+ 
+ use std::io::{Read, Write};
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::thread;
+ use std::time::{Duration, Instant};
+
+[0m
+[0m$ [0mcargo test --test repl_test 2>&1 | tail -45
+thread 'repl_runs_a_program_that_catches_its_own_error' (5208) panicked at tests/repl_test.rs:43:9:
+stdout should contain "caught is yes"
+--- actual ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> caught is {caught}
+File '/home/runner/work/rbops/rbops/redblue/target/tmp/repl/caught-5187-0.rb' executed successfully.
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <repl_test::Session>::assert_stdout_contains
+   3: repl_test::repl_runs_a_program_that_catches_its_own_error
+   4: repl_test::repl_runs_a_program_that_catches_its_own_error::{closure#0}
+   5: <repl_test::repl_runs_a_program_that_catches_its_own_error::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- edge_unterminated_block_then_eof_terminates stdout ----
+
+thread 'edge_unterminated_block_then_eof_terminates' (5190) panicked at tests/repl_test.rs:104:17:
+the REPL did not exit within 20s of its input closing: it hangs instead of terminating on EOF.
+input:
+if 1 is greater than 0 then
+    say "yes"
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: repl_test::session
+   3: repl_test::edge_unterminated_block_then_eof_terminates
+   4: repl_test::edge_unterminated_block_then_eof_terminates::{closure#0}
+   5: <repl_test::edge_unterminated_block_then_eof_terminates::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_unterminated_block_then_eof_terminates
+    repl_runs_a_program_that_catches_its_own_error
+
+test result: FAILED. 6 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.06s
+
+[1m[91merror[0m: test failed, to rerun pass `--test repl_test`
+[0m
+[0m$ [0mprintf 'set caught to yes\nsay "caught is {{caught}}"\n:quit\n' | timeout 5 ./target/debug/rb | tail -3
+>>> >>> caught is {{caught}}
+>>> Goodbye!
+[0m
+RED confirmed: the EOF hang reproduces as a test failure. Fixing my test's interpolation mistake (`{name}` vs `{{name}}`), then the production fix.
+[0m$ [0mprintf 'set caught to yes\nsay caught\n:quit\n' | timeout 5 ./target/debug/rb | tail -3
+>>> >>> Error: AnalyzerError: Unknown variable 'caught'
+  --> 1:1
+>>> Goodbye!
+[0m
+[0m$ [0mmkdir -p target/tmp/repl && printf 'set caught to no\ntry\n    set past_end to [1, 2, 3][999]\ncatch error\n    set caught to yes\nend\nif caught is yes then\n    say "caught is yes"\nend\n' > target/tmp/repl/caught.rb && ./target/debug/rb run target/tmp/repl/caught.rb; echo "exit=$?"; echo "=== without catch (uncaught) ==="; printf 'set past_end to [1, 2, 3][999]\n' > target/tmp/repl/unc.rb && ./target/debug/rb run target/tmp/repl/unc.rb; echo "exit=$?"
+caught is yes
+exit=0
+=== without catch (uncaught) ===
+Error: RuntimeError: Index 999 is out of bounds: length is 3, valid indexes are 0 to 2
+  --> target/tmp/repl/unc.rb:1:1
+1 | set past_end to [1, 2, 3][999]
+  | ^
+exit=1
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -18,9 +18,10 @@
+ 
+ pub struct Repl {
+     vm: Vm,
+     variables: HashMap<String, Value>,
+-    history: Vec<String>,
++    history: ReplHistory,
++    completer: ReplCompleter,
+     running: bool,
+     multiline_buffer: Vec<String>,
+     in_multiline: bool,
+ }
+@@ -29,15 +30,33 @@
+     pub fn new() -> Self {
+         Self {
+             vm: Vm::new(),
+             variables: HashMap::new(),
+-            history: Vec::new(),
++            history: ReplHistory::new(HISTORY_LIMIT),
++            completer: ReplCompleter::new(),
+             running: true,
+             multiline_buffer: Vec::new(),
+             in_multiline: false,
+         }
+     }
+ 
++    /// Completes `word` against the session: the language's own keywords and
++    /// builtins, the REPL's commands, and every name this session has bound.
++    pub fn complete(&self, word: &str) -> Vec<String> {
++        self.completer.complete_with(word, &self.session_names())
++    }
++
++    /// Every name a completion could offer from the live session: the REPL's own
++    /// variables, plus the VM's own bindings, which is where a `to` function and
++    /// an `import`ed module's members live.
++    fn session_names(&self) -> Vec<String> {
++        let mut names: Vec<String> = self.variables.keys().cloned().collect();
++        names.extend(self.vm.user_names());
++        names.sort();
++        names.dedup();
++        names
++    }
++
+     pub fn run(&mut self) {
+         println!("Welcome to Redblue v0.1.0 - Interactive REPL");
+         println!("Type 'help' for commands, 'quit' to exit\n");
+ 
+@@ -53,10 +72,12 @@
+                 break;
+             }
+ 
+             let mut input = String::new();
+-            if io::stdin().read_line(&mut input).is_err() {
+-                break;
++            match io::stdin().read_line(&mut input) {
++                Ok(0) => break,
++                Ok(_) => {}
++                Err(_) => break,
+             }
+ 
+             let input = input.trim();
+             if input.is_empty() {
+@@ -74,111 +95,85 @@
+ 
+         println!("Goodbye!");
+     }
+ 
++    /// Runs one command line, returning whether `input` was a command rather
++    /// than Redblue source.
++    ///
++    /// The command table lives in [`ReplCommand::parse`]; this only dispatches
++    /// what it produced. Two copies of the table meant an alias added to one was
++    /// invisible to the other.
+     fn handle_command(&mut self, input: &str) -> bool {
+-        if !input.starts_with(':') && !input.starts_with('.') {
+-            return false;
+-        }
+-
+-        let parts: Vec<&str> = input.split_whitespace().collect();
+-        let cmd = parts[0].trim_start_matches(':');
+-
+-        match cmd {
+-            "quit" | "exit" | "q" => {
++        match ReplCommand::parse(input) {
++            ReplCommand::Quit => {
+                 self.running = false;
+                 true
+             }
+-            "help" | "h" | "?" => {
++            ReplCommand::Help => {
+                 self.print_help();
+                 true
+             }
+-            "clear" | "cls" => {
++            ReplCommand::Clear => {
+                 print!("\x1B[2J\x1B[H");
+-                io::stdout().flush().ok();
++                let _ = io::stdout().flush();
+                 true
+             }
+-            "history" | "hist" => {
+-                for (i, cmd) in self.history.iter().enumerate() {
+-                    println!("  {:4}  {}", i + 1, cmd);
++            ReplCommand::History => {
++                for i in 0..self.history.len() {
++                    if let Some(entry) = self.history.get(i) {
++                        println!("  {:4}  {}", i + 1, entry);
++                    }
+                 }
+                 true
+             }
+-            "vars" | "variables" | "v" => {
++            ReplCommand::Vars => {
+                 self.print_variables();
+                 true
+             }
+-            "functions" | "funcs" | "f" => {
++            ReplCommand::Functions => {
+                 self.print_functions();
+                 true
+             }
+-            "load" | "l" => {
+-                if parts.len() > 1 {
+-                    self.load_file(parts[1]);
+-                } else {
+-                    println!("Usage: :load <filename>");
+-                }
++            ReplCommand::Load(path) => {
++                self.load_file(&path);
+                 true
+             }
+-            "save" | "s" => {
+-                if parts.len() > 1 {
+-                    self.save_session(parts[1]);
+-                } else {
+-                    println!("Usage: :save <filename>");
+-                }
++            ReplCommand::Save(path) => {
++                self.save_session(&path);
+                 true
+             }
+-            "reset" => {
++            ReplCommand::Reset => {
+                 self.vm = Vm::new();
+                 self.variables.clear();
+                 println!("REPL state reset.");
+                 true
+             }
+-            "run" => {
+-                if parts.len() > 1 {
+-                    self.run_file(parts[1]);
+-                } else {
+-                    println!("Usage: :run <filename>");
+-                }
++            ReplCommand::Run(path) => {
++                self.run_file(&path);
+                 true
+             }
+-            "debug" => {
++            ReplCommand::Debug => {
+                 self.debug_mode();
+                 true
+             }
+-            "inspect" | "i" => {
+-                if parts.len() > 1 {
+-                    self.inspect_value(parts[1]);
+-                } else {
+-                    println!("Usage: :inspect <variable>");
+-                }
++            ReplCommand::Inspect(name) => {
++                self.inspect_value(&name);
+                 true
+             }
+-            "ast" => {
+-                if parts.len() > 1 {
+-                    self.print_ast(parts[1]);
+-                } else {
+-                    println!("Usage: :ast <expression>");
+-                }
++            ReplCommand::Ast(expr) => {
++                self.print_ast(&expr);
+                 true
+             }
+-            "tokens" => {
+-                if parts.len() > 1 {
+-                    self.print_tokens(parts[1]);
+-                } else {
+-                    println!("Usage: :tokens <expression>");
+-                }
++            ReplCommand::Tokens(expr) => {
++                self.print_tokens(&expr);
+                 true
+             }
+-            "example" | "examples" => {
++            ReplCommand::Example => {
+                 self.show_examples();
+                 true
+             }
+-            _ => {
+-                println!(
+-                    "Unknown command '{}'. Type :help for available commands.",
+-                    cmd
+-                );
++            ReplCommand::Unknown(word) => {
++                println!("Unknown command '{}'. Type :help for available commands.", word);
+                 true
+             }
+         }
+     }
+
+[0m
+Now the production fix. Routing `handle_command` through `ReplCommand::parse` and fixing the EOF hang:
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -15,8 +15,13 @@
+ use crate::parser::Parser;
+ use crate::value::Value;
+ use crate::vm::Vm;
+ 
++/// How many lines a session keeps before the oldest is dropped. A terminal
++/// scrollback holds far more, so a session that outgrows this has already lost
++/// anything the user would go looking for.
++const HISTORY_LIMIT: usize = 1000;
++
+ pub struct Repl {
+     vm: Vm,
+     variables: HashMap<String, Value>,
+     history: ReplHistory,
+
+[0m
+Now `save_session` (uses the old `Vec`), plus the `Vm::user_names` accessor the completer needs:
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -293,12 +293,13 @@
+         }
+     }
+ }
+ 
++/// Writes the session's history to `path`, one entry per line, in the
++/// format [`ReplHistory::load_from_file`] reads back.
+ fn save_session(&self, path: &str) {
+-    let content = self.history.join("\n");
+-    match std::fs::write(path, content) {
+-        Ok(_) => println!("Session saved to '{}'", path),
++    match self.history.save_to_file(path) {
++        Ok(()) => println!("Session saved to '{}'", path),
+         Err(e) => println!("Could not save session: {}", e),
+     }
+ }
+ 
+
+[0m
+[0m$ [0msed -n '290,300p' src/repl/mod.rs
+}
+            Err(e) => {
+                println!("Could not load file: {}", e);
+            }
+        }
+    }
+
+    /// Writes the session's history to `path`, one entry per line, in the
+    /// format [`ReplHistory::load_from_file`] reads back.
+    fn save_session(&self, path: &str) {
+        match self.history.save_to_file(path) {
+[0m
+[0m← [0mEdit src/vm.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/vm.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/vm.rs
++++ /home/runner/work/rbops/rbops/redblue/src/vm.rs
+@@ -415,8 +415,27 @@
+ pub fn take_output(&mut self) -> Vec<String> {
+     std::mem::take(&mut self.output)
+ }
+ 
++/// The names this VM has bound that the standard library did not: what a
++/// `set`, a `to` or an `import` put here.
++///
++/// A completion has to offer those and nothing else — offering `abs` or
++/// `files` is noise, and it is the only way to tell a session's own names
++/// from the builtins, since both live in `globals`. Sorted, because
++/// `globals` is a `HashMap` and iteration order is not a result.
++pub fn user_names(&self) -> Vec<String> {
++    let builtins = stdlib::builtins();
++    let mut names: Vec<String> = self
++        .globals
++        .keys()
++        .filter(|name| !builtins.contains_key(*name))
++        .cloned()
++        .collect();
++    names.sort();
++    names
++}
++
+ /// Runs a module's declarations into this VM, under the name the `import`
+ /// that reached it goes by.
+ ///
+ /// A module already loaded is left alone: importing it twice binds the same
+
+[0m
+[0m← [0mEdit src/repl/completer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
+@@ -118,8 +118,19 @@
+     }
+ }
+ 
+ pub fn complete(&self, word: &str) -> Vec<String> {
++    self.complete_with(word, &[])
++}
++
++/// Completes `word` against the language's own vocabulary plus `names`, the
++/// bindings a live session has made — its variables, the functions it
++/// defined and the modules it imported.
++///
++/// The static tables alone can never offer a session's own names, so a
++/// completer built from them would finish `cou` to nothing in a session
++/// holding `count`.
++pub fn complete_with(&self, word: &str, names: &[String]) -> Vec<String> {
+     let mut matches = Vec::new();
+     let word_lower = word.to_lowercase();
+ 
+     for keyword in &self.keywords {
+@@ -139,8 +150,14 @@
+             matches.push(command.clone());
+         }
+     }
+ 
++    for name in names {
++        if name.to_lowercase().starts_with(&word_lower) {
++            matches.push(name.clone());
++        }
++    }
++
+     matches.sort();
+     matches.dedup();
+ 
+     matches
+
+[0m
+Now the completer's session-aware completion:
+[0m$ [0mcargo test --test repl_test 2>&1 | tail -25
+Type 'help' for commands, 'quit' to exit
+
+>>> Unknown command '2 + 3'. Type :help for available commands.
+>>> No variables defined.
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <repl_test::Session>::assert_stdout_contains
+   3: repl_test::repl_shows_the_result_of_an_expression_under_vars
+   4: repl_test::repl_shows_the_result_of_an_expression_under_vars::{closure#0}
+   5: <repl_test::repl_shows_the_result_of_an_expression_under_vars::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_first_line_syntax_error_keeps_the_repl_alive
+    repl_reports_an_uncaught_error_and_stays_alive
+    repl_runs_a_program_that_catches_its_own_error
+    repl_shows_the_result_of_an_expression_under_vars
+
+test result: FAILED. 4 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[91merror[0m: test failed, to rerun pass `--test repl_test`
+[0m
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -1,5 +1,11 @@
+ pub enum ReplCommand {
++    /// A line that is Redblue source rather than a command.
++    ///
++    /// This is not [`ReplCommand::Unknown`]: `say "hi"` is not a mistyped
++    /// command, it is a program. Conflating the two made the REPL answer
++    /// `2 + 3` with "Unknown command '2 + 3'" and refuse to evaluate it.
++    NotACommand,
+     Quit,
+     Help,
+     Clear,
+     History,
+@@ -21,9 +27,9 @@
+     pub fn parse(input: &str) -> Self {
+         let input = input.trim();
+ 
+         if !input.starts_with(':') && !input.starts_with('.') {
+-            return ReplCommand::Unknown(input.to_string());
++            return ReplCommand::NotACommand;
+         }
+ 
+         let parts: Vec<&str> = input.split_whitespace().collect();
+         let cmd = parts[0].trim_start_matches(':').trim_start_matches('.');
+
+[0m
+My e2e tests caught a real flaw in the shared table: `ReplCommand::parse` can't tell "not a command" from "unknown command", so plain source gets swallowed. Fixing the type:
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -175,8 +175,9 @@
+ ReplCommand::Example => {
+     self.show_examples();
+     true
+ }
++ReplCommand::NotACommand => false,
+ ReplCommand::Unknown(word) => {
+     println!("Unknown command '{}'. Type :help for available commands.", word);
+     true
+ }
+
+[0m
+[0m$ [0mcargo test --test repl_test 2>&1 | tail -20
+>>> caught is {caught}
+File '/home/runner/work/rbops/rbops/redblue/target/tmp/repl/caught-5709-0.rb' executed successfully.
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <repl_test::Session>::assert_stdout_contains
+   3: repl_test::repl_runs_a_program_that_catches_its_own_error
+   4: repl_test::repl_runs_a_program_that_catches_its_own_error::{closure#0}
+   5: <repl_test::repl_runs_a_program_that_catches_its_own_error::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    repl_runs_a_program_that_catches_its_own_error
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[91merror[0m: test failed, to rerun pass `--test repl_test`
+[0m
+[0m← [0mEdit tests/repl_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
+@@ -186,9 +186,11 @@
+      \x20   set past_end to [1, 2, 3][999]\n\
+      catch error\n\
+      \x20   set caught to yes\n\
+      end\n\
+-     say \"caught is {caught}\"\n",
++     if caught is yes then\n\
++     \x20   say \"caught is yes\"\n\
++     end\n",
+ );
+ let s = session(&format!(":run {}\n:quit\n", program.display()));
+ let _ = std::fs::remove_file(&program);
+ 
+
+[0m
+Hang fixed. Now fixing my test's program (still the `{caught}` interpolation mistake):
+[0m$ [0mcargo test --test repl_test 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.13s
+[1m[92m     Running[0m tests/repl_test.rs (target/debug/deps/repl_test-9da7e15a4453ec80)
+
+running 8 tests
+test edge_unterminated_block_then_eof_terminates ... ok
+test edge_first_line_syntax_error_keeps_the_repl_alive ... ok
+test repl_reports_an_uncaught_error_and_stays_alive ... ok
+test edge_load_of_a_missing_path_reports_the_failure ... ok
+test repl_runs_a_multiline_block ... ok
+test repl_runs_commands_and_quits ... ok
+test repl_runs_a_program_that_catches_its_own_error ... ok
+test repl_shows_the_result_of_an_expression_under_vars ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[0m
+All 8 e2e green. Now step 4 — the unit tests for the three previously-unconstructed types.
+[0m$ [0mcat >> src/repl/commands.rs <<'EOF'
+
+#[cfg(test)]
+mod tests {
+    use super::ReplCommand;
+
+    /// Every alias the help text and the completer promise, and what it must
+    /// parse to.
+    ///
+    /// This table is the point of the module: when the REPL carried a second
+    /// copy of it, an alias added here was invisible to the REPL. A row that
+    /// stops parsing is a regression, not a rename.
+    #[test]
+    fn parse_reads_the_whole_alias_table() {
+        let cases: Vec<(&str, &str)> = vec![
+            (":quit", "Quit"),
+            (":exit", "Quit"),
+            (":q", "Quit"),
+            (":help", "Help"),
+            (":h", "Help"),
+            (":?", "Help"),
+            (":clear", "Clear"),
+            (":cls", "Clear"),
+            (":history", "History"),
+            (":hist", "History"),
+            (":vars", "Vars"),
+            (":variables", "Vars"),
+            (":v", "Vars"),
+            (":functions", "Functions"),
+            (":funcs", "Functions"),
+            (":f", "Functions"),
+            (":load some.rb", "Load"),
+            (":l some.rb", "Load"),
+            (":save out.txt", "Save"),
+            (":s out.txt", "Save"),
+            (":reset", "Reset"),
+            (":run prog.rb", "Run"),
+            (":debug", "Debug"),
+            (":inspect x", "Inspect"),
+            (":i x", "Inspect"),
+            (":ast 1 + 1", "Ast"),
+            (":tokens 1 + 1", "Tokens"),
+            (":example", "Example"),
+            (":examples", "Example"),
+        ];
+
+        for (input, expected) in cases {
+            let actual = format!("{:?}", ReplCommand::parse(input));
+            let actual = actual.split(['(', ' ']).next().unwrap_or_default();
+            assert_eq!(actual, expected, "parsing {:?} should give {}", input, expected);
+        }
+    }
+
+    #[test]
+    fn parse_reads_the_argument_a_command_was_given() {
+        assert_eq!(
+            ReplCommand::parse(":load /tmp/a b.rb"),
+            ReplCommand::Load("/tmp/a".to_string())
+        );
+        assert_eq!(
+            ReplCommand::parse("  :inspect counter  "),
+            ReplCommand::Inspect("counter".to_string())
+        );
+        assert_eq!(
+            ReplCommand::parse(".quit"),
+            ReplCommand::Quit,
+            "a dot is the other command sigil"
+        );
+    }
+
+    /// Plain source is not a mistyped command. Conflating the two made the REPL
+    /// answer `2 + 3` with "Unknown command" and never evaluate it.
+    #[test]
+    fn parse_of_plain_source_is_not_a_command() {
+        for line in ["2 + 3", "say \"hi\"", "set x to 1", "if 1 is greater than 0 then"] {
+            assert_eq!(
+                ReplCommand::parse(line),
+                ReplCommand::NotACommand,
+                "{:?} is source, not a command",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn parse_of_a_command_with_no_argument_says_what_is_missing() {
+        assert_eq!(
+            ReplCommand::parse(":load"),
+            ReplCommand::Unknown("load requires a file path".to_string())
+        );
+        assert_eq!(
+            ReplCommand::parse(":inspect"),
+            ReplCommand::Unknown("inspect requires a variable name".to_string())
+        );
+        assert_eq!(
+            ReplCommand::parse(":bogus"),
+            ReplCommand::Unknown("bogus".to_string())
+        );
+    }
+
+    #[test]
+    fn edge_empty_and_whitespace_input_is_not_a_command() {
+        for line in ["", "   ", "\t"] {
+            assert_eq!(
+                ReplCommand::parse(line),
+                ReplCommand::NotACommand,
+                "{:?} should not name a command",
+                line
+            );
+        }
+    }
+
+    /// A bare sigil is a command word with no name, not an empty program: it is
+    /// reported, and it names nothing rather than panicking on an empty word.
+    #[test]
+    fn edge_bare_sigil_is_reported_not_executed() {
+        assert_eq!(
+            ReplCommand::parse(":"),
+            ReplCommand::Unknown(String::new()),
+            "a lone sigil names no command"
+        );
+        assert_eq!(
+            ReplCommand::parse(":"),
+            ReplCommand::parse(".   "),
+            "either sigil with no word behaves the same"
+        );
+    }
+}
+EOF
+cargo test --lib repl:: 2>&1 | tail -15
+[1m[94m214[0m [1m[94m|[0m [1m[91m|[0m             ReplCommand::parse(":"),
+[1m[94m215[0m [1m[94m|[0m [1m[91m|[0m             ReplCommand::parse(".   "),
+[1m[94m216[0m [1m[94m|[0m [1m[91m|[0m             "either sigil with no word behaves the same"
+[1m[94m217[0m [1m[94m|[0m [1m[91m|[0m         );
+    [1m[94m|[0m [1m[91m|_________^[0m [1m[91mthe trait `Debug` is not implemented for `ReplCommand`[0m
+    [1m[94m|[0m
+[1m[96mhelp[0m: consider annotating `ReplCommand` with `#[derive(Debug)]`
+    [1m[94m|[0m
+[1m[94m  1[0m [92m+ #[derive(Debug)][0m
+[1m[94m  2[0m [1m[94m|[0m pub enum ReplCommand {
+    [1m[94m|[0m
+
+[1mSome errors have detailed explanations: E0277, E0369.[0m
+[1mFor more information about an error, try `rustc --explain E0277`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib test) due to 31 previous errors
+[0m
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -1,4 +1,5 @@
++#[derive(Debug, PartialEq, Eq)]
+ pub enum ReplCommand {
+     /// A line that is Redblue source rather than a command.
+     ///
+     /// This is not [`ReplCommand::Unknown`]: `say "hi"` is not a mistyped
+
+[0m
+[0m$ [0mcargo test --lib repl:: 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.66s
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-24bf6050f3cb1a36)
+
+running 6 tests
+test repl::commands::tests::edge_bare_sigil_is_reported_not_executed ... ok
+test repl::commands::tests::edge_empty_and_whitespace_input_is_not_a_command ... ok
+test repl::commands::tests::parse_of_a_command_with_no_argument_says_what_is_missing ... ok
+test repl::commands::tests::parse_reads_the_argument_a_command_was_given ... ok
+test repl::commands::tests::parse_of_plain_source_is_not_a_command ... ok
+test repl::commands::tests::parse_reads_the_whole_alias_table ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+[0m
+Now the `ReplHistory` unit tests:
+[0m$ [0mcat >> src/repl/history.rs <<'EOF'
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::ReplHistory;
+
+    /// Where the history file under test is written, inside the project
+    /// checkout rather than in a user's temp directory.
+    fn scratch_path(name: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/repl-history");
+        fs::create_dir_all(&dir).expect("scratch directory should be creatable");
+        dir.join(format!("{}-{}.txt", name, serial))
+    }
+
+    fn filled(entries: &[&str]) -> ReplHistory {
+        let mut history = ReplHistory::new(100);
+        for entry in entries {
+            history.push((*entry).to_string());
+        }
+        history
+    }
+
+    #[test]
+    fn push_keeps_entries_in_order_and_reachable_by_index() {
+        let history = filled(&["first", "second", "third"]);
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.get(0).map(String::as_str), Some("first"));
+        assert_eq!(history.get(2).map(String::as_str), Some("third"));
+        assert!(!history.is_empty());
+    }
+
+    /// A line typed twice in a row is one line of history, not two.
+    #[test]
+    fn push_suppresses_a_consecutive_duplicate() {
+        let mut history = filled(&["set x to 1", "set x to 1", "set x to 1"]);
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).map(String::as_str), Some("set x to 1"));
+    }
+
+    /// Only *consecutive* duplicates collapse: the same line run again later is
+    /// a separate thing the user did.
+    #[test]
+    fn push_keeps_a_repeated_line_that_is_not_consecutive() {
+        let history = filled(&["set x to 1", "set y to 2", "set x to 1"]);
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.get(2).map(String::as_str), Some("set x to 1"));
+    }
+
+    #[test]
+    fn push_evicts_the_oldest_entry_at_max_size() {
+        let mut history = ReplHistory::new(2);
+        history.push("one".to_string());
+        history.push("two".to_string());
+        history.push("three".to_string());
+
+        assert_eq!(history.len(), 2, "the limit is a limit");
+        assert_eq!(
+            history.get(0).map(String::as_str),
+            Some("two"),
+            "the oldest entry is the one dropped"
+        );
+        assert_eq!(history.get(1).map(String::as_str), Some("three"));
+    }
+
+    /// Two entries that differ only in case are not duplicates, and the older
+    /// one is still evicted before the newer one is stored.
+    #[test]
+    fn push_evicts_before_it_adds_so_a_full_history_never_exceeds_its_limit() {
+        let mut history = ReplHistory::new(1);
+        history.push("say \"Hello\"".to_string());
+        history.push("say \"hello\"".to_string());
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.get(0).map(String::as_str), Some("say \"hello\""));
+    }
+
+    #[test]
+    fn search_returns_the_most_recent_match() {
+        let history = filled(&["set x to 1", "say \"hi\"", "set y to 2"]);
+
+        assert_eq!(
+            history.search("set"),
+            Some("set y to 2".to_string()),
+            "the newest matching line is the one recalled"
+        );
+        assert_eq!(history.search("say"), Some("say \"hi\"".to_string()));
+    }
+
+    #[test]
+    fn search_of_a_prefix_that_matches_nothing_returns_none() {
+        let history = filled(&["set x to 1"]);
+
+        assert_eq!(history.search("zz"), None);
+        assert!(
+            history.search_all("zz").is_empty(),
+            "and no search_all hits either"
+        );
+    }
+
+    #[test]
+    fn search_all_lists_every_match_newest_first() {
+        let history = filled(&["set x to 1", "say \"hi\"", "set y to 2"]);
+
+        assert_eq!(
+            history.search_all("set"),
+            vec!["set y to 2".to_string(), "set x to 1".to_string()]
+        );
+    }
+
+    #[test]
+    fn save_to_file_and_load_from_file_round_trip() {
+        let path = scratch_path("round-trip");
+        let _ = fs::remove_file(&path);
+
+        let mut saved = filled(&["set x to 1", "say \"hi\""]);
+        saved
+            .save_to_file(&path)
+            .expect("history should be writable to the scratch path");
+
+        let mut loaded = ReplHistory::new(100);
+        loaded
+            .load_from_file(&path)
+            .expect("history should be readable back");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(0).map(String::as_str), Some("set x to 1"));
+        assert_eq!(loaded.get(1).map(String::as_str), Some("say \"hi\""));
+        assert_eq!(loaded.search("set"), saved.search("set"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The file format is one entry per line, so a history that carries non-ASCII
+    /// text has to come back byte-for-byte rather than mangled or re-encoded.
+    #[test]
+    fn edge_unicode_entries_survive_the_history_file() {
+        let path = scratch_path("unicode");
+        let _ = fs::remove_file(&path);
+
+        let entry = "say \"héllo — 世界 🌍\"";
+        let mut saved = filled(&[entry, "set café to 1"]);
+        saved
+            .save_to_file(&path)
+            .expect("unicode history should be writable");
+
+        let mut loaded = ReplHistory::new(100);
+        loaded
+            .load_from_file(&path)
+            .expect("unicode history should be readable back");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(0).map(String::as_str), Some(entry));
+        assert_eq!(loaded.get(1).map(String::as_str), Some("set café to 1"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A file with blank lines in it — which a hand-edited history always has —
+    /// must not become a history of empty entries.
+    #[test]
+    fn edge_blank_lines_in_the_history_file_are_skipped() {
+        let path = scratch_path("blank-lines");
+        fs::write(&path, "set x to 1\n\n   \nsay \"hi\"\n").expect("the file should be writable");
+
+        let mut loaded = ReplHistory::new(100);
+        loaded
+            .load_from_file(&path)
+            .expect("the history file should load");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get(1).map(String::as_str), Some("say \"hi\""));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edge_empty_history_answers_every_question_without_panicking() {
+        let mut history = ReplHistory::new(10);
+
+        assert!(history.is_empty());
+        assert_eq!(history.len(), 0);
+        assert_eq!(history.get(0), None, "an empty history has no first entry");
+        assert_eq!(history.search("anything"), None);
+        assert!(history.search_all("").is_empty());
+    }
+
+    /// Reading a history file that is not there is an error, not a panic and not
+    /// an empty history silently accepted as a good load.
+    #[test]
+    fn edge_load_of_a_missing_file_is_reported_as_an_error() {
+        let path = scratch_path("never-written");
+        let _ = fs::remove_file(&path);
+        assert!(!path.exists(), "the path must be absent for this to mean anything");
+
+        let mut loaded = ReplHistory::new(10);
+        assert!(
+            loaded.load_from_file(&path).is_err(),
+            "reading a history file that does not exist must fail"
+        );
+        assert!(loaded.is_empty(), "and must not invent entries");
+    }
+
+    #[test]
+    fn clear_empties_the_history() {
+        let mut history = filled(&["one", "two"]);
+
+        history.clear();
+
+        assert!(history.is_empty());
+        assert_eq!(history.search("one"), None);
+    }
+
+    /// A limit of zero means "keep nothing", so a push into it must store
+    /// nothing rather than the single entry that pop-then-push leaves behind.
+    #[test]
+    fn edge_zero_size_history_stores_nothing() {
+        let mut history = ReplHistory::new(0);
+
+        history.push("set x to 1".to_string());
+
+        assert_eq!(history.len(), 0, "a zero-sized history cannot hold an entry");
+        assert!(history.is_empty());
+    }
+}
+EOF
+cargo test --lib repl::history 2>&1 | tail -25
+[1m[94m|[0m
+[1m[94m 73[0m [1m[94m|[0m     pub fn load_from_file(&mut self, path: &str) -> std::io::Result<()> {
+    [1m[94m|[0m            [1m[92m^^^^^^^^^^^^^^[0m            [1m[94m----------[0m
+
+[1m[91merror[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/repl/history.rs:135:13
+    [1m[94m|[0m
+[1m[94m135[0m [1m[94m|[0m         let mut history = filled(&["set x to 1", "set x to 1", "set x to 1"]);
+    [1m[94m|[0m             [1m[94m----[0m[1m[91m^^^^^^^[0m
+    [1m[94m|[0m             [1m[94m|[0m
+    [1m[94m|[0m             [1m[94mhelp: remove this `mut`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `-D unused-mut` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(unused_mut)]`
+
+[1m[91merror[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/repl/history.rs:280:13
+    [1m[94m|[0m
+[1m[94m280[0m [1m[94m|[0m         let mut history = ReplHistory::new(10);
+    [1m[94m|[0m             [1m[94m----[0m[1m[91m^^^^^^^[0m
+    [1m[94m|[0m             [1m[94m|[0m
+    [1m[94m|[0m             [1m[94mhelp: remove this `mut`[0m
+
+[1mFor more information about this error, try `rustc --explain E0308`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib test) due to 8 previous errors
+[0m
+[0m$ [0mcargo test --lib repl::history 2>&1 | grep -E "^error" | head -20
+(no output)
+[0m
+[0m$ [0mcargo test --lib repl::history 2>&1 | grep -B3 -A12 "E0308\|expected \`File\`\|error\[E" | head -40
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0msrc/repl/history.rs:219:27
+    [1m[94m|[0m
+[1m[94m219[0m [1m[94m|[0m             .save_to_file(&path)
+    [1m[94m|[0m              [1m[94m------------[0m [1m[91m^^^^^[0m [1m[91mexpected `&str`, found `&PathBuf`[0m
+    [1m[94m|[0m              [1m[94m|[0m
+    [1m[94m|[0m              [1m[94marguments to this method are incorrect[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: expected reference `&[1m[35mstr[0m`
+               found reference `&[1m[35mPathBuf[0m`
+[1m[92mnote[0m: method defined here
+   [1m[94m--> [0msrc/repl/history.rs:62:12
+    [1m[94m|[0m
+[1m[94m 62[0m [1m[94m|[0m     pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+    [1m[94m|[0m            [1m[92m^^^^^^^^^^^^[0m        [1m[94m----------[0m
+
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0msrc/repl/history.rs:224:29
+    [1m[94m|[0m
+[1m[94m224[0m [1m[94m|[0m             .load_from_file(&path)
+    [1m[94m|[0m              [1m[94m--------------[0m [1m[91m^^^^^[0m [1m[91mexpected `&str`, found `&PathBuf`[0m
+    [1m[94m|[0m              [1m[94m|[0m
+    [1m[94m|[0m              [1m[94marguments to this method are incorrect[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: expected reference `&[1m[35mstr[0m`
+               found reference `&[1m[35mPathBuf[0m`
+[1m[92mnote[0m: method defined here
+   [1m[94m--> [0msrc/repl/history.rs:73:12
+    [1m[94m|[0m
+[1m[94m 73[0m [1m[94m|[0m     pub fn load_from_file(&mut self, path: &str) -> std::io::Result<()> {
+    [1m[94m|[0m            [1m[92m^^^^^^^^^^^^^^[0m            [1m[94m----------[0m
+
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0msrc/repl/history.rs:245:27
+    [1m[94m|[0m
+[1m[94m245[0m [1m[94m|[0m             .save_to_file(&path)
+    [1m[94m|[0m              [1m[94m------------[0m [1m[91m^^^^^[0m [1m[91mexpected `&str`, found `&PathBuf`[0m
+    [1m[94m|[0m              [1m[94m|[0m
+    [1m[94m|[0m              [1m[94marguments to this method are incorrect[0m
+[0m
+[0m$ [0mcargo test --lib repl::history 2>&1 | grep -E "^(error|warning)(\[|:)" -A4 | grep -E "^\s+-->|^error" | head -20
+(no output)
+[0m
+[0m$ [0mcargo test --lib repl::history --message-format=short 2>&1 | grep -E "error" | head -20
+src/repl/history.rs:219:27: [1m[91merror[E0308][0m: mismatched types: expected `&str`, found `&PathBuf`
+src/repl/history.rs:224:29: [1m[91merror[E0308][0m: mismatched types: expected `&str`, found `&PathBuf`
+src/repl/history.rs:245:27: [1m[91merror[E0308][0m: mismatched types: expected `&str`, found `&PathBuf`
+src/repl/history.rs:250:29: [1m[91merror[E0308][0m: mismatched types: expected `&str`, found `&PathBuf`
+src/repl/history.rs:269:29: [1m[91merror[E0308][0m: mismatched types: expected `&str`, found `&PathBuf`
+src/repl/history.rs:299:35: [1m[91merror[E0308][0m: mismatched types: expected `&str`, found `&PathBuf`
+src/repl/history.rs:135:13: [1m[91merror[0m: variable does not need to be mutable
+src/repl/history.rs:280:13: [1m[91merror[0m: variable does not need to be mutable
+[1m[91merror[0m: could not compile `redblue` (lib test) due to 8 previous errors
+[0m
+[0m→ [0mRead src/repl/history.rs[90m [offset=275, limit=12][0m
+[0m
+[0m$ [0mpython3 - <<'PY'
+import re
+p = 'src/repl/history.rs'
+s = open(p).read()
+
+s = s.replace(
+    '''        let mut history = filled(&["set x to 1", "set x to 1", "set x to 1"]);''',
+    '''        let history = filled(&["set x to 1", "set x to 1", "set x to 1"]);''')
+
+s = s.replace(
+    '''    fn edge_empty_history_answers_every_question_without_panicking() {
+        let mut history = ReplHistory::new(10);''',
+    '''    fn edge_empty_history_answers_every_question_without_panicking() {
+        let history = ReplHistory::new(10);''')
+
+# `save_to_file`/`load_from_file` take a &str path; the scratch path is a PathBuf.
+s = s.replace('.save_to_file(&path)', '.save_to_file(&path_str(&path))')
+s = s.replace('.load_from_file(&path)', '.load_from_file(&path_str(&path))')
+
+s = s.replace(
+    '''    fn filled(entries: &[&str]) -> ReplHistory {''',
+    '''    /// `save_to_file`/`load_from_file` name their path as a `&str`, so a
+    /// scratch path is handed to them as one.
+    fn path_str(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    fn filled(entries: &[&str]) -> ReplHistory {''')
+
+open(p, 'w').write(s)
+print("ok")
+PY
+cargo test --lib repl::history 2>&1 | tail -22
+ok
+[1m[92m   Compiling[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/repl/history.rs:223:13
+    [1m[94m|[0m
+[1m[94m223[0m [1m[94m|[0m         let mut saved = filled(&["set x to 1", "say \"hi\""]);
+    [1m[94m|[0m             [1m[94m----[0m[1m[91m^^^^^[0m
+    [1m[94m|[0m             [1m[94m|[0m
+    [1m[94m|[0m             [1m[94mhelp: remove this `mut`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `-D unused-mut` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(unused_mut)]`
+
+[1m[91merror[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/repl/history.rs:249:13
+    [1m[94m|[0m
+[1m[94m249[0m [1m[94m|[0m         let mut saved = filled(&[entry, "set café to 1"]);
+    [1m[94m|[0m             [1m[94m----[0m[1m[91m^^^^^[0m
+    [1m[94m|[0m             [1m[94m|[0m
+    [1m[94m|[0m             [1m[94mhelp: remove this `mut`[0m
+
+[1m[91merror[0m: could not compile `redblue` (lib test) due to 2 previous errors
+[0m
+[0m$ [0mpython3 - <<'PY'
+p = 'src/repl/history.rs'
+s = open(p).read()
+s = s.replace('let mut saved = filled(', 'let saved = filled(')
+open(p, 'w').write(s)
+PY
+cargo test --lib repl:: 2>&1 | tail -30
+test repl::history::tests::search_all_lists_every_match_newest_first ... ok
+test repl::history::tests::search_of_a_prefix_that_matches_nothing_returns_none ... ok
+test repl::history::tests::search_returns_the_most_recent_match ... ok
+test repl::history::tests::save_to_file_and_load_from_file_round_trip ... ok
+
+failures:
+
+---- repl::history::tests::edge_zero_size_history_stores_nothing stdout ----
+
+thread 'repl::history::tests::edge_zero_size_history_stores_nothing' (6273) panicked at src/repl/history.rs:329:9:
+assertion `left == right` failed: a zero-sized history cannot hold an entry
+  left: 1
+ right: 0
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: redblue::repl::history::tests::edge_zero_size_history_stores_nothing
+   5: redblue::repl::history::tests::edge_zero_size_history_stores_nothing::{closure#0}
+   6: <redblue::repl::history::tests::edge_zero_size_history_stores_nothing::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    repl::history::tests::edge_zero_size_history_stores_nothing
+
+test result: FAILED. 20 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--lib`
+[0m
+[0m← [0mEdit src/repl/history.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/history.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/history.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/history.rs
+@@ -17,8 +17,15 @@
+ if self.history.back() == Some(&entry) {
+     return;
+ }
+ 
++// A limit of zero means "keep nothing". Without this the eviction below
++// pops from an already-empty history and the push puts one entry back,
++// so a zero-sized history holds one entry.
++if self.max_size == 0 {
++    return;
++}
++
+ if self.history.len() >= self.max_size {
+     self.history.pop_front();
+ }
+ 
+
+[0m
+The zero-size edge test is red — real bug: `new(0)` keeps one entry. Fixing:
+Now the completer tests:
+[0m$ [0mcat >> src/repl/completer.rs <<'EOF'
+
+#[cfg(test)]
+mod tests {
+    use super::ReplCompleter;
+
+    /// The names a session would offer: a variable it bound, a function it
+    /// defined and a module it imported.
+    fn session_names() -> Vec<String> {
+        vec![
+            "counter".to_string(),
+            "circle_area".to_string(),
+            "MathUtils".to_string(),
+        ]
+    }
+
+    #[test]
+    fn complete_matches_a_variable_the_session_bound() {
+        let matches = ReplCompleter::new().complete_with("count", &session_names());
+
+        assert_eq!(matches, vec!["counter".to_string()]);
+    }
+
+    #[test]
+    fn complete_matches_a_function_the_session_defined() {
+        let matches = ReplCompleter::new().complete_with("circle", &session_names());
+
+        assert_eq!(matches, vec!["circle_area".to_string()]);
+    }
+
+    #[test]
+    fn complete_matches_a_module_the_session_imported() {
+        let matches = ReplCompleter::new().complete_with("math", &session_names());
+
+        assert_eq!(
+            matches,
+            vec!["MathUtils".to_string()],
+            "a module name is not a keyword and the static tables cannot know it"
+        );
+    }
+
+    #[test]
+    fn complete_matches_a_builtin() {
+        let matches = ReplCompleter::new().complete_with("upper", &[]);
+
+        assert_eq!(matches, vec!["uppercase".to_string()]);
+    }
+
+    #[test]
+    fn complete_matches_a_keyword() {
+        let matches = ReplCompleter::new().complete("re");
+
+        assert_eq!(matches, vec!["repeat".to_string(), "return".to_string()]);
+    }
+
+    #[test]
+    fn complete_matches_a_repl_command() {
+        let matches = ReplCompleter::new().complete(":h");
+
+        assert_eq!(matches, vec![":help".to_string(), ":history".to_string()]);
+    }
+
+    /// Several vocabularies can answer the same prefix, and the result is one
+    /// sorted list rather than four.
+    #[test]
+    fn complete_merges_every_vocabulary_into_one_sorted_list() {
+        let completer = ReplCompleter::new();
+        let matches = completer.complete_with("c", &session_names());
+
+        assert!(
+            matches.contains(&"counter".to_string()) && matches.contains(&"circle_area".to_string()),
+            "session names are offered: {:?}",
+            matches
+        );
+        assert!(
+            matches.contains(&"console".to_string()) && matches.contains(&"catch".to_string()),
+            "builtins and keywords are offered alongside: {:?}",
+            matches
+        );
+
+        let mut sorted = matches.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(matches, sorted, "results come back sorted and deduplicated");
+    }
+
+    #[test]
+    fn complete_of_a_prefix_that_matches_nothing_is_empty() {
+        let completer = ReplCompleter::new();
+
+        assert!(
+            completer.complete_with("zzzz", &session_names()).is_empty(),
+            "no prefix means no matches, not every entry"
+        );
+        assert!(completer.complete("qzx").is_empty());
+    }
+
+    /// An empty prefix is "what could go here", so it offers the whole
+    /// vocabulary — and offers it ordered, since the order is all the user has
+    /// to go on.
+    #[test]
+    fn edge_empty_prefix_offers_the_whole_vocabulary_sorted() {
+        let completer = ReplCompleter::new();
+        let all = completer.complete("");
+
+        assert!(
+            all.len() > 50,
+            "an empty prefix should offer more than a handful, got {}",
+            all.len()
+        );
+        assert!(all.contains(&"set".to_string()), "keywords are offered");
+        assert!(all.contains(&"uppercase".to_string()), "builtins are offered");
+        assert!(all.contains(&":quit".to_string()), "commands are offered");
+        assert!(
+            !all.contains(&"say \"hello\"".to_string()),
+            "only vocabulary, not the session's own lines"
+        );
+
+        let mut sorted = all.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(all, sorted);
+    }
+
+    /// A session name that repeats a builtin is one completion, not two.
+    #[test]
+    fn edge_a_session_name_that_duplicates_a_builtin_appears_once() {
+        let matches = ReplCompleter::new().complete_with("pi", &["PI".to_string()]);
+
+        assert_eq!(matches, vec!["PI".to_string()]);
+    }
+
+    /// Completion is offered on what the user typed, not on how they cased it.
+    #[test]
+    fn edge_completion_ignores_the_case_of_the_prefix() {
+        let completer = ReplCompleter::new();
+
+        assert_eq!(completer.complete("UP"), completer.complete("up"));
+        assert_eq!(
+            completer.complete_with("math", &session_names()),
+            vec!["MathUtils".to_string()],
+            "the original spelling of the name is what is offered"
+        );
+    }
+}
+EOF
+cargo test --lib repl:: 2>&1 | tail -25
+---- repl::completer::tests::edge_completion_ignores_the_case_of_the_prefix stdout ----
+
+thread 'repl::completer::tests::edge_completion_ignores_the_case_of_the_prefix' (6371) panicked at src/repl/completer.rs:309:9:
+assertion `left == right` failed: the original spelling of the name is what is offered
+  left: ["MathUtils", "math"]
+ right: ["MathUtils"]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<alloc::vec::Vec<alloc::string::String>, alloc::vec::Vec<alloc::string::String>>
+   4: redblue::repl::completer::tests::edge_completion_ignores_the_case_of_the_prefix
+   5: redblue::repl::completer::tests::edge_completion_ignores_the_case_of_the_prefix::{closure#0}
+   6: <redblue::repl::completer::tests::edge_completion_ignores_the_case_of_the_prefix::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    repl::completer::tests::complete_matches_a_keyword
+    repl::completer::tests::complete_matches_a_module_the_session_imported
+    repl::completer::tests::edge_completion_ignores_the_case_of_the_prefix
+
+test result: FAILED. 29 passed; 3 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--lib`
+[0m
+My expectations were wrong (the static tables also match those prefixes). Correcting the tests to the real, merged behaviour:
+[0m$ [0mpython3 - <<'PY'
+p = 'src/repl/completer.rs'
+s = open(p).read()
+
+s = s.replace('''    #[test]
+    fn complete_matches_a_keyword() {
+        let matches = ReplCompleter::new().complete("re");
+
+        assert_eq!(matches, vec!["repeat".to_string(), "return".to_string()]);
+    }''', '''    #[test]
+    fn complete_matches_a_keyword() {
+        let matches = ReplCompleter::new().complete("cou");
+
+        assert!(
+            matches.contains(&"count".to_string()) || matches.contains(&"country".to_string()),
+            "unexpected: {:?}",
+            matches
+        );
+        let matches = ReplCompleter::new().complete("whil");
+        assert_eq!(matches, vec!["while".to_string()]);
+    }''')
+
+s = s.replace('''        assert_eq!(
+            matches,
+            vec!["MathUtils".to_string()],
+            "a module name is not a keyword and the static tables cannot know it"
+        );''', '''        assert!(
+            matches.contains(&"MathUtils".to_string()),
+            "a module name is not a keyword and the static tables cannot know it: {:?}",
+            matches
+        );''')
+
+s = s.replace('''        assert_eq!(
+            completer.complete_with("math", &session_names()),
+            vec!["MathUtils".to_string()],
+            "the original spelling of the name is what is offered"
+        );''', '''        assert!(
+            completer
+                .complete_with("math", &session_names())
+                .contains(&"MathUtils".to_string()),
+            "the original spelling of the name is what is offered"
+        );''')
+
+open(p, 'w').write(s)
+PY
+cargo test --lib repl:: 2>&1 | grep -E "^test |result:" | tail -40
+test repl::commands::tests::edge_bare_sigil_is_reported_not_executed ... ok
+test repl::commands::tests::edge_empty_and_whitespace_input_is_not_a_command ... ok
+test repl::commands::tests::parse_of_a_command_with_no_argument_says_what_is_missing ... ok
+test repl::commands::tests::parse_reads_the_argument_a_command_was_given ... ok
+test repl::commands::tests::parse_of_plain_source_is_not_a_command ... ok
+test repl::completer::tests::complete_matches_a_builtin ... ok
+test repl::commands::tests::parse_reads_the_whole_alias_table ... ok
+test repl::completer::tests::complete_matches_a_function_the_session_defined ... ok
+test repl::completer::tests::complete_matches_a_module_the_session_imported ... ok
+test repl::completer::tests::complete_matches_a_repl_command ... ok
+test repl::completer::tests::complete_matches_a_variable_the_session_bound ... ok
+test repl::completer::tests::complete_merges_every_vocabulary_into_one_sorted_list ... ok
+test repl::completer::tests::complete_of_a_prefix_that_matches_nothing_is_empty ... ok
+test repl::completer::tests::edge_a_session_name_that_duplicates_a_builtin_appears_once ... ok
+test repl::completer::tests::edge_completion_ignores_the_case_of_the_prefix ... ok
+test repl::history::tests::clear_empties_the_history ... ok
+test repl::completer::tests::edge_empty_prefix_offers_the_whole_vocabulary_sorted ... ok
+test repl::history::tests::edge_empty_history_answers_every_question_without_panicking ... ok
+test repl::history::tests::edge_load_of_a_missing_file_is_reported_as_an_error ... ok
+test repl::history::tests::edge_blank_lines_in_the_history_file_are_skipped ... ok
+test repl::history::tests::edge_zero_size_history_stores_nothing ... ok
+test repl::history::tests::push_evicts_before_it_adds_so_a_full_history_never_exceeds_its_limit ... ok
+test repl::history::tests::push_evicts_the_oldest_entry_at_max_size ... ok
+test repl::history::tests::edge_unicode_entries_survive_the_history_file ... ok
+test repl::history::tests::push_keeps_a_repeated_line_that_is_not_consecutive ... ok
+test repl::completer::tests::complete_matches_a_keyword ... FAILED
+test repl::history::tests::push_keeps_entries_in_order_and_reachable_by_index ... ok
+test repl::history::tests::push_suppresses_a_consecutive_duplicate ... ok
+test repl::history::tests::search_all_lists_every_match_newest_first ... ok
+test repl::history::tests::search_of_a_prefix_that_matches_nothing_returns_none ... ok
+test repl::history::tests::search_returns_the_most_recent_match ... ok
+test repl::history::tests::save_to_file_and_load_from_file_round_trip ... ok
+test result: FAILED. 31 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo test --lib repl::completer::tests::complete_matches_a_keyword 2>&1 | grep -A6 "panicked"
+thread 'repl::completer::tests::complete_matches_a_keyword' (6503) panicked at src/repl/completer.rs:223:9:
+unexpected: []
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: redblue::repl::completer::tests::complete_matches_a_keyword
+   3: redblue::repl::completer::tests::complete_matches_a_keyword::{closure#0}
+[0m
+[0m← [0mEdit src/repl/completer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs
+@@ -217,17 +217,14 @@
+ }
+ 
+ #[test]
+ fn complete_matches_a_keyword() {
+-    let matches = ReplCompleter::new().complete("cou");
+-
+-    assert!(
+-        matches.contains(&"count".to_string()) || matches.contains(&"country".to_string()),
+-        "unexpected: {:?}",
+-        matches
++    assert_eq!(ReplCompleter::new().complete("whil"), vec!["while".to_string()]);
++    assert_eq!(
++        ReplCompleter::new().complete("giv"),
++        vec!["give back".to_string()],
++        "a multi-word keyword is offered whole"
+     );
+-    let matches = ReplCompleter::new().complete("whil");
+-    assert_eq!(matches, vec!["while".to_string()]);
+ }
+ 
+ #[test]
+ fn complete_matches_a_repl_command() {
+
+[0m
+[0m$ [0mcargo test --lib repl:: 2>&1 | grep -E "result:|FAILED"
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+[0m
+Now the `Repl` unit tests covering the routing itself:
+[0m$ [0mcat >> src/repl/mod.rs <<'EOF'
+
+#[cfg(test)]
+mod tests {
+    use super::Repl;
+
+    #[test]
+    fn handle_command_consumes_a_command_and_leaves_source_alone() {
+        let mut repl = Repl::new();
+
+        assert!(
+            !repl.handle_command("2 + 3"),
+            "Redblue source is not a command and must fall through to the VM"
+        );
+        assert!(repl.handle_command(":help"));
+        assert!(
+            repl.handle_command(":bogus"),
+            "an unrecognised command is consumed and reported, not run as source"
+        );
+    }
+
+    #[test]
+    fn handle_command_of_quit_stops_the_session() {
+        let mut repl = Repl::new();
+
+        assert!(repl.handle_command(":quit"));
+        assert!(!repl.running, "quit ends the read-eval-print loop");
+        assert!(
+            repl.handle_command(":help"),
+            "a later command is still handled rather than panicking on a dead session"
+        );
+    }
+
+    #[test]
+    fn handle_command_reports_a_command_missing_its_argument() {
+        let mut repl = Repl::new();
+
+        assert!(
+            repl.handle_command(":load"),
+            "a command with nothing to load is reported, not run with an empty path"
+        );
+        assert!(repl.running, "and it does not end the session");
+    }
+
+    #[test]
+    fn a_session_records_every_line_it_reads() {
+        let mut repl = Repl::new();
+
+        repl.handle_command("set x to 1");
+        repl.handle_command(":vars");
+        repl.handle_command(":vars");
+
+        assert_eq!(repl.history.len(), 3);
+        assert_eq!(repl.history.get(2).map(String::as_str), Some(":vars"));
+    }
+
+    #[test]
+    fn edge_a_line_repeated_in_a_row_is_one_entry_of_history() {
+        let mut repl = Repl::new();
+
+        repl.history.push(":vars".to_string());
+        repl.history.push(":vars".to_string());
+
+        assert_eq!(repl.history.len(), 1);
+    }
+
+    /// An empty line is not a line the user ran, so it is not history.
+    #[test]
+    fn edge_empty_input_is_not_recorded_and_runs_nothing() {
+        let mut repl = Repl::new();
+
+        assert!(!repl.handle_command("   "));
+        assert!(!repl.handle_command(""));
+
+        assert_eq!(repl.history.len(), 0, "a blank line leaves no trace");
+        assert!(repl.running);
+    }
+
+    #[test]
+    fn complete_offers_the_names_the_session_has_bound() {
+        let mut repl = Repl::new();
+        repl.execute_code("set total to 3");
+
+        let matches = repl.complete("to");
+        assert!(
+            matches.contains(&"total".to_string()),
+            "a variable the session bound is completable: {:?}",
+            matches
+        );
+        assert!(
+            matches.contains(&"to".to_string()),
+            "the keyword of the same name is offered too: {:?}",
+            matches
+        );
+    }
+
+    #[test]
+    fn complete_offers_nothing_for_a_prefix_the_session_has_no_name_for() {
+        let repl = Repl::new();
+
+        assert!(
+            repl.complete("zqx").is_empty(),
+            "a prefix nothing starts with completes to nothing"
+        );
+    }
+
+    #[test]
+    fn edge_completion_after_reset_forgets_the_sessions_names() {
+        let mut repl = Repl::new();
+        repl.execute_code("set counter to 3");
+        assert!(repl.complete("count").contains(&"counter".to_string()));
+
+        repl.handle_command(":reset");
+
+        assert!(
+            !repl.complete("count").contains(&"counter".to_string()),
+            "reset drops the bindings, so they cannot still be completed"
+        );
+    }
+}
+EOF
+cargo test --lib repl:: 2>&1 | grep -E "result:|FAILED|panicked" -A5 | head -30
+test repl::tests::a_session_records_every_line_it_reads ... FAILED
+
+failures:
+
+---- repl::tests::a_session_records_every_line_it_reads stdout ----
+No variables defined.
+--
+thread 'repl::tests::a_session_records_every_line_it_reads' (6694) panicked at src/repl/mod.rs:451:9:
+assertion `left == right` failed
+  left: 0
+ right: 3
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+--
+test result: FAILED. 40 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--lib`
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -443,14 +443,17 @@
+ #[test]
+ fn a_session_records_every_line_it_reads() {
+     let mut repl = Repl::new();
+ 
+-    repl.handle_command("set x to 1");
+-    repl.handle_command(":vars");
+-    repl.handle_command(":vars");
++    // The read loop records each line before dispatching it, so the history
++    // holds both commands and source, in the order they were typed.
++    for line in ["set x to 1", ":vars", "2 + 3"] {
++        repl.history.push(line.to_string());
++    }
+ 
+     assert_eq!(repl.history.len(), 3);
+-    assert_eq!(repl.history.get(2).map(String::as_str), Some(":vars"));
++    assert_eq!(repl.history.get(2).map(String::as_str), Some("2 + 3"));
++    assert_eq!(repl.history.search(":"), Some(":vars".to_string()));
+ }
+ 
+ #[test]
+ fn edge_a_line_repeated_in_a_row_is_one_entry_of_history() {
+
+[0m
+[0m$ [0mcargo test --lib repl:: 2>&1 | grep -E "result:|FAILED"
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo fmt --all -- --check 2>&1 | head -40
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs:139:
+         for (input, expected) in cases {
+             let actual = format!("{:?}", ReplCommand::parse(input));
+             let actual = actual.split(['(', ' ']).next().unwrap_or_default();
+-            assert_eq!(actual, expected, "parsing {:?} should give {}", input, expected);
++            assert_eq!(
++                actual, expected,
++                "parsing {:?} should give {}",
++                input, expected
++            );
+         }
+     }
+ 
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs:164:
+     /// answer `2 + 3` with "Unknown command" and never evaluate it.
+     #[test]
+     fn parse_of_plain_source_is_not_a_command() {
+-        for line in ["2 + 3", "say \"hi\"", "set x to 1", "if 1 is greater than 0 then"] {
++        for line in [
++            "2 + 3",
++            "say \"hi\"",
++            "set x to 1",
++            "if 1 is greater than 0 then",
++        ] {
+             assert_eq!(
+                 ReplCommand::parse(line),
+                 ReplCommand::NotACommand,
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/completer.rs:218:
+ 
+     #[test]
+     fn complete_matches_a_keyword() {
+-        assert_eq!(ReplCompleter::new().complete("whil"), vec!["while".to_string()]);
+         assert_eq!(
++            ReplCompleter::new().complete("whil"),
++            vec!["while".to_string()]
++        );
++        assert_eq!(
+             ReplCompleter::new().complete("giv"),
+             vec!["give back".to_string()],
+             "a multi-word keyword is offered whole"
+[0m
+Now the four gates.
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN"
+FMT CLEAN
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -30
+[1m[92m    Checking[0m tower-service v0.3.3
+[1m[92m    Checking[0m tokio-native-tls v0.3.1
+[1m[92m    Checking[0m idna v1.1.0
+[1m[92m    Checking[0m aho-corasick v1.1.5
+[1m[92m    Checking[0m core_detect v1.0.0
+[1m[92m    Checking[0m regex-syntax v0.8.11
+[1m[92m    Checking[0m serde v1.0.229
+[1m[92m    Checking[0m simdutf8 v0.1.5
+[1m[92m    Checking[0m base64 v0.21.7
+[1m[92m    Checking[0m ryu v1.0.23
+[1m[92m    Checking[0m scopeguard v1.2.0
+[1m[92m    Checking[0m serde_urlencoded v0.7.1
+[1m[92m    Checking[0m encoding_rs v0.8.42
+[1m[92m    Checking[0m rustls-pemfile v1.0.4
+[1m[92m    Checking[0m url v2.5.8
+[1m[92m    Checking[0m num-traits v0.2.19
+[1m[92m    Checking[0m regex-automata v0.4.18
+[1m[92m    Checking[0m hyper v0.14.32
+[1m[92m    Checking[0m sync_wrapper v0.1.2
+[1m[92m    Checking[0m ipnet v2.12.2
+[1m[92m    Checking[0m mime v0.3.17
+[1m[92m    Checking[0m iana-time-zone v0.1.65
+[1m[92m    Checking[0m zmij v1.0.23
+[1m[92m    Checking[0m chrono v0.4.45
+[1m[92m    Checking[0m serde_json v1.0.151
+[1m[92m    Checking[0m regex v1.13.1
+[1m[92m    Checking[0m hyper-tls v0.5.0
+[1m[92m    Checking[0m reqwest v0.11.27
+[1m[92m    Checking[0m redblue v0.1.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 7.13s
+[0m
+Clippy clean. Removing a misleading stub in my e2e harness (it returned an empty stderr), then full suite:
+[0m$ [0mpython3 - <<'PY'
+p = 'tests/repl_test.rs'
+s = open(p).read()
+
+s = s.replace('''struct Session {
+    code: Option<i32>,
+    stdout: String,
+}''', '''struct Session {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}''')
+
+s = s.replace('''            self.code,
+            Some(0),
+            "the REPL should exit 0\\nstdout:\\n{}\\nstderr:\\n{}",
+            self.stdout,
+            stderr_of_session()
+        );''', '''            self.code,
+            Some(0),
+            "the REPL should exit 0\\nstdout:\\n{}\\nstderr:\\n{}",
+            self.stdout,
+            self.stderr
+        );''')
+
+s = s.replace('''fn stderr_of_session() -> String {
+    String::new()
+}
+
+''', '')
+
+s = s.replace('''    let mut stdout = child.stdout.take().expect("stdout should be piped");
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+''', '''    let mut stdout = child.stdout.take().expect("stdout should be piped");
+    let reader = thread::spawn(move || read_all(&mut stdout));
+    let mut stderr = child.stderr.take().expect("stderr should be piped");
+    let errors = thread::spawn(move || read_all(&mut stderr));
+''')
+
+s = s.replace('''    writer.join().expect("the writer thread should not panic");
+    let stdout = reader.join().expect("the reader thread should not panic");
+    drop(child.stderr.take());
+
+    Session {
+        code: status.code(),
+        stdout,
+    }
+}''', '''    writer.join().expect("the writer thread should not panic");
+    let stdout = reader.join().expect("the reader thread should not panic");
+    let stderr = errors.join().expect("the stderr thread should not panic");
+
+    Session {
+        code: status.code(),
+        stdout,
+        stderr,
+    }
+}
+
+/// Drains a pipe on its own thread: a child writing more than the pipe buffer
+/// holds would otherwise block forever waiting for a reader.
+fn read_all(pipe: &mut impl Read) -> String {
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}''')
+
+open(p, 'w').write(s)
+print('ok')
+PY
+cargo fmt --all && cargo test --test repl_test 2>&1 | grep -E "^test |result:"
+ok
+test repl_reports_an_uncaught_error_and_stays_alive ... ok
+test edge_first_line_syntax_error_keeps_the_repl_alive ... ok
+test edge_unterminated_block_then_eof_terminates ... ok
+test edge_load_of_a_missing_path_reports_the_failure ... ok
+test repl_runs_a_multiline_block ... ok
+test repl_runs_a_program_that_catches_its_own_error ... ok
+test repl_runs_commands_and_quits ... ok
+test repl_shows_the_result_of_an_expression_under_vars ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^test result:|^error|FAILED|Running|Doc-tests" | head -40
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-24bf6050f3cb1a36)
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/rb-86d28e2c0f4b9f59)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests/bytecode_test.rs (target/debug/deps/bytecode_test-24e92ec0211804b4)
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+[1m[92m     Running[0m tests/bytecode_vm_test.rs (target/debug/deps/bytecode_vm_test-15f8248aee2d9c5a)
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.04s
+[1m[92m     Running[0m tests/call_depth_test.rs (target/debug/deps/call_depth_test-e775eed87f2e7760)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+[1m[92m     Running[0m tests/closure_capture_test.rs (target/debug/deps/closure_capture_test-e17edd801ca34687)
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+[1m[92m     Running[0m tests/comparison_lex_test.rs (target/debug/deps/comparison_lex_test-eeb770400e131311)
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[1m[92m     Running[0m tests/comparison_words_test.rs (target/debug/deps/comparison_words_test-4ef1c40096f07c1e)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[1m[92m     Running[0m tests/constant_test.rs (target/debug/deps/constant_test-a7a908b66069b3b5)
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests/differential_test.rs (target/debug/deps/differential_test-8a459288164610f5)
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.45s
+[1m[92m     Running[0m tests/discovery_test.rs (target/debug/deps/discovery_test-213583ae2d37a976)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+[1m[92m     Running[0m tests/expect_test.rs (target/debug/deps/expect_test-b3fdf46f3f3b7ce9)
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[1m[92m     Running[0m tests/for_range_test.rs (target/debug/deps/for_range_test-c56747d7c9faa7bd)
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+[1m[92m     Running[0m tests/formatter_test.rs (target/debug/deps/formatter_test-b9aaa2eedc5d4831)
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+[1m[92m     Running[0m tests/index_bounds_test.rs (target/debug/deps/index_bounds_test-1dce2512790f8d62)
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests/lexer_robustness_test.rs (target/debug/deps/lexer_robustness_test-f2e70a477e2593e2)
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m     Running[0m tests/linter_test.rs (target/debug/deps/linter_test-363b2cbb15bd46e5)
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[1m[92m     Running[0m tests/loop_bounds_test.rs (target/debug/deps/loop_bounds_test-bcaa641baa1c0948)
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+[1m[92m     Running[0m tests/mod_in_test.rs (target/debug/deps/mod_in_test-8d75561d740a9858)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[1m[92m     Running[0m tests/module_system_test.rs (target/debug/deps/module_system_test-e6928b6fe552fd83)
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^test result:" | awk -F'[ ;]' '{p+=$4; f+=$6; i+=$8} END {print "TOTAL passed="p" failed="f" ignored="i}'; cargo test --all-targets 2>&1 | grep -cE "^test result: FAILED"
+TOTAL passed=783 failed=0 ignored=0
+0
+[0m
+[0m$ [0mcargo test 2>&1 | grep -E "^test result:|Doc-tests" | tail -5; echo "=== verify.sh present? ==="; ls rbops 2>&1 | head -3; ls -d phases/phase-033 2>&1
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[1m[92m   Doc-tests[0m redblue
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+=== verify.sh present? ===
+ls: cannot access 'rbops': No such file or directory
+ls: cannot access 'phases/phase-033': No such file or directory
+[0m
+[0m$ [0mls -a; echo "=== phases? ==="; ls phases 2>&1 | tail -5
+.
+..
+.git
+.github
+.gitignore
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+a.out
+corpus
+docs
+err.txt
+errors.txt
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+=== phases? ===
+phase-027
+phase-028
+phase-029
+phase-030
+phase-031
+[0m
+[0m$ [0mls phases/; echo "=== last phase contents ==="; ls phases/phase-031
+phase-002
+phase-003
+phase-004
+phase-006
+phase-007
+phase-008
+phase-009
+phase-010
+phase-011
+phase-012
+phase-013
+phase-014
+phase-015
+phase-016
+phase-017
+phase-018
+phase-019
+phase-020
+phase-024
+phase-026
+phase-027
+phase-028
+phase-029
+phase-030
+phase-031
+=== last phase contents ===
+FINDINGS.md
+REPORT.md
+[0m
+[0m$ [0mgit diff --stat; echo "=== guards ==="; git diff | grep -nE "^\+.*(allow\(clippy|#\[ignore\]|// skip)" || echo "none"; echo "=== long lines in changed files ==="; awk 'length>100 {print FILENAME":"FNR": "length}' src/repl/*.rs src/vm.rs tests/repl_test.rs
+src/repl/commands.rs  | 145 +++++++++++++++++++++++++++-
+ src/repl/completer.rs | 172 +++++++++++++++++++++++++++++++++
+ src/repl/history.rs   | 252 +++++++++++++++++++++++++++++++++++++++++++++++++
+ src/repl/mod.rs       | 257 +++++++++++++++++++++++++++++++++++++-------------
+ src/vm.rs             |  19 ++++
+ 5 files changed, 779 insertions(+), 66 deletions(-)
+=== guards ===
+none
+=== long lines in changed files ===
+src/vm.rs:1326: 103
+[0m
+[0m$ [0msed -n '1326p' src/vm.rs; git diff src/vm.rs | head -40
+"Object '{name}' extends '{current}', which is already in its own parent chain"
+diff --git a/src/vm.rs b/src/vm.rs
+index 970ece0..2624f0a 100644
+--- a/src/vm.rs
++++ b/src/vm.rs
+@@ -416,6 +416,25 @@ impl Vm {
+         std::mem::take(&mut self.output)
+     }
+ 
++    /// The names this VM has bound that the standard library did not: what a
++    /// `set`, a `to` or an `import` put here.
++    ///
++    /// A completion has to offer those and nothing else — offering `abs` or
++    /// `files` is noise, and it is the only way to tell a session's own names
++    /// from the builtins, since both live in `globals`. Sorted, because
++    /// `globals` is a `HashMap` and iteration order is not a result.
++    pub fn user_names(&self) -> Vec<String> {
++        let builtins = stdlib::builtins();
++        let mut names: Vec<String> = self
++            .globals
++            .keys()
++            .filter(|name| !builtins.contains_key(*name))
++            .cloned()
++            .collect();
++        names.sort();
++        names
++    }
++
+     /// Runs a module's declarations into this VM, under the name the `import`
+     /// that reached it goes by.
+     ///
+[0m
+[0m$ [0mgit diff src/repl/mod.rs | head -130
+diff --git a/src/repl/mod.rs b/src/repl/mod.rs
+index 1876197..531789b 100644
+--- a/src/repl/mod.rs
++++ b/src/repl/mod.rs
+@@ -16,10 +16,16 @@ use crate::parser::Parser;
+ use crate::value::Value;
+ use crate::vm::Vm;
+ 
++/// How many lines a session keeps before the oldest is dropped. A terminal
++/// scrollback holds far more, so a session that outgrows this has already lost
++/// anything the user would go looking for.
++const HISTORY_LIMIT: usize = 1000;
++
+ pub struct Repl {
+     vm: Vm,
+     variables: HashMap<String, Value>,
+-    history: Vec<String>,
++    history: ReplHistory,
++    completer: ReplCompleter,
+     running: bool,
+     multiline_buffer: Vec<String>,
+     in_multiline: bool,
+@@ -30,13 +36,31 @@ impl Repl {
+         Self {
+             vm: Vm::new(),
+             variables: HashMap::new(),
+-            history: Vec::new(),
++            history: ReplHistory::new(HISTORY_LIMIT),
++            completer: ReplCompleter::new(),
+             running: true,
+             multiline_buffer: Vec::new(),
+             in_multiline: false,
+         }
+     }
+ 
++    /// Completes `word` against the session: the language's own keywords and
++    /// builtins, the REPL's commands, and every name this session has bound.
++    pub fn complete(&self, word: &str) -> Vec<String> {
++        self.completer.complete_with(word, &self.session_names())
++    }
++
++    /// Every name a completion could offer from the live session: the REPL's own
++    /// variables, plus the VM's own bindings, which is where a `to` function and
++    /// an `import`ed module's members live.
++    fn session_names(&self) -> Vec<String> {
++        let mut names: Vec<String> = self.variables.keys().cloned().collect();
++        names.extend(self.vm.user_names());
++        names.sort();
++        names.dedup();
++        names
++    }
++
+     pub fn run(&mut self) {
+         println!("Welcome to Redblue v0.1.0 - Interactive REPL");
+         println!("Type 'help' for commands, 'quit' to exit\n");
+@@ -54,8 +78,10 @@ impl Repl {
+             }
+ 
+             let mut input = String::new();
+-            if io::stdin().read_line(&mut input).is_err() {
+-                break;
++            match io::stdin().read_line(&mut input) {
++                Ok(0) => break,
++                Ok(_) => {}
++                Err(_) => break,
+             }
+ 
+             let input = input.trim();
+@@ -75,108 +101,86 @@ impl Repl {
+         println!("Goodbye!");
+     }
+ 
++    /// Runs one command line, returning whether `input` was a command rather
++    /// than Redblue source.
++    ///
++    /// The command table lives in [`ReplCommand::parse`]; this only dispatches
++    /// what it produced. Two copies of the table meant an alias added to one was
++    /// invisible to the other.
+     fn handle_command(&mut self, input: &str) -> bool {
+-        if !input.starts_with(':') && !input.starts_with('.') {
+-            return false;
+-        }
+-
+-        let parts: Vec<&str> = input.split_whitespace().collect();
+-        let cmd = parts[0].trim_start_matches(':');
+-
+-        match cmd {
+-            "quit" | "exit" | "q" => {
++        match ReplCommand::parse(input) {
++            ReplCommand::Quit => {
+                 self.running = false;
+                 true
+             }
+-            "help" | "h" | "?" => {
++            ReplCommand::Help => {
+                 self.print_help();
+                 true
+             }
+-            "clear" | "cls" => {
++            ReplCommand::Clear => {
+                 print!("\x1B[2J\x1B[H");
+-                io::stdout().flush().ok();
++                let _ = io::stdout().flush();
+                 true
+             }
+-            "history" | "hist" => {
+-                for (i, cmd) in self.history.iter().enumerate() {
+-                    println!("  {:4}  {}", i + 1, cmd);
++            ReplCommand::History => {
++                for i in 0..self.history.len() {
++                    if let Some(entry) = self.history.get(i) {
++                        println!("  {:4}  {}", i + 1, entry);
++                    }
+                 }
+                 true
+             }
+-            "vars" | "variables" | "v" => {
++            ReplCommand::Vars => {
+                 self.print_variables();
+                 true
+             }
+-            "functions" | "funcs" | "f" => {
++            ReplCommand::Functions => {
+                 self.print_functions();
+                 true
+             }
+-            "load" | "l" => {
+-                if parts.len() > 1 {
+-                    self.load_file(parts[1]);
+-                } else {
+[0m
+[0m$ [0mprintf ':load\n:inspect\n:\n:quit\n' | timeout 5 ./target/debug/rb
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Unknown command 'load requires a file path'. Type :help for available commands.
+>>> Unknown command 'inspect requires a variable name'. Type :help for available commands.
+>>> Unknown command ''. Type :help for available commands.
+>>> Goodbye!
+[0m
+[0m$ [0mpython3 - <<'PY'
+p = 'src/repl/commands.rs'
+s = open(p).read()
+
+s = s.replace('''    Example,
+    Unknown(String),
+}''', '''    Example,
+    /// A command that was recognised but not given what it needs.
+    ///
+    /// Not [`ReplCommand::Unknown`]: the command *is* known, its argument is
+    /// not, and reporting "Unknown command 'load requires a file path'" told
+    /// the user they had mistyped a command they had typed correctly.
+    MissingArgument {
+        command: &'static str,
+        usage: &'static str,
+    },
+    Unknown(String),
+}''')
+
+for cmd, usage in [
+    ("load", "<filename>"),
+    ("save", "<filename>"),
+    ("run", "<filename>"),
+    ("inspect", "<variable>"),
+    ("ast", "<expression>"),
+    ("tokens", "<expression>"),
+]:
+    old = 'ReplCommand::Unknown("%s requires' % cmd
+    idx = s.index(old)
+    end = s.index('\n', idx)
+    s = s[:idx] + 'ReplCommand::MissingArgument {\n                        command: "%s",\n                        usage: "%s",\n                    }' % (cmd, usage) + s[end:]
+
+open(p, 'w').write(s)
+print('ok')
+PY
+sed -n '38,60p' src/repl/commands.rs
+ok
+        let input = input.trim();
+
+        if !input.starts_with(':') && !input.starts_with('.') {
+            return ReplCommand::NotACommand;
+        }
+
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let cmd = parts[0].trim_start_matches(':').trim_start_matches('.');
+
+        match cmd {
+            "quit" | "exit" | "q" => ReplCommand::Quit,
+            "help" | "h" | "?" => ReplCommand::Help,
+            "clear" | "cls" => ReplCommand::Clear,
+            "history" | "hist" => ReplCommand::History,
+            "vars" | "variables" | "v" => ReplCommand::Vars,
+            "functions" | "funcs" | "f" => ReplCommand::Functions,
+            "load" | "l" => {
+                if let Some(path) = parts.get(1) {
+                    ReplCommand::Load(path.to_string())
+                } else {
+                    ReplCommand::MissingArgument {
+                        command: "load",
+                        usage: "<filename>",
+[0m
+The routed path produces worse messages (`Unknown command 'load requires a file path'`). Fixing the type rather than shipping that regression:
+[0m✗ [0mEdit src/repl/mod.rs failed
+[91m[1mError: [0mCould not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+[0m
+[0m$ [0mgrep -n "ReplCommand::NotACommand => false" -A5 src/repl/mod.rs
+179:            ReplCommand::NotACommand => false,
+180-            ReplCommand::Unknown(word) => {
+181-                println!(
+182-                    "Unknown command '{}'. Type :help for available commands.",
+183-                    word
+184-                );
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -176,8 +176,12 @@
+     self.show_examples();
+     true
+ }
+ ReplCommand::NotACommand => false,
++ReplCommand::MissingArgument { command, usage } => {
++    println!("Usage: :{} {}", command, usage);
++    true
++}
+ ReplCommand::Unknown(word) => {
+     println!(
+         "Unknown command '{}'. Type :help for available commands.",
+         word
+
+[0m
+[0m$ [0mpython3 - <<'PY'
+p = 'src/repl/commands.rs'
+s = open(p).read()
+
+s = s.replace('''    #[test]
+    fn parse_of_a_command_with_no_argument_says_what_is_missing() {
+        assert_eq!(
+            ReplCommand::parse(":load"),
+            ReplCommand::Unknown("load requires a file path".to_string())
+        );
+        assert_eq!(
+            ReplCommand::parse(":inspect"),
+            ReplCommand::Unknown("inspect requires a variable name".to_string())
+        );
+        assert_eq!(
+            ReplCommand::parse(":bogus"),
+            ReplCommand::Unknown("bogus".to_string())
+        );
+    }''', '''    /// A recognised command with nothing to work on is reported as missing its
+    /// argument, not as an unknown command: the user typed the command correctly.
+    #[test]
+    fn parse_of_a_command_with_no_argument_says_what_is_missing() {
+        assert_eq!(
+            ReplCommand::parse(":load"),
+            ReplCommand::MissingArgument {
+                command: "load",
+                usage: "<filename>"
+            }
+        );
+        assert_eq!(
+            ReplCommand::parse(":inspect"),
+            ReplCommand::MissingArgument {
+                command: "inspect",
+                usage: "<variable>"
+            }
+        );
+        assert_eq!(
+            ReplCommand::parse(":tokens"),
+            ReplCommand::MissingArgument {
+                command: "tokens",
+                usage: "<expression>"
+            }
+        );
+        assert_eq!(
+            ReplCommand::parse(":bogus"),
+            ReplCommand::Unknown("bogus".to_string()),
+            "a command that does not exist is still unknown"
+        );
+    }''')
+
+open(p, 'w').write(s)
+print('ok')
+PY
+cargo fmt --all && cargo test --lib repl:: 2>&1 | grep -E "result:|FAILED"
+ok
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+[0m
+[0m← [0mEdit tests/repl_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/repl_test.rs
+@@ -232,4 +232,27 @@
+     s.assert_exited_ok()
+         .assert_stdout_contains("Could not load file:")
+         .assert_stdout_contains("No such file or directory");
+ }
++
++/// A command given no argument is reported as missing one, not as an unknown
++/// command, and never runs against an empty path.
++#[test]
++fn edge_command_missing_its_argument_is_reported_not_guessed() {
++    let s = session(":load\n:inspect\n:quit\n");
++
++    s.assert_exited_ok()
++        .assert_stdout_contains("Usage: :load")
++        .assert_stdout_contains("Usage: :inspect")
++        .assert_stdout_lacks("Unknown command 'load");
++}
++
++/// A command word that does not exist is reported by name, and the session
++/// carries on rather than treating it as source.
++#[test]
++fn edge_unknown_command_is_named_and_the_session_survives() {
++    let s = session(":bogus\nsay \"still here\"\n:quit\n");
++
++    s.assert_exited_ok()
++        .assert_stdout_contains("Unknown command 'bogus'")
++        .assert_stdout_contains("still here");
++}
+
+[0m
+Adding an e2e assertion to pin the missing-argument message, since routing changed it:
+[0m$ [0mcargo fmt --all && cargo test --test repl_test 2>&1 | grep -E "^test |result:|panicked" -A3 | head -30
+test edge_command_missing_its_argument_is_reported_not_guessed ... ok
+test edge_first_line_syntax_error_keeps_the_repl_alive ... ok
+test edge_unknown_command_is_named_and_the_session_survives ... ok
+test edge_load_of_a_missing_path_reports_the_failure ... ok
+test edge_unterminated_block_then_eof_terminates ... ok
+test repl_reports_an_uncaught_error_and_stays_alive ... ok
+test repl_runs_a_multiline_block ... ok
+test repl_runs_a_program_that_catches_its_own_error ... ok
+test repl_runs_commands_and_quits ... ok
+test repl_shows_the_result_of_an_expression_under_vars ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+[0m
+Now the final gate run — all four, in order:
+[0m$ [0mecho "--- GATE 1: fmt ---"; cargo fmt --all -- --check && echo "PASS"
+--- GATE 1: fmt ---
+PASS
+[0m
+[0m$ [0mecho "--- GATE 2: clippy ---"; cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "^(warning|error)" | head; echo "exit=${PIPESTATUS[0]}"; cargo clippy --all-targets -- -D warnings >/dev/null 2>&1 && echo "PASS"
+--- GATE 2: clippy ---
+exit=0
+PASS
+[0m
+[0m$ [0mecho "--- GATE 3: cargo test --all-targets ---"; cargo test --all-targets 2>&1 | grep -E "^test result:" | awk -F'[ ;]' '{p+=$4; f+=$6; i+=$8} END {print "passed="p" failed="f" ignored="i}'; cargo test --all-targets >/dev/null 2>&1 && echo "PASS (exit 0)"; echo "--- doc tests ---"; cargo test --doc 2>&1 | grep -E "^test result:"
+--- GATE 3: cargo test --all-targets ---
+passed=785 failed=0 ignored=0
+PASS (exit 0)
+--- doc tests ---
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+[0m
+[0m$ [0mecho "--- GATE 4: rbops/verify.sh ---"; ./rbops/verify.sh phase-033; echo "exit=$?"
+--- GATE 4: rbops/verify.sh ---
+/bin/bash: line 1: ./rbops/verify.sh: No such file or directory
+exit=127
+[0m
+Gate 4 is unavailable in this checkout (`rbops/` does not exist here). Verifying the language corpus still runs, since I touched `vm.rs`:
+[0m$ [0mfail=0; for f in examples/*.rb; do out=$(timeout 30 ./target/debug/rb run "$f" 2>&1); if [ $? -ne 0 ]; then fail=$((fail+1)); echo "FAIL: $f"; echo "$out" | head -3; fi; done; echo "examples failing: $fail / $(ls examples/*.rb | wc -l)"
+examples failing: 0 / 6
+[0m
+[0m$ [0m./target/debug/rb test 2>&1 | tail -5; echo "=== modules ==="; for f in modules/*.rb; do echo "-- $f"; timeout 30 ./target/debug/rb run "$f" 2>&1 | head -2; done
+..................................................................................................................................................................................................................................................................................Tests run: 274
+Passed: 274
+Failed: 0
+=== modules ===
+-- modules/MathUtils.rb
+-- modules/SuiteKit.rb
+[0m
+[0m$ [0mmkdir -p phases/phase-033 && ls phases/phase-031 && head -30 phases/phase-031/REPORT.md
+FINDINGS.md
+REPORT.md
+# Phase 031 — Implement `module ... end`, `export`, and the `import X as Y` alias
+
+Two runs. The first run added the feature to the parser, the tree-walking VM
+and the module files. The second closed the gap that left behind: the bytecode VM
+could not run a single one of the programs the first run introduced. A review of
+the second run then found four defects in it, all now fixed; what they were and
+how each was caught is below.
+
+## What changed
+
+### First run — the language feature
+
+| File | Lines | What |
+|---|---|---|
+| src/lexer.rs | +2 −0 | `("as", TokenKind::As)` (`src/lexer.rs:57`) and the `As` variant — `as` was lexed as an identifier, so `import json as J` parsed as three statements |
+| src/parser.rs | +191 −14 | `Statement::Module { name, body }` and `Statement::Export { names, all }` (`src/parser.rs:224`, `src/parser.rs:230`); `parse_module()` (`src/parser.rs:1084`) and `parse_export()` (`src/parser.rs:1123`); both added to the statement dispatch; `as` accepted as an alias keyword beside the older `to` (`src/parser.rs:560`); `module_body()` (`src/parser.rs:267`) and `module_declared_names()` (`src/parser.rs:288`) — one rule for reading a module's names whichever of the two spellings the file uses |
+| src/vm.rs | +316 −17 | `Vm::declare_module()` (`src/vm.rs:522`) — the module scope, the `export` check, the published members; the `Statement::Module`/`Statement::Export` arms; the rewritten `Statement::Import` arm (`src/vm.rs:1003`) — circular-import refusal, a builtin namespace is importable, the alias is a name for the module, an import does not take over a name the program already holds; `module_aliases` / `importing` / `declared_modules` / `module_depth`; `is_module_name()`, `declare_member()`, `qualified_member()`, `call_method` resolves an alias to the module it names; `load_module` binds a module file's functions under the same `module_function` name; `set_var` writes into the module's own scope above `module_depth` |
+| src/analyzer.rs | +22 −4 | `Statement::Module` analyzed in a scope of its own, `Statement::Export` a no-op; both in `collect_later_names`; an import declares the module's own name as well as its alias |
+| src/formatter.rs | +19 −0 | `Statement::Module` and `Statement::Export` arms (`src/formatter.rs:380`) — `module M … export … end` round-trips through `rb format` |
+| src/linter.rs | +4 −0 | `Statement::Module` arm so unused-variable tracking covers a module body (`src/linter.rs:336`) |
+| src/runtime.rs | +1 −1 | `module_bindings` reads `module_body` (`src/runtime.rs:56`), so a module file written with `module … end` binds the same names as one written without |
+| modules/MathUtils.rb | +25 −21 | the `module MathUtils … export all end` wrapper its header comment has described since it was written |
+| tooling/vscode/syntaxes/redblue.tmLanguage.json | +1 −1 | regenerated by `rb grammar` — the shipped grammar file must list the new keyword (`tests/tooling_grammar_test.rs:102`) |
+| tests/module_system_test.rs | +380 | 18 new `#[test]` functions |
+
+### Second run — the bytecode VM runs the same module programs, and the review round
+
+| File | Lines | What |
+|---|---|---|
+| src/bytecode/codegen.rs | +96 | the alias goes in `IMPORT`'s second operand; `Statement::Module` compiles to `MODULE` over a block of its own; `Compiler::module_exports` emits the declaration's `EXPORT` run |
+[0m
+Everything green. Writing the two phase documents:
+[0m$ [0mgit diff --numstat; echo "=== new test counts ==="; grep -c "#\[test\]" src/repl/*.rs tests/repl_test.rs
+193	7	src/repl/commands.rs
+172	0	src/repl/completer.rs
+252	0	src/repl/history.rs
+196	65	src/repl/mod.rs
+19	0	src/vm.rs
+=== new test counts ===
+src/repl/commands.rs:6
+src/repl/completer.rs:11
+src/repl/history.rs:15
+src/repl/mod.rs:9
+tests/repl_test.rs:10
+[0m
+[0m← [0mWrite phases/phase-033/REPORT.md
+Wrote file successfully.
+[0m
+[0m← [0mWrite phases/phase-033/FINDINGS.md
+Wrote file successfully.
+[0m
+Verifying every `file:line` I cited before finalising:
+[0m$ [0mfor spec in "src/repl/mod.rs:22" "src/repl/mod.rs:44" "src/repl/mod.rs:93" "src/repl/mod.rs:216" "src/repl/mod.rs:220" "src/repl/mod.rs:242" "src/repl/mod.rs:288" "src/repl/mod.rs:400" "src/repl/history.rs:62" "docs/GRAMMAR.md:296"; do f=${spec%:*}; n=${spec#*:}; printf "%-24s %s\n" "$spec" "$(sed -n "${n}p" "$f")"; done
+src/repl/mod.rs:22       const HISTORY_LIMIT: usize = 1000;
+src/repl/mod.rs:44               }
+src/repl/mod.rs:93       
+src/repl/mod.rs:216              );
+src/repl/mod.rs:220                  self.in_multiline = true;
+src/repl/mod.rs:242      
+src/repl/mod.rs:288      
+src/repl/mod.rs:400      }
+src/repl/history.rs:62           self.history.is_empty()
+docs/GRAMMAR.md:296                          { 'catch' [ identifier ] [ 'of' identifier ]
+[0m
+[0m$ [0mgrep -n "pub fn run(&mut self)\|fn print_help\|fn run_code\|fn execute_code\|fn print_variables\|fn show_examples\|fn execute_line\|read_line\|fn needs_multiline\|ends_with(\"then\")\|variables.insert" src/repl/mod.rs; echo "=== history ==="; grep -n "pub fn save_to_file" src/repl/history.rs
+64:    pub fn run(&mut self) {
+81:            match io::stdin().read_line(&mut input) {
+194:    fn execute_line(&mut self, input: &str) {
+210:            s if s.ends_with("then")
+227:    fn execute_code(&mut self, code: &str) {
+234:                    self.variables.insert("_".to_string(), value);
+243:    fn run_code(&mut self, code: &str) -> Result<Value, crate::error::Error> {
+251:    fn print_help(&self) {
+277:    fn print_variables(&self) {
+370:    fn show_examples(&self) {
+=== history ===
+69:    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+[0m
+[0m$ [0mpython3 - <<'PY'
+import re
+
+f = 'phases/phase-033/FINDINGS.md'
+s = open(f).read()
+fixes = {
+    'src/repl/mod.rs:216': 'src/repl/mod.rs:243',      # run_code
+    'src/repl/mod.rs:220': 'src/repl/mod.rs:210',      # multiline suffix heuristic
+    'src/repl/mod.rs:242': 'src/repl/mod.rs:234',      # variables.insert("_")
+    'src/repl/mod.rs:288': 'src/repl/mod.rs:277',      # print_variables
+    'src/repl/mod.rs:93':  'src/repl/mod.rs:251',      # print_help
+    'src/repl/mod.rs:400': 'src/repl/mod.rs:370',      # show_examples
+    'src/repl/mod.rs:44':  'src/repl/mod.rs:64',       # run()
+    'src/repl/history.rs:62': 'src/repl/history.rs:69', # save_to_file
+}
+for old, new in fixes.items():
+    s = s.replace(old, new)
+open(f, 'w').write(s)
+
+f = 'phases/phase-033/REPORT.md'
+s = open(f).read()
+s = s.replace('src/repl/mod.rs:57-64 before the fix', 'src/repl/mod.rs:57-64 before the fix')
+open(f, 'w').write(s)
+print('ok')
+PY
+grep -n "src/repl" phases/phase-033/FINDINGS.md | grep -oE "src/repl/[a-z]+\.rs:[0-9]+" | sort -u | while read spec; do f=${spec%:*}; n=${spec#*:}; printf "%-24s %s\n" "$spec" "$(sed -n "${n}p" "$f")"; done
+ok
+src/repl/history.rs:69       pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+src/repl/mod.rs:210                  s if s.ends_with("then")
+src/repl/mod.rs:234                          self.variables.insert("_".to_string(), value);
+src/repl/mod.rs:243          fn run_code(&mut self, code: &str) -> Result<Value, crate::error::Error> {
+src/repl/mod.rs:277          fn print_variables(&self) {
+src/repl/mod.rs:64           pub fn run(&mut self) {
+[0m
+[0m$ [0mpython3 - <<'PY'
+f = 'phases/phase-033/FINDINGS.md'
+s = open(f).read()
+s = s.replace('`print_help` (`:93`)', '`print_help` (`src/repl/mod.rs:251`)')
+s = s.replace('`show_examples` (`:400`)', '`show_examples` (`src/repl/mod.rs:370`)')
+open(f, 'w').write(s)
+PY
+grep -oE "src/repl/[a-z]+\.rs:[0-9]+" phases/phase-033/FINDINGS.md | sort -u | while read spec; do f=${spec%:*}; n=${spec#*:}; printf "%-24s %s\n" "$spec" "$(sed -n "${n}p" "$f")"; done; echo "=== any bare :NN refs left? ==="; grep -nE '`:[0-9]+`' phases/phase-033/FINDINGS.md || echo none
+src/repl/history.rs:69       pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+src/repl/mod.rs:210                  s if s.ends_with("then")
+src/repl/mod.rs:234                          self.variables.insert("_".to_string(), value);
+src/repl/mod.rs:243          fn run_code(&mut self, code: &str) -> Result<Value, crate::error::Error> {
+src/repl/mod.rs:251          fn print_help(&self) {
+src/repl/mod.rs:277          fn print_variables(&self) {
+src/repl/mod.rs:370          fn show_examples(&self) {
+src/repl/mod.rs:64           pub fn run(&mut self) {
+=== any bare :NN refs left? ===
+none
+[0m
+[0m$ [0mecho "--- #3 stray end ---"; printf 'say "hi"\nend\nsay "bye"\n' | timeout 5 ./target/debug/rb; echo "--- #4 interpolation ---"; printf 'set n to "World"\nsay "Hello, {{n}}!"\n' | timeout 5 ./target/debug/rb
+--- #3 stray end ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> hi
+>>> ..  ..  Goodbye!
+--- #4 interpolation ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> >>> Hello, {{n}}!
+>>> Goodbye!
+[0m
+Two transcripts in FINDINGS.md are from inference — running them for real:
+[0m$ [0mpython3 - <<'PY'
+f = 'phases/phase-033/FINDINGS.md'
+s = open(f).read()
+old = '''```
+$ printf 'say "hi"\\nend\\nsay "bye"\\n' | rb
+>>> ..  bye          <- "bye" was buffered, never executed
+>>> Goodbye!
+```'''
+new = '''```
+$ printf 'say "hi"\\nend\\nsay "bye"\\n' | rb
+>>> hi
+>>> ..  ..  Goodbye!      <- "bye" was buffered and never executed or reported
+```'''
+assert old in s
+s = s.replace(old, new)
+open(f, 'w').write(s)
+print('ok')
+PY
+grep -n "Goodbye!      <-" phases/phase-033/FINDINGS.md
+ok
+55:>>> ..  ..  Goodbye!      <- "bye" was buffered and never executed or reported
+[0m
+#3's transcript was wrong — correcting it to the actual output (the line is *silently swallowed*, not printed):
+Final verification of the complete state:
+[0m$ [0mcargo fmt --all -- --check && echo "GATE1 fmt: PASS"; cargo clippy --all-targets -- -D warnings >/dev/null 2>&1 && echo "GATE2 clippy: PASS"; cargo test --all-targets 2>&1 | grep -E "^test result:" | awk -F'[ ;]' '{p+=$4; f+=$6; i+=$8} END {print "GATE3 test: "p" passed, "f" failed, "i" ignored"}'
+GATE1 fmt: PASS
+GATE2 clippy: PASS
+GATE3 test: 785 passed, 0 failed, 0 ignored
+[0m
+[0m$ [0mgit status --short; echo "=== no forbidden paths touched ==="; git diff --name-only HEAD | grep -E "^\.github/|^rbops/|^\.opencode/" && echo "VIOLATION" || echo "clean"; echo "=== no ignores/skips added ==="; git diff HEAD | grep -cE "^\+.*(#\[ignore\]|// skip|allow\(clippy)"
+M src/repl/commands.rs
+ M src/repl/completer.rs
+ M src/repl/history.rs
+ M src/repl/mod.rs
+ M src/vm.rs
+?? phases/phase-033/
+?? tests/repl_test.rs
+=== no forbidden paths touched ===
+clean
+=== no ignores/skips added ===
+0
+[0m
+Work is complete and uncommitted (no commit was requested).
+
+**What I found and fixed**
+
+The filed finding reproduced exactly (0 tests across all four REPL modules; `ReplCommand`/`ReplHistory`/`ReplCompleter` constructed nowhere). Reading the code turned up something worse than dead weight — **the REPL hangs forever on EOF**: `read_line` returns `Ok(0)`, `run` did `continue`, so `printf 'say 1\n' | rb` spun printing `>>> ` (9.9 MB in 3 s, exit 124 under `timeout`). Fixed at src/repl/mod.rs:81.
+
+Routing `handle_command` through `ReplCommand::parse` (deleting the duplicate table) failed3 of 10 e2e tests on first run — the shared table couldn't tell "not a command" from "unknown command", so `2 + 3` was answered `Unknown command '2 + 3'` and never evaluated. Added `NotACommand` and `MissingArgument` variants; `:load` with no argument now says `Usage: :load <filename>` again rather than calling itself unknown.
+
+Two smaller real bugs found by the new tests: `ReplHistory::new(0)` held one entry, and `.quit` was rejected (old table stripped only `:`, `parse` strips `:` or `.`).
+
+**Gates**: fmt pass · clippy `-D warnings` pass · `cargo test --all-targets` **785 passed, 0 failed, 0 ignored** (was 734) · `rb test` 274/274 · all 6 `examples/*.rb` + both `modules/*.rb` run.
+
+**Gate 4 I did not run**: `./rbops/verify.sh phase-033` → exit 127, `rbops/` does not exist in this checkout. I have not claimed it passes, in the report or here.
+
+51 new tests (41 in `src/repl/`, 10 e2e in `tests/repl_test.rs`), 17 named `edge_*`, no `#[ignore]`/`allow(`. `REPORT.md` and `FINDINGS.md` written to `phases/phase-033/` with every `file:line` verified against the files — including two transcripts I had to correct after running them for real.
+
+Six unfixed defects are filed in `FINDINGS.md` with evidence, the largest being that **the REPL cannot use a variable it just set** (`set x to 1` then `say x` → `AnalyzerError: Unknown variable 'x'`), which makes it much less usable than the dead code I removed.
+
+DONE

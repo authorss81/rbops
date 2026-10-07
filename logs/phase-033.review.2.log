@@ -1,0 +1,28 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-2 adversarial review — hunting what's still broken behind the green gate.
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/repl/history.rs
+[0m→ [0mRead src/repl/completer.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/repl/mod.rs
+First pass done — now digging into the continuation detector, history persistence and end-to-end coverage.
+[0m→ [0mRead tests/repl_test.rs
+[0m→ [0mRead src/parser.rs
+[0m✱ [0mGrep "open_block_depth"[90m 12 matches[0m
+[0m→ [0mRead src/parser.rs[90m [offset=1970, limit=220][0m
+[0m✱ [0mGrep "load_from_file|save_to_file|save_session|load_file|run_file"[90m 43 matches[0m
+FINDINGS:
+1. [BLOCKER] src/repl/mod.rs:274 — `run_code` lexes/parses/analyzes each line in isolation with an empty analyzer scope, so `set x to 1` then `say x` fails with `AnalyzerError: Unknown variable 'x'` — the REPL cannot carry state across lines, which is the thing a REPL is for, while all 10 e2e tests avoid a cross-line variable read and stay green — seed the analyzer from the session bindings (`Vm::user_names`/`globals`) instead of starting empty per line.
+2. [MAJOR] src/repl/mod.rs:342 — `print_functions` is a stub that prints static text and never lists functions, and `tests/repl_test.rs:143` pins the stub text (`User-defined functions are stored in the VM`) so the test cannot fail while the feature is missing — enumerate `vm.user_names` function values instead of printing a placeholder.
+3. [MAJOR] src/repl/mod.rs:392 — `inspect_value` looks only in `self.variables` (which holds at most `_`), never in the VM where `set`/`to`/`import` actually bind, so `:inspect <session-name>` always reports `not found` — look up `vm.get_var`/session names before reporting absence.
+4. [MAJOR] src/repl/commands.rs:44 — `argument` does `split_whitespace` + `join(" ")`, collapsing significant whitespace: `:ast say "a   b"` becomes `say "a b"` and a path with consecutive spaces resolves to the wrong file — slice the remainder from the original input after the command word instead of re-joining tokens.
+5. [MAJOR] src/repl/mod.rs:373 — `:save` writes command history (including `:help`/`:vars` lines) via `ReplHistory::save_to_file`, but `:load` runs its file via `execute_code` as Redblue source and no REPL path ever calls `load_from_file`, so a saved session cannot be loaded and the save/load round-trip is only tested in unit tests, never through the REPL — add a history-restore path or make `:save` write replayable source.
+6. [MAJOR] src/repl/completer.rs:100 — the completer ships its own 16-entry canonical command list while `ReplCommand::parse` accepts ~30 aliases (`:q`, `:h`, `:?`, `:hist`, `:v`, `:f`, `:l`, `:s`, `:i`, `:examples` missing), recreating the two-table divergence this phase claimed to delete — derive completion candidates from the parse table instead of a second hand list.
+7. [MAJOR] src/repl/mod.rs:444 — `show_examples` (and `print_help`) promise `say "Hello, {{name}}!"` interpolation that the `say` path does not perform (admitted in FINDINGS #4), so help makes a language promise the interpreter breaks — remove the promise or implement interpolation on the `say` path.
+8. [MAJOR] src/repl/mod.rs:224 — `multiline_buffer` grows without any line/byte cap while `needs_continuation` stays true, so a piped unclosed block buffers until OOM and `report_unclosed_block` then prints it all unbounded — enforce a buffer limit and report `incomplete block` once exceeded.
+9. [MINOR] src/repl/history.rs:69 — `save_to_file`/`load_from_file` take `&str` instead of `impl AsRef<Path>`, so non-UTF-8 paths cannot be saved/loaded and callers must lossily convert — widen the parameter to `impl AsRef<Path>`.
+10. [STYLE] src/repl/completer.rs:25 — `keywords` contains `"to"` twice (lines 12 and 25), hidden only by downstream `dedup` — remove the duplicate entry.
+REVIEW VERDICT: FINDINGS 10

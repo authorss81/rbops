@@ -1,0 +1,35 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-3 audit — hunting the remaining gaps behind the green gate.
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/repl/completer.rs
+[0m→ [0mRead src/repl/history.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/repl/mod.rs
+First pass done — now digging into the analyzer, parser, and remaining VM surface.
+[0m→ [0mRead src/analyzer.rs
+[0m→ [0mRead tests/repl_test.rs
+[0m→ [0mRead src/parser.rs
+[0m→ [0mRead src/vm.rs[90m [offset=1228][0m
+Core REPL and language internals mapped — now checking block detection and remaining edge cases.
+[0m✱ [0mGrep "open_block_depth"[90m in src · 10 matches[0m
+[0m→ [0mRead src/parser.rs[90m [offset=1980][0m
+[0m✱ [0mGrep "analyze\(|analyze_with|is_module|builtins\(\)"[90m in src · 34 matches[0m
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/stdlib.rs
+Suspicious patterns emerging in the REPL helpers — now verifying panic paths and output handling.
+[0m✱ [0mGrep "unwrap|expect\(|panic!|unreachable!|todo!|unimplemented!|\[.*\]"[90m in src/repl · 100 matches[0m
+[0m✱ [0mGrep "\.unwrap\(\)|\.expect\(|panic!|unreachable!|todo!|unimplemented!"[90m in src/repl · 16 matches[0m
+[0m✱ [0mGrep "\.unwrap\(\)"[90m in src · 12 matches[0m
+[0m✱ [0mGrep "type_name|Type:|fn.*type"[90m in src · 10 matches[0m
+[0m→ [0mRead src/value.rs[90m [offset=255, limit=30][0m
+FINDINGS:
+1. [BLOCKER] src/parser.rs:425 — `Parser::opens_block` omits `Module` while `opens_block_at_statement_start` (src/parser.rs:2007) counts it, so nested `module` declarations never increment `block_depth` toward `MAX_BLOCK_DEPTH` — a file of deeply nested `module A` blocks recurses via `parse_module`/`parse_statement` with no bound and overflows the stack (abort) instead of the spanned `Blocks nest more than 64 levels deep` error — add `TokenKind::Module` to `opens_block` so both counters agree.
+2. [MAJOR] src/vm.rs:438 — `Vm::user_names` returns every non-builtin global including the mangled `qualified_member` entries (`Module_member`) inserted at src/vm.rs:547 and src/vm.rs:650, so after an `import` `:vars`, `:funcs`, completion and the analyzer seed offer `MathUtils_circle_area` as a session name — filter out names built by `qualified_member` (or only return names bound by `bind_module_name`/`set_var`/`declare`) before sorting.
+3. [MAJOR] src/repl/mod.rs:238 — `:reset` replaces `vm` and clears `variables` but leaves `multiline_buffer`/`in_multiline` intact, so `repeat 3 times` then `:reset` then `say "hi"` appends to the stale block and never runs — clear `multiline_buffer` and set `in_multiline=false` in the `Reset` arm (no test covers reset inside continuation mode).
+4. [MAJOR] src/repl/mod.rs:583 — `:restore` only replaces `history` (history lines), never re-executes them into `vm`/`variables`, so `set x to 1` + `:save` + fresh session + `:restore` still reports `Unknown variable 'x'` despite `Restored N line(s)` and the test `save_and_restore_round_trip_the_session_through_the_repl` (src/repl/mod.rs:1253) asserting history alone — re-run restored lines through `execute_code`/`run_code` or document that restore is history-only and rename the test.
+5. [MAJOR] src/repl/mod.rs:617 — `:inspect` prints `Type: {:?}", type_name_of_val(value)` which is the Rust type (`redblue::value::Value`) for every value instead of the Redblue type — use `value.type_name()` (src/value.rs:263, the name `type_of` reports) so `counter: 7` is followed by `number`, not identical text for number/text/list/function.
+6. [MINOR] src/repl/commands.rs:250 — `word.trim_start_matches([':', '.'])` strips all leading sigils, so `...quit`, `::load x`, `..vars` parse as real commands, while `ReplCommand::names` (src/repl/commands.rs:170) only advertises `:` forms so `.quit` works but is never completed or helped — strip exactly one sigil and either offer `.` aliases in `names`/`help_lines` or reject `.`.
+REVIEW VERDICT: FINDINGS 6
