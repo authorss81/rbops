@@ -2,35 +2,37 @@
 [0m
 > build · muse-spark-1.3-contributor-free
 [0m
-Hunting for what's still broken — reading the phase-020 diff and source.
-[0m→ [0mRead tests/differential_test.rs
-[0m→ [0mRead src/bytecode/codegen.rs
+Round-1 review of phase-020 — hunting the diff for what's still broken.
 [0m→ [0mRead phases/phase-020/FINDINGS.md
 [0m→ [0mRead src/bytecode/vm.rs
-First pass done — now digging into the test harness and remaining VM code for hidden flaws.
-[0m→ [0mRead tests/common/corpus.rs
-[0m→ [0mRead tests/common/shrink.rs
+[0m→ [0mRead tests/differential_test.rs
+[0m→ [0mRead src/bytecode/codegen.rs
+First pass shows the harness shape — now digging into the failure paths and panic sites.
 [0m→ [0mRead tests/common/vm.rs
-[0m→ [0mRead tests/common/rng.rs
+[0m→ [0mRead tests/common/corpus.rs
 [0m→ [0mRead tests/common/generator.rs
-[0m→ [0mRead corpus/value-tails-0001.rb
-[0m→ [0mRead corpus/value-tails-0001.expected
-[0m→ [0mRead tests/common/mod.rs
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1300][0m
-[0m→ [0mRead corpus/loop-forms-0017.rb
-[0m→ [0mRead corpus/loop-forms-0017.expected
-[0m→ [0mRead corpus/control-flow-0003.expected
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1273][0m
+[0m→ [0mRead corpus/control-flow-0001.rb
 [0m→ [0mRead corpus/control-flow-0003.rb
-[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|as usize|as u32|as i64|\[.*\]"[90m in tests/common · 100 matches[0m
-Spotted a few suspicious patterns — verifying them against the parser and remaining sources.
-[0m✱ [0mGrep "Object|pending_object|nested"[90m in src · 79 matches[0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=884, limit=60][0m
-[0m→ [0mRead src/vm.rs[90m [offset=700, limit=350][0m
+[0m→ [0mRead corpus/control-flow-0003.expected
+[0m→ [0mRead tests/common/rng.rs
+[0m→ [0mRead tests/common/shrink.rs
+Spotted a few weak spots in the comparison logic — now verifying the remaining edge cases.
+[0m→ [0mRead src/value.rs
+[0m→ [0mRead corpus/value-tails-0020.expected
+[0m→ [0mRead corpus/value-tails-0020.rb
+[0m→ [0mRead tests/common/mod.rs
+[0m→ [0mRead corpus/loop-forms-0012.rb
+[0m→ [0mRead corpus/loop-forms-0012.expected
+[0m→ [0mRead src/vm.rs[90m [offset=1330, limit=60][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1262, limit=20][0m
 FINDINGS:
-1. [BLOCKER] src/bytecode/vm.rs:941 — nested `object` panics on `.take().expect("an object declaration being assembled")` — the tree-walking VM explicitly supports a nested `object` in the body (src/vm.rs:1041 runs `rest` after registration so it may extend the enclosing type), but the bytecode VM keeps a single `pending_object: Option` overwritten at def_object (src/bytecode/vm.rs:1776), so the inner unwind takes the inner pending to None and the outer unwind panics instead of erroring — keep a stack of pendings or reject nesting with a clean Error.
-2. [MAJOR] tests/common/vm.rs:84 — `tree_walk_verbose` discards the Ok value with `result.err()` and `tree_walk` (tests/common/vm.rs:111) re-lexes, re-parses and re-runs the whole program to recover it — every corpus/generated comparison executes impure programs twice (double `say`/file/time side effects, double cost) and the recovery path uses `.expect()` panics instead of Errors — return the value from the first pipeline instead of re-running it.
-3. [MAJOR] tests/common/generator.rs:327 — `loop_forms` emits `"set xs = []\n"`, checked in as corpus/loop-forms-0017.rb with `#label LexerError` — a family that claims to pin loop forms holds a malformed program, inflating the loop count while testing no loop — replace it with a real loop form or move it to `malformed`.
-4. [MINOR] tests/common/corpus.rs:68 — `corpus()` uses `.filter_map(|entry| entry.ok())`, silently dropping unreadable directory entries — a shrinking/corrupt corpus entry is hidden instead of reported — propagate the IO error or panic naming the directory.
-5. [MINOR] tests/common/generator.rs:581 — doc comment says "The five failures" but `FAULTS` holds six entries — count drift between docs and the list the coverage assertion pins — change the comment to six.
-6. [STYLE] src/bytecode/codegen.rs:155 — the `is_last` doc sentence is duplicated verbatim across lines 152-157 — copy-paste that confuses the value-bearing contract — delete one copy.
-REVIEW VERDICT: FINDINGS 6
+1. [BLOCKER] tests/differential_test.rs:209 — `let fresh = corpus::corpus().len()` compared against `checked_in.len()` from the same `corpus()` call, so the assertion is tautological — a vacuous gate that cannot fail — compare `sources.len()` against the on-disk count instead
+2. [BLOCKER] src/bytecode/vm.rs:1026 — `.expect("an object declaration being assembled")` panics when `pending_object` is `None`, reachable from Redblue source because `def_object` keeps a single slot (src/bytecode/vm.rs:1893 overwrites it) and a `has default <expr>` compiles any expression (src/bytecode/codegen.rs:353), so a default that calls a function declaring an object clobbers the outer pending and the outer unwind panics — keep a stack of pendings and return a clean error on underflow
+3. [MAJOR] tests/common/vm.rs:328 — `same_place` ignores columns for every `RuntimeError`, so the differential gate is widened to line-only for 43 corpus failures — a column regression on either VM is invisible — compare full positions or record the format limit per-failure instead of blanket-ignoring
+4. [MAJOR] tests/differential_test.rs:317 — `edge_a_generated_program_only_faults_on_a_fault_that_was_injected` runs only `vm::tree_walk`, never `vm::bytecode`, so the typed-grammar invariant is unproven on the second engine — run and assert both engines per seed
+5. [MAJOR] tests/common/vm.rs:546 — `edge_a_vm_built_as_a_library_does_not_print_what_the_program_said` builds `loud` with default echo-on and only asserts `take_output`, never capturing stdout, so a broken `set_echo(false)` still passes — assert silence via output capture on the echo-off path
+6. [MAJOR] corpus/control-flow-0003.rb:3 — all three `else if` programs record `#label ParserError` (corpus/control-flow-0003.expected:1), and the generator only draws bare `if` (tests/common/generator.rs:440), so zero successful `else if` programs exist despite the claimed `if/else if/else` coverage — add a working `else if` success case or correct the coverage claim
+7. [MINOR] tests/differential_test.rs:202 — `RB_WRITE_CORPUS=1` rewrites the checked-in `corpus/` dir inside the test while other tests read it, so a regression is laundered into goldens and parallel runs race — write only to scratch and fail on diff, never mutate `corpus_dir()` in-test
+8. [MINOR] src/bytecode/vm.rs:1602 — `break_loop`/`skip_loop` only advance, and corpus/loop-forms-0012.expected:4 enshrines the no-op as success, baking the bug into goldens so a real fix breaks the corpus — mark these as known-failure expectations, not completions
+REVIEW VERDICT: FINDINGS 8
