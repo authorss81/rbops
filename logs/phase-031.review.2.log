@@ -1,0 +1,47 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting round-2 regressions — auditing the module-system diff line by line.
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=100][0m
+The committed diff came up empty — I'll read the working tree directly to find the real changes.
+[0m→ [0mRead src/bytecode/format.rs
+[0m→ [0mRead src/bytecode/opcode.rs
+[0m→ [0mRead src/bytecode/disasm.rs
+[0m→ [0mRead src/bytecode/codegen.rs
+[0m✱ [0mGrep "takes_constant_index|takes_block_index|has_aux|has_operand"[90m 16 matches[0m
+[0m→ [0mRead src/parser.rs[90m [limit=350][0m
+[0m→ [0mRead src/vm.rs[90m [limit=80][0m
+[0m✱ [0mGrep "module_aliases|declared_modules|module_depth|fn import|fn compile_module|MODULE|EXPORT|module_exports|is_module_name"[90m 100 matches[0m
+I spotted a few encoding irregularities — now digging into the module execution paths.
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=400, offset=800][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=500, offset=1200][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=600, offset=1700][0m
+[0m→ [0mRead tests/test_modules.rb
+[0m→ [0mRead tests/bytecode_test.rs[90m [limit=150, offset=860][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=150, offset=2299][0m
+[0m→ [0mRead src/vm.rs[90m [limit=400, offset=200][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=200, offset=260][0m
+[0m→ [0mRead src/vm.rs[90m [limit=400, offset=600][0m
+[0m→ [0mRead src/vm.rs[90m [limit=300, offset=1000][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [limit=200, offset=1][0m
+The core module paths check out — now probing file imports and declaration edge cases.
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=100, offset=460][0m
+[0m✱ [0mGrep "fn child_path|fn block_of|fn instruction_at|fn code_len|fn get_var|fn frame_for|unwrap\(\)|expect\(|panic!|unreachable!|todo!|\[.*\]"[90m 100 matches[0m
+[0m✱ [0mGrep "fn (child_path|block_of|instruction_at|code_len|get_var|frame_for|constant_of|object_name)"[90m in src/bytecode/vm.rs · 8 matches[0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=200, offset=618][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=260, offset=560][0m
+I've mapped the main execution flows — now cross-checking the phase's claims against the actual code.
+[0m→ [0mRead phases/phase-031/REPORT.md[90m [limit=80][0m
+[0m→ [0mRead phases/phase-031/FINDINGS.md[90m [limit=80][0m
+[0m→ [0mRead src/formatter.rs[90m [limit=80, offset=370][0m
+[0m→ [0mRead src/parser.rs[90m [limit=80, offset=540][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [limit=250, offset=2300][0m
+[0m✱ [0mGrep "edge_a_version_3_file_is_refused_before|a_module_declaration_publishes_what|edge_a_module_with_nothing|edge_an_export_of_a_name"[90m in tests · 4 matches[0m
+FINDINGS:
+1. [MAJOR] src/bytecode/vm.rs:2190 — `import` trailing `STORE` binds the alias via `bind`/`set_var`, which inside `module_depth > 0` lands in the module's own scope (src/bytecode/vm.rs:810), while the tree-walker binds the same name via `bind_module_name` into `globals` (src/vm.rs:719) — an `import json as J` inside `module M … end` is lost when the module scope pops on one VM and persists on the other — concrete fix: bind the alias through the globals path when handling `IMPORT`/`STORE`, not through `set_var`.
+2. [MAJOR] src/bytecode/vm.rs:832 — `declare_const` inserts unconditionally into `globals`, ignoring `module_depth`, while `declare_member` (src/bytecode/vm.rs:2328) reads only `locals` — `module M` with `constant X to 1` plus `export X` passes validation (`module_declared_names` includes it) then `finish_module` silently publishes nothing — concrete fix: bind `constant` into the module scope like `set_var` does, or refuse/lookup globals in `declare_member`.
+3. [MAJOR] src/parser.rs:267 — `module_body` returns the single `Module` body when exactly one declaration exists and the whole program otherwise, so top-level siblings beside a `module` declaration are dropped when a file is read as a module, and a two-module file takes yet another path — no test covers either side — concrete fix: define and pin sibling/two-module behavior or refuse it with a spanned error.
+4. [MINOR] src/formatter.rs:440 — writes `" to "` for an import alias while `SPEC.md`/`docs/GRAMMAR.md` and `src/parser.rs:575` document `as` as the spelling, so `rb format` rewrites `import json as J` to `import json to J` — concrete fix: emit `as` and update the two pinned `to` fixtures.
+REVIEW VERDICT: FINDINGS 4

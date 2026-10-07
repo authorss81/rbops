@@ -1,0 +1,25 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the remaining defects — reading the changed modules to verify the gate.
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead src/bytecode/codegen.rs
+[0m→ [0mRead src/bytecode/opcode.rs
+[0m→ [0mRead src/bytecode/disasm.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1301][0m
+First pass shows the import paths diverging — now digging into the exact failure modes.
+[0m→ [0mRead src/bytecode
+[0m✱ [0mGrep "FORMAT_VERSION"[90m in src/bytecode · 7 matches[0m
+[0m→ [0mRead tests/test_modules.rb
+[0m→ [0mRead tests/bytecode_vm_test.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/bytecode/format.rs
+[0m→ [0mRead tests/bytecode_vm_test.rs[90m [offset=1369][0m
+FINDINGS:
+1. [BLOCKER] src/bytecode/format.rs:53 — IMPORT aux repurposed without a version bump, old .rbc silently reinterpreted — why it matters: format.rs:29 says anything an older file decodes differently must bump the version, and format.rs:128 says an unused aux is left at 0; codegen.rs:439 now writes the alias there and bytecode/vm.rs:2008 reads aux as constant_text unconditionally, so a v3 file with aux 0 resolves its alias to constants[0] instead of failing — concrete fix: bump FORMAT_VERSION to 4 and document the operand, or accept NO_CONST/0 as unaliased on decode.
+2. [BLOCKER] src/bytecode/codegen.rs:449 — module declaration still compiles inline and export to nothing, so the bytecode VM has no declaration; src/bytecode/vm.rs:2096 refuses to count it in is_module_name while src/vm.rs:511 does — why it matters: every module-declaration program disagrees across VMs yet the corpus gate is green because no corpus program declares one, which is a vacuous differential — concrete fix: add a corpus program with module/end plus member call, or gate the divergence with a pinned failing test and Opcode::Module.
+3. [MAJOR] src/bytecode/vm.rs:2085 — import pushes get_var(alias) for the trailing STORE, and store at src/bytecode/vm.rs:1368 refuses a constant rebind, while src/vm.rs:1061 skips the bind when the name is already bound and never errors — why it matters: constant M to 5 then import MathUtils as M succeeds on rb run and fails with Cannot assign to constant on rb vm; the shadowing test only covers set — concrete fix: mirror the tree-walker guard and skip the STORE when the alias is already bound or is a constant.
+4. [MAJOR] src/bytecode/vm.rs:2038 — modules.insert runs before compile_module, and the ? on that line returns without removing the name; only the drive failure at src/bytecode/vm.rs:2059 cleans up — why it matters: a module that fails to compile poisons the loaded set, so a retry of the same name skips loading and binds the alias to nothing instead of re-reporting the error, while src/vm.rs:505 inserts only on success — concrete fix: insert after a successful compile/run, or remove the name on the compile-error path as the run-error path does.
+REVIEW VERDICT: FINDINGS 4
