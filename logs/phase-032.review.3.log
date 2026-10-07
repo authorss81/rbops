@@ -1,0 +1,39 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-3 adversarial review — hunting what's still broken beneath the green gate.
+[0m→ [0mRead src/stdlib.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/bytecode/vm.rs
+Initial pass shows the module routing — now digging into the remaining implementation for hidden defects.
+[0m→ [0mRead src/runtime.rs[90m [offset=1290][0m
+[0m→ [0mRead src/vm.rs[90m [offset=1230][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1279][0m
+[0m→ [0mRead tests/stdlib_modules_test.rs
+[0m→ [0mRead phases/phase-032/FINDINGS.md
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [limit=200][0m
+[0m→ [0mRead src/value.rs
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=200, limit=600][0m
+Deep scan found several candidates — now verifying panic paths and spec drift.
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|as u64|as i64|\[index\]|\[i\]"[90m in src · 73 matches[0m
+[0m→ [0mRead src/error.rs[90m [offset=100, limit=30][0m
+[0m→ [0mRead SPEC.md[90m [offset=625, limit=30][0m
+[0m→ [0mRead SPEC.md[90m [offset=800, limit=30][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=800, limit=500][0m
+[0m→ [0mRead SPEC.md[90m [offset=830, limit=160][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=1300, limit=660][0m
+I've mapped the key failure modes — now confirming the last details to finalize the verdict.
+[0m→ [0mRead src/error.rs
+[0m→ [0mRead src/testing/harness.rs[90m [offset=20, limit=50][0m
+FINDINGS:
+1. [BLOCKER] src/runtime.rs:923 — `Random::below` retries by recursing `self.below(bound)` with no depth bound — why it matters: every `random_choice`/`random_shuffle`/`math.random` draw reaches it, so an unlucky rejection streak overflows the Rust stack and aborts instead of erroring — concrete fix: rewrite as a `loop` that redraws until `draw < bound`.
+2. [MAJOR] src/runtime.rs:736 — `math.random` computes `min + r * (max - min)` directly — why it matters: for a finite range like `-1e308` to `1e308` the intermediate `max - min` is `inf`, so a drawable range always fails via `Value::number`, and that error names no function — concrete fix: use a stable form like `min * (1.0 - r) + max * r` and return a `math.random`-named error if still non-finite.
+3. [MAJOR] src/runtime.rs:789 — `type_of` answers `args.first().map(...).unwrap_or("nothing")` — why it matters: `type_of()` with no argument returns `Text("nothing")`, indistinguishable from `type_of(nothing)`, so a missing argument produces plausible data like the `join` bug in FINDINGS §16 did — concrete fix: require exactly 1 argument in `stdlib::arity` plus `runtime::builtin` and refuse otherwise by name with a span.
+4. [MAJOR] src/vm.rs:1230 — unknown-module path builds `qualified_member(&module, method)` (`module_method`) then falls through to `self.call` — why it matters: `nosuchmodule.read("x")` reports `Unknown function 'nosuchmodule_read'` with the internal underscore encoding instead of `nosuchmodule.read` — concrete fix: report `Module 'x' has no function` or dotted `module.method` before calling, mirroring the `is_module_name` branch; same leak at src/bytecode/vm.rs:1734.
+5. [MAJOR] tests/stdlib_module_docs_test.rs:688 — `edge_an_unknown_module_name_is_a_clean_error` asserts only `message.contains("nosuch")` — why it matters: the underscore leak above still contains that substring, so the test cannot fail on the wrong format and pins nothing about the spelling — concrete fix: assert the exact dotted spelling `nosuchmodule.read` and reject any message containing `nosuchmodule_read`.
+6. [MAJOR] SPEC.md:634 — Properties example shows `give back math.PI * this.radius * this.radius` — why it matters: a module has functions not members, so `math.PI` is `AnalyzerError: Unknown variable`, contradicting a shipped example outside §Standard Library that this phase's test never reads — concrete fix: replace with a declared `constant PI to 3.14159` read as `PI`, as SPEC §math already does.
+7. [MAJOR] SPEC.md:973 — Appendix Keywords still lists `might fail` as an error-prone operation — why it matters: `might`/`fail` lex to `TokenKind::MightFail` which no parser arm accepts, so every documented `might fail` spelling is a `ParserError`, same class as FINDINGS §5 left for five other sites — concrete fix: delete the row or mark it reserved-but-unimplemented until the parser grows it.
+8. [MINOR] src/stdlib.rs:239 — `call_module_function` fallback reports `Unknown function '{name}'` with the underscore `module_function` name — why it matters: any future builtin reaching it leaks internals instead of the dotted spelling the program wrote — concrete fix: report `written` (dotted) there, as the `requirement` branch above it does.
+REVIEW VERDICT: FINDINGS 8

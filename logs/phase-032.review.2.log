@@ -1,0 +1,32 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-two audit underway — hunting for what the green gate missed.
+[0m→ [0mRead src/stdlib.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/bytecode/vm.rs
+First pass shows the dispatch tables — now probing the remaining execution paths for defects.
+[0m→ [0mRead src/value.rs
+[0m→ [0mRead src/vm.rs[90m [offset=1199][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1279][0m
+[0m→ [0mRead README.md[90m [offset=115, limit=100][0m
+[0m→ [0mRead SPEC.md[90m [offset=805, limit=130][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [limit=150][0m
+[0m→ [0mRead AGENTS.md[90m [offset=143, limit=60][0m
+[0m→ [0mRead tests/bytecode_vm_test.rs
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=151, limit=300][0m
+Core runtime checks look inconsistent — now verifying the remaining details to finalize the report.
+[0m✱ [0mGrep "CORPUS_WALK|corpus_walk"[90m in tests · 6 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=455, limit=45][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=451, limit=200][0m
+FINDINGS:
+1. [BLOCKER] src/runtime.rs:465 — `time.sleep` calls `Duration::from_secs_f64(seconds)` with no validation — `time.sleep(-1)` or `time.sleep(1e20)` aborts the process instead of a catchable `Runtime` error — reject non-finite, negative, and overflowing values with `Error::Runtime` before constructing the `Duration`.
+2. [BLOCKER] src/runtime.rs:488 — `time.format` does `UNIX_EPOCH + Duration::from_secs(timestamp as u64)` then `duration_since(...).unwrap()` — a large finite literal like `time.format(1e20)` saturates to `u64::MAX` and panics on `SystemTime` overflow, and a negative like `time.format(-1)` saturates to `0` and silently answers `1970` — validate the timestamp is a finite non-negative in-range integer and return `Error::Runtime` otherwise.
+3. [MAJOR] src/runtime.rs:667 — `random_number`/`random_choice`/`random_shuffle` use `SystemTime::now().duration_since(UNIX_EPOCH).unwrap()` and wall-clock nanos as an unseeded draw — a pre-epoch clock aborts, and every draw is nondeterministic with no seed — replace `unwrap()` with a `Runtime` error and route draws through a seeded RNG.
+4. [MAJOR] src/runtime.rs:272 — `runtime::builtin` refuses only `args.len() > expected`, never too few — bare spellings rely on per-arm errors with different wording (`length` vs `text.length`) while `stdlib::call_module_function` at src/stdlib.rs:205 refuses `given != expected` — check `!=` in both places so bare and module spellings refuse identically.
+5. [MAJOR] src/stdlib.rs:528 — `text.join` stringifies every element with `item.to_string()` — `text.join([1, yes, [1]], ",")` coerces instead of refusing, contradicting the strict refusal for `text.uppercase(1)` and `list.length(5)` — refuse non-text elements with a named `Runtime` error.
+6. [MAJOR] README.md:142 — `math.random(min, max)` and `time.format(ts, format)` are documented as fixed-arity, but `math.random(5)` draws from zero and `time.format(0)` answers with the default format per src/runtime.rs:658 and src/runtime.rs:480 and pinned by tests — correct the signatures to the optional-arity the code implements.
+7. [MAJOR] AGENTS.md:195 — `PI, E` plus `pow/sin/cos/tan/log/exp` and `contains/starts_with/replace` are still listed as callable, but none is answered (`say PI` is `Unknown variable`, `say pow(2,3)` is `Unknown function` per phases/phase-032/FINDINGS.md §2/§8) — remove the unimplemented names or gate them behind their owning phase.
+REVIEW VERDICT: FINDINGS 7

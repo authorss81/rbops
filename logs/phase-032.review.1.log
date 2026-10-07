@@ -1,0 +1,30 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the green gate for what's still broken — pulling the changed files to verify the claims.
+[0m→ [0mRead .
+Got the layout — now reading the stdlib, VM dispatch, and new tests to check for defects.
+[0m→ [0mRead src/stdlib.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead tests/stdlib_module_docs_test.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead README.md[90m [offset=115, limit=100][0m
+[0m→ [0mRead SPEC.md[90m [offset=800, limit=110][0m
+[0m→ [0mRead src/vm.rs[90m [offset=1229][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1279][0m
+Initial pass shows the docs and dispatch may disagree — now digging into the runtime and analyzer to confirm.
+[0m✱ [0mGrep "is_module|MODULES|builtin"[90m in src · 84 matches[0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=370, limit=60][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=259, limit=180][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=439, limit=300][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=580, limit=30][0m
+FINDINGS:
+1. [MAJOR] README.md:192 — claims `uppercase("hi")` and `text.uppercase("hi")` "reach one function", but bare names can never resolve: `src/stdlib.rs:72` only resolves `module_function` names like `text_uppercase`, and `src/vm.rs:1170` routes a `Value::Builtin` only when `call_module_function` returns `Some`, otherwise reporting `Unknown function` — FINDINGS.md §3 admits bare names still fail, so the shipped doc is false — remove the paragraph or route bare builtins.
+2. [MAJOR] src/runtime.rs:599 — `random_number` falls through to `(0.0, 1.0)` on wrong-typed args, so `math.random("hi", "there")` answers a nondeterministic number instead of a clean error; `src/stdlib.rs:119` gives it arity `None`, so the pre-call count check is skipped and no wrong-argument test covers it — validate `(Number, Number)` and return a named `Runtime` error with span.
+3. [MAJOR] tests/stdlib_module_docs_test.rs:535 — `edge_documented_calls_all_lex_parse_and_resolve` skips every `network.`/`time.` line, plus `tests/stdlib_module_docs_test.rs:529` skips any non-module line and `tests/stdlib_module_docs_test.rs:518` skips empty/`//`/`might fail`/`if`/`end`, so the test that claims "every line must lex and parse" checks only a subset and cannot catch the class it was built for — check shape for network/time without executing, or drop the claim.
+4. [BLOCKER] tests/stdlib_module_docs_test.rs:111 — `module_call` returns `None` when `!is_module(&module)` and `tests/stdlib_module_docs_test.rs:576` only asserts when it returns `Some`, so a documented `nosuchmod.foo(..)` line is silently skipped rather than failed — the routing test cannot fail on the unknown-module case — assert on every `word.word(` line regardless of `is_module`.
+5. [MINOR] src/runtime.rs:581 — `console_log`/`console_error` succeed with zero args (`if let Some(arg)` then `Ok(Some(Nothing))`) while `src/stdlib.rs:119` enforces arity only for text/math `length`/`split`/`join`/`uppercase`, so `console.log()` and extra-arg calls like `files.read("a","b")` are silently accepted, contradicting the `console.log(text)`/`files.read(path)` signatures and untested by `edge_a_module_function_refuses_wrong_arguments_by_naming_itself` — add arity/requirement entries or document the leniency.
+6. [MINOR] src/stdlib.rs:436 — `text.length` uses `s.len() as f64` (bytes), enshrined by `tests/stdlib_module_docs_test.rs:731` asserting `label.len() as f64`; for emoji/CJK/combining marks byte count != character count and `runtime.rs:277` does the same, so `text.length("🎉")` answers 4 — decide bytes vs chars in SPEC and fix code or test to match.
+
+REVIEW VERDICT: FINDINGS 6
