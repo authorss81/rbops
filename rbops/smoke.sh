@@ -1753,6 +1753,68 @@ case "$out" in
   *) no "tree still fails without the scratch file"; printf '%s\n' "$out" | grep -E 'FAIL' | head -4 | sed 's/^/      /' ;;
 esac
 
+# =========================================================== 29. truncation never changes a verdict
+head_ "29. truncating output must not change what the gate decides"
+# Two faces of the same bug: `| head` exits early, the writer dies on SIGPIPE
+# (141), and under `set -o pipefail` the 141 becomes the pipeline's status.
+# In rbops.yml that killed a whole run on a diagnostic line (694 corpus files,
+# phase-020). In verify.sh it was worse: `... | grep | head -20; then bad;
+# else ok` meant 21+ gate-weakening matches took the ELSE branch and a phase
+# full of #[ignore] reported "no gate-weakening constructs added". Truncation
+# is for display; verdicts must read the whole stream (`sed -n '1,20p'`
+# consumes everything and prints the first 20).
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase report
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| src/vm.rs | +50 −0 | many skipped tests |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_expect_mismatch | failure |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+# 25 gate-weakening constructs: over the old head -20 limit, so the old code
+# would have reported this tree clean.
+for i in $(seq 1 25); do printf '#[ignore]\nfn skipped_%s() {}\n' "$i" >> "$PROJ/src/vm.rs"; done
+out="$( ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+case "$out" in
+  *"gate-weakening construct added"*) ok "25 violations still fail the gate (no verdict inversion)" ;;
+  *) no "21+ violations reported clean — verdict inverted"; printf '%s\n' "$out" | grep -iE 'weakening|ignore' | head -3 | sed 's/^/      /' ;;
+esac
+# And the inventory line that killed the phase-020 run: 700 untracked files
+# through the exact yml pipeline must exit 0 and show 20 lines. NOTE: this must
+# NOT use $( ) capture — an assignment's status is the LAST command's, which
+# would mask a SIGPIPE death upstream. A temp file preserves the real status
+# under the suite's `set -o pipefail`, so this fails on the old `| head` code
+# and passes on the fix.
+build_fixture >/dev/null; use_stubs
+for i in $(seq 1 700); do printf 'x\n' > "$PROJ/tests/f$i.txt" 2>/dev/null; done
+( cd "$PROJ" && git status --porcelain | sed -n '1,20p' | sed 's/^/    /' ) > "$T/inv.out" 2>&1
+inv_rc=$?
+# NOTE: no `|| echo 0` after this grep -c — that idiom prints a second line on
+# no-match (grep -c prints 0 AND exits 1), leaving "0\n0" and breaking the
+# integer comparison below. Same bug class as the one just fixed in dispatch.
+inv_n="$(grep -c '^    ' "$T/inv.out" 2>/dev/null)"; inv_n="${inv_n:-0}"; inv_n="$(printf '%s' "$inv_n" | head -1)"
+if [ "$inv_rc" -eq 0 ] && [ "$inv_n" -eq 20 ]; then
+  ok "700-file inventory exits 0 and shows 20 lines (no SIGPIPE death)"
+else
+  no "inventory pipeline failed (rc=$inv_rc, lines=$inv_n) on 700 files"
+fi
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

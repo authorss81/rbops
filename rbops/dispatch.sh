@@ -401,7 +401,7 @@ cmd_run() {
       # starting clean would mean re-deriving all of it. The gate still decides
       # whether the resolved tree is any good.
       log "resumed from previous attempt (rbops-recovery/$phase) WITH UNRESOLVED CONFLICTS"
-      in_project git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/    conflict: /' | head -10
+      in_project git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/    conflict: /' | sed -n '1,10p'
       touch "$(marker "$phase" .recovered)"
       touch "$(marker "$phase" .conflict)"
       resumed=1
@@ -790,7 +790,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
                 | awk '$1 != $2 {print $1}' | wc -l | tr -d ' ')"
       if [ "${touched:-0}" -eq 0 ]; then
         log "fix round $round DID NOT TOUCH any file cited by the findings:"
-        sed 's/^/    /' "$cited" | head -8
+        sed 's/^/    /' "$cited" | sed -n '1,8p'
         log "the pass reported progress without editing the code under review — not retrying"
         rm -f "$cited" "$before" "$after"
         touch "$(marker "$phase" .blocked)"

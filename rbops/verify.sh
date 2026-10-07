@@ -139,7 +139,11 @@ ok "forbidden-path scan done"
 # blocked a phase for containing the word it was testing against.
 if git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null \
   | grep -nE '^\+[[:space:]]*(#\[ignore|#\[allow\((clippy|dead_code)|//[[:space:]]*skip\b)' \
-  | head -20; then
+  | sed -n '1,20p'; then
+  # NOTE: `| head -20` here would be a verdict-inverting bug, not a display
+  # choice. head exits after 20 lines; with 21+ matches grep dies on SIGPIPE
+  # (141), pipefail propagates it, and the `else` below reports a phase with
+  # twenty-one violations as clean. sed consumes the whole stream instead.
   bad "gate-weakening construct added (#[ignore], // skip, allow(clippy::...)) — see AGENTS.md rule 2"
 else
   ok "no gate-weakening constructs added"
@@ -213,7 +217,7 @@ step "cargo clippy"
 if cargo clippy --all-targets -- -D warnings >/tmp/clippy.log 2>&1; then
   ok "cargo clippy -D warnings"
 else
-  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | head -20
+  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | sed -n '1,20p'
 fi
 
 step "cargo test"
@@ -223,7 +227,7 @@ if cargo test --all-targets >/tmp/test.log 2>&1; then
   if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
   else bad "cargo test reported 0 passing tests — a suite that cannot fail is not a suite"; fi
 else
-  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | head -20
+  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | sed -n '1,20p'
 fi
 
 step "doc tests"
