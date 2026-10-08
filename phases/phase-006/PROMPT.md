@@ -12,7 +12,7 @@
 ## Evidence — verified finding
 
 ```
-src/vm.rs has no frame or recursion counter (grep for depth|stack|limit in vm.rs returns only a string-splitting depth at line 990). Infinite or deep recursion aborts the process with a Rust stack overflow instead of a clean Runtime error.
+src/interpreter.rs has no frame or recursion counter (grep for depth|stack|limit in vm.rs returns only a string-splitting depth at line 990). Infinite or deep recursion aborts the process with a Rust stack overflow instead of a clean Runtime error.
 ```
 
 **Re-verify this before you change anything.** If the finding no longer
