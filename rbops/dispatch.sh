@@ -661,9 +661,20 @@ cmd_review() {
   local base; base="$(in_project git rev-parse HEAD)"
   local round=0
 
-  while [ "$round" -lt "${RBOPS_MAX_REVIEW_ROUNDS:-3}" ]; do
+  # Rounds 1..MAX may fix; round MAX+1 reviews ONLY. The loop used to end after
+  # the last fix, so that fix was never reviewed: phase-025 blocked with a
+  # fully-fixed, gate-green tree because no round 5 existed to confirm round
+  # 4's fix. A verification-only round closes that gap without reopening the
+  # loop — nothing after it can fix, so it can only approve or block.
+  local max_fix="${RBOPS_MAX_REVIEW_ROUNDS:-3}" verify_round
+  verify_round=$((max_fix + 1))
+  while [ "$round" -lt "$verify_round" ]; do
     round=$((round+1))
-    log "review round $round for $phase"
+    if [ "$round" -ge "$verify_round" ]; then
+      log "verification-only review round $round for $phase (no fixes after this)"
+    else
+      log "review round $round for $phase"
+    fi
 
     # The reviewer agent is read-only AND has no shell, so it cannot run
     # `git diff`. The change set has to be handed to it, and it must be the
@@ -764,6 +775,11 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     blocking="$(grep -coE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL):' "$rlog" 2>/dev/null)"; blocking="${blocking:-0}"
 
     if [ "$blocking" -gt 0 ]; then
+      if [ "$round" -ge "$verify_round" ]; then
+        touch "$(marker "$phase" .blocked)"
+        log "$phase BLOCKED - verification round still finds blocking findings"
+        return 3
+      fi
       log "review round $round: $blocking blocking finding(s) - fixing"
     elif [ "$has_clean" -gt 0 ]; then
       log "review round $round: explicit CLEAN verdict - shipping"
@@ -778,7 +794,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       # No verdict, no severities, no clean marker. Either the model rambled, or
       # it never received the contract. Either way this is not a sign-off.
       log "review round $round INVALID - no verdict line, no severity tags, no clean marker"
-      if [ "$round" -ge "${RBOPS_MAX_REVIEW_ROUNDS:-3}" ]; then
+      if [ "$round" -ge "$verify_round" ]; then
         log "$phase BLOCKED - reviewer never produced a parseable verdict in $round rounds"
         touch "$(marker "$phase" .blocked)"
         return 3

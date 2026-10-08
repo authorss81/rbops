@@ -1163,6 +1163,48 @@ case "$out" in
   *"INVALID"*) ok "an unusable review is INVALID" ;;
   *) no "an unusable review was treated as clean" ;;
 esac
+# e) a fix verified by one more round ships: round 1 finds a BLOCKER, the fix
+#    lands, and the verification-only round comes back CLEAN. Old code blocked
+#    here with the fix unverified (the loop ended after the fix, and the stale
+#    finding in round 1's log failed the post-loop check). This is the test
+#    that fails without the verify round and passes with it.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+export SMOKE_PIPE="$PIPE" SMOKE_PROJ="$PROJ"
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+title=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--title" ] && title="$a"
+  prev="$a"
+done
+case "$title" in
+  *review*)
+    if [ -f "$SMOKE_PIPE/logs/phase-001.fix.1.log" ]; then
+      echo "rechecked the fixed tree against the report and the gates."
+      echo "FINDINGS: none"
+      echo "REVIEW VERDICT: CLEAN"
+    else
+      echo "1. [BLOCKER] src/vm.rs:1 - the defect is here - fix it - done"
+      echo "REVIEW VERDICT: FINDINGS 1"
+    fi
+    echo "review done" ;;
+  *)
+    printf '// verified fix\n' >> "$SMOKE_PROJ/src/vm.rs"
+    echo "fixed src/vm.rs" ;;
+esac
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$(R)"
+case "$out" in
+  *"verification-only"*) ok "the last fix gets a verification-only review" ;;
+  *) no "no verification-only round ran"; printf '%s\n' "$out" | grep -E 'review round|BLOCKED' | head -4 | sed 's/^/      /' ;;
+esac
+marker phase-001 .done \
+  && ok ".done written once the verification round approves" \
+  || no "a verified fix still did not ship"
 
 # =========================================================== 21. one pipeline, one lock
 head_ "21. both workflows share one concurrency group"
