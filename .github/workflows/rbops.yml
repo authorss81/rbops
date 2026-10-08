@@ -518,13 +518,17 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # retrigger: chain to the next phase ONLY if the pipeline actually advanced.
+  # retrigger: chain to the next tick unless the queue is drained.
   #
-  # Chaining unconditionally is how a failure becomes a storm: the phase defers
-  # or fails, the run is still "successful" as far as Actions is concerned, so a
-  # new run starts, hits the same wall, defers again, and five queued runs burn
-  # MAX_DEFERRALS before anyone looks. A phase that did not progress is retried
-  # by the cron safety net, on purpose, with a human-sized gap.
+  # This used to chain ONLY on progress (a clean run), leaving every deferral,
+  # failure and block to the cron safety net — and the cron has multi-hour
+  # holes, so a stuck-then-recovered queue sat idle for 4.5 hours. Chaining on
+  # non-progress is safe because every non-progress path terminates: gate
+  # failures consume attempts toward .blocked, deferrals consume deferral
+  # budget toward .blocked, and a run that selects nothing leaves work skipped,
+  # which also stops the chain. The only thing that must never chain is a
+  # cancelled run (superseded work; the superseding run owns what happens
+  # next) and an explicit no_retrigger.
   # ---------------------------------------------------------------------------
   retrigger:
     needs: [select, work]
@@ -532,8 +536,7 @@ jobs:
       always() && needs.select.outputs.exists == 'true' &&
       needs.select.outputs.action != 'audit' && needs.select.outputs.action != 'status' &&
       (inputs.no_retrigger != true) &&
-      needs.work.result == 'success' &&
-      needs.work.outputs.progress == 'true'
+      (needs.work.result == 'success' || needs.work.result == 'failure')
     runs-on: ubuntu-latest
     permissions:
       contents: write            # repository_dispatch requires contents: write
@@ -543,11 +546,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PHASE: ${{ needs.select.outputs.phase }}
         run: |
-          sleep 10
+          if [ "${{ needs.work.outputs.progress }}" = "true" ]; then
+            sleep 10
+            reason="phase_done_gate_green"
+          else
+            # No progress (defer/fail/block): still chain — the cron has
+            # multi-hour holes — but wait a few minutes so a down model chain
+            # or a hot failure loop gets breathing room instead of hammering.
+            sleep 300
+            reason="no_progress_retry"
+          fi
           gh api -X POST -H "Accept: application/vnd.github+json" \
             "/repos/${{ github.repository }}/dispatches" \
             -f "event_type=rbops_tick" \
             -f "client_payload[phase]=${PHASE}" \
-            -f "client_payload[reason]=phase_done_gate_green" \
+            -f "client_payload[reason]=$reason" \
             -f "client_payload[run_id]=${{ github.run_id }}" \
-            || echo "::warning::re-dispatch failed — cron safety net retries in <=10 min"
+            || echo "::warning::re-dispatch failed — cron safety net retries"

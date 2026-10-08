@@ -1961,6 +1961,66 @@ else
   no "inventory pipeline failed (rc=$inv_rc, lines=$inv_n) on 700 files"
 fi
 
+# =========================================================== 30. deferral caps terminate every path
+head_ "30. every deferral path is counter-bounded"
+# Three defer paths exist: run (cmd_run classify), review (cmd_review round),
+# fix (cmd_review fix round). Only the first bumped a capped counter; the other
+# two looped forever on a dead chain — each retry re-running a full implement
+# or fix for zero progress. All three now funnel through defer_phase: bump,
+# cap at MAX_DEFERRALS, block with the reason stated.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+echo "Error: OpenCode 1.18.0 or newer is required to use the free tier"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+# (a) review-defer below cap still defers (no behavior change here).
+out="$( RBOPS_MIN_OUTPUT=500 D review phase-001 | strip )"; rc=$?
+[ "$rc" = "42" ] && ok "review defer still exits 42" || no "review defer exit changed: got $rc"
+marker phase-001 .deferred && ok ".deferred written on review defer" || no ".deferred missing on review defer"
+marker phase-001 .blocked && no "blocked on first review deferral" || ok "not blocked on first review deferral"
+# (b) review-defer AT cap blocks instead of looping forever.
+printf '4' > "$PIPE/phases/phase-001/.deferred_attempts"
+out="$( RBOPS_MIN_OUTPUT=500 D review phase-001 | strip )"; rc=$?
+[ "$rc" = "3" ] && ok "review defer at cap exits 3 (blocked)" || no "review defer at cap exit changed: got $rc"
+marker phase-001 .blocked && ok ".blocked written at deferral cap" || no ".blocked missing at deferral cap"
+case "$out" in
+  *"BLOCKED after 5 deferrals"*) ok "cap message names the count" ;;
+  *) no "no cap message in output" ;;
+esac
+# (c) fix-defer at cap blocks too. Review emits a BLOCKER (with padding so the
+# review call itself counts as usable output); the fix call hits the dead
+# chain. Without the fix, this looped forever: the fix deferral touched no
+# counter at all.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+title=""
+prev=""
+for a in "$@"; do
+  [ "$prev" = "--title" ] && title="$a"
+  prev="$a"
+done
+case "$title" in
+  *review*)
+    echo "1. [BLOCKER] src/vm.rs:1 - the defect is here - fix it - done"
+    echo "REVIEW VERDICT: FINDINGS 1"
+    for i in $(seq 1 30); do echo "padding padding padding padding padding padding"; done
+    echo "review done" ;;
+  *)
+    echo "Error: OpenCode 1.18.0 or newer is required to use the free tier"
+    exit 0 ;;
+esac
+EOS
+chmod +x "$STUB/opencode"
+printf '4' > "$PIPE/phases/phase-001/.deferred_attempts"
+out="$( RBOPS_MIN_OUTPUT=500 D review phase-001 | strip )"; rc=$?
+[ "$rc" = "3" ] && ok "fix defer at cap exits 3 (blocked)" || no "fix defer at cap exit changed: got $rc"
+marker phase-001 .blocked && ok ".blocked written on fix-defer cap" || no ".blocked missing on fix-defer cap"
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then

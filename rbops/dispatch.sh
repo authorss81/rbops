@@ -148,6 +148,26 @@ bump()   { # bump <phase> <file>
   mkdir -p "$(dirname "$f")"; printf '%s' "$((n+1))" > "$f"
 }
 read_n() { local f; f="$(marker "$1" "$2")"; [ -f "$f" ] && tr -cd '0-9' < "$f" || printf '0'; }
+# Every deferral path funnels through here so none can loop forever: each
+# deferral bumps the counter, and at MAX_DEFERRALS the phase blocks for a
+# human instead of retrying forever. (The two review-path defers once bypassed
+# this — no counter, no cap — so a dead model chain during review could pin
+# the queue indefinitely while every tick re-picked the same phase.)
+# Returns 42 (defer) or 3 (blocked at cap); callers propagate with `return $?`.
+defer_phase() { # defer_phase <phase> <reason>
+  local phase="$1" reason="$2" d
+  rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .done)"
+  bump "$phase" .deferred_attempts
+  d="$(read_n "$phase" .deferred_attempts)"
+  if [ "$d" -ge "$MAX_DEFERRALS" ]; then
+    touch "$(marker "$phase" .blocked)"
+    log "$phase BLOCKED after $d deferrals — $reason; this needs a human"
+    return 3
+  fi
+  touch "$(marker "$phase" .deferred)"
+  log "$phase DEFERRED ($d/$MAX_DEFERRALS) — $reason; no attempt consumed, retry next tick"
+  return 42
+}
 # Emit stdin capped at $1 bytes, with an honest marker when truncated.
 # run_agent passes the whole prompt as ONE argv string, and one string over
 # 128KB (MAX_ARG_STRLEN) fails execve with E2BIG regardless of the total size.
@@ -615,18 +635,9 @@ done
   # It must never be counted as a phase attempt: nothing was attempted, so
   # burning MAX_ATTEMPTS on it would block a phase that never even ran.
   if [ "$code" = "75" ] || infra_failure "$LOG_DIR/$phase.log"; then
-    rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .done)"
-    bump "$phase" .deferred_attempts
-    local d; d="$(read_n "$phase" .deferred_attempts)"
-    if [ "$d" -ge "$MAX_DEFERRALS" ]; then
-      touch "$(marker "$phase" .blocked)"
-      log "$phase BLOCKED after $d deferrals — the model chain is unusable, this needs a human"
-      return 3
-    fi
-    touch "$(marker "$phase" .deferred)"
-    log "$phase DEFERRED ($d/$MAX_DEFERRALS) — infra, no attempt consumed, retry next tick"
     tail -6 "$LOG_DIR/$phase.log" | sed 's/^/    | /'
-    return 42
+    defer_phase "$phase" "infra"
+    return $?
   fi
 
   # --- THE GATE -------------------------------------------------------------
@@ -749,9 +760,8 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     local rc_round=$?
     if [ "$rc_round" = "75" ]; then
       log "review round $round: model chain unusable — deferring, no attempt consumed"
-      bump "$phase" .deferred_attempts
-      touch "$(marker "$phase" .deferred)"
-      return 42
+      defer_phase "$phase" "model chain unusable in review round $round"
+      return $?
     fi
 
     # --- parse the review -------------------------------------------------------
@@ -851,7 +861,8 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     if [ "$?" = "75" ]; then
       log "fix round $round: model chain unusable — deferring"
       rm -f "$cited" "$before" "$after"
-      return 42
+      defer_phase "$phase" "model chain unusable in fix round $round"
+      return $?
     fi
 
     while read -r f; do
