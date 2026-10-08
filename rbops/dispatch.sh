@@ -198,9 +198,22 @@ cmd_select() {
   # CRLF output would otherwise produce a phase id of "phase-001\r" and create a
   # directory with a carriage return in its name.
   local p
-  # 1. resume a deferral
+  # A phase that keeps getting picked but never progresses must not pin the
+  # queue: every tick would re-select it while ready work waits. Deferrals
+  # already terminate at .blocked, but that takes up to MAX_DEFERRALS cycles —
+  # meanwhile each retry re-runs a full implement+gate for zero progress.
+  # Past this many consecutive deferrals the phase YIELDS priority: it stays
+  # eligible and is still picked when nothing else can run, and any real
+  # progress clears the counters (gate pass wipes .deferred/.deferred_attempts).
+  local yield_at="${RBOPS_DEFER_YIELD_AT:-3}"
+  case "$yield_at" in ''|*[!0-9]*) yield_at=3;; esac
+  # 1. resume a deferral — unless it has already yielded priority
   p="$( "$JQ" -r '.phases[].id' "$PHASES" 2>/dev/null | tr -d '\r' | sort -t- -k2 -n \
-       | while read -r id; do has "$id" .deferred && { echo "$id"; break; }; done)"
+       | while read -r id; do
+           has "$id" .deferred || continue
+           [ "$(read_n "$id" .deferred_attempts)" -lt "$yield_at" ] || continue
+           echo "$id"; break
+         done)"
   if [ -n "$p" ]; then log "resuming deferred: $p"; printf '%s\n' "$p"; return; fi
 
   # 2. first phase in manifest order whose deps are satisfied
@@ -208,6 +221,10 @@ cmd_select() {
         has "$id" .done     && continue
         has "$id" .blocked  && continue
         has "$id" .starved  && continue
+        # Yielded: deferred too many times in a row without progress. Skip for
+        # now so other ready work proceeds; step 3 below still picks it when
+        # nothing else can run.
+        [ "$(read_n "$id" .deferred_attempts)" -ge "$yield_at" ] && continue
         local unmet=0 dep
         for dep in $( "$JQ" -r --arg p "$id" '.phases[]|select(.id==$p)|.depends_on[]?' "$PHASES" | tr -d '\r'); do
           has "$dep" .done || unmet=1
@@ -224,6 +241,7 @@ cmd_select() {
           if [ "$id" = "$p" ]; then break; fi
           has "$id" .blocked  && { echo "$id:blocked"; continue; }
           d="$(read_n "$id" .deferred_attempts)"
+          [ "$d" -ge "$yield_at" ] && { echo "$id:yielded($d)"; continue; }
           [ "$d" -gt 0 ] && echo "$id:deferred($d)"
         done)"
     if [ -n "$skipped" ]; then
@@ -236,7 +254,27 @@ cmd_select() {
     return
   fi
 
-  # 3. queue drained
+  # 3. everything eligible yielded priority — fall back to the first phase that
+  # can run at all. The yield only reorders; it never starves. Without this the
+  # queue would idle while yielded work exists.
+  p="$( "$JQ" -r '.phases[].id' "$PHASES" | tr -d '\r' | sort -t- -k2 -n | while read -r id; do
+        has "$id" .done     && continue
+        has "$id" .blocked  && continue
+        has "$id" .starved  && continue
+        local unmet=0 dep
+        for dep in $( "$JQ" -r --arg p "$id" '.phases[]|select(.id==$p)|.depends_on[]?' "$PHASES" | tr -d '\r'); do
+          has "$dep" .done || unmet=1
+        done
+        [ "$unmet" -eq 0 ] && { echo "$id"; break; }
+      done)"
+  if [ -n "$p" ]; then
+    log "all eligible phases yielded priority — running $p anyway (nothing else can proceed)"
+    log "selected: $p"
+    printf '%s\n' "$p"
+    return
+  fi
+
+  # 4. queue drained
   local blocked
   blocked="$(ls -d "$PHASE_ROOT"/*/.blocked 2>/dev/null | wc -l | tr -d ' ')"
   if [ "${blocked:-0}" -gt 0 ]; then
@@ -650,10 +688,15 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       in_project git diff --no-color --numstat "$base"..HEAD 2>/dev/null || printf '(none committed)\n'
       in_project git diff --no-color --numstat 2>/dev/null || printf '(none uncommitted)\n'
       printf '```\n\n## 1. Committed changes (%s..HEAD)\n\n```diff\n' "$base"
-      in_project git diff --no-color "$base"..HEAD 2>/dev/null | emit_capped 40000 'committed diff' || printf '(none)\n'
+      in_project git diff --no-color "$base"..HEAD 2>/dev/null | emit_capped 30000 'committed diff' || printf '(none)\n'
       printf '```\n\n## 2. Uncommitted tracked changes\n\n```diff\n'
-      in_project git diff --no-color 2>/dev/null | emit_capped 20000 'uncommitted diff' || printf '(none)\n'
-      printf '```\n\n## 3. Untracked files (capped at 8KB each)\n\n'
+      in_project git diff --no-color 2>/dev/null | emit_capped 15000 'uncommitted diff' || printf '(none)\n'
+      printf '```\n\n## 3. Untracked files (capped at 8KB each, 15KB total)\n\n'
+      # The TOTAL cap is the one that matters: per-file caps alone are unbounded
+      # (25 files x 8KB sailed past the 100KB argv budget and deferred a real
+      # phase-025 review). Files past the budget are still listed by name — and
+      # the file list above is always complete — so nothing is silently hidden.
+      {
       # git collapses a wholly-untracked directory to ONE `?? dir/` line. Without
       # expansion the reviewer sees `(unreadable)` for every new file in a new
       # directory — exactly where a phase like bootstrap/ puts its work.
@@ -673,9 +716,21 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
           printf -- '--- %s\n(unreadable)\n' "$f"
         fi
       done
-      printf '\n## 4. The phase REPORT.md\n\n'
-      cat "$RBOPS_ROOT/phases/$phase/REPORT.md" 2>/dev/null || printf '(missing)\n'
+      } | emit_capped 15000 'review section 3 (untracked files)'
+      printf '\n## 4. The phase REPORT.md (capped)\n\n'
+      if [ -f "$RBOPS_ROOT/phases/$phase/REPORT.md" ]; then
+        emit_capped 10000 "phase $phase REPORT.md" < "$RBOPS_ROOT/phases/$phase/REPORT.md"
+      else
+        printf '(missing)\n'
+      fi
     } > "$rctx"
+    # Defense in depth: the section budgets above sum to ~80KB worst case, but
+    # if that arithmetic ever drifts, say so LOUDLY here rather than discovering
+    # it as another E2BIG. The 100KB argv guard remains the backstop.
+    rctx_bytes="$(wc -c < "$rctx")"
+    if [ "$rctx_bytes" -gt 90000 ]; then
+      log "WARNING: review ctx for $phase is ${rctx_bytes} bytes — over the 90KB internal budget"
+    fi
 
     run_agent "$REVIEW_MODELS" "$LOG_DIR/$phase.review.$round.log" "$rctx" \
         --dir "$PROJECT_DIR" --agent reviewer --title "rbops-review-${phase}-${round}"

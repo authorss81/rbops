@@ -375,6 +375,41 @@ touch "$PIPE/phases/phase-012/.deferred"
 sel="$(D select | tail -1)"
 check "$sel" "phase-012" "a deferred phase is resumed first"
 rm -f "$PIPE/phases/phase-012/.deferred"
+# Yield: a phase deferred past the threshold yields priority so one stuck phase
+# cannot pin the queue while ready work waits. phase-025 deferred identically
+# every tick on an oversize context while clean phases sat idle. Fresh fixture
+# (nothing done): phase-002 needs 001 and 003 needs 001+002, so with 001
+# yielded the pick must be phase-004.
+build_fixture >/dev/null
+touch "$PIPE/phases/phase-001/.deferred"
+printf '3' > "$PIPE/phases/phase-001/.deferred_attempts"
+sel="$(D select | tail -1)"
+check "$sel" "phase-004" "a thrice-deferred phase yields to ready work"
+out="$(D select)"
+case "$out" in
+  *"yielded(3)"*) ok "the yield is logged loudly, never silent" ;;
+  *) no "no yield notice in selection output" ;;
+esac
+# Below the threshold, deferral priority is preserved (normal case untouched).
+printf '1' > "$PIPE/phases/phase-001/.deferred_attempts"
+sel="$(D select | tail -1)"
+check "$sel" "phase-001" "a once-deferred phase is still resumed first"
+# Fallback: block everything else, so the ONLY runnable phase is the yielded
+# one. Re-assert attempts=3 (the previous subtest lowered it to 1, which would
+# take the normal deferral-priority path instead of the fallback). The queue
+# must still run it rather than idle — yield reorders, never starves.
+touch "$PIPE/phases/phase-001/.deferred"
+printf '3' > "$PIPE/phases/phase-001/.deferred_attempts"
+for id in $(seq -f "phase-%03g" 2 41); do
+  touch "$PIPE/phases/$id/.blocked"
+done
+out="$(D select)"
+sel="$(printf '%s' "$out" | tail -1)"
+check "$sel" "phase-001" "an all-yielded queue still runs the head, not idle"
+case "$out" in
+  *"nothing else can proceed"*) ok "the fallback path says why it runs a yielded phase" ;;
+  *) no "no fallback notice in selection output" ;;
+esac
 D stop >/dev/null 2>&1
 out="$(D select)"
 case "$out" in *"pipeline halted"*) ok ".stop halts selection" ;; *) no ".stop did not halt" ;; esac
@@ -1527,12 +1562,45 @@ else
   no "no complete file list alongside the capped content"
 fi
 
-# (b) content that is STILL over budget after capping must defer loudly, not
-# crash with E2BIG. 25 untracked 16KB files cap at 8KB each = 200KB.
+# (b) MANY untracked files must hit the section-3 TOTAL cap, not the per-file
+# one: 25 files x 8KB would sail past the budget. They stay reviewable (first
+# files whole, rest by name) and the request stays small.
 build_fixture >/dev/null; use_stubs
 for i in $(seq 1 25); do
   yes 'filler text line for argv budget test' | head -n 400 > "$PROJ/tests/big$i.txt" 2>/dev/null
 done
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+cat <<'BODY'
+I checked the diff against the report and the gates.
+FINDINGS: none
+REVIEW VERDICT: CLEAN
+BODY
+echo "review done"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$(R)"
+if grep -q 'truncated:' "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null; then
+  ok "untracked-file flood hits the section total cap with markers"
+else
+  no "25 uncapped files went to the model raw"
+fi
+ctx_bytes="$(wc -c < "$PIPE"/logs/phase-001.review.1.ctx 2>/dev/null || echo 999999)"
+if [ "$ctx_bytes" -lt 100000 ]; then
+  ok "the flooded request stays under the 100KB budget ($ctx_bytes bytes)"
+else
+  no "the flooded request is $ctx_bytes bytes — over budget"
+fi
+case "$out" in
+  *"explicit CLEAN"*) ok "a capped CLEAN review still approves" ;;
+  *) no "capping broke the verdict path"; printf '%s\n' "$out" | tail -3 | sed 's/^/      /' ;;
+esac
+# (c) content that is STILL over budget after capping must defer loudly, not
+# crash with E2BIG. The only way left to blow the budget is fixed costs: bloat
+# the contract itself past it and the guard must refuse before execve.
+build_fixture >/dev/null; use_stubs
+awk 'BEGIN{for(i=0;i<2200;i++)print "// bloated contract line to exceed any section budget, line " i}' >> "$PIPE/rbops/agents/reviewer.md"
 cat > "$STUB/opencode" <<'EOS'
 #!/usr/bin/env bash
 echo "this model call must never happen"
