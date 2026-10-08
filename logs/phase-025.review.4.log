@@ -1,0 +1,35 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting round-4 defects — mapping the phase-025 changes to the hunt list.
+[0m→ [0mRead .
+[0m→ [0mRead src/value.rs
+[0m→ [0mRead src/bytecode/opcode.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead src/bytecode/codegen.rs
+Mapped the statement-marker design — now probing execution paths for panics and resource gaps.
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/bytecode/format.rs
+[0m→ [0mRead src/bytecode/mod.rs
+[0m→ [0mRead src/bytecode/disasm.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1212][0m
+[0m✱ [0mGrep "Export"[90m in src/vm.rs · 23 matches[0m
+[0m→ [0mRead src/vm.rs[90m [offset=1173][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2321][0m
+[0m✱ [0mGrep "unwrap\(\)|\.expect\(|panic!|unreachable!|todo!|\[.*\]"[90m in src/bytecode · 100 matches[0m
+Initial sweep shows no obvious aborts — now digging into the specific risks this phase introduced.
+[0m✱ [0mGrep "\.unwrap\(|\.expect\(|panic!|unreachable!|todo!"[90m in src · 40 matches[0m
+[0m→ [0mRead src/error.rs
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead tests/bytecode_vm_test.rs
+[0m→ [0mRead tests/bytecode_test.rs
+[0m→ [0mRead src/vm.rs[90m [offset=1504, limit=100][0m
+[0m✱ [0mGrep "Every statement begins"[90m in docs · 2 matches[0m
+[0m→ [0mRead docs/BYTECODE.md[90m [offset=318, limit=20][0m
+FINDINGS:
+1. [BLOCKER] src/bytecode/codegen.rs:198 — object `has`/`to can` declarations each emit a `STATEMENT_MARKER` NOP (pinned by `tests/bytecode_test.rs:654` as `["NOP", "PUSH_CONST", "DEF_FIELD", "NOP", "DEF_METHOD"]`) and each marker calls `charge_step` in `src/bytecode/vm.rs:1357`, while the tree VM's `src/vm.rs:1526` collects the same declarations via bare `evaluate`/`make_function` with no `charge_step` — only the outer `object` statement costs 1 there — so an object with H fields + M methods costs 1+H+M+rest on bytecode and 1+rest on the tree, and the same program under a tight step budget stops at a different statement with different words, re-opening the §19 divergence class this phase claimed to close — concrete fix: do not emit the statement marker for `Has`/`Method` when compiling the object-declaration block (thread an `in_object_decl` flag like `module_body`), or charge one step per declaration in `declare_object`.
+2. [MAJOR] src/bytecode/vm.rs:1753 — `self.loops[index].iterator.as_mut().expect("a sequence")` panics on a `STORE` at an iterator loop-top whose entry has `iterator: None`, reachable via `rb vm` on a hand-crafted `.rbc` that jumps directly to the `STORE` without running `GET_ITER`/`GET_RANGE` (then `loop_entry` creates the entry with `iterator: None` at `src/bytecode/vm.rs:1791`), aborting the process instead of erroring — violates the hostile-file-is-a-diagnostic rule stated in `src/bytecode/format.rs:9` — concrete fix: replace `expect` with a `Runtime` error like every other malformed-bytecode path (`pop`, `constant`, `child_path`).
+3. [MINOR] docs/BYTECODE.md:321 — "Every statement begins with a `NOP` carrying `STATEMENT_MARKER`" is false for `export` in a module body's direct body, which per `src/bytecode/codegen.rs:196` sets `charges_step` false and per `src/bytecode/codegen.rs:549` emits zero bytes — concrete fix: qualify the sentence ("every statement except an `export` in a module body's direct body, which compiles to nothing and costs nothing, matching the tree VM which skips it without `execute_statement`").
+REVIEW VERDICT: FINDINGS 3
