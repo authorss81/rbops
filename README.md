@@ -22,7 +22,7 @@ weaknesses:
 | 1 | Phases discovered by `grep -E '^workspace/phase-[0-9]+/'` over the git tree; no deps, no DAG | `rbops/phases.json` — validated, diffable, ordered, dependency-aware |
 | 2 | "Definition of done" is a line of prompt text the agent self-reports | `rbops/verify.sh` runs the gates; its exit code decides `.done` |
 | 3 | Evidence gate only proves *some* file changed | Gate requires a populated report, a minimum diff, and **zero** gate-weakening constructs |
-| 4 | Bot pushes straight to `main`, no PRs, 20-model free-tier chain | Per-phase commits, push-rebase-retry, recovery branch + patch artifact, 4-model ranked chain |
+| 4 | Bot pushes straight to `main`, no PRs, 20-model free-tier chain | Per-phase commits, push-rebase-retry, recovery branch + patch artifact, 7-model ranked chain |
 | 5 | Cron removed at HEAD; `llops-tick.yml` has `contents: read` but POSTs `repository_dispatch` → 403 | Cron present, `contents: write`, and a real in-flight check |
 | 6 | Tests are whatever the phase felt like writing | Mandatory edge-case matrix + hard test quota, machine-enforced |
 | 7 | No self-improvement loop; audits are a human writing prompt files by hand | Auditor agent measures, diffs against SPEC/ROADMAP, and appends new phases |
