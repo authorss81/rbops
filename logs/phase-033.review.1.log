@@ -2,22 +2,44 @@
 [0m
 > build · muse-spark-1.3-contributor-free
 [0m
-Hunting the still-broken paths in this green-gated REPL pass.
+Round-1 review: hunting the green gate for what's still broken.
+[0m→ [0mRead src/repl/commands.rs
 [0m→ [0mRead src/repl/history.rs
 [0m→ [0mRead src/repl/completer.rs
-[0m→ [0mRead src/repl/commands.rs
 [0m→ [0mRead src/repl/mod.rs
-[0m→ [0mRead src/vm.rs
-I've charted the REPL's core loop and command table — now digging into the end-to-end coverage and remaining edges.
-[0m→ [0mRead tests/repl_test.rs
-[0m→ [0mRead src/vm.rs[90m [offset=1235][0m
+First pass clean — now tracing the session, parser, and VM paths for deeper faults.
+[0m✱ [0mGrep "fn (user_names|user_value|user_functions|open_block_depth|with_bound_names|analyze_with_bound_names|get_var_ref)"[90m in src · 12 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=1388][0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=40, limit=80][0m
+[0m→ [0mRead src/vm.rs[90m [offset=590, limit=360][0m
+[0m→ [0mRead src/parser.rs[90m [offset=2030, limit=200][0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=565, limit=85][0m
+[0m→ [0mRead src/parser.rs[90m [offset=2225][0m
+[0m✱ [0mGrep "opens_block_at_statement_start|fn opens_block\b|MAX_BLOCK_DEPTH|MAX_BLOCK_LINES|qualified_members"[90m in src · 33 matches[0m
+[0m→ [0mRead src/parser.rs[90m [offset=1995, limit=50][0m
+[0m→ [0mRead src/parser.rs[90m [offset=425, limit=50][0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=118, limit=60][0m
+[0m→ [0mRead src/vm.rs[90m [offset=195, limit=180][0m
+Spotted a possible last-result inconsistency — now verifying module bindings and edge cases.
+[0m✱ [0mGrep "fn (bind_module_name|bind_constant|set_var|declare_in_program_scope|module_bound_names)"[90m in src · 6 matches[0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=1, limit=40][0m
+[0m→ [0mRead src/vm.rs[90m [offset=993, limit=70][0m
+[0m✱ [0mGrep "for_each|ForEach|push_scope|pop_scope|declare\("[90m in src · 19 matches[0m
+[0m→ [0mRead src/vm.rs[90m [offset=490, limit=130][0m
+[0m→ [0mRead src/vm.rs[90m [offset=1105, limit=130][0m
+[0m→ [0mRead src/vm.rs[90m [offset=460, limit=35][0m
+[0m→ [0mRead src/vm.rs[90m [offset=1365, limit=80][0m
+[0m✱ [0mGrep "unwrap|expect\(|panic!|unreachable!|todo!|unimplemented!|\[0\]|\[i\]"[90m in src/repl · 31 matches[0m
+No panic paths in the new code — now checking for silent failures and resource gaps.
+[0m✱ [0mGrep "\.get\(|\[.*\ glossy|\.expect|partition|split_once"[90m in src/repl · 11 matches[0m
+[0m✱ [0mGrep ""_""[90m in src · 5 matches[0m
+[0m✱ [0mGrep " '_'|is_alphabetic|is_alphanumeric|underscore"[90m in src · 2 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [offset=300, limit=110][0m
+[0m✱ [0mGrep "module_aliases|declared_modules\.insert|modules\.insert|bind_module_name"[90m in src · 19 matches[0m
+[0m→ [0mRead src/vm.rs[90m [offset=1310, limit=60][0m
 FINDINGS:
-1. [BLOCKER] src/repl/mod.rs:294 — `:load` never executes, only prints byte count, while `print_help` promises `Load and run a file` — help text and `:run` both claim execution, `load_file` just does `read_to_string` + `Loaded N bytes`, and no end-to-end test asserts `:load` runs anything — make `:load` execute via `run_code`/`run_file` in the session VM or fix help to say inspect-only.
-2. [MAJOR] src/repl/history.rs:87 — `reader.lines().map_while(Result::ok)` silently stops at first IO/UTF-8 error and still returns `Ok(())` — a corrupt history file loads truncated with success — iterate `for line in reader.lines()` and propagate with `let line = line?;`.
-3. [MAJOR] src/repl/mod.rs:284 — `for (name, value) in &self.variables` iterates a `HashMap` directly into stdout — nondeterministic order once more than one entry exists, tests only ever put `_` in it — sort names before printing as `user_names` already does.
-4. [MAJOR] src/repl/mod.rs:82 — `Ok(0) => break` on EOF discards `multiline_buffer` silently — `edge_unterminated_block_then_eof_terminates` only asserts `Goodbye!`, so dropped lines pass — report `incomplete block` error before breaking instead of dropping the buffer.
-5. [MAJOR] src/repl/commands.rs:97 — `:ast`, `:tokens`, `:load`, `:save`, `:run`, `:inspect` take only `parts.get(1)`, dropping the rest — `:ast 1 + 1` becomes `Ast("1")`, `:load /tmp/a b.rb` becomes `Load("/tmp/a")`, and `parse_reads_the_whole_alias_table` only checks the variant discriminant so it cannot fail — join the remainder (`parts[1..].join(" ")`) or reject trailing words.
-6. [MAJOR] src/vm.rs:426 — `Vm::user_names` scans only `globals`, but `Statement::Function` binds via `declare`+`set_var` into `locals`, so a `to`-defined function is never offered — comment on `session_names` claims functions are offered — union `locals` scopes into the result.
-7. [MAJOR] src/repl/mod.rs:208 — multiline detector is `ends_with("then"/"end"/"to"/"else"/"while"/"repeat")` substring match — `repeat 3 times` ends in `times`, `to greet(name)` ends in `)`, `for each i from 1 to 10` ends in `10`, so real blocks never trigger, while stray `end` does trigger and swallows all later lines — replace heuristic with parser completeness check or `end`-counting.
-
-REVIEW VERDICT: FINDINGS 7
+1. [MAJOR] src/repl/mod.rs:426 — `run_code` seeds the analyzer with `session_names()`, which includes `"_"` from `self.variables` (inserted at src/repl/mod.rs:403), but the VM never binds `"_"` — `2 + 3` then `say _` passes the static check and fails at runtime with `Unknown variable '_'`, while `:vars`/`:inspect`/completion advertise `_` as readable — exclude `"_"` from the analyzer seed or bind the last result in the VM so static acceptance implies runtime resolution.
+2. [MAJOR] src/repl/mod.rs:295 — `exceeds_block_limits` is checked before `needs_continuation`, so a single complete line larger than `MAX_BLOCK_BYTES` (64KB) is dropped as an "incomplete block ... that never balanced" and never runs, though the same source runs via file — only enforce the line/byte cap while continuation is pending, or bypass it for input whose `open_block_depth` is already balanced.
+3. [MAJOR] src/repl/mod.rs:659 — `replay` runs restored lines through `execute_line` with no end-of-replay `report_unclosed_block`, so a saved file ending in an unclosed block leaves `multiline_buffer`/`in_multiline` set and the next typed line is swallowed into a block the user never opened — drain/report the pending buffer after the loop as `run` does on EOF.
+4. [MAJOR] src/repl/commands.rs:296 — `None => (spec.build)(None)` ignores any argument to a no-arg command despite the `CommandSpec` contract that `usage: None` "tells the parser it must not be given one", so `:quit foo`/`:vars bar`/`:reset baz` silently succeed with no test on that side — check `Self::argument(input)` on the `None` arm and report `Unknown`/`MissingArgument`-style usage instead of discarding it.
+REVIEW VERDICT: FINDINGS 4
