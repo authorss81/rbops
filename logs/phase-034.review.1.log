@@ -1,0 +1,33 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the green gate for what's still broken — inspecting the literal implementation line by line.
+[0m→ [0mRead src/parser.rs
+[0m→ [0mRead src/stdlib.rs
+[0m→ [0mRead src/analyzer.rs
+[0m→ [0mRead src/vm.rs
+[0m→ [0mRead src/formatter.rs
+[0m→ [0mRead src/parser.rs[90m [offset=1643][0m
+Initial pass shows the shape of the feature — now digging into execution, analysis, and edge cases.
+[0m✱ [0mGrep "FunctionLiteral|map_builtin|apply_map|ANONYMOUS|call_method|MAX_CALL_DEPTH|call_user_function|list_map"[90m in src · 44 matches[0m
+[0m→ [0mRead src/linter.rs
+[0m→ [0mRead src/bytecode/codegen.rs
+[0m→ [0mRead tests/function_literal_test.rs
+[0m→ [0mRead src/vm.rs[90m [offset=1440, limit=400][0m
+[0m→ [0mRead src/value.rs
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|as cast|\[.*\]"[90m in src/vm.rs · 100 matches[0m
+Core mechanics look mostly sound — now checking for panic paths, resource limits, and spec mismatches.
+[0m→ [0mRead docs/GRAMMAR.md[90m [offset=435, limit=50][0m
+[0m✱ [0mGrep "\.unwrap\(|\.expect\(|panic!|unreachable!|todo!"[90m in src/vm.rs · 67 matches[0m
+[0m✱ [0mGrep "\.unwrap\(|\.expect\(|panic!|unreachable!|todo!"[90m in src/parser.rs · 67 matches[0m
+FINDINGS:
+1. [MAJOR] src/vm.rs:1558 — `apply_map` loops over every element with no `charge_step`/`charge_iteration`, unlike every `for`/`while`/`repeat` body — with an empty literal body (`map(xs, to (x) end)`) zero statements run so `MAX_STEPS` is never charged and a large list maps unbounded — charge one iteration per element as `ForEach` does.
+2. [MAJOR] src/bytecode/codegen.rs:741 — literal refusal uses `Span::unknown()` despite REPORT.md claiming a "spanned error", so `rb compile` of any literal program loses line/column — thread the `line` already in scope into a real `Span` instead of `unknown`.
+3. [MAJOR] src/parser.rs:2197 — `open_block_depth` only counts `to` at statement start, so a block literal opened mid-statement (`set f to to (x)`) leaves depth 0 and the REPL executes an unclosed literal instead of continuing — count a `to` that lexes as a literal opener, or track literal depth separately from declaration depth.
+4. [MAJOR] tests/function_literal_test.rs:571 — `a_literal_maps_in_every_spelling` asserts only `length+length+length is "9"`, so all three spellings returning wrong elements of the right length still passes — assert the mapped contents (e.g. `[2, 4, 6]`) per spelling.
+5. [MAJOR] src/parser.rs:1983 — `parse_postfix` rejects any callee except `Variable`/`Property` with `Expected function name`, so a literal stored in a list/record is not directly callable (`pair[0](1)`, `tools.double(50)`, `to (x) ... end (21)` all fail) and the tests only pass by rebinding through a variable first — accept any postfix value as callee or document the restriction in SPEC.md/GRAMMAR.md.
+6. [MINOR] src/linter.rs:403 — literal bodies are analyzed with `Span::unknown()`, while `Function` at line 279 passes the real `span`, so a parameter-shadows-outer warning inside a literal points at line 0 — pass through the enclosing statement span.
+7. [MINOR] src/analyzer.rs:570 — `collect_later_names` recurses into `Function`/`Method`/`Object`/`Module` bodies but falls through for `Statement::Expr(_)`, so a `constant` declared inside a literal body is never registered in `LaterNames` while the same declaration inside a named function is — recurse into `Expr::FunctionLiteral` bodies as well.
+8. [MINOR] src/formatter.rs:782 — a literal always formats as a multi-line block with `end` and no test covers a literal nested in call args (`xs.map(to (x) ...)`, which prints as `... to (x)\n ...\nend)`), so idempotence/re-parse of the nested shape is unproven — add a formatter round-trip test for the in-argument spelling.
+REVIEW VERDICT: FINDINGS 8
