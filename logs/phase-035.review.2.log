@@ -1,0 +1,25 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting for what's still broken — reading the changed files against the contract.
+[0m→ [0mRead tests/time_builtin_test.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead phases/phase-035/REPORT.md
+[0m→ [0mRead phases/phase-035/FINDINGS.md
+Initial pass shows the obvious panics are handled — now digging into the remaining code for subtler issues.
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|as u64|as usize|as i64|\[.*\]"[90m in src · 100 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1286][0m
+[0m✱ [0mGrep "finite_number|fn number|is_finite|non-finite|non_finite"[90m in src · 26 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [limit=30, offset=786][0m
+Two solid leads so far — now verifying whether the new sleep limit and error messages drift from the spec.
+[0m✱ [0mGrep "time\.sleep|time\.format|time\.unix"[90m in . · 48 matches[0m
+[0m→ [0mRead src/value.rs[90m [limit=60, offset=150][0m
+[0m✱ [0mGrep "sleep|time|finite"[90m in . · 17 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [limit=50, offset=340][0m
+FINDINGS:
+1. [MAJOR] tests/time_builtin_test.rs:274 — `time_sleep_of_zero_seconds_is_accepted` matches `Ok(_) => {}` with no assertion on the value, so it passes whatever `time.sleep(0)` returns — the same `say`-returns-`Nothing` shape round 1 claimed was fully removed ("Every assertion in the file is now on the value") — a test that cannot fail on the wrong return type — assert `Ok(Value::Nothing)` or the exact value instead of `Ok(_)`.
+2. [MAJOR] tests/time_builtin_test.rs:230 — `now.seconds >= 1600000000` hardcodes an absolute wall-clock date ("past 2020"), so the test depends on host-clock state and fails on any clock before 2020, contradicting the file header at tests/time_builtin_test.rs:7 ("Nothing here depends on wall-clock state") — nondeterministic/env-coupled test — assert a structural property (field exists, is a number, round-trips) or inject the instant instead of reading the live clock.
+3. [MINOR] src/runtime.rs:380 — `seconds_for_unix` parse failure returns `"Invalid date format, use YYYY-MM-DD HH:MM:SS"` with no `time.unix` prefix, while the sibling window refusal at src/runtime.rs:389 and every `time.format`/`time.sleep` refusal names its builtin, so the malformed-input path is unactionable and unpinned by `assert_runtime_error` — include `time.unix` in the message.
+4. [MINOR] src/runtime.rs:356 — the shared window is two independent literals (`const MAX_SECONDS: f64` at src/runtime.rs:356 and `const MAX_SECONDS: i64` at src/runtime.rs:386) with no single source of truth, so the "same window" claim holds only by keeping two numbers in step by hand — hoist one `const MAX_SECONDS: i64` and derive the `f64` bound from it.
+REVIEW VERDICT: FINDINGS 4
