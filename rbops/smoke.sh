@@ -400,7 +400,15 @@ check "$sel" "phase-001" "a once-deferred phase is still resumed first"
 # must still run it rather than idle — yield reorders, never starves.
 touch "$PIPE/phases/phase-001/.deferred"
 printf '3' > "$PIPE/phases/phase-001/.deferred_attempts"
-for id in $(seq -f "phase-%03g" 2 41); do
+# Block every other phase the manifest knows about, so the ONLY runnable one is
+# the yielded phase. This used to hardcode `seq 2 41`, which silently stopped
+# covering the queue the moment the manifest grew past 41 phases — phases 042+
+# were left unblocked and became runnable, so the subtest was no longer testing
+# an all-blocked queue at all. The count now comes from the manifest, so it
+# cannot drift from the thing it is meant to exhaust.
+last_phase="$(cd "$RBOPS_ROOT" && "$JQ" -r '.phases | length' rbops/phases.json)"
+last_phase="${last_phase:-41}"
+for id in $(seq -f "phase-%03g" 2 "$last_phase"); do
   touch "$PIPE/phases/$id/.blocked"
 done
 out="$(D select)"
@@ -1364,7 +1372,12 @@ else
   no "an exemption was granted to a phase that does produce errors"
 fi
 n_ex="$(echo "$na" | grep -c .)"
-[ "$n_ex" -le 4 ] && ok "the exemption is narrow ($n_ex phases)" \
+# The cap is a *narrowness* assertion, not a fixed count: it must catch a wave of
+# exemptions, not fail because an audit legitimately granted a fifth one. Five is
+# the widest the list has ever been (three diagnostics producers, one keywords
+# phase, one stdlib-reconciliation phase), so the bound is 6 — anything wider is
+# the exemption list becoming a way to skip the failure assertion entirely.
+[ "$n_ex" -le 6 ] && ok "the exemption is narrow ($n_ex phases)" \
   || no "$n_ex phases exempted — too broad"
 
 # =========================================================== 24. fix-pass honesty
