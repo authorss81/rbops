@@ -1,0 +1,28 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting phase-023 defects — inspecting the release ladder for weak gates and unsafe paths.
+[0m→ [0mRead src/bootstrap.rs
+Initial scan shows the build flow — now digging into the wiring and test coverage.
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead tests/bootstrap_ship_test.rs
+[0m→ [0mRead bootstrap/build.sh
+[0m✱ [0mGrep "set_program_args|program_args|MAX_STEPS|MAX_CALL_DEPTH|take_output|set_echo"[90m 100 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=870, limit=40][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=700, limit=90][0m
+[0m→ [0mRead src/error.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=80, offset=640][0m
+I've mapped the main failure modes — now verifying the release wiring and error handling.
+[0m→ [0mRead phases/phase-023/FINDINGS.md[90m [limit=40][0m
+[0m→ [0mRead .github/workflows/release.yml
+[0m→ [0mRead phases/phase-023/REPORT.md[90m [limit=15][0m
+FINDINGS:
+1. [BLOCKER] .github/workflows/release.yml:29 — `cargo build --release --locked` is still the only build step, no `bootstrap/build.sh` invocation and no `compiler.rbc` artifact, so the release never runs the ladder — why it matters: REPORT.md claims S4 green/shipped while FINDINGS.md admits the phase is "incomplete against this one" DoD row, which is fake completion — concrete fix: add the `- run: ./bootstrap/build.sh` step before the cargo build and upload `target/release-bootstrap/compiler.rbc` alongside the binary
+2. [MAJOR] src/lib.rs:139 — bare `rb bootstrap` (args len 2) still falls through to `_ => run_file_with_diagnostic(cmd)`, reproducing the exact `Is a directory` failure the REPORT lists as "before", because only the `3 if` (src/lib.rs:151) and `n >= 3` (src/lib.rs:270) arms handle `bootstrap` — why it matters: the documented `rb bootstrap [out-dir]` with a defaulted out-dir exits 1 without building — concrete fix: add a `"bootstrap" => bootstrap_args(&[])` arm to the len-2 match; the inner `"bootstrap"` arm at src/lib.rs:190 is dead code shadowed by src/lib.rs:151 and should be removed
+3. [MAJOR] src/bootstrap.rs:219 — `run_compiler_on` publishes the input/output paths via the process-global `PROGRAM_ARGS` mutex (src/runtime.rs:883) and then runs a minutes-long `vm.run`, with no lock held across the pair — why it matters: in-process parallel tests (`release()` stage 2 vs `edge_a_missing_empty_or_silent_compiler...` silent build, both live `BytecodeVm` runs reading `sys.argv()` from the same global) can interleave and compile the wrong input to the wrong path — concrete fix: pass argv per-VM (constructor/captured scope) instead of a global, or serialize `build`/`run_compiler_on` with a dedicated mutex
+4. [MAJOR] src/bootstrap.rs:204 — `rendered()` re-wraps any frontend failure as `Runtime(msg, Span::unknown())`, and every other bootstrap failure (src/bootstrap.rs:139,149,154,237,243,250,284) is built with `Span::unknown()` — why it matters: a program that previously produced a positioned Lexer/Parser/Analyzer error now surfaces as an unpositioned Runtime string, losing line/column for programmatic consumers — concrete fix: preserve and return the original `Error` variant/span instead of stringifying it into a Runtime message
+5. [MAJOR] src/lib.rs:405 — `--rollback` runs the full self-hosted build, then unconditionally `fs::write`s `rollback()` bytes over the shipped file with no comparison to the just-verified `built.stage2` — why it matters: a divergent rollback (frontend nondeterminism, changed compiler between the two reads) ships with exit 0 and a "Rolled back" message; only the script's later `cmp` would catch it, direct CLI users get an unverified compiler — concrete fix: refuse (non-zero, ship nothing) unless `bytes == built.stage2`
+6. [MINOR] tests/bootstrap_ship_test.rs:225 — the tamper test asserts only `refused_build.is_err()` and never asserts the refused build wrote no `compiler.rbc`, unlike the silent-compiler test at tests/bootstrap_ship_test.rs:289 — why it matters: a future refactor that writes before `verify` would still pass this test while shipping a non-fixed-point compiler — concrete fix: assert `!scratch("refused").join("compiler.rbc").exists()` after the refused build
+7. [STYLE] bootstrap/build.sh:77 — file ends without a trailing newline — concrete fix: append the newline
+REVIEW VERDICT: FINDINGS 7

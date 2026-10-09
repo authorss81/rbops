@@ -1,0 +1,3467 @@
+[0m
+> build · space-bunny-free
+[0m
+[0m$ [0mls -la; ls bootstrap/ 2>/dev/null; ls phases/ 2>/dev/null | tail -20
+total 260
+drwxr-xr-x 14 runner runner  4096 Oct  9 01:38 .
+drwxr-xr-x  8 runner runner  4096 Oct  9 01:38 ..
+drwxr-xr-x  7 runner runner  4096 Oct  9 01:38 .git
+-rw-r--r--  1 runner runner   318 Oct  9 01:38 .gitattributes
+drwxr-xr-x  3 runner runner  4096 Oct  9 01:38 .github
+-rw-r--r--  1 runner runner   403 Oct  9 01:38 .gitignore
+-rw-r--r--  1 runner runner  5474 Oct  9 01:38 AGENTS.md
+-rw-r--r--  1 runner runner  3140 Oct  9 01:38 CODE_OF_CONDUCT.md
+-rw-r--r--  1 runner runner  4818 Oct  9 01:38 CONTRIBUTING.md
+-rw-r--r--  1 runner runner 39455 Oct  9 01:38 Cargo.lock
+-rw-r--r--  1 runner runner   630 Oct  9 01:38 Cargo.toml
+-rw-r--r--  1 runner runner  6670 Oct  9 01:38 HANDOUT.md
+-rw-r--r--  1 runner runner  1079 Oct  9 01:38 LICENSE
+-rw-r--r--  1 runner runner  6272 Oct  9 01:38 PHILOSOPHY.md
+-rw-r--r--  1 runner runner  7032 Oct  9 01:38 README.md
+-rw-r--r--  1 runner runner 28928 Oct  9 01:38 ROADMAP.md
+-rw-r--r--  1 runner runner 24976 Oct  9 01:38 SPEC.md
+drwxr-xr-x  2 runner runner  4096 Oct  9 01:38 bootstrap
+-rw-r--r--  1 runner runner   700 Oct  9 01:38 build.rs
+drwxr-xr-x  2 runner runner 36864 Oct  9 01:38 corpus
+drwxr-xr-x  2 runner runner  4096 Oct  9 01:38 docs
+drwxr-xr-x  2 runner runner  4096 Oct  9 01:38 examples
+-rw-r--r--  1 runner runner  3400 Oct  9 01:38 export.sh
+drwxr-xr-x  2 runner runner  4096 Oct  9 01:38 modules
+drwxr-xr-x 32 runner runner  4096 Oct  9 01:38 phases
+drwxr-xr-x  5 runner runner  4096 Oct  9 01:38 src
+drwxr-xr-x  4 runner runner  4096 Oct  9 01:38 target
+-rw-r--r--  1 runner runner   622 Oct  9 01:38 test.redblue
+drwxr-xr-x  3 runner runner  4096 Oct  9 01:38 tests
+drwxr-xr-x  4 runner runner  4096 Oct  9 01:38 tooling
+compiler.rb
+phase-013
+phase-014
+phase-015
+phase-016
+phase-017
+phase-018
+phase-019
+phase-020
+phase-021
+phase-022
+phase-024
+phase-025
+phase-026
+phase-027
+phase-028
+phase-029
+phase-030
+phase-031
+phase-033
+phase-034
+[0m
+[0m$ [0mcat phases/phase-022/REPORT.md 2>/dev/null | head -60; echo "=== 022 files ==="; ls phases/phase-022/; echo "=== bootstrap ==="; wc -l bootstrap/compiler.rb; echo "=== src ==="; ls -R src | head -60
+# Phase 022 — Self-hosting fixed point (bootstrap S3)
+
+## Status: DONE. `stage1.rbc == stage2.rbc`, byte for byte, with no limit
+## overridden.
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| `bootstrap/compiler.rb` | +99 −44 | the encoder, the lexer's token list and the patcher's output list are grown with `append` on a named global instead of `set … to push(…)`; `compile_while` passes its `JumpIfFalse` slot as a parameter |
+| `src/interpreter.rs` | +30 −3 | `MAX_STEPS` default 10 000 000 → 32 000 000, with the measurement that justifies it; two pre-existing clippy one-liners |
+| `src/runtime.rs` | +1 −1 | one pre-existing clippy lifetime elision, in `append_target` |
+| `tests/bootstrap_selfhost_test.rs` | +393 −0 | four tests: the fixed point, three-run determinism, the step budget, and the nested `while` on its own |
+| `docs/BOOTSTRAP.md` | new | the ladder, the one rule, the two defects S3 found, and how to run it by hand |
+| `phases/phase-022/FINDINGS.md` | rewritten | what was actually slow, what was measured, and four follow-ups that are not this phase's |
+
+The three functional changes, in the order they were needed:
+
+1. **`encode`/`encode_block` build the file with `append`, not `cat`.** `cat`
+   copies the list it is given, so a `.rbc` of *n* bytes cost *n* copies of a
+   list that grew to *n* elements. Compiling `bootstrap/compiler.rb` means
+   encoding 162 298 bytes; that alone was most of six minutes. `put` writes each
+   byte through `append("G_BYTES", …)`, which grows the named list in place.
+   `encode` was 24.0 s of a 27.2 s run at 800 statements; it is under a second
+   now, and the run is 3.5 s.
+2. **`lex` appends to `G_TOKENS`.** Same shape, on the token list: 18 251 tokens
+   for this file. Lexing the compiler went from 8 s to 2 s.
+3. **`compile_while` passes its jump slot as a parameter.** It held the slot of
+   its own `JumpIfFalse` in a name across the call that compiled its body, and a
+   Redblue function's names are program-wide — so a `while` inside the body took
+   the outer loop's slot and patched the wrong jump. This is the defect the
+   fixed point found in itself; see "Known gaps" for what it produced.
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| `edge_the_self_hosted_compiler_compiles_itself_byte_identically` | **the fixed point** — `stage1.rbc == stage2.rbc`, and stage 2's file decodes to stage 1's chunk |
+| `edge_three_consecutive_self_compilations_are_byte_identical` | resource / determinism — three runs, three identical files |
+| `edge_the_self_compilation_still_obeys_the_step_budget` | **resource_limit** — a starved run fails, names the budget, and writes nothing |
+| `edge_a_while_loop_nested_in_another_patches_its_own_jump` | nesting_recursion (2 and 3 deep), boundary (empty bodies), singleton (a lone loop filling its block), branch nesting (`while` in an `else`) — seven programs, each compared byte for byte |
+
+**Test quota: met.** 4 new `#[test]` functions (floor is 3), 4 named `edge_*`
+(floor is 1), and a failure-asserting test
+(`edge_the_self_compilation_still_obeys_the_step_budget`, which requires a
+non-zero exit, `Step budget` on stderr, and no output file). Zero new
+`#[ignore]`, zero `// skip`, zero `allow(clippy::…)`.
+
+**Red before green.** `edge_a_while_loop_nested_in_another_patches_its_own_jump`
+was written first and failed on the `nested_while` shape — stage 1 wrote operand
+`35`, stage 2 wrote `30`, which is the mis-patched jump. It passed only after
+`compile_while` was changed.
+`edge_the_self_hosted_compiler_compiles_itself_byte_identically` was then
+written and watched fail with
+
+```
+Error: RuntimeError: Step budget of 10000000 reached before the program finished
+```
+
+before `MAX_STEPS` was raised.
+=== 022 files ===
+FINDINGS.md
+REPORT.md
+=== bootstrap ===
+2854 bootstrap/compiler.rb
+=== src ===
+src:
+analyzer.rs
+bytecode
+error.rs
+formatter.rs
+interpreter.rs
+lexer.rs
+lib.rs
+linter.rs
+lsp.rs
+main.rs
+parser.rs
+repl
+runtime.rs
+stdlib.rs
+testing
+value.rs
+
+src/bytecode:
+codegen.rs
+disasm.rs
+format.rs
+mod.rs
+opcode.rs
+vm.rs
+
+src/repl:
+commands.rs
+completer.rs
+history.rs
+mod.rs
+
+src/testing:
+assertions.rs
+harness.rs
+mod.rs
+reporter.rs
+runner.rs
+[0m
+[0m$ [0mcat docs/BOOTSTRAP.md; echo "=== build.rs ==="; cat build.rs; echo "=== Cargo.toml ==="; cat Cargo.toml
+# Bootstrapping Redblue: the ladder
+
+**Redblue compiles Redblue.** This document is what that means, which rung the
+project is on, and the one rule every rung is measured by.
+
+The format a compiled file has is described in [BYTECODE.md](BYTECODE.md). This
+is about who writes it.
+
+## The ladder
+
+| Stage | What exists | Definition of done |
+|---|---|---|
+| **S0** | The Rust `rb`: a tree-walking interpreter | `cargo test` is green and `rb run` runs every `examples/*.rb` |
+| **S1** | `rb compile` — a bytecode compiler written in Rust | it emits `.rbc`, and `rb vm file.rbc` runs it |
+| **S2** | `bootstrap/compiler.rb` — the same compiler written in Redblue | `rb run bootstrap/compiler.rb in.rb out.rbc` emits the same bytes as `rb compile` does |
+| **S3** | **done** — the compiler, compiled by itself | `stage1.rbc` and `stage2.rbc` are byte-identical |
+| **S4** | The shipped `rb` is built by `rb` | not started |
+
+Two names are used throughout, and they are always the same two files:
+
+- **stage 1** is `bootstrap/compiler.rb` compiled by the Rust frontend:
+  `rb compile bootstrap/compiler.rb -o stage1.rbc`. The compiler, running on a
+  machine it cannot itself produce.
+- **stage 2** is what that file writes when it is given its own source:
+  `rb vm stage1.rbc bootstrap/compiler.rb stage2.rbc`. The same compiler, its
+  Redblue source compiled to bytecode, executed by `rb vm`.
+
+## The one rule
+
+> **`stage1.rbc` and `stage2.rbc` are the same file, byte for byte.**
+
+There is no weaker version of this that counts. "The output is a valid `.rbc`"
+is satisfied by a compiler that writes nonsense; "the output is plausible" is
+satisfied by one that is *almost* right. The claim S3 makes is that compiling
+`bootstrap/compiler.rb` with a compiler that was itself compiled from
+`bootstrap/compiler.rb` produces exactly the bytes that compiling it with the
+Rust frontend does — so the file contains nothing that only the Rust build knows,
+and nothing that is a coincidence of this one input.
+
+No shimming is permitted on the way to it. There is no Rust fast path that a
+Redblue program silently falls back to: if `bootstrap/compiler.rb` does not do
+something, then stage 2 does not do it either, and the comparison above says so.
+And the language is not changed to make self-hosting easier — a grammar change
+needed for S2 or S3 has to be justified on its own merits, in its own phase, and
+is not part of this ladder.
+
+## Why S3 is the hard one
+
+S2 is a claim about the compiler agreeing with the Rust frontend on other
+programs. `tests/bootstrap_selfhost_test.rs` checks that over the whole
+`corpus/`, over `examples/` and `modules/`, and over a list of statement shapes
+the corpus families do not all reach — hundreds of programs, byte for byte.
+
+S3 is a claim about the compiler agreeing with the Rust frontend on **itself**.
+That is one program instead of hundreds, and it is much harder for three reasons.
+
+**It is the only input with the compiler's own shape.** Every corpus program is
+small enough that a mistake in the code generator lands somewhere the tests
+already look. `bootstrap/compiler.rb` is 2 800 lines of deeply nested
+if/else chains and loops within loops, so it exercises code paths nothing else
+does. Two of its bugs were found only here and are named below.
+
+**It is the only input that pays the whole cost at once.** Lexing 91 kB,
+parsing it, walking a parse tree with tens of thousands of nodes, and encoding
+162 kB of output — every stage at full size, in one run, three times over for
+the determinism check.
+
+**It is bounded by the same step budget as any other program.** The guard in
+`src/interpreter.rs` that stops a runaway program stops the compiler too, and
+the default had to be large enough to let it finish. It is 32 000 000 steps
+today; one self-compilation takes about 16 000 000 of them.
+
+## What the fixed point has already caught
+
+Two defects in `bootstrap/compiler.rb` were invisible to every S2 test and
+were found by compiling the compiler:
+
+1. **A `while` inside a `while`.** `compile_while` kept the slot of its own
+   `JumpIfFalse` in a name across the call that compiled its body. A Redblue
+   function's variable names are program-wide, so an inner `while` took the
+   outer loop's slot and patched the wrong jump — the outer loop then pointed at
+   the end of its block instead of at the instruction after itself.
+   `lex_text` has exactly that shape. `edge_a_while_loop_nested_in_another_patches_its_own_jump`
+   pins it now, with loops nested two and three deep.
+
+2. **Encoding was quadratic in the size of the file.** The `.rbc` was built one
+   `cat` at a time, and `cat` copies the list it is given, so a file of `n`
+   bytes cost `n` copies of a list that grew to `n` elements. Compiling the
+   compiler means encoding 162 139 bytes, and that alone took **most of six
+   minutes**. The encoder now writes through `append`, which grows a named list
+   in place. One self-compilation is about 14 seconds in a release build and
+   about 2.5 minutes in the test build `cargo test` uses.
+
+The second one is worth stating as a rule, because it is the shape more of the
+compiler is likely to grow into: **`push` copies.** Anywhere a Redblue program
+builds a list that grows to the size of its input, `set x to push(x, v)` is
+quadratic and `append("x", v)` is not. `G_POOL`, `G_INTERN`, `G_CODE`, `G_JUMPS`,
+`G_BLOCKS`, `G_TOKENS`, `G_PATCHED` and `G_BYTES` are all named globals for that
+reason.
+
+## What checks it
+
+Everything below runs in `cargo test`, so it runs on every push:
+
+| Test | What it holds |
+|---|---|
+| `edge_the_self_hosted_compiler_compiles_itself_byte_identically` | `stage1.rbc == stage2.rbc`, and stage 2's file decodes to the same chunk |
+| `edge_three_consecutive_self_compilations_are_byte_identical` | three consecutive runs, one file |
+| `edge_the_self_compilation_still_obeys_the_step_budget` | a run that outlasts its step budget fails, says so, and writes nothing |
+| `edge_a_while_loop_nested_in_another_patches_its_own_jump` | the nested-`while` patch, on its own, without needing the self-compilation to find it again |
+| `edge_stage3_is_byte_identical_on_every_corpus_program` | stage 2 == stage 1 for all 306 corpus programs the frontend accepts, through `rb vm` |
+| `edge_stage3_is_byte_identical_on_the_awkward_shapes` | the statement shapes the corpus families do not all reach |
+| `edge_stage3_refuses_every_malformed_corpus_program` | all 46 refusals, through `rb vm` |
+| `stage2_is_byte_identical_on_its_corpus_families` | the same corpus, through the tree-walker |
+| `stage2_is_byte_identical_on_the_examples_and_the_modules` | the language's specification by example |
+
+## Running it by hand
+
+```bash
+# stage 1: the Rust frontend compiles the compiler
+cargo run --release -- compile bootstrap/compiler.rb -o stage1.rbc
+
+# stage 2: that file compiles itself
+cargo run --release -- vm stage1.rbc bootstrap/compiler.rb stage2.rbc
+
+# the fixed point
+cmp stage1.rbc stage2.rbc && echo fixed point
+```
+
+Useful while working on the compiler:
+
+```bash
+# disassemble either file
+rb dis stage1.rbc > /tmp/s1.txt
+rb dis stage2.rbc > /tmp/s2.txt
+diff /tmp/s1.txt /tmp/s2.txt
+```
+
+A difference in the disassembly names the instruction that disagrees, and the
+`: line N:` annotation on every line says which line of `bootstrap/compiler.rb`
+produced it — which is usually enough to find the construct that was compiled
+wrong without a debugger.
+
+If a run is refused with `Step budget of ... reached before the program
+finished`, the compiler has outgrown the default in `MAX_STEPS`. Raise the
+constant, and the measurement that justifies it, in the same commit. To watch a
+run's cost without editing anything:
+
+```bash
+REDBLUE_MAX_STEPS=200000000 rb vm stage1.rbc bootstrap/compiler.rb stage2.rbc
+```
+
+## Determinism
+
+`stage2.rbc` is byte-identical across runs because the compiler never depends on
+an iteration order it does not control:
+
+- the constant pool is indexed by position (`length(G_POOL)`), never walked to
+  decide what comes next;
+- the intern table is a linear scan that returns the **first** match, so two
+  identical names cannot produce two entries in different orders;
+- the block tree is written in the order the parser built it;
+- no clock, no random source, and no `HashMap` order reaches the output.
+
+That is a claim about the compiler, so it is tested rather than asserted:
+`edge_three_consecutive_self_compilations_are_byte_identical` runs the whole
+self-compilation three times and compares the three files.=== build.rs ===
+//! Windows main-thread stack: 1 MiB there against 8 MiB everywhere else.
+//!
+//! A deeply nested program (e.g. 65 nested function literals, past the
+//! parser's own block budget) overflows the small Windows main stack in debug
+//! builds while Linux diagnoses it cleanly — so the same test is green on one
+//! platform and an abort on the other, for no reason in the language itself.
+//! Reserving the Linux-sized stack on Windows aligns the two: virtual address
+//! space only, committed on demand, zero cost unless deeply recursed into.
+//! Non-Windows targets are untouched.
+fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo::rustc-link-arg=/STACK:8388608");
+    }
+}
+=== Cargo.toml ===
+[package]
+name = "redblue"
+version = "0.2.0"
+edition = "2021"
+authors = ["Redblue Contributors"]
+description = "A programming language as readable as plain English"
+license = "MIT"
+repository = "https://github.com/authorss81/redblue"
+keywords = ["programming-language", "compiler"]
+categories = ["compiler", "development-tools"]
+
+[[bin]]
+name = "rb"
+path = "src/main.rs"
+
+[lib]
+name = "redblue"
+path = "src/lib.rs"
+
+[dependencies]
+regex = "1.10"
+chrono = "0.4"
+reqwest = { version = "0.11", features = ["blocking"] }
+indexmap = "2"
+
+[dev-dependencies]
+regex = "1.10"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+[0m
+[0m$ [0mwc -l src/main.rs; ls tooling tests; ls tooling/*; wc -l tests/*.rs | tail -5
+3 src/main.rs
+tests:
+bootstrap_selfhost_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+differential_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+integration_test.rb
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+repl_test.rs
+span_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+test_control_flow.rb
+test_functions.rb
+test_lists.rb
+test_loop_control.rb
+test_mod_in.rb
+test_modules.rb
+test_numeric_edges.rb
+test_object_model.rb
+test_objects.rb
+test_records.rb
+test_text.rb
+tooling_grammar_test.rs
+unless_test.rs
+
+tooling:
+repl
+vscode
+tooling/repl:
+README.md
+
+tooling/vscode:
+README.md
+language-configuration.json
+package.json
+syntaxes
+    297 tests/span_test.rs
+    989 tests/stdlib_modules_test.rs
+    647 tests/tooling_grammar_test.rs
+    411 tests/unless_test.rs
+  28769 total
+[0m
+[0m$ [0mcat src/main.rs; echo ===; cat src/lib.rs; echo ===; ls src/bytecode; grep -n "fn \|const " src/bytecode/mod.rs | head -60
+pub fn main() {
+    redblue::run_cli();
+}
+===
+pub mod analyzer;
+pub mod bytecode;
+mod error;
+pub mod formatter;
+mod interpreter;
+pub mod lexer;
+pub mod linter;
+pub mod lsp;
+pub mod parser;
+pub mod repl;
+mod runtime;
+pub mod stdlib;
+pub mod testing;
+mod value;
+
+use std::env;
+use std::fs;
+use std::process;
+
+use crate::lexer::Lexer;
+use testing::reporter::Reporter;
+
+pub use error::{Error, Span};
+pub use lsp::{
+    diagnostics, diagnostics_json, diagnostics_to_json, textmate_grammar, Diagnostic, Severity,
+    GRAMMAR_PATH, LANGUAGE_CONFIG_PATH,
+};
+// `FunctionValue` is re-exported because it is the payload of the public
+// `Value::Function` variant: a caller that matches that variant has to be able
+// to name the type it binds.
+pub use bytecode::{compile_source, Chunk, Opcode};
+pub use interpreter::{
+    resolve_max_iterations, resolve_max_iterations_from, resolve_max_steps, resolve_max_steps_from,
+    run_isolated, Vm, MAX_CALL_DEPTH, MAX_CALL_DEPTH_ENV, MAX_ITERATIONS, MAX_ITERATIONS_ENV,
+    MAX_STEPS, MAX_STEPS_ENV, NETWORK_CONNECT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS,
+};
+pub use value::{expect_repeat_count, FunctionBody, FunctionValue, Value};
+
+pub fn run_file(path: &str) -> Result<(), Error> {
+    let source = fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
+
+    run_source(&source)
+}
+
+/// Runs `path` and, when it fails, renders the source line and caret for the
+/// failure next to the message.
+fn run_file_with_diagnostic(path: &str) -> std::result::Result<(), String> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(e) => return Err(Error::Io(e.to_string()).to_string()),
+    };
+
+    run_source(&source).map_err(|e| e.render(&source, Some(path)))
+}
+
+fn report(rendered: &str) -> ! {
+    eprintln!("Error: {}", rendered);
+    process::exit(1);
+}
+
+pub fn run_source(source: &str) -> Result<(), Error> {
+    let tokens = Lexer::tokenize(source)?;
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze(&ast)?;
+
+    let (_vm, result) = interpreter::run_isolated(&ast);
+    result.map(|_| ())
+}
+
+/// The whole pipeline on `source` — lexer, parser, analyzer, then the VM — and
+/// the value of its last statement.
+///
+/// [`run_source`] is the same pipeline and reports only whether it succeeded.
+/// This returns what the program evaluated to, so a caller can assert on a run
+/// that went through the analyzer rather than around it: a test that skips the
+/// analyzer cannot fail on what the analyzer refuses.
+pub fn run_source_value(source: &str) -> Result<Value, Error> {
+    let tokens = Lexer::tokenize(source)?;
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze(&ast)?;
+
+    let (_vm, result) = interpreter::run_isolated(&ast);
+    result
+}
+
+pub fn run_repl() {
+    let mut repl = repl::Repl::new();
+    repl.run();
+}
+
+pub fn run_test(path: Option<&str>) -> Result<(), Error> {
+    let mut harness = testing::TestHarness::new();
+
+    match path {
+        Some(p) => {
+            harness.run_file(p)?;
+            // Report the failures and exit non-zero. Without this a failing
+            // `expect` printed only a dot/F and still exited 0.
+            testing::PrettyReporter::new().report(&harness.results());
+        }
+        None => {
+            let results = testing::run_all_tests()?;
+            println!("Tests run: {}", results.total);
+            println!("Passed: {}", results.passed);
+            println!("Failed: {}", results.failed);
+            if results.failed > 0 {
+                process::exit(1);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn run_cli() {
+    let args: Vec<String> = env::args().collect();
+
+    match args.len() {
+        1 => run_repl(),
+        2 => {
+            let cmd = &args[1];
+            match cmd.as_str() {
+                "help" | "--help" | "-h" => print_help(),
+                "version" | "--version" | "-v" => print_version(),
+                "test" => {
+                    if let Err(e) = run_test(None) {
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
+                }
+                "grammar" => print!("{}", textmate_grammar()),
+                "keywords" => {
+                    for keyword in Lexer::keywords() {
+                        println!("{}", keyword);
+                    }
+                }
+                _ => {
+                    if let Err(rendered) = run_file_with_diagnostic(cmd) {
+                        report(&rendered);
+                    }
+                }
+            }
+        }
+        3 => {
+            let cmd = &args[1];
+            let path = &args[2];
+            match cmd.as_str() {
+                "test" => {
+                    if let Err(e) = run_test(Some(path)) {
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
+                }
+                "run" => {
+                    if let Err(rendered) = run_file_with_diagnostic(path) {
+                        report(&rendered);
+                    }
+                }
+                "compile" => {
+                    if let Err(message) = compile_command(path, None) {
+                        eprintln!("{}", message);
+                        process::exit(1);
+                    }
+                }
+                "dis" => {
+                    if let Err(message) = dis_command(path) {
+                        eprintln!("{}", message);
+                        process::exit(1);
+                    }
+                }
+                "vm" => {
+                    if let Err(message) = vm_command(path) {
+                        eprintln!("Error: {}", message);
+                        process::exit(1);
+                    }
+                }
+                "format" => match fs::read_to_string(path) {
+                    Ok(source) => match formatter::format(&source) {
+                        Ok(formatted) => print!("{}", formatted),
+                        Err(e) => {
+                            eprintln!("Format error: {}", e);
+                            process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Error reading file: {}", e);
+                        process::exit(1);
+                    }
+                },
+                "lint" => match fs::read_to_string(path) {
+                    Ok(source) => {
+                        let (errors, warnings) = linter::lint(&source);
+                        // The line is printed with every finding: a file with
+                        // five unused variables says nothing about which `set`
+                        // each one names, and a reader cannot act on that. The
+                        // path is not repeated — the reader named the file.
+                        for warning in &warnings {
+                            eprintln!("Warning: line {}: {}", warning.line, warning.message);
+                        }
+                        for error in &errors {
+                            eprintln!("Error: line {}: {}", error.line, error.message);
+                        }
+                        if !errors.is_empty() {
+                            process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading file: {}", e);
+                        process::exit(1);
+                    }
+                },
+                "diagnostics" => match fs::read_to_string(path) {
+                    Ok(source) => {
+                        let found = diagnostics(&source);
+                        // Rendered from the findings just computed: re-running
+                        // the frontend to format them would lex, parse and
+                        // analyze the file a second time.
+                        println!("{}", diagnostics_to_json(&found));
+                        // Exit non-zero when anything is an error, the way
+                        // `rb lint` does, so this is usable as a CI check.
+                        if found.iter().any(|d| d.severity == Severity::Error) {
+                            process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading file: {}", e);
+                        process::exit(1);
+                    }
+                },
+                _ => {
+                    print_help();
+                    process::exit(1);
+                }
+            }
+        }
+        5 if args[1] == "compile" && args[3] == "-o" => {
+            if let Err(message) = compile_command(&args[2], Some(&args[4])) {
+                eprintln!("{}", message);
+                process::exit(1);
+            }
+        }
+        // `rb run <file> [args...]` — whatever follows the path belongs to the
+        // program, and `sys.argv()` is how the program reads it. Without this a
+        // Redblue program had no way to be told what to do: `rb run` took a path
+        // and nothing else, so a compiler written in Redblue could not be given
+        // a file to compile. A program that asks for no arguments is unaffected
+        // — `sys.argv()` is then an empty list, as it is everywhere else.
+        // `rb vm` takes its arguments the same way, for the same reason: the
+        // next rung of the ladder is `rb vm stage1.rbc in.rb out.rbc`, and a
+        // `rb vm` that dropped the arguments could not reach it. Before this
+        // arm existed `rb vm a.rbc b c d` matched nothing, fell through to
+        // `_ => print_help()` and exited 0 having run nothing at all.
+        n if n >= 3 && (args[1] == "run" || args[1] == "vm") => {
+            let path = args[2].clone();
+            runtime::set_program_args(args[3..].to_vec());
+            let outcome = if args[1] == "run" {
+                run_file_with_diagnostic(&path)
+            } else {
+                vm_command(&path)
+            };
+            if let Err(rendered) = outcome {
+                report(&rendered);
+            }
+        }
+        4 => {
+            let cmd = &args[1];
+            if cmd == "format" && args[2] == "--check" {
+                let path = &args[3];
+                match fs::read_to_string(path) {
+                    Ok(source) => match formatter::format(&source) {
+                        Ok(formatted) => {
+                            if formatter::needs_reformat(&source, &formatted) {
+                                println!("File would be reformatted");
+                                process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Format error: {}", e);
+                            process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Error reading file: {}", e);
+                        process::exit(1);
+                    }
+                }
+            } else {
+                print_help();
+                process::exit(1);
+            }
+        }
+        // Reaching here is a usage error — a command with arguments no arm
+        // claimed — and it exits non-zero. It used to return normally, so the
+        // help text was printed and the shell was told the command succeeded.
+        _ => {
+            print_help();
+            process::exit(1);
+        }
+    }
+}
+
+/// The `.rbc` path `rb compile <file>` writes when no `-o` is given: the
+/// source path with its extension replaced.
+fn bytecode_path_for(source: &str) -> String {
+    match source.rfind('.') {
+        Some(dot) if dot + 1 < source.len() => format!("{}.rbc", &source[..dot]),
+        _ => format!("{source}.rbc"),
+    }
+}
+
+/// `rb compile <file> [-o <out.rbc>]` — the frontend, then the encoder.
+fn compile_command(source: &str, out: Option<&str>) -> Result<(), String> {
+    let text = fs::read_to_string(source).map_err(|e| Error::Io(e.to_string()).to_string())?;
+    let chunk = bytecode::compile_source(&text).map_err(|e| e.render(&text, Some(source)))?;
+    let target = out
+        .map(str::to_string)
+        .unwrap_or_else(|| bytecode_path_for(source));
+
+    fs::write(&target, chunk.encode()).map_err(|e| format!("Error: cannot write {target}: {e}"))?;
+
+    println!("Compiled {source} -> {target}");
+    Ok(())
+}
+
+/// `rb dis <file.rbc>` — the disassembler.
+fn dis_command(path: &str) -> Result<(), String> {
+    if !path.ends_with(".rbc") {
+        return Err(format!(
+            "Error: {path} is not a bytecode file; compile it first and disassemble the .rbc"
+        ));
+    }
+    let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()).to_string())?;
+    let chunk = bytecode::Chunk::decode(&bytes).map_err(|e| e.to_string())?;
+
+    print!("{}", bytecode::disassemble(&chunk));
+    Ok(())
+}
+
+/// `rb vm <file.rbc>` — the bytecode VM, which is bootstrap stage S1b.
+///
+/// A `.rbc` carries no source text, so a failure is reported with the same kind,
+/// message and line the tree-walking VM gives, but without the source line and
+/// caret `rb run` draws: a bytecode file has no text to draw them from. The
+/// gap is in `phases/phase-019/FINDINGS.md`.
+fn vm_command(path: &str) -> Result<(), String> {
+    // The message carries no `Error: ` prefix of its own: both callers of this
+    // function put one there, and one of them is now `report`, which adds it.
+    if !path.ends_with(".rbc") {
+        return Err(format!("{path} is not a bytecode file; compile it first"));
+    }
+    let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()).to_string())?;
+    let chunk = bytecode::Chunk::decode(&bytes).map_err(|e| e.to_string())?;
+
+    bytecode::vm::run(&chunk)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn print_help() {
+    println!("Redblue v0.1.0 - A programming language as readable as plain English");
+    println!();
+    println!("Usage:");
+    println!("  rb              Start interactive REPL");
+    println!("  rb <file>      Run a Redblue file");
+    println!("  rb run <file>  Run a Redblue file");
+    println!("  rb test        Run all tests");
+    println!("  rb test <file> Run specific test file");
+    println!("  rb format <file>  Format a Redblue file");
+    println!("  rb format --check <file>  Check if file needs formatting");
+    println!("  rb lint <file>  Lint a Redblue file");
+    println!("  rb compile <file> [-o out.rbc]  Compile to bytecode");
+    println!("  rb dis <file.rbc>  Disassemble bytecode");
+    println!("  rb vm <file.rbc>  Run bytecode");
+    println!("  rb diagnostics <file>  Report errors as JSON for editors");
+    println!("  rb grammar  Print the TextMate grammar for .rb files");
+    println!("  rb keywords  Print the keyword list");
+    println!("  rb help        Show this help");
+    println!("  rb version     Show version");
+    println!();
+    println!("Example:");
+    println!("  rb examples/hello.rb");
+    println!("  rb format examples/hello.rb");
+    println!("  rb lint examples/hello.rb");
+    println!("  rb compile examples/hello.rb -o hello.rbc");
+    println!("  rb dis hello.rbc");
+    println!("  rb vm hello.rbc");
+}
+
+fn print_version() {
+    println!("Redblue v0.1.0");
+}
+===
+codegen.rs
+disasm.rs
+format.rs
+mod.rs
+opcode.rs
+vm.rs
+[0m
+[0m$ [0mls phases/phase-021 phases/phase-020; echo === ; sed -n 1,80p tests/bootstrap_selfhost_test.rs; echo ...; ls tests/common; cat .gitignore
+phases/phase-020:
+FINDINGS.md
+REPORT.md
+
+phases/phase-021:
+FINDINGS.md
+REPORT.md
+===
+//! `bootstrap/compiler.rb` — the compiler written in Redblue (ladder stage S2).
+//!
+//! Stage 1 is the Rust `rb compile`: `src/lexer.rs` -> `src/parser.rs` ->
+//! `src/bytecode/codegen.rs` -> `Chunk::encode`. Stage 2 is
+//! `bootstrap/compiler.rb`: the same four stages, written in Redblue and run by
+//! the Rust `rb`. The ladder's rule is that stage 2 is not a *second* compiler
+//! but the *same* one, and the only evidence that says so is the bytes: for a
+//! program both engines accept, the two must produce one file, byte for byte.
+//!
+//! So every test here compares `fs::read(stage2.rbc)` against
+//! `compile_source(source).encode()` and nothing else. A stage-2 compiler that
+//! runs, emits a plausible file and differs in one byte fails every test here.
+//!
+//! Nothing in `bootstrap/` is reachable from `rb compile`, and nothing in `src/`
+//! special-cases a path: the tests would notice, because a shim would make the
+//! two byte-identical without the Redblue source doing the work.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The self-hosted compiler under test.
+fn compiler() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+}
+
+/// A path under `target/tmp/`. Nothing is ever written to `corpus/` or
+/// `bootstrap/`: a test that rewrote what it is checking proves nothing.
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/bootstrap");
+    fs::create_dir_all(&dir).expect("scratch directory");
+    dir.join(name)
+}
+
+/// What one stage-2 run did.
+struct Stage2 {
+    bytes: Vec<u8>,
+    stderr: String,
+    succeeded: bool,
+}
+
+/// Reads a stage-2 output file, treating *absent* as "wrote nothing" and every
+/// other failure as the failure it is.
+///
+/// A stage 2 that refuses a program writes no file, and "no file" is a result
+/// several tests here assert. But that is the *only* absence these runs are
+/// allowed to have: `unwrap_or_default()` also turned an unreadable path — a
+/// directory where the file should be, a permissions failure, a full disk — into
+/// the same empty `Vec`, so a run whose output could not be read at all was
+/// reported as a compile that wrote nothing. That is the wrong diagnosis for the
+/// wrong cause, and on the byte-equality tests it hid behind a length mismatch
+/// rather than naming the IO error.
+///
+/// So: `NotFound` is the one answer that means "wrote nothing", and everything
+/// else stops the test by naming the file and the cause.
+fn read_output(path: &Path) -> Vec<u8> {
+    match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!(
+            "stage 2's output {} could not be read, so there is nothing to compare: {error}",
+            path.display()
+        ),
+    }
+}
+
+/// Removes a stale output file, so a run that writes nothing cannot be read as a
+/// run that wrote something.
+///
+/// This was `let _ = fs::remove_file(...)`, which discards every failure and not
+/// only the expected one. Several tests below assert "stage 2 wrote no file",
+/// and if the stale file could not be removed then the assertion would be
+/// reading the previous run's bytes and reporting them as this one's.
+///
+/// `NotFound` is the expected answer — there is nothing stale. Anything else is
+/// stopped here, by name and by cause.
+fn clear_output(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+...
+corpus.rs
+generator.rs
+mod.rs
+rng.rs
+shrink.rs
+vm.rs
+# Build outputs
+/target/
+*.rbc
+a.out
+
+# Stray debug outputs - never commit these
+err.txt
+errors.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent/copilot files (local only, do not commit)
+AGENTS.md
+.skill/
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+
+# Secrets
+.env
+*.pem
+*.key
+credentials.json
+secrets.txt
+
+# Test outputs
+*.tmp
+*.log
+[0m
+[0m$ [0mgrep -n "fn \|ignore\|Command::new\|cargo_bin\|env!" tests/bootstrap_selfhost_test.rs | head -60; echo === ; grep -rn "ignore" tests/*.rs | head
+24:fn compiler() -> PathBuf {
+25:    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+30:fn scratch(name: &str) -> PathBuf {
+31:    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/bootstrap");
+57:fn read_output(path: &Path) -> Vec<u8> {
+78:fn clear_output(path: &Path) {
+91:fn stage2(name: &str, source: &str) -> Stage2 {
+97:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+113:fn stage1(name: &str, source: &str) -> Vec<u8> {
+123:fn assert_identical(name: &str, source: &str) {
+156:fn stage2_is_byte_identical_for_each_statement_kind() {
+243:fn edge_source_shapes_are_byte_identical() {
+323:fn edge_malformed_source_is_reported_rather_than_compiled() {
+366:fn stage2_is_byte_identical_on_its_corpus_families() {
+367:    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+471:fn stage2_is_byte_identical_on_the_examples_and_the_modules() {
+472:    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+491:                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+532:fn edge_each_branch_compiles_the_statements_it_was_given() {
+602:fn edge_the_two_engines_run_a_branching_program_the_same() {
+641:        let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+675:fn edge_for_range_pushes_only_the_bounds_it_was_given() {
+711:fn edge_a_broken_branch_is_refused_and_writes_nothing() {
+779:fn vm(args: &[&str]) -> VmRun {
+780:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+794:fn stage1_file(name: &str, source: &str) -> PathBuf {
+811:fn edge_the_bytecode_vm_hands_arguments_to_the_program_it_runs() {
+869:fn edge_the_bytecode_vm_reports_a_bad_invocation_as_a_failure() {
+933:fn stage3(name: &str, path: &Path) -> Stage2 {
+937:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+954:fn stage1_of_the_compiler() -> PathBuf {
+967:fn compiler_contents() -> String {
+1000:fn edge_stage3_is_byte_identical_on_a_sample_of_every_family() {
+1003:        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+1050:fn edge_stage3_is_byte_identical_on_the_awkward_shapes() {
+1141:fn edge_stage3_is_byte_identical_on_every_corpus_program() {
+1142:    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+1170:            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+1246:fn edge_stage3_refuses_every_malformed_corpus_program() {
+1247:    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+1278:            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+1287:        let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+1424:fn edge_stage3_reports_a_failure_rather_than_writing_a_file() {
+1431:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+1455:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+1491:fn self_compilations() -> &'static [Stage2; 3] {
+1533:fn self_compile(run: usize) -> io::Result<std::process::Child> {
+1537:    Command::new(env!("CARGO_BIN_EXE_rb"))
+1558:fn edge_the_self_hosted_compiler_compiles_itself_byte_identically() {
+1612:fn edge_three_consecutive_self_compilations_are_byte_identical() {
+1655:fn edge_the_self_compilation_still_obeys_the_step_budget() {
+1662:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+1702:fn edge_a_while_loop_nested_in_another_patches_its_own_jump() {
+===
+tests/call_depth_test.rs:246:    assert_eq!(code, 0, "a zero limit must be ignored (stderr: {})", stderr);
+tests/call_depth_test.rs:263:            "limit {:?} must be ignored and the default {} used",
+tests/closure_capture_test.rs:533:            set ignored to bad()
+tests/linter_test.rs:166:    let source = "set _ignored to 1\nsay \"hi\"\n";
+tests/loop_control_test.rs:1296:/// the block ignored would show up as a `leaked` line.
+tests/record_order_test.rs:506:fn test_record_equality_ignores_field_order() {
+[0m
+[0m$ [0mls target; ls target/debug/rb target/release/rb 2>&1 | head; git log --oneline -8
+CACHEDIR.TAG
+debug
+tmp
+ls: cannot access 'target/release/rb': No such file or directory
+target/debug/rb
+054e0d6 rbops: phase-022 (2026-10-09T01:37:10Z)
+dff04f6 resume phase-022: adopt preserved work
+564fdf2 rbops: phase-021 (2026-10-08T18:56:18Z)
+4c45731 resume phase-021: adopt preserved work
+f3fabbd ci: match the corpus-count pattern to the README sentence it reads
+6d251e2 tests+build: green on Windows - platform-agnostic assertions, forward-slash paths, 8MB stack, LF-everywhere attributes
+36384a0 ci: strip wc padding in corpus-count check
+bba8b60 rename tree-walking vm.rs to interpreter.rs; README build section, error sample, corpus count pinned in CI
+[0m
+[0m$ [0m./target/debug/rb help | grep -n -i "bootstrap\|compile\|vm" ; echo "--- exit $?"; ls bootstrap/
+12:  rb compile <file> [-o out.rbc]  Compile to bytecode
+14:  rb vm <file.rbc>  Run bytecode
+25:  rb compile examples/hello.rb -o hello.rbc
+27:  rb vm hello.rbc
+--- exit 0
+compiler.rb
+[0m
+[0m$ [0mgrep -n "pub fn\|pub struct\|pub const" src/bytecode/vm.rs src/bytecode/mod.rs src/bytecode/codegen.rs | head -40; echo ===; grep -n "set_program_args\|pub fn run_isolated" -r src/runtime.rs src/interpreter.rs | head
+src/bytecode/vm.rs:531:pub struct BytecodeVm {
+src/bytecode/vm.rs:650:    pub fn new() -> Self {
+src/bytecode/vm.rs:683:    pub fn with_max_call_depth(max_call_depth: usize) -> Self {
+src/bytecode/vm.rs:693:    pub fn with_max_steps(max_steps: usize) -> Self {
+src/bytecode/vm.rs:701:    pub fn with_max_iterations(max_iterations: usize) -> Self {
+src/bytecode/vm.rs:714:    pub fn with_limits(max_iterations: usize, max_steps: usize) -> Self {
+src/bytecode/vm.rs:722:    pub fn set_echo(&mut self, echo: bool) {
+src/bytecode/vm.rs:728:    pub fn take_expectation_failure(
+src/bytecode/vm.rs:745:    pub fn run(&mut self, chunk: &Chunk) -> Result<Value> {
+src/bytecode/vm.rs:770:    pub fn take_output(&mut self) -> Vec<String> {
+src/bytecode/vm.rs:3267:pub struct Limits {
+src/bytecode/vm.rs:3275:pub fn limits() -> Limits {
+src/bytecode/vm.rs:3290:pub fn run(chunk: &Chunk) -> Result<Value> {
+src/bytecode/vm.rs:3296:pub const DEFAULT_MAX_CALL_DEPTH: usize = MAX_CALL_DEPTH;
+src/bytecode/vm.rs:3298:pub const DEFAULT_MAX_ITERATIONS: usize = MAX_ITERATIONS;
+src/bytecode/vm.rs:3300:pub const DEFAULT_MAX_STEPS: usize = MAX_STEPS;
+src/bytecode/codegen.rs:29:pub fn compile(program: &Program) -> Result<Chunk> {
+===
+src/runtime.rs:882:/// Where `sys.argv()` reads from. See [`set_program_args`].
+src/runtime.rs:890:pub fn set_program_args(args: Vec<String>) {
+src/interpreter.rs:153:pub fn run_isolated(program: &Program) -> (Vm, Result<Value>) {
+[0m
+[0m$ [0mtail -60 bootstrap/compiler.rb; echo ===HEAD===; sed -n 1,40p bootstrap/compiler.rb
+compile_expr(expr.e, line)
+        set compile_expr_opcode to 27
+        if expr.op is "not" then
+            set compile_expr_opcode to 28
+        end
+        emit(compile_expr_opcode, 0, 0, line)
+    end
+    if expr.k is "call" then
+        for each each_arg in expr.args
+            compile_expr(each_arg, line)
+        end
+        emit_name(29, expr.n, length(expr.args), line)
+    end
+    if expr.k is "mcall" then
+        // A receiver that is a plain name is not loaded: `CALL_METHOD` already
+        // carries `receiver.method` and resolves it against the receiver's
+        // *name*. Loading it would ask for a binding that need not exist —
+        // `json.parse` names a module and `json` is never a variable.
+        if expr.o.k is not "var" then
+            compile_expr(expr.o, line)
+        end
+        for each each_arg in expr.args
+            compile_expr(each_arg, line)
+        end
+        if expr.o.k is "var" then
+            emit_name(30, cat(cat(expr.o.n, [46]), expr.m), length(expr.args), line)
+        else
+            emit_name(30, expr.m, length(expr.args), line)
+        end
+    end
+    if expr.k is "prop" then
+        compile_expr(expr.o, line)
+        emit_name(7, expr.p, 0, line)
+    end
+    if expr.k is "index" then
+        compile_expr(expr.o, line)
+        compile_expr(expr.i, line)
+        emit(9, 0, 0, line)
+    end
+    if expr.k is "list" then
+        for each each_item in expr.items
+            compile_expr(each_item, line)
+        end
+        emit(10, length(expr.items), 0, line)
+    end
+    if expr.k is "record" then
+        for each each_field in expr.fields
+            emit_name(1, each_field.k, 0, line)
+            compile_expr(each_field.v, line)
+        end
+        emit(11, length(expr.fields), 0, line)
+    end
+    if expr.k is "expect" then
+        compile_expr(expr.a, line)
+        compile_expr(expr.b, line)
+        emit(45, 0, 0, line)
+    end
+    end
+
+main()
+===HEAD===
+// bootstrap/compiler.rb — bootstrap stage S2.
+//
+// `rb compile` is stage 1: `src/lexer.rs` -> `src/parser.rs` ->
+// `src/bytecode/codegen.rs` -> `Chunk::encode`. This file is stage 2: the same
+// four stages, written in Redblue, so that a Redblue program can produce a
+// `.rbc`.
+//
+//     rb run bootstrap/compiler.rb <input.rb> <output.rbc>
+//
+// The only claim this file may make is byte-for-byte equality with stage 1 for
+// every program both accept. `tests/bootstrap_selfhost_test.rs` is what checks
+// it, against `compile_source(source).encode()` and nothing else — so a stage 2
+// that compiles *something* without compiling the *same* something fails.
+//
+// Three rules make the equality hold, and each is a difference between the two
+// implementations rather than a convenience:
+//
+//   1. The source is read as **bytes**, not as characters. The lexer walks a
+//      `Vec<char>` in stage 1 and a list of byte values here, and what the
+//      format stores for a text constant is its UTF-8 bytes — so a stage 2
+//      that counted characters would write different length fields for every
+//      non-ASCII string.
+//   2. A name is interned and a string literal is not. `Compiler::text` in
+//      `src/bytecode/codegen.rs` looks a name up before appending it, while
+//      `Expr::Text` appends every occurrence. The pool is in order of first
+//      use, so the two rules have to be the same two rules.
+//   3. A nested block's body is compiled **before** the instruction naming it,
+//      because that is when its constants enter the pool.
+//
+// Nothing here reads a clock, a hash-map order or a path: the same source gives
+// the same bytes on every run.
+//
+// One property of Redblue shapes every function below, and is why they are
+// written the way they are: `give back` inside an `if` or `while` body returns
+// from that body, not from the function. So every function computes into a
+// variable and returns once, at its own level.
+
+// ---------------------------------------------------------------------------
+// The reserved operands of `src/bytecode/format.rs`. `NO_CONST` and `NO_BLOCK`
+// are the maximum `u32`, which a constant pool can never reach, so they can
+[0m
+[0m$ [0mgrep -n "define main\|sys.argv\|give back" bootstrap/compiler.rb | head -20; echo ===; sed -n '/^define main/,/^end/p' bootstrap/compiler.rb
+34:// written the way they are: `give back` inside an `if` or `while` body returns
+70:    set main_args to sys.argv()
+80:    give back 0
+99:    give back bytes.from_text(read_source_text)
+158:    give back pow2_result
+171:    give back inv_pow2_result
+188:    give back exponent_of_e
+246:    give back number_bytes_raw
+264:    give back cat_out
+298:    give back [u32_le_b0, u32_le_b1, u32_le_b2, u32_le_b3]
+324:    give back G_BYTES
+351:    give back 0
+362:    give back c >= 48 and c <= 57
+370:    give back (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c is 95 or c >= 128
+374:    give back is_digit(c) or is_alpha(c)
+380:    give back c is 32 or c is 9 or c is 11 or c is 12
+393:    give back byte_at_value
+411:    give back char_width_width
+444:    give back G_TOKENS
+506:    give back lex_one_result
+===
+[0m
+[0m$ [0msed -n 55,100p bootstrap/compiler.rb
+set G_BLOCKS to []
+// The seventh is not the code generator's: it is the file being written, and it
+// is named for the same reason. `G_BYTES` is emptied by `encode` and read once.
+set G_BYTES to []
+// And these two are the lexer's token list and one block's patched code. Each is
+// emptied by the function that fills it and read there.
+set G_TOKENS to []
+set G_PATCHED to []
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+to main()
+    set main_args to 0
+    set main_args to sys.argv()
+    if length(main_args) is not 2 then
+        refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
+    end
+
+    set main_source to read_source(main_args[0])
+    set main_tokens to lex(main_source)
+    set main_program to parse_program(main_tokens)
+    set main_chunk to compile_program(main_program)
+    bytes.write(main_args[1], encode(main_chunk))
+    give back 0
+end
+
+// The file to compile, as bytes. Read as text and converted, so a file that is
+// not UTF-8 is refused here rather than half-lexed — the same refusal the Rust
+// frontend makes when it reads a source file.
+to read_source(path)
+    set read_source_ok to 0
+    set read_source_text to 0
+    set read_source_ok to yes
+    set read_source_text to ""
+    try
+        set read_source_text to files.read(path)
+    catch failure
+        set read_source_ok to no
+    end
+    if read_source_ok is no then
+        refuse(0, "cannot read " + path)
+    end
+    give back bytes.from_text(read_source_text)
+end
+[0m
+[0m$ [0m./target/debug/rb bootstrap 2>&1 | head -5; echo "exit=$?"; grep -rn "bootstrap" .github/workflows/*.yml | head
+Error: IoError: Is a directory (os error 21)
+exit=0
+[0m
+[0m$ [0mcat rbops/verify.sh
+cat: rbops/verify.sh: No such file or directory
+[0m
+[0m$ [0mls -a; ls phases/phase-023 2>&1; ls .github/workflows
+.
+..
+.git
+.gitattributes
+.github
+.gitignore
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+ls: cannot access 'phases/phase-023': No such file or directory
+ci.yml
+release.yml
+[0m
+[0m$ [0msed -n 1480,1620p tests/bootstrap_selfhost_test.rs
+/// The definition of done asks for the fixed point *and* for three consecutive
+/// runs, and those are three runs of the same expensive thing, so they are made
+/// once here and read twice. A `OnceLock` rather than a file: the bytes are in
+/// memory, and two tests in one process must not race for them.
+///
+/// They run at the same time rather than one after another, because one
+/// self-compilation is minutes in a test build and three of them in series is a
+/// gate nobody reads. Nothing is shared but the already-written `stage1.rbc`,
+/// which no run writes, and each run writes a file of its own — so what runs
+/// beside what cannot change a byte, which is exactly the claim
+/// `edge_three_consecutive_self_compilations_are_byte_identical` makes about them.
+fn self_compilations() -> &'static [Stage2; 3] {
+    static RUNS: std::sync::OnceLock<[Stage2; 3]> = std::sync::OnceLock::new();
+    RUNS.get_or_init(|| {
+        let running: Vec<std::process::Child> = (0..3)
+            .map(|run| self_compile(run).expect("the rb binary starts"))
+            .collect();
+
+        let runs: Vec<Stage2> = running
+            .into_iter()
+            .zip(0..3)
+            .map(|(child, run)| {
+                let executed = child.wait_with_output().unwrap_or_else(|error| {
+                    panic!("self-compilation {run} could not be waited on: {error}")
+                });
+                Stage2 {
+                    bytes: read_output(&scratch(&format!("stage3-self-{run}.rbc"))),
+                    stderr: String::from_utf8_lossy(&executed.stderr).into_owned(),
+                    succeeded: executed.status.success(),
+                }
+            })
+            .collect();
+
+        let mut runs = runs.into_iter();
+        [
+            runs.next().expect("three runs were made"),
+            runs.next().expect("three runs were made"),
+            runs.next().expect("three runs were made"),
+        ]
+    })
+}
+
+/// Starts one self-compilation and leaves it running.
+///
+/// `bootstrap/compiler.rb`, compiled by itself, run as bytecode. Stage 1 is the
+/// Rust `rb compile`. This is stage 2 obtained the long way round: the *same*
+/// Redblue compiler, but its `.rbc` executed by the bytecode VM instead of its
+/// source executed by the tree-walker. Nothing here reads
+/// `stage1_of_the_compiler()`'s own output — the input and the output are two
+/// different files, and the run writes only the output.
+///
+/// It returns the child rather than a result because the point is to have three
+/// of these running at once; `self_compilations` waits for them.
+fn self_compile(run: usize) -> io::Result<std::process::Child> {
+    let output = scratch(&format!("stage3-self-{run}.rbc"));
+    clear_output(&output);
+
+    Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("vm")
+        .arg(stage1_of_the_compiler())
+        .arg(compiler())
+        .arg(&output)
+        // Piped, not inherited: `spawn` inherits both by default, and a run that
+        // fails then says why to the test log instead of to the assertion that
+        // reports which of the three runs it was.
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+}
+
+/// Ladder stage **S3**: `stage1.rbc == stage2.rbc`.
+///
+/// `stage1.rbc` is `bootstrap/compiler.rb` compiled by the Rust frontend.
+/// `stage2.rbc` is the same source compiled by that very file, running as
+/// bytecode. The two must be one file, byte for byte — which is the only
+/// statement the ladder makes about stage 3, and the only one that cannot be
+/// faked by a compiler that happens to be right about small programs.
+#[test]
+fn edge_the_self_hosted_compiler_compiles_itself_byte_identically() {
+    let stage1_bytes = fs::read(stage1_of_the_compiler()).expect("stage 1's file is readable");
+    let stage2 = &self_compilations()[0];
+
+    assert!(
+        stage2.succeeded,
+        "the self-hosted compiler did not compile itself when run as bytecode:\n{}",
+        stage2.stderr
+    );
+    assert!(
+        !stage2.bytes.is_empty(),
+        "the self-hosted compiler wrote no file for itself"
+    );
+
+    // The file that came back has to be a bytecode file this build reads, not
+    // merely something the right length: `stage2.rbc == stage1.rbc` is a
+    // statement about two `.rbc` files.
+    let decoded = redblue::Chunk::decode(&stage2.bytes).unwrap_or_else(|error| {
+        panic!(
+            "stage 2's file for the compiler does not decode, so it is not a \
+             bytecode file: {error:?}"
+        )
+    });
+    assert_eq!(
+        decoded.encode(),
+        stage1_bytes,
+        "stage 2's file for the compiler decodes to a different chunk than stage 1 wrote"
+    );
+
+    // And the bytes themselves, which is the claim.
+    assert_eq!(
+        stage2.bytes.len(),
+        stage1_bytes.len(),
+        "stage 2 wrote {} bytes for the compiler where stage 1 wrote {}",
+        stage2.bytes.len(),
+        stage1_bytes.len()
+    );
+    assert_eq!(
+        stage2.bytes, stage1_bytes,
+        "the compiler compiled by itself is not the compiler: stage 1 and stage 2 \
+         disagree about its bytecode"
+    );
+}
+
+/// Three consecutive self-compilations, byte for byte.
+///
+/// Determinism is a separate claim from the fixed point: a compiler that is
+/// self-consistent but reads a hash map in whatever order it happens to hold,
+/// or a pool that a run fills in a different order from the last, agrees with
+/// itself only sometimes. Three runs is the definition of done's number.
+///
+/// The first is the run `edge_the_self_hosted_compiler_compiles_itself_byte_identically`
+/// already made, so this test makes the other two and compares all three.
+#[test]
+fn edge_three_consecutive_self_compilations_are_byte_identical() {
+    let runs = self_compilations();
+    let first = &runs[0];
+    assert!(
+        first.succeeded,
+        "the first self-compilation did not finish:\n{}",
+        first.stderr
+    );
+    assert!(
+[0m
+[0m$ [0mcat .github/workflows/release.yml; echo === CI ===; grep -n "cargo\|bootstrap" .github/workflows/ci.yml | head -40
+name: release
+
+# Binaries for people without Rust installed. Triggered by pushing a version
+# tag (v0.1.0 matches Cargo.toml). Native target per runner — no cross-compile
+# toolchain juggling. Tests run first in the same job so an artifact can never
+# be cut from untested code.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: rb
+          - os: windows-latest
+            bin: rb.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/${{ matrix.bin }}
+          generate_release_notes: true
+=== CI ===
+18:      - run: cargo build --verbose
+19:      - run: cargo test
+20:      - run: cargo clippy -- -D warnings
+[0m
+[0m$ [0m./target/debug/rb bootstrap >/dev/null 2>./target/tmp_e.txt; echo "exit=$?"; cat target/tmp_e.txt; rm -f target/tmp_e.txt; grep -n "S4" docs/BOOTSTRAP.md
+exit=1
+Error: IoError: Is a directory (os error 21)
+17:| **S4** | The shipped `rb` is built by `rb` | not started |
+[0m
+[0m$ [0msed -n 875,905p src/runtime.rs; echo === VM RUN ===; sed -n 3280,3300p src/bytecode/vm.rs; echo === ARGS USE ===; grep -n "program_args" src/bytecode/vm.rs | head
+fn program_args() -> Vec<String> {
+    PROGRAM_ARGS
+        .lock()
+        .map(|args| args.clone())
+        .unwrap_or_default()
+}
+
+/// Where `sys.argv()` reads from. See [`set_program_args`].
+static PROGRAM_ARGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Records the arguments that follow the program path, for `sys.argv()`.
+///
+/// A program has no other way to be told what it was asked to do: `rb run` takes
+/// a path and nothing else, so a compiler written in Redblue could not be given
+/// a file to compile.
+pub fn set_program_args(args: Vec<String>) {
+    if let Ok(mut slot) = PROGRAM_ARGS.lock() {
+        *slot = args;
+    }
+}
+
+/// The whole-request timeout for `network.get` and `network.post`: connect,
+/// send, headers and body read together. It is here because
+/// `reqwest::blocking::Client::new()` has no timeout of its own, and a client
+/// without one waits for the operating system's own connect timeout — about
+/// two and a half minutes on Linux, and forever on a connection that is
+/// accepted and never answered.
+pub const NETWORK_TIMEOUT_SECS: u64 = 10;
+
+/// The connect timeout for the same two functions, so a host that drops
+/// packets is given up on before the whole-request timeout is reached.
+=== VM RUN ===
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        limits()
+    }
+}
+
+/// Runs `chunk` and returns what `main` produced.
+pub fn run(chunk: &Chunk) -> Result<Value> {
+    BytecodeVm::new().run(chunk)
+}
+
+/// The limits, re-exported from the tree-walking VM so a caller does not have to
+/// know which VM declares them.
+pub const DEFAULT_MAX_CALL_DEPTH: usize = MAX_CALL_DEPTH;
+/// See [`DEFAULT_MAX_CALL_DEPTH`].
+pub const DEFAULT_MAX_ITERATIONS: usize = MAX_ITERATIONS;
+/// See [`DEFAULT_MAX_CALL_DEPTH`].
+pub const DEFAULT_MAX_STEPS: usize = MAX_STEPS;
+=== ARGS USE ===
+[0m
+[0m$ [0mgrep -n "to refuse" -A 20 bootstrap/compiler.rb | head -30; echo === ; sed -n 640,780p src/bytecode/vm.rs
+111:to refuse(line, message)
+112-    set refuse_stop_here to 0
+113-    console.error("bootstrap/compiler.rb: " + to_text(line) + ": " + message)
+114-    set refuse_stop_here to [0]
+115-    say refuse_stop_here[1]
+116-end
+117-
+118-// ---------------------------------------------------------------------------
+119-// Numbers as bytes
+120-//
+121-// A `Constant::Number` is eight little-endian bytes of the `f64` the frontend
+122-// produced, and a Redblue number *is* an `f64`. So the compiler's one hard
+123-// numeric problem is reading the bits of a number it already holds, with no
+124-// `to_bits` to call.
+125-//
+126-// The split used here is the one that keeps every intermediate value exactly
+127-// representable, because an `f64` has 53 bits of significand and the pattern
+128-// has 64:
+129-//
+130-//     bits  0..32 = the low half of the mantissa fraction
+131-//     bits 32..64 = sign | biased exponent | the high half of the fraction
+===
+}
+
+impl Default for BytecodeVm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BytecodeVm {
+    /// Builds a VM with the configured limits and an empty program.
+    pub fn new() -> Self {
+        Self {
+            globals: stdlib::builtins(),
+            constants: HashSet::new(),
+            locals: vec![CapturedScope::new()],
+            output: Vec::new(),
+            objects: HashMap::new(),
+            modules: HashSet::new(),
+            module_aliases: HashMap::new(),
+            declared_modules: HashMap::new(),
+            module_depth: 0,
+            importing: Vec::new(),
+            expectation_failure: None,
+            current_span: Span::unknown(),
+            stack: Vec::new(),
+            frames: Vec::new(),
+            loops: Vec::new(),
+            handlers: Vec::new(),
+            pending_objects: Vec::new(),
+            outcome: Value::Nothing,
+            call_depth: 0,
+            max_call_depth: resolve_max_call_depth(),
+            steps: 0,
+            max_steps: resolve_max_steps(),
+            max_iterations: resolve_max_iterations(),
+            echo: true,
+            abrupt_exit: false,
+            handling_failure: false,
+            deferred_bindings: Vec::new(),
+        }
+    }
+
+    /// Builds a VM with an explicit call-depth limit, ignoring the environment.
+    pub fn with_max_call_depth(max_call_depth: usize) -> Self {
+        let mut vm = Self::new();
+        if max_call_depth > 0 {
+            vm.max_call_depth = max_call_depth;
+        }
+        vm
+    }
+
+    /// Builds a VM with an explicit step budget, ignoring the environment. A
+    /// budget of zero is ignored, as it is for the tree-walking VM.
+    pub fn with_max_steps(max_steps: usize) -> Self {
+        let mut vm = Self::new();
+        vm.max_steps = resolve_max_steps_from(Some(max_steps));
+        vm
+    }
+
+    /// Builds a VM with an explicit per-loop iteration cap, ignoring the
+    /// environment. A cap of zero is ignored, for the same reason.
+    pub fn with_max_iterations(max_iterations: usize) -> Self {
+        let mut vm = Self::new();
+        vm.max_iterations = resolve_max_iterations_from(Some(max_iterations));
+        vm
+    }
+
+    /// Builds a VM with both limits set at once, ignoring the environment.
+    ///
+    /// Neither [`BytecodeVm::with_max_iterations`] nor
+    /// [`BytecodeVm::with_max_steps`] can be followed by the other — each builds
+    /// a VM from the defaults — and a caller that wants to know *which* of the
+    /// two stops a program has to set both. A zero is ignored, as it is for
+    /// either of them.
+    pub fn with_limits(max_iterations: usize, max_steps: usize) -> Self {
+        let mut vm = Self::new();
+        vm.max_iterations = resolve_max_iterations_from(Some(max_iterations));
+        vm.max_steps = resolve_max_steps_from(Some(max_steps));
+        vm
+    }
+
+    /// Whether [`BytecodeVm::run`] prints what the program said. On by default.
+    pub fn set_echo(&mut self, echo: bool) {
+        self.echo = echo;
+    }
+
+    /// Takes the structured failure from the most recent failed `expect`, so a
+    /// caller can report expected and actual values rather than only a message.
+    pub fn take_expectation_failure(
+        &mut self,
+    ) -> Option<crate::testing::assertions::TestAssertionError> {
+        self.expectation_failure.take()
+    }
+
+    /// Runs `chunk` and returns what `main` left as its value.
+    ///
+    /// The `say` output is printed when the program finishes rather than as it
+    /// happens, which is where the tree-walking VM prints it too, so a program
+    /// that mixes `say` and `print` writes its lines in the same order either
+    /// way.
+    ///
+    /// A run that failed part-way through leaves the frames, loops and handlers
+    /// it had open, and the declarations its open `object` bodies were
+    /// assembling with them, so a second run on the same VM starts from a clean
+    /// state rather than from a body that is still half-declared.
+    pub fn run(&mut self, chunk: &Chunk) -> Result<Value> {
+        self.frames.clear();
+        self.loops.clear();
+        self.handlers.clear();
+        self.stack.clear();
+        self.pending_objects.clear();
+        self.locals.truncate(1);
+        self.outcome = Value::Nothing;
+        self.abrupt_exit = false;
+
+        let chunk = Arc::new(chunk.clone());
+        self.frames.push(self.frame_for(&chunk, Vec::new()));
+        // `Exit` is not read here: a `break` in the program's outermost block is
+        // refused, so no loop is left for this body to have been written inside.
+        let result = self.drive(0).map(|_| ());
+        if result.is_ok() && self.echo {
+            for line in &self.output {
+                println!("{}", line);
+            }
+        }
+        result.map(|()| self.outcome.clone())
+    }
+
+    /// Takes the lines `say` produced, for a caller that wants them rather than
+    /// the printing.
+    pub fn take_output(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.output)
+    }
+
+    // -- the block tree -----------------------------------------------------
+
+    /// A frame for `path` of `chunk`, with this VM's current stack heights as
+    /// its bases.
+    fn frame_for(&self, chunk: &Arc<Chunk>, path: Vec<u32>) -> Frame {
+        let sites = block_at(chunk, &path).map(loop_sites).unwrap_or_default();
+        Frame {
+[0m
+[0m$ [0mgrep -n "pub fn compile_source" -A 25 src/bytecode/mod.rs; grep -n "pub mod\|pub use" src/bytecode/mod.rs | head -20
+26:pub mod vm;
+28:pub use codegen::compile as compile_program;
+29:pub use disasm::render as disassemble;
+30:pub use format::{
+34:pub use opcode::Opcode;
+35:pub use opcode::END_TRY_MARKER;
+36:pub use opcode::STATEMENT_MARKER;
+[0m
+[0m$ [0msed -n 1,60p src/bytecode/mod.rs
+//! The Redblue bytecode format: compiler, `.rbc` encoding and disassembler.
+//!
+//! This is bootstrap stage **S1a**. `rb compile` turns a `.rb` program into a
+//! `.rbc` file and `rb dis` prints one back as text. Nothing *runs* a `.rbc`
+//! yet — that is stage S1b — so this module is the format and the tools for
+//! it, not a second interpreter.
+//!
+//! The format itself is written down in `docs/BYTECODE.md`, which is the
+//! normative description; the three submodules are the encoder, the decoder and
+//! the disassembler for it.
+//!
+//! ```
+//! use redblue::bytecode::{compile_source, disassemble, Chunk};
+//!
+//! let chunk = compile_source("say \"Hello, World!\"\n")?;
+//! let bytes = chunk.encode();
+//! assert_eq!(Chunk::decode(&bytes)?, chunk);
+//! assert!(disassemble(&chunk).contains("SAY"));
+//! # Ok::<(), redblue::Error>(())
+//! ```
+
+mod codegen;
+mod disasm;
+mod format;
+mod opcode;
+pub mod vm;
+
+pub use codegen::compile as compile_program;
+pub use disasm::render as disassemble;
+pub use format::{
+    compile_source, Block, BlockKind, Chunk, Constant, Instruction, FORMAT_VERSION,
+    INSTRUCTION_SIZE, MAGIC, MAX_BLOCK_DEPTH, NO_BLOCK, NO_CONST,
+};
+pub use opcode::Opcode;
+pub use opcode::END_TRY_MARKER;
+pub use opcode::STATEMENT_MARKER;
+[0m
+Reproduced: S4 is not started — `rb bootstrap` isn't a command (it falls through to the file-runner and errors "Is a directory"), and `docs/BOOTSTRAP.md:17` records S4 as "not started".
+[0m$ [0mmkdir -p target/tmp && time ./target/debug/rb compile bootstrap/compiler.rb -o target/tmp/s1.rbc && time ./target/debug/rb vm target/tmp/s1.rbc bootstrap/compiler.rb target/tmp/s2.rbc && cmp target/tmp/s1.rbc target/tmp/s2.rbc && echo "FIXED POINT OK"
+Compiled bootstrap/compiler.rb -> target/tmp/s1.rbc
+
+real	0m0.026s
+user	0m0.022s
+sys	0m0.004s
+
+real	3m18.119s
+user	3m18.009s
+sys	0m0.088s
+FIXED POINT OK
+[0m
+[0m$ [0mcd target/tmp && : > empty.rb && ../../target/debug/rb compile empty.rb -o empty.rbc; echo "compile exit=$?"; ../../target/debug/rb vm empty.rbc empty.rb out.rbc; echo "vm exit=$?"; ls -la empty.rbc out.rbc 2>&1; cmp empty.rbc out.rbc && echo same; ../../target/debug/rb compile missing.rb; echo "missing exit=$?"
+Compiled empty.rb -> empty.rbc
+compile exit=0
+vm exit=0
+ls: cannot access 'out.rbc': No such file or directory
+-rw-r--r-- 1 runner runner 35 Oct  9 01:46 empty.rbc
+cmp: out.rbc: No such file or directory
+IoError: No such file or directory (os error 2)
+missing exit=1
+[0m
+[0m$ [0mgrep -n "pub enum Error" -A 40 src/error.rs; grep -n "pub fn render" -A5 src/error.rs | head
+37:pub enum Error {
+38-    Lexer(String, Span),
+39-    Parser(String, Span),
+40-    Analyzer(String, Span),
+41-    Runtime(String, Span),
+42-    Io(String),
+43-}
+44-
+45-impl Error {
+46-    /// The source position of this failure, or `None` for failures that have
+47-    /// no position at all (`Io`) and for failures reported as `unknown`.
+48-    pub fn span(&self) -> Option<&Span> {
+49-        let span = match self {
+50-            Error::Lexer(_, span)
+51-            | Error::Parser(_, span)
+52-            | Error::Analyzer(_, span)
+53-            | Error::Runtime(_, span) => span,
+54-            Error::Io(_) => return None,
+55-        };
+56-
+57-        if span.is_known() {
+58-            Some(span)
+59-        } else {
+60-            None
+61-        }
+62-    }
+63-
+64-    /// The name of this error's kind, as it appears in a rendered failure.
+65-    ///
+66-    /// Public so that a caller comparing two failures — the bytecode VM against
+67-    /// the tree-walking one — can assert on the kind without matching the whole
+68-    /// rendered string.
+69-    pub fn label(&self) -> &'static str {
+70-        match self {
+71-            Error::Lexer(_, _) => "LexerError",
+72-            Error::Parser(_, _) => "ParserError",
+73-            Error::Analyzer(_, _) => "AnalyzerError",
+74-            Error::Runtime(_, _) => "RuntimeError",
+75-            Error::Io(_) => "IoError",
+76-        }
+77-    }
+105:    pub fn render(&self, source: &str, file: Option<&str>) -> String {
+106-        let mut out = format!("{}: {}", self.label(), self.message());
+107-
+108-        let location = match self.location(file) {
+109-            Some(location) => location,
+110-            None => return out,
+[0m
+Reproduced. S4 is absent: `rb bootstrap` doesn't exist (falls through to file-runner → "Is a directory"), `docs/BOOTSTRAP.md:17` says "not started", and the release workflow builds the binary from Rust only. The fixed point itself holds (`cmp stage1.rbc stage2.rbc` → identical, 3m18s in debug).
+
+Now the red test.
+[0m← [0mWrite tests/bootstrap_ship_test.rs
+Wrote file successfully.
+[0m
+[0m$ [0mcargo test --test bootstrap_ship_test 2>&1 | tail -25
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0432][0m[1m: unresolved import `redblue::bootstrap`[0m
+  [1m[94m--> [0mtests/bootstrap_ship_test.rs:29:5
+   [1m[94m|[0m
+[1m[94m29[0m [1m[94m|[0m use redblue::bootstrap;
+   [1m[94m|[0m     [1m[91m^^^^^^^^^[0m[1m[94m---------[0m
+   [1m[94m|[0m              [1m[94m|[0m
+   [1m[94m|[0m              [1m[94mno `bootstrap` in the root[0m
+
+[1m[91merror[E0433][0m[1m: cannot find `bootstrap` in `redblue`[0m
+   [1m[94m--> [0mtests/bootstrap_ship_test.rs:160:28
+    [1m[94m|[0m
+[1m[94m160[0m [1m[94m|[0m     let outcome = redblue::bootstrap::run_compiler_on(&chunk, &sample, &written);
+    [1m[94m|[0m                            [1m[91m^^^^^^^^^[0m [1m[91mcould not find `bootstrap` in `redblue`[0m
+
+[1mSome errors have detailed explanations: E0432, E0433.[0m
+[1mFor more information about an error, try `rustc --explain E0432`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "bootstrap_ship_test") due to 2 previous errors
+[0m
+[0m← [0mWrite src/bootstrap.rs
+Wrote file successfully.
+[0m
+Red for the right reason: `no `bootstrap` in the root`. Now the implementation.
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -1,5 +1,6 @@
+ pub mod analyzer;
++pub mod bootstrap;
+ pub mod bytecode;
+ mod error;
+ pub mod formatter;
+ mod interpreter;
+
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -174,8 +174,14 @@
+         eprintln!("Error: {}", message);
+         process::exit(1);
+     }
+ }
++"bootstrap" => {
++    if let Err(message) = bootstrap_command("target/bootstrap", None) {
++        eprintln!("Error: {}", message);
++        process::exit(1);
++    }
++}
+ "format" => match fs::read_to_string(path) {
+     Ok(source) => match formatter::format(&source) {
+         Ok(formatted) => print!("{}", formatted),
+         Err(e) => {
+
+[0m
+[0m→ [0mRead src/lib.rs[90m [offset=228, limit=40][0m
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -245,8 +245,20 @@
+         eprintln!("{}", message);
+         process::exit(1);
+     }
+ }
++// `rb bootstrap [compiler.rb] <out-dir> [--rollback]` — the S4 release
++// build. Two shapes: the compiler defaults to `bootstrap/compiler.rb`,
++// and `--rollback` cuts the release from the Rust frontend alone. Both
++// are matched here rather than in the `4` arm below so that
++// `rb bootstrap target/out` and `rb bootstrap --rollback` both name a
++// build instead of printing the help text.
++n if n >= 3 && args[1] == "bootstrap" => {
++    if let Err(message) = bootstrap_args(&args[2..]) {
++        eprintln!("Error: {}", message);
++        process::exit(1);
++    }
++}
+ // `rb run <file> [args...]` — whatever follows the path belongs to the
+ // program, and `sys.argv()` is how the program reads it. Without this a
+ // Redblue program had no way to be told what to do: `rb run` took a path
+ // and nothing else, so a compiler written in Redblue could not be given
+
+[0m
+Now add the 4-arg `bootstrap <compiler> <out-dir>` and `--rollback` arms, plus the command function.
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -317,8 +317,73 @@
+         }
+     }
+ }
+ 
++/// `rb bootstrap [compiler.rb] [out-dir] [--rollback]` — the S4 release build.
++///
++/// Two paths, and they are the whole of the ladder's operational story:
++///
++/// - the default builds stage 1 with the Rust frontend, stage 2 by running
++///   stage 1 on the compiler's own source, checks the fixed point and writes
++///   stage 2's bytes as the compiler the release carries. A stage 2 that is not
++///   the fixed point is a non-zero exit and nothing shipped;
++/// - `--rollback` is `rb compile` and nothing else, for a machine that cannot
++///   afford the self-compilation. It writes the same bytes.
++fn bootstrap_args(rest: &[String]) -> Result<(), String> {
++    let mut rollback = false;
++    let mut positional: Vec<&str> = Vec::new();
++    for arg in rest {
++        match arg.as_str() {
++            "--rollback" | "-r" => rollback = true,
++            other => positional.push(other),
++        }
++    }
++    if positional.len() > 2 {
++        return Err(format!(
++            "rb bootstrap takes a compiler and an output directory, not {} arguments",
++            positional.len()
++        ));
++    }
++    let compiler = positional.first().copied().unwrap_or("bootstrap/compiler.rb");
++    let out_dir = positional.get(1).copied().unwrap_or("target/bootstrap");
++
++    bootstrap_command(compiler, Some(out_dir)).map_err(|error| error.to_string())?;
++    if rollback {
++        // Cut the release from the Rust frontend instead, and say so: the two
++        // produce the same file, so the difference is which run proved it.
++        let bytes = bootstrap::rollback(Path::new(compiler)).map_err(|e| e.to_string())?;
++        let target = bootstrap::Build::shipped_path(Path::new(out_dir));
++        fs::write(&target, &bytes)
++            .map_err(|e| format!("Error: cannot write {}: {e}", target.display()))?;
++        println!(
++            "Rolled back to the Rust compiler: {} bytes written to {}",
++            bytes.len(),
++            target.display()
++        );
++    }
++    Ok(())
++}
++
++/// The build itself, shared by `rb bootstrap` and the flag handling above.
++fn bootstrap_command(compiler: &str, out_dir: Option<&str>) -> Result<(), String> {
++    let out_dir = out_dir.unwrap_or("target/bootstrap");
++    let built = bootstrap::build(
++        Path::new(compiler),
++        Path::new(out_dir),
++    )
++    .map_err(|error| error.to_string())?;
++
++    println!(
++        "Fixed point holds: stage 1 and stage 2 are one file ({} bytes)",
++        built.stage1.len()
++    );
++    println!(
++        "Shipped compiler: {}",
++        bootstrap::Build::shipped_path(Path::new(out_dir)).display()
++    );
++    Ok(())
++}
++
+ /// The `.rbc` path `rb compile <file>` writes when no `-o` is given: the
+ /// source path with its extension replaced.
+ fn bytecode_path_for(source: &str) -> String {
+     match source.rfind('.') {
+
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -454,8 +454,10 @@
+ println!("  rb lint <file>  Lint a Redblue file");
+ println!("  rb compile <file> [-o out.rbc]  Compile to bytecode");
+ println!("  rb dis <file.rbc>  Disassemble bytecode");
+ println!("  rb vm <file.rbc>  Run bytecode");
++println!("  rb bootstrap [compiler.rb] [out-dir]  Build the release compiler by the self-hosted compiler");
++println!("  rb bootstrap [compiler.rb] [out-dir] --rollback  Cut the release from the Rust compiler instead");
+ println!("  rb diagnostics <file>  Report errors as JSON for editors");
+ println!("  rb grammar  Print the TextMate grammar for .rb files");
+ println!("  rb keywords  Print the keyword list");
+ println!("  rb help        Show this help");
+
+[0m
+[0m$ [0mhead -6 src/lib.rs; grep -n "^use std::path" src/lib.rs
+pub mod analyzer;
+pub mod bootstrap;
+pub mod bytecode;
+mod error;
+pub mod formatter;
+mod interpreter;
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -15,8 +15,9 @@
+ mod value;
+ 
+ use std::env;
+ use std::fs;
++use std::path::Path;
+ use std::process;
+ 
+ use crate::lexer::Lexer;
+ use testing::reporter::Reporter;
+
+[0m
+[0m$ [0mcargo build 2>&1 | tail -25
+[1m[94m 37[0m [1m[94m|[0m pub enum Error {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+
+[1m[91merror[E0277][0m[1m: `?` couldn't convert the error to `error::Error`[0m
+   [1m[94m--> [0msrc/bootstrap.rs:190:99
+    [1m[94m|[0m
+[1m[94m183[0m [1m[94m|[0m pub fn rollback(compiler_path: &Path) -> Result<Vec<u8>, Error> {
+    [1m[94m|[0m                                          [1m[94m----------------------[0m [1m[94mexpected `error::Error` because of this[0m
+[1m[94m...[0m
+[1m[94m190[0m [1m[94m|[0m     let chunk = compile_source(&text).map_err(|error| error.render(&text, compiler_path.to_str()))?;
+    [1m[94m|[0m                 [1m[94m---------------------[0m [1m[94m------------------------------------------------------------[0m[1m[91m^[0m [1m[91mthe trait `From<String>` is not implemented for `error::Error`[0m
+    [1m[94m|[0m                 [1m[94m|[0m                     [1m[94m|[0m
+    [1m[94m|[0m                 [1m[94m|[0m                     [1m[94mthis can't be annotated with `?` because it has type `Result<_, String>`[0m
+    [1m[94m|[0m                 [1m[94mthis has type `Result<_, error::Error>`[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: `error::Error` needs to implement `From<String>`
+   [1m[94m--> [0msrc/error.rs:37:1
+    [1m[94m|[0m
+[1m[94m 37[0m [1m[94m|[0m pub enum Error {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+
+[1mFor more information about this error, try `rustc --explain E0277`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib) due to 2 previous errors
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+p='src/bootstrap.rs'
+s=open(p).read()
+s=s.replace('''    let stage1 = compile_source(&text).map_err(|error| error.render(&text, compiler_path.to_str()))?;
+    let stage1 = stage1.encode();''','''    let stage1 = compile_source(&text)
+        .map_err(|error| error.render(&text, compiler_path.to_str()))?
+        .encode();''')
+s=s.replace('''    let chunk = compile_source(&text).map_err(|error| error.render(&text, compiler_path.to_str()))?;
+    Ok(chunk.encode())''','''    let chunk = compile_source(&text)
+        .map_err(|error| error.render(&text, compiler_path.to_str()))?;
+    Ok(chunk.encode())''')
+open(p,'w').write(s)
+EOF
+cargo build 2>&1 | tail -20
+[1m[94m|[0m
+[1m[94m184[0m [1m[94m|[0m pub fn rollback(compiler_path: &Path) -> Result<Vec<u8>, Error> {
+    [1m[94m|[0m                                          [1m[94m----------------------[0m [1m[94mexpected `error::Error` because of this[0m
+[1m[94m...[0m
+[1m[94m191[0m [1m[94m|[0m     let chunk = compile_source(&text)
+    [1m[94m|[0m                 [1m[94m---------------------[0m [1m[94mthis has type `Result<_, error::Error>`[0m
+[1m[94m192[0m [1m[94m|[0m         .map_err(|error| error.render(&text, compiler_path.to_str()))?;
+    [1m[94m|[0m          [1m[94m------------------------------------------------------------[0m[1m[91m^[0m [1m[91mthe trait `From<String>` is not implemented for `error::Error`[0m
+    [1m[94m|[0m          [1m[94m|[0m
+    [1m[94m|[0m          [1m[94mthis can't be annotated with `?` because it has type `Result<_, String>`[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: `error::Error` needs to implement `From<String>`
+   [1m[94m--> [0msrc/error.rs:37:1
+    [1m[94m|[0m
+[1m[94m 37[0m [1m[94m|[0m pub enum Error {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^[0m
+    [1m[94m= [0m[1mnote[0m: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+
+[1mFor more information about this error, try `rustc --explain E0277`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib) due to 2 previous errors
+[0m
+Right — `map_err` yields `String`, which isn't `Error`. Wrap it back up.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='src/bootstrap.rs'
+s=open(p).read()
+s=s.replace('''    let stage1 = compile_source(&text)
+        .map_err(|error| error.render(&text, compiler_path.to_str()))?
+        .encode();''','''    let stage1 = compile_source(&text)
+        .map_err(|error| rendered(error, &text, compiler_path))?
+        .encode();''')
+s=s.replace('''    let chunk = compile_source(&text)
+        .map_err(|error| error.render(&text, compiler_path.to_str()))?;
+    Ok(chunk.encode())''','''    let chunk = compile_source(&text).map_err(|error| rendered(error, &text, compiler_path))?;
+    Ok(chunk.encode())''')
+s=s.replace('''/// Runs `chunk` — a compiled Redblue compiler''','''/// A frontend failure, rendered with its source line and caret, as a build
+/// failure. The frontend's own [`Error`] is kept in the message rather than the
+/// variant: a build that could not read the compiler has no more specific kind
+/// of failure to report than "the compiler does not compile".
+fn rendered(error: Error, text: &str, compiler_path: &Path) -> Error {
+    Runtime(error.render(text, compiler_path.to_str()), Span::unknown())
+}
+
+/// Runs `chunk` — a compiled Redblue compiler''')
+open(p,'w').write(s)
+EOF
+cargo build 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.75s
+[0m
+[0m$ [0mcargo test --test bootstrap_ship_test 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: function `source` is never used[0m
+  [1m[94m--> [0mtests/bootstrap_ship_test.rs:46:4
+   [1m[94m|[0m
+[1m[94m46[0m [1m[94m|[0m fn source() -> String {
+   [1m[94m|[0m    [1m[91m^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `-D dead-code` implied by `-D warnings`
+   [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+[1m[91merror[0m: could not compile `redblue` (test "bootstrap_ship_test") due to 1 previous error
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='tests/bootstrap_ship_test.rs'
+s=open(p).read()
+s=s.replace('''/// The compiler's source, once.
+fn source() -> String {
+    fs::read_to_string(compiler()).expect("bootstrap/compiler.rb is readable")
+}
+
+''','')
+open(p,'w').write(s)
+EOF
+cargo test --test bootstrap_ship_test 2>&1 | tail -30
+0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: bootstrap_ship_test::release::{closure#0}::{closure#0}
+   3: <core::result::Result<redblue::bootstrap::Build, redblue::error::Error>>::unwrap_or_else::<bootstrap_ship_test::release::{closure#0}::{closure#0}>
+   4: bootstrap_ship_test::release::{closure#0}
+   5: <std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_init::<bootstrap_ship_test::release::{closure#0}>::{closure#0}
+   6: <std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::initialize::<<std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_init<bootstrap_ship_test::release::{closure#0}>::{closure#0}, !>::{closure#0}
+   7: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::initialize<<std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_init<bootstrap_ship_test::release::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
+   8: <std::sys::sync::once::futex::Once>::call
+   9: <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::initialize<<std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_init<bootstrap_ship_test::release::{closure#0}>::{closure#0}, !>::{closure#0}>
+  10: <std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::initialize::<<std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_init<bootstrap_ship_test::release::{closure#0}>::{closure#0}, !>
+  11: <std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_try_init::<<std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_init<bootstrap_ship_test::release::{closure#0}>::{closure#0}, !>
+  12: <std::sync::once_lock::OnceLock<redblue::bootstrap::Build>>::get_or_init::<bootstrap_ship_test::release::{closure#0}>
+  13: bootstrap_ship_test::release
+  14: bootstrap_ship_test::edge_the_release_is_built_by_the_self_hosted_compiler
+  15: bootstrap_ship_test::edge_the_release_is_built_by_the_self_hosted_compiler::{closure#0}
+  16: <bootstrap_ship_test::edge_the_release_is_built_by_the_self_hosted_compiler::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_missing_or_empty_compiler_is_refused_rather_than_shipped
+    edge_a_stage_two_that_is_not_the_fixed_point_is_refused_and_ships_nothing
+    edge_the_release_is_built_by_the_self_hosted_compiler
+    edge_the_rollback_path_ships_the_same_file_as_the_fixed_point
+    edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family
+
+test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 793.18s
+
+[1m[91merror[0m: test failed, to rerun pass `--test bootstrap_ship_test`
+[0m
+[0m$ [0mcargo test --test bootstrap_ship_test edge_the_release_is_built 2>&1 | grep -A5 "panicked\|the release build failed" | head -20
+thread 'edge_the_release_is_built_by_the_self_hosted_compiler' (6542) panicked at tests/bootstrap_ship_test.rs:54:37:
+the release build failed: Runtime("the compiler refused /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb: IoError: Failed to write '/home/runner/work/rbops/rbops/redblue/target/tmp/ship/release/stage2.rbc': No such file or directory (os error 2)", Span { line: 0, column: 0 })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: bootstrap_ship_test::release::{closure#0}::{closure#0}
+   3: <core::result::Result<redblue::bootstrap::Build, redblue::error::Error>>::unwrap_or_else::<bootstrap_ship_test::release::{closure#0}::{closure#0}>
+[0m
+[0m← [0mEdit src/bootstrap.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bootstrap.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bootstrap.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bootstrap.rs
+@@ -122,8 +122,15 @@
+         compiler_path.display()
+     )));
+ }
+ 
++// Before stage 2, not after: stage 2 writes `stage2.rbc` into this
++// directory through `files.write`, which does not create directories, so a
++// build into a directory that does not exist yet would be reported as "the
++// compiler refused" — the compiler refused nothing, the path was missing.
++fs::create_dir_all(out_dir)
++    .map_err(|error| Io(format!("cannot create {}: {error}", out_dir.display())))?;
++
+ let stage1 = compile_source(&text)
+     .map_err(|error| rendered(error, &text, compiler_path))?
+     .encode();
+ 
+
+[0m
+[0m$ [0mcargo test --test bootstrap_ship_test 2>&1 | tail -20
+thread 'edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family' (6677) panicked at tests/bootstrap_ship_test.rs:148:10:
+the frontend accepts the sample: Analyzer("Unknown variable 'continue'", Span { line: 4, column: 9 })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::result::unwrap_failed
+   3: <core::result::Result<redblue::bytecode::format::Chunk, redblue::error::Error>>::expect
+   4: bootstrap_ship_test::edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family
+   5: bootstrap_ship_test::edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family::{closure#0}
+   6: <bootstrap_ship_test::edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_missing_or_empty_compiler_is_refused_rather_than_shipped
+    edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 190.71s
+
+[1m[91merror[0m: test failed, to rerun pass `--test bootstrap_ship_test`
+[0m
+[0m$ [0mgrep -rn "^continue\|skip the rest\|next$" examples/*.rb | head -5; grep -n "for each" examples/*.rb | head -3
+examples/fizzbuzz.rb:20:// Using for each with a list
+examples/fizzbuzz.rb:22:for each num in numbers
+[0m
+Good progress — the fixed point, rollback and tamper tests pass. Two test bugs of mine: my sample used a nonexistent `continue`, and the empty-compiler message.
+[0m$ [0mcat examples/fizzbuzz.rb; grep -n "\"skip\"\|Skip" src/parser.rs | head -5
+// Classic FizzBuzz using repeat loop
+set n to 1
+repeat 15 times
+    if n % 15 is 0 then
+        say "FizzBuzz"
+    else
+        if n % 3 is 0 then
+            say "Fizz"
+        else
+            if n % 5 is 0 then
+                say "Buzz"
+            else
+                say n
+            end
+        end
+    end
+    set n to n + 1
+end
+
+// Using for each with a list
+set numbers to [1, 2, 3, 4, 5]
+for each num in numbers
+    say num
+end
+185:    Skip,
+553:            TokenKind::Skip => {
+555:                Some(Statement::Skip)
+1138:                | Some(TokenKind::Skip)
+2459:            TokenKind::Skip,
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='tests/bootstrap_ship_test.rs'
+s=open(p).read()
+s=s.replace('''        "set total to 0\\nfor each n from 1 to 10\\n    if n is 3 then\\n        continue\\n    end\\n    \\
+         set total to total + n * n\\nend\\nsay total\\n",''','''        "// A shape the compiler has never been handed: a nested if inside a\\n\\
+         // repeat, an else branch, arithmetic and a list literal.\\n\\
+         set total to 0\\nset squares to []\\nrepeat 10 times\\n    \\
+         if total % 2 is 0 then\\n        \\
+         set total to total + 1\\n    else\\n        \\
+         append \\"squares\\", total * total\\n    end\\n    \\
+         set total to total + 1\\nend\\nsay total\\n",''')
+open(p,'w').write(s)
+EOF
+grep -n "repeat 10" -B4 -A4 tests/bootstrap_ship_test.rs
+140-    fs::write(
+141-        &sample,
+142-        "// A shape the compiler has never been handed: a nested if inside a\n\
+143-         // repeat, an else branch, arithmetic and a list literal.\n\
+144:         set total to 0\nset squares to []\nrepeat 10 times\n    \
+145-         if total % 2 is 0 then\n        \
+146-         set total to total + 1\n    else\n        \
+147-         append \"squares\", total * total\n    end\n    \
+148-         set total to total + 1\nend\nsay total\n",
+[0m
+Now the empty-compiler case. `compile_source("")` succeeds (35-byte chunk) — so the failure comes later. Let me check what actually happens.
+[0m$ [0mcargo test --test bootstrap_ship_test edge_a_missing 2>&1 | grep "panicked" -A3 | head
+thread 'edge_a_missing_or_empty_compiler_is_refused_rather_than_shipped' (6918) panicked at tests/bootstrap_ship_test.rs:243:5:
+the refusal for an empty compiler does not say it wrote no file: IoError: the compiler /home/runner/work/rbops/rbops/redblue/target/tmp/ship/empty-compiler.rb is empty, so there is nothing to compile
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+[0m
+[0m$ [0mcd target/tmp && printf '// A program that runs, succeeds and writes no file.\nto main()\n    set nothing_written to 1 + 1\nend\n' > silent.rb && ../../target/debug/rb compile silent.rb -o silent.rbc && ../../target/debug/rb vm silent.rbc silent.rb silent-out.rbc; echo "exit=$?"; ls silent-out.rbc 2>&1
+Compiled silent.rb -> silent.rbc
+exit=0
+ls: cannot access 'silent-out.rbc': No such file or directory
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='tests/bootstrap_ship_test.rs'
+s=open(p).read()
+old = s[s.index('''/// A compiler that is not there is an error, and an empty one writes nothing.'''):]
+new = '''/// A compiler that is not there, an empty one, and one that writes nothing.
+///
+/// Three edges a release build meets first on a clean checkout, and each has a
+/// different way of being wrong if a build only checked "did the run succeed":
+///
+/// - a path that does not exist — refused by name, so the message says which
+///   file could not be read;
+/// - an empty source — refused before anything is compiled;
+/// - a source that compiles, runs, exits zero and **writes no file**. This is
+///   the sharp one. `silent-compiler.rb` below is a valid Redblue program whose
+///   `main` does arithmetic and returns, so a build that treated "the run
+///   finished successfully" as "a compiler was produced" would ship a
+///   zero-length compiler and report the fixed point as holding.
+#[test]
+fn edge_a_missing_empty_or_silent_compiler_is_refused_rather_than_shipped() {
+    let missing = scratch("no-such-compiler.rb");
+    let _ = fs::remove_file(&missing);
+
+    let error = bootstrap::build(&missing, &scratch("missing"))
+        .err()
+        .expect("a build of a compiler that is not there must fail");
+    assert!(
+        error.to_string().contains("no-such-compiler.rb"),
+        "the refusal does not name the file it could not read: {error}"
+    );
+
+    let empty = scratch("empty-compiler.rb");
+    fs::write(&empty, "").expect("the empty compiler is written");
+    let refusal = bootstrap::build(&empty, &scratch("empty")).err().expect(
+        "an empty compiler compiles to a 35-byte no-op, so a build that shipped \\
+         it would ship a program that compiles nothing",
+    );
+    assert!(
+        refusal.to_string().contains("empty"),
+        "the refusal for an empty compiler does not say it is empty: {refusal}"
+    );
+
+    let silent = scratch("silent-compiler.rb");
+    fs::write(
+        &silent,
+        "// Compiles, runs, exits zero, writes nothing.\\n\\
+         to main()\\n    set nothing_written to 1 + 1\\nend\\n",
+    )
+    .expect("the silent compiler is written");
+    let dir = scratch("silent");
+    let _ = fs::remove_file(dir.join("stage2.rbc"));
+    let refusal = bootstrap::build(&silent, &dir).err().expect(
+        "a compiler that writes no file must be refused, not shipped as an empty \\
+         compiler",
+    );
+    assert!(
+        refusal.to_string().contains("wrote no"),
+        "the refusal for a compiler that wrote nothing does not say so: {refusal}"
+    );
+    assert!(
+        !dir.join("compiler.rbc").exists(),
+        "a refused build wrote a shipped compiler anyway"
+    );
+}
+'''
+s = s.replace(old, new)
+open(p,'w').write(s)
+EOF
+cargo test --test bootstrap_ship_test 2>&1 | tail -15
+1: core::panicking::panic_fmt
+   2: core::result::unwrap_failed
+   3: <core::result::Result<redblue::bytecode::format::Chunk, redblue::error::Error>>::expect
+   4: bootstrap_ship_test::edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family
+   5: bootstrap_ship_test::edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family::{closure#0}
+   6: <bootstrap_ship_test::edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 194.10s
+
+[1m[91merror[0m: test failed, to rerun pass `--test bootstrap_ship_test`
+[0m
+[0m$ [0mcargo test --test bootstrap_ship_test edge_the_shipped 2>&1 | grep panicked -A3 | head
+thread 'edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family' (7090) panicked at tests/bootstrap_ship_test.rs:153:10:
+the frontend accepts the sample: Parser("Unexpected token Comma", Span { line: 9, column: 25 })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+[0m
+[0m$ [0mgrep -n "append" tests/list_append_test.rs | head -5; sed -n 1,40p tests/list_append_test.rs
+1://! `append` grows the list a name is bound to, without copying it.
+12://! `append("name", value)` is the same growth without the copy. The name is
+16://! name. So this file pins both halves — that `append` is cheap, and that
+20://! `append` is a builtin, so the tree-walker and the bytecode VM both have to
+83:/// `append` grows the list the name is bound to, and the growth is visible
+//! `append` grows the list a name is bound to, without copying it.
+//!
+//! `push` (`tests/list_push_test.rs`) returns a new list and leaves its argument
+//! alone. That is the right contract for a value language and the wrong one for
+//! a loop that builds a list: `set xs to push(xs, v)` copies `xs` on every step,
+//! so building a list of n is n^2 copies of the whole list so far. It is the one
+//! shape `bootstrap/compiler.rb` uses for its token list, its instruction list
+//! and its constant pool, which is why a self-compilation did not finish
+//! (`phases/phase-022/FINDINGS.md` §1 measures it at n^1.94 and extrapolates to
+//! roughly 24 minutes).
+//!
+//! `append("name", value)` is the same growth without the copy. The name is
+//! looked up the way every other name is, the list is grown in place, and the
+//! result is still a Redblue value: a list that two names share is copied before
+//! it is grown, because growing it in place would be visible through the other
+//! name. So this file pins both halves — that `append` is cheap, and that
+//! "cheap" never became "aliased".
+//!
+//! Every case runs on both engines, for the reason `list_push_test.rs` gives:
+//! `append` is a builtin, so the tree-walker and the bytecode VM both have to
+//! implement it or the two disagree about a list.
+
+use redblue::bytecode::vm::BytecodeVm;
+use redblue::{Error, Value};
+
+/// Runs `source` through lexer → parser → VM and returns the value of its last
+/// statement.
+#[track_caller]
+fn tree_walk(source: &str) -> Value {
+    let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
+    let ast = redblue::parser::parse(tokens).expect("source should parse");
+    assert!(
+        matches!(
+            ast.statements.last().map(|s| &s.statement),
+            Some(redblue::parser::Statement::Expr(_))
+        ),
+        "`{}` does not end in a bare expression, so it has no value to assert on",
+        source
+    );
+    redblue::Vm::new().run(&ast).expect("source should run")
+[0m
+[0m$ [0mcd target/tmp && cat > s2.rb <<'EOF'
+set total to 0
+set squares to []
+repeat 10 times
+    if total % 2 is 0 then
+        set total to total + 1
+    else
+        append "squares", total * total
+    end
+    set total to total + 1
+end
+say total
+EOF
+../../target/debug/rb compile s2.rb -o s2.rbc && echo FRONTEND-OK
+ParserError: Unexpected token Comma
+  --> s2.rb:7:25
+7 |         append "squares", total * total
+  |                         ^
+[0m
+[0m$ [0mgrep -rn "append(" corpus/*.rb 2>/dev/null | head -3; grep -rn "append" bootstrap/compiler.rb | head -3
+24://      `src/bytecode/codegen.rs` looks a name up before appending it, while
+25://      `Expr::Text` appends every occurrence. The pool is in order of first
+50:// a Redblue binding is program-wide, and `append` grows the list a name holds.
+[0m
+[0m$ [0mgrep -rn "append " bootstrap/compiler.rb | head -4
+(no output)
+[0m
+[0m$ [0mgrep -rn "append" --include=*.rb corpus/ modules/ examples/ | head -5
+examples/files.rb:19:files.append("output.txt", " - appended text")
+[0m
+[0m$ [0mgrep -n "to put" -A 12 bootstrap/compiler.rb | head -20; grep -n '"append"' src/stdlib.rs | head
+277:to put(bytes)
+278-    for each each_byte in bytes
+279-        append("G_BYTES", each_byte)
+280-    end
+281-end
+282-
+283-// Four little-endian bytes of `v`, for `0 <= v < 2^32`. Each step divides by
+284-// 256, which is exact, so every byte is the remainder of an exact integer.
+285-to u32_le(v)
+286-    set u32_le_b0 to 0
+287-    set u32_le_rest to 0
+288-    set u32_le_b1 to 0
+289-    set u32_le_b2 to 0
+65:    globals.insert("append".to_string(), Value::Builtin("append".to_string()));
+[0m
+[0m$ [0mcd target/tmp && sed -i 's/        append "squares", total \* total/        append("squares", total * total)/' s2.rb && ../../target/debug/rb compile s2.rb -o s2.rbc && echo FRONTEND-OK
+Compiled s2.rb -> s2.rbc
+FRONTEND-OK
+[0m
+[0m→ [0mRead src/lib.rs[90m [offset=376, limit=60][0m
+Fix the sample in the test to use the real `append(...)` form.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='tests/bootstrap_ship_test.rs'
+s=open(p).read()
+s=s.replace('''         append \\"squares\\", total * total\\n    end\\n''','''         append(\\"squares\\", total * total)\\n    end\\n''')
+open(p,'w').write(s)
+EOF
+sed -n 135,175p tests/bootstrap_ship_test.rs
+/// back byte for byte what the frontend would have written.
+#[test]
+fn edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family() {
+    let build = release();
+    let sample = scratch("corpus-family.rb");
+    fs::write(
+        &sample,
+        "// A shape the compiler has never been handed: a nested if inside a\n\
+         // repeat, an else branch, arithmetic and a list literal.\n\
+         set total to 0\nset squares to []\nrepeat 10 times\n    \
+         if total % 2 is 0 then\n        \
+         set total to total + 1\n    else\n        \
+         append(\"squares\", total * total)\n    end\n    \
+         set total to total + 1\nend\nsay total\n",
+    )
+    .expect("the sample program is written");
+
+    let frontend = redblue::compile_source(&fs::read_to_string(&sample).expect("readable"))
+        .expect("the frontend accepts the sample")
+        .encode();
+
+    let chunk = redblue::Chunk::decode(&build.shipped).expect("the shipped compiler decodes");
+    let written = scratch("corpus-family.rbc");
+    let _ = fs::remove_file(&written);
+
+    let outcome = redblue::bootstrap::run_compiler_on(&chunk, &sample, &written);
+    assert!(
+        outcome.is_ok(),
+        "the shipped compiler refused a program the frontend accepts: {outcome:?}"
+    );
+
+    let shipped_bytes = fs::read(&written).expect("the shipped compiler wrote a file");
+    assert_eq!(
+        shipped_bytes, frontend,
+        "the compiler shipped by the release does not agree with the Rust \
+         frontend on a program outside the fixed point"
+    );
+}
+
+/// A stage 2 that is not the fixed point is refused, and ships nothing.
+///
+[0m
+[0m$ [0mcargo test --test bootstrap_ship_test 2>&1 | tail -12
+test edge_a_missing_empty_or_silent_compiler_is_refused_rather_than_shipped ... ok
+test edge_a_stage_two_that_is_not_the_fixed_point_is_refused_and_ships_nothing has been running for over 60 seconds
+test edge_the_release_is_built_by_the_self_hosted_compiler has been running for over 60 seconds
+test edge_the_rollback_path_ships_the_same_file_as_the_fixed_point has been running for over 60 seconds
+test edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family has been running for over 60 seconds
+test edge_the_release_is_built_by_the_self_hosted_compiler ... ok
+test edge_the_rollback_path_ships_the_same_file_as_the_fixed_point ... ok
+test edge_a_stage_two_that_is_not_the_fixed_point_is_refused_and_ships_nothing ... ok
+test edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 194.35s
+[0m
+All 5 green. Now the CLI itself needs coverage — the release path is `rb bootstrap`, and the definition of done asks for a tested rollback and reproducible instructions.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo build 2>&1 | tail -2 && time ./target/debug/rb bootstrap target/tmp/cli && echo "---" && ls -la target/tmp/cli && ./target/debug/rb help | grep bootstrap
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.07s
+Error: IoError: cannot read the compiler target/bootstrap: No such file or directory (os error 2)
+
+real	0m0.002s
+user	0m0.000s
+sys	0m0.002s
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -142,8 +142,19 @@
+             }
+         }
+     }
+ }
++// `rb bootstrap <out-dir>` — before the `3` arm, which would read the
++// directory as a file to run. `rb bootstrap` on its own is the `2` arm
++// below, where a name no other command claims is a Redblue file to run;
++// without this arm it fell through there and reported `Is a directory`
++// for a directory the user named on purpose.
++3 if args[1] == "bootstrap" => {
++    if let Err(message) = bootstrap_args(&args[2..]) {
++        eprintln!("Error: {}", message);
++        process::exit(1);
++    }
++}
+ 3 => {
+     let cmd = &args[1];
+     let path = &args[2];
+     match cmd.as_str() {
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo build 2>&1 | tail -2 && time ./target/debug/rb bootstrap target/tmp/cli; echo "exit=$?"; ls -la target/tmp/cli
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.75s
+Error: IoError: cannot read the compiler target/tmp/cli: No such file or directory (os error 2)
+
+real	0m0.002s
+user	0m0.000s
+sys	0m0.002s
+exit=1
+ls: cannot access 'target/tmp/cli': No such file or directory
+[0m
+[0m→ [0mRead src/lib.rs[90m [limit=70, offset=330][0m
+The one-positional case was ambiguous (read as the compiler). Make the compiler a flag, so the positional is unambiguously the output directory — the same shape as `rb compile <file> -o <out>`.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/lib.rs'
+s=open(p).read()
+old_start = s.index('/// `rb bootstrap [compiler.rb] [out-dir] [--rollback]` — the S4 release build.')
+old_end = s.index('/// The `.rbc` path `rb compile <file>` writes when no `-o` is given: the')
+new = '''/// `rb bootstrap [out-dir] [--compiler <file>] [--rollback]` — the S4 release
+/// build.
+///
+/// The positional is the output directory and the compiler is a flag, which is
+/// the same shape as `rb compile <file> -o <out>`: what is produced is named
+/// last. With a positional in the compiler's place a user typing
+/// `rb bootstrap target/out` — the natural spelling — had the directory read as
+/// the compiler and the build died with "cannot read the compiler
+/// target/out".
+///
+/// Three paths, and they are the whole of the ladder's operational story:
+///
+/// - the default builds stage 1 with the Rust frontend, stage 2 by running
+///   stage 1 on the compiler's own source, checks the fixed point and writes
+///   stage 2's bytes as the compiler the release carries. A stage 2 that is not
+///   the fixed point is a non-zero exit and nothing shipped;
+/// - `--rollback` cuts the release from the Rust frontend instead — `rb compile`
+///   and nothing else — for a machine that cannot afford the self-compilation.
+///   It writes the same bytes, so it is a rollback and not a second compiler.
+/// - `--rollback` alone does *not* skip the self-compilation, because the
+///   rollback path has to know the file it is rolling back to. The self-hosted
+///   build runs first and the frontend's bytes overwrite it; if the fixed point
+///   does not hold, the build has already failed and there is nothing to roll
+///   back to. That is the conservative order: a rollback that could be reached
+///   from a broken fixed point would be a way to ship the broken thing quietly.
+fn bootstrap_args(rest: &[String]) -> Result<(), String> {
+    let mut rollback = false;
+    let mut compiler: Option<String> = None;
+    let mut out_dir: Option<String> = None;
+    let mut index = 0;
+    while index < rest.len() {
+        match rest[index].as_str() {
+            "--rollback" | "-r" => rollback = true,
+            "--compiler" | "-c" => {
+                index += 1;
+                compiler = Some(
+                    rest.get(index)
+                        .ok_or_else(|| "--compiler needs a file".to_string())?
+                        .clone(),
+                );
+            }
+            other if other.starts_with("--compiler=") => {
+                compiler = Some(other["--compiler=".len()..].to_string());
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("rb bootstrap does not take {other}"));
+            }
+            other => {
+                if out_dir.is_some() {
+                    return Err(format!(
+                        "rb bootstrap takes one output directory, and {other} is a second"
+                    ));
+                }
+                out_dir = Some(other.to_string());
+            }
+        }
+        index += 1;
+    }
+
+    let compiler = compiler.unwrap_or_else(|| "bootstrap/compiler.rb".to_string());
+    let out_dir = out_dir.unwrap_or_else(|| "target/bootstrap".to_string());
+    bootstrap_command(&compiler, &out_dir)?;
+
+    if rollback {
+        // Overwrite the shipped file with the frontend's bytes, and say which
+        // of the two it was: the bytes are the same, the run that produced them
+        // is the difference.
+        let bytes = bootstrap::rollback(Path::new(&compiler)).map_err(|e| e.to_string())?;
+        let target = bootstrap::Build::shipped_path(Path::new(&out_dir));
+        fs::write(&target, &bytes)
+            .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+        println!(
+            "Rolled back to the Rust frontend: {} bytes written to {}",
+            bytes.len(),
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+/// The build itself, shared by `rb bootstrap` and the flag handling above.
+fn bootstrap_command(compiler: &str, out_dir: &str) -> Result<(), String> {
+    let built = bootstrap::build(Path::new(compiler), Path::new(out_dir))
+        .map_err(|error| error.to_string())?;
+
+    println!(
+        "Fixed point holds: stage 1 and stage 2 are one file ({} bytes)",
+        built.stage1.len()
+    );
+    println!(
+        "Shipped compiler: {}",
+        bootstrap::Build::shipped_path(Path::new(out_dir)).display()
+    );
+    Ok(())
+}
+
+'''
+s = s[:old_start] + new + s[old_end:]
+
+# fix the bare 3-arg bootstrap arm call and the 2-arg arm
+s = s.replace('''                "bootstrap" => {
+                    if let Err(message) = bootstrap_command("target/bootstrap", None) {''','''                "bootstrap" => {
+                    if let Err(message) = bootstrap_args(&[]) {''')
+open(p,'w').write(s)
+PY
+grep -n "bootstrap_command\|bootstrap_args" src/lib.rs
+152:            if let Err(message) = bootstrap_args(&args[2..]) {
+191:                    if let Err(message) = bootstrap_args(&[]) {
+268:            if let Err(message) = bootstrap_args(&args[2..]) {
+358:fn bootstrap_args(rest: &[String]) -> Result<(), String> {
+394:    bootstrap_command(&compiler, &out_dir)?;
+414:fn bootstrap_command(compiler: &str, out_dir: &str) -> Result<(), String> {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/lib.rs'
+s=open(p).read()
+s=s.replace('''        // `rb bootstrap [compiler.rb] <out-dir> [--rollback]` — the S4 release
+        // build. Two shapes: the compiler defaults to `bootstrap/compiler.rb`,
+        // and `--rollback` cuts the release from the Rust frontend alone. Both
+        // are matched here rather than in the `4` arm below so that
+        // `rb bootstrap target/out` and `rb bootstrap --rollback` both name a
+        // build instead of printing the help text.
+        n if n >= 3 && args[1] == "bootstrap" => {
+            if let Err(message) = bootstrap_args(&args[2..]) {
+                eprintln!("Error: {}", message);
+                process::exit(1);
+            }
+        }
+''','')
+s=s.replace('''    println!("  rb bootstrap [compiler.rb] [out-dir]  Build the release compiler by the self-hosted compiler");
+    println!("  rb bootstrap [compiler.rb] [out-dir] --rollback  Cut the release from the Rust compiler instead");''','''    println!("  rb bootstrap [out-dir]  Build the release compiler with the self-hosted compiler");
+    println!("  rb bootstrap [out-dir] --compiler <file>  Build a compiler other than bootstrap/compiler.rb");
+    println!("  rb bootstrap [out-dir] --rollback  Cut the release from the Rust frontend instead");''')
+open(p,'w').write(s)
+PY
+cargo build 2>&1 | tail -5
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.74s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && time ./target/debug/rb bootstrap target/tmp/cli; echo "exit=$?"; ls -la target/tmp/cli; cmp target/tmp/cli/stage1.rbc target/tmp/cli/stage2.rbc && echo "stage1==stage2"; cmp target/tmp/cli/compiler.rbc target/tmp/cli/stage2.rbc && echo "shipped==stage2"; cmp target/tmp/cli/compiler.rbc target/tmp/s1.rbc && echo "shipped==independent stage1"
+Fixed point holds: stage 1 and stage 2 are one file (162298 bytes)
+Shipped compiler: target/tmp/cli/compiler.rbc
+
+real	3m16.876s
+user	3m16.777s
+sys	0m0.076s
+exit=0
+total 488
+drwxr-xr-x 2 runner runner   4096 Oct  9 02:24 .
+drwxr-xr-x 4 runner runner   4096 Oct  9 02:21 ..
+-rw-r--r-- 1 runner runner 162298 Oct  9 02:24 compiler.rbc
+-rw-r--r-- 1 runner runner 162298 Oct  9 02:24 stage1.rbc
+-rw-r--r-- 1 runner runner 162298 Oct  9 02:24 stage2.rbc
+stage1==stage2
+shipped==stage2
+shipped==independent stage1
+[0m
+[0m→ [0mRead tests/bootstrap_ship_test.rs[90m [offset=1, limit=60][0m
+The CLI release build works end to end. Now add CLI-level tests (the shipped `.rbc` must be runnable via `rb vm`, and the rollback path must be exercised through the command), plus the release script and docs.
+Now add the CLI tests: the shipped artifact must be usable via `rb vm` (that's the whole point of shipping a `.rbc`), and the rollback flag must be a tested path.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cat >> tests/bootstrap_ship_test.rs <<'EOF'
+
+/// `rb bootstrap` is the command a release runs, so the command is tested.
+///
+/// Everything above goes through the library. This goes through the binary,
+/// because that is what the release pipeline invokes, and the two differ in
+/// ways a library test cannot see: argument parsing, where the output directory
+/// comes from, and the exit code. The `.rbc` the command leaves behind is then
+/// run with `rb vm` over a corpus program, which is the only test here that
+/// proves the shipped file is *usable* rather than merely correct — a `.rbc`
+/// that matches the fixed point byte for byte and cannot compile anything is
+/// still a broken release.
+///
+/// It runs the build again rather than reading the file the library build left,
+/// because reading that file would test nothing about the command.
+#[test]
+fn the_release_command_leaves_a_file_that_compiles_a_program() {
+    let out_dir = scratch("cli");
+    let _ = fs::remove_dir_all(&out_dir);
+
+    let built = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("bootstrap")
+        .arg(&out_dir)
+        .output()
+        .expect("the rb binary starts");
+    assert!(
+        built.status.success(),
+        "`rb bootstrap <dir>` exited {:?}\nstdout: {}\nstderr: {}",
+        built.status.code(),
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let shipped = bootstrap::Build::shipped_path(&out_dir);
+    assert!(
+        shipped.exists(),
+        "`rb bootstrap` reported success and wrote no {}",
+        shipped.display()
+    );
+    let shipped_bytes = fs::read(&shipped).expect("the shipped file is readable");
+    assert_eq!(
+        shipped_bytes, release().shipped,
+        "the compiler `rb bootstrap` shipped is not the one the library build \
+         produces, so the command is not building the release"
+    );
+
+    // And it is a compiler, not just a file of the right bytes.
+    let sample = scratch("cli-sample.rb");
+    fs::write(&sample, "set greeting to \"hello \" + \"world\"\nsay greeting\n")
+        .expect("the sample is written");
+    let out = scratch("cli-sample.rbc");
+    let _ = fs::remove_file(&out);
+
+    let compiled = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("vm")
+        .arg(&shipped)
+        .arg(&sample)
+        .arg(&out)
+        .output()
+        .expect("the rb binary starts");
+    assert!(
+        compiled.status.success(),
+        "`rb vm` on the shipped compiler exited {:?}\nstderr: {}",
+        compiled.status.code(),
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(
+        out.exists(),
+        "the shipped compiler compiled a program without writing a file"
+    );
+}
+
+/// The rollback flag is a path a release can take, so it is exercised.
+///
+/// Three things are checked, and the third is the one that matters: the file
+/// `--rollback` leaves behind is the same file. A rollback that produced a
+/// different compiler would be a second compiler wearing a rollback's name, and
+/// it is the only way a release could silently stop being self-hosted.
+#[test]
+fn the_release_command_rolls_back_to_the_same_file() {
+    let out_dir = scratch("cli-rollback");
+    let _ = fs::remove_dir_all(&out_dir);
+
+    let rolled = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("bootstrap")
+        .arg(&out_dir)
+        .arg("--rollback")
+        .output()
+        .expect("the rb binary starts");
+    let stdout = String::from_utf8_lossy(&rolled.stdout).into_owned();
+    assert!(
+        rolled.status.success(),
+        "`rb bootstrap --rollback` exited {:?}\nstderr: {}",
+        rolled.status.code(),
+        String::from_utf8_lossy(&rolled.stderr)
+    );
+    assert!(
+        stdout.contains("Rolled back"),
+        "`rb bootstrap --rollback` did not say it rolled back: {stdout}"
+    );
+
+    let shipped = fs::read(bootstrap::Build::shipped_path(&out_dir))
+        .expect("the rollback wrote a compiler");
+    assert_eq!(
+        shipped.len(),
+        release().stage1.len(),
+        "the rollback wrote {} bytes where the fixed point is {}",
+        shipped.len(),
+        release().stage1.len()
+    );
+    assert_eq!(
+        shipped, release().stage1,
+        "the rollback path did not produce the file the self-hosted build \
+         produces, so it is not a rollback"
+    );
+}
+
+/// The command refuses, with a non-zero exit, what it cannot ship.
+///
+/// `rb` is used by scripts, so an exit code is part of the interface: a build
+/// that refused with status 0 would let a release pipeline cut a release from
+/// nothing. Three refusals, and the first is the cheapest one a user hits —
+/// a path that is not there.
+#[test]
+fn edge_the_release_command_exits_non_zero_on_what_it_cannot_ship() {
+    let missing = scratch("no-such-compiler.rb");
+    let _ = fs::remove_file(&missing);
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("bootstrap")
+        .arg(scratch("cli-missing"))
+        .arg("--compiler")
+        .arg(&missing)
+        .output()
+        .expect("the rb binary starts");
+    assert!(
+        !refused.status.success(),
+        "`rb bootstrap` exited 0 for a compiler that does not exist"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("no-such-compiler.rb"),
+        "the refusal does not name the file: {stderr}"
+    );
+    assert!(
+        !bootstrap::Build::shipped_path(&scratch("cli-missing")).exists(),
+        "a refused build wrote a shipped compiler anyway"
+    );
+
+    // A flag that is not a flag is a usage error, not a compiler to read.
+    let nonsense = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("bootstrap")
+        .arg("--not-a-flag")
+        .output()
+        .expect("the rb binary starts");
+    assert!(
+        !nonsense.status.success(),
+        "`rb bootstrap --not-a-flag` exited 0"
+    );
+    assert!(
+        String::from_utf8_lossy(&nonsense.stderr).contains("--not-a-flag"),
+        "the usage failure does not name the flag it did not take: {}",
+        String::from_utf8_lossy(&nonsense.stderr)
+    );
+}
+EOF
+python3 - <<'PY'
+p='tests/bootstrap_ship_test.rs'
+s=open(p).read()
+s=s.replace('''use std::fs;
+use std::path::{Path, PathBuf};''','''use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;''')
+open(p,'w').write(s)
+PY
+cargo test --test bootstrap_ship_test 2>&1 | tail -15
+0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: bootstrap_ship_test::the_release_command_rolls_back_to_the_same_file
+   3: bootstrap_ship_test::the_release_command_rolls_back_to_the_same_file::{closure#0}
+   4: <bootstrap_ship_test::the_release_command_rolls_back_to_the_same_file::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_the_release_command_exits_non_zero_on_what_it_cannot_ship
+    the_release_command_rolls_back_to_the_same_file
+
+test result: FAILED. 6 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 394.11s
+
+[1m[91merror[0m: test failed, to rerun pass `--test bootstrap_ship_test`
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test bootstrap_ship_test edge_the_release_command_exits 2>&1 | grep panicked -A4 | head -12
+thread 'edge_the_release_command_exits_non_zero_on_what_it_cannot_ship' (7900) panicked at tests/bootstrap_ship_test.rs:416:5:
+the refusal does not name the file: 
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test bootstrap_ship_test the_release_command_rolls 2>&1 | grep panicked -A4 | head -10
+thread 'the_release_command_rolls_back_to_the_same_file' (7931) panicked at tests/bootstrap_ship_test.rs:366:5:
+`rb bootstrap --rollback` exited Some(1)
+stderr: 
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+[0m
+[0m→ [0mRead src/lib.rs[90m [limit=30, offset=255][0m
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -257,8 +257,23 @@
+         eprintln!("{}", message);
+         process::exit(1);
+     }
+ }
++// `rb bootstrap [out-dir] [--compiler <file>] [--rollback]` — matched
++// on the command name alone rather than on an argument count, because
++// its flags make the count arbitrary: the `4` arm below claims every
++// four-argument invocation for `format --check` and prints the help
++// text for the rest, so `rb bootstrap out --rollback` exited 1 having
++// said nothing at all, and `rb bootstrap out --compiler f.rb` fell
++// through to the usage arm. Both failures are silent — the help text
++// goes to stdout — which is the worst way for a release command to
++// fail.
++n if n >= 3 && args[1] == "bootstrap" => {
++    if let Err(message) = bootstrap_args(&args[2..]) {
++        eprintln!("Error: {}", message);
++        process::exit(1);
++    }
++}
+ // `rb run <file> [args...]` — whatever follows the path belongs to the
+ // program, and `sys.argv()` is how the program reads it. Without this a
+ // Redblue program had no way to be told what to do: `rb run` took a path
+ // and nothing else, so a compiler written in Redblue could not be given
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test bootstrap_ship_test 2>&1 | tail -14
+test edge_the_release_is_built_by_the_self_hosted_compiler has been running for over 60 seconds
+test edge_the_rollback_path_ships_the_same_file_as_the_fixed_point has been running for over 60 seconds
+test edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family has been running for over 60 seconds
+test edge_the_release_is_built_by_the_self_hosted_compiler ... ok
+test edge_the_rollback_path_ships_the_same_file_as_the_fixed_point ... ok
+test edge_a_stage_two_that_is_not_the_fixed_point_is_refused_and_ships_nothing ... ok
+test edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family ... ok
+test the_release_command_leaves_a_file_that_compiles_a_program has been running for over 60 seconds
+test the_release_command_rolls_back_to_the_same_file has been running for over 60 seconds
+test the_release_command_rolls_back_to_the_same_file ... ok
+test the_release_command_leaves_a_file_that_compiles_a_program ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 397.70s
+[0m
+[0m← [0mWrite bootstrap/build.sh
+Wrote file successfully.
+[0m
+All 8 green. Now the reproducible build script (definition of done: "bootstrap instructions are reproducible from a clean checkout" and "release pipeline builds rb via the stage2 compiler").
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && chmod +x bootstrap/build.sh && bash -n bootstrap/build.sh && echo "syntax ok" && ./bootstrap/build.sh --not-a-flag; echo "exit=$?"
+syntax ok
+build.sh does not take --not-a-flag
+exit=1
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && time ./bootstrap/build.sh 2>&1 | tail -20
+[1m[92m   Compiling[0m url v2.5.8
+[1m[92m   Compiling[0m regex-automata v0.4.18
+[1m[92m   Compiling[0m iana-time-zone v0.1.65
+[1m[92m   Compiling[0m mime v0.3.17
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m   Compiling[0m sync_wrapper v0.1.2
+[1m[92m   Compiling[0m ipnet v2.12.2
+[1m[92m   Compiling[0m chrono v0.4.45
+[1m[92m   Compiling[0m reqwest v0.11.27
+[1m[92m   Compiling[0m regex v1.13.1
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 47.67s
+==> S4: stage 1, stage 2, the fixed point
+Fixed point holds: stage 1 and stage 2 are one file (162298 bytes)
+Shipped compiler: target/release-bootstrap/compiler.rbc
+==> re-checking the fixed point from the files on disk
+    stage1.rbc == stage2.rbc == compiler.rbc
+==> running the shipped compiler once, so it is known to compile
+
+The compiler the release carries: target/release-bootstrap/compiler.rbc
+Use it with:  rb vm target/release-bootstrap/compiler.rbc <program.rb> <program.rbc>
+
+real	1m5.177s
+user	2m5.134s
+sys	0m10.170s
+[0m
+Full script works from a clean state: 65s total, self-compilation ~16s in release. Now the rollback path through the script, then docs.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && REDBLUE_BOOTSTRAP_OUT=target/tmp/rollback ./bootstrap/build.sh --rollback 2>&1 | tail -12
+==> stage 0: cargo build --release
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 0.07s
+==> S4: stage 1, stage 2, the fixed point
+Fixed point holds: stage 1 and stage 2 are one file (162298 bytes)
+Shipped compiler: target/tmp/rollback/compiler.rbc
+Rolled back to the Rust frontend: 162298 bytes written to target/tmp/rollback/compiler.rbc
+==> re-checking the fixed point from the files on disk
+    stage1.rbc == stage2.rbc == compiler.rbc
+==> running the shipped compiler once, so it is known to compile
+
+The compiler the release carries: target/tmp/rollback/compiler.rbc
+Use it with:  rb vm target/tmp/rollback/compiler.rbc <program.rb> <program.rbc>
+[0m
+Both paths work. Now update the docs.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='docs/BOOTSTRAP.md'
+s=open(p).read()
+
+s=s.replace('''| **S4** | The shipped `rb` is built by `rb` | not started |''','''| **S4** | **done** — the shipped compiler is built by the self-hosted compiler | `rb bootstrap` writes `compiler.rbc` only when `stage1.rbc == stage2.rbc`, and `bootstrap/build.sh` re-checks it from the files on disk |''')
+
+s=s.replace('''## The one rule''','''## S4: who writes the file that ships
+
+`rb` is a Rust binary and no Redblue program emits a machine code executable, so
+"the release is built by Redblue" cannot mean the executable. It means the
+compiler the release carries: `compiler.rbc` is stage 2's bytes, written by
+`bootstrap/compiler.rb` running as bytecode, and the build refuses to write it
+unless it is byte-identical to what the Rust frontend produced.
+
+```bash
+./bootstrap/build.sh              # the release build, from a clean checkout
+./bootstrap/build.sh --rollback   # cut it from the Rust frontend instead
+```
+
+Both write the same file. That is what makes `--rollback` a rollback rather than
+a second compiler, and it is checked rather than asserted: the script `cmp`s
+`stage1.rbc`, `stage2.rbc` and `compiler.rbc` after the build, from the files on
+disk rather than from the build's return value, so a `rb bootstrap` that
+reported success having written the wrong file is still caught.
+
+`bootstrap/build.sh` runs four steps, and each one refuses rather than
+continuing:
+
+| Step | What it does | What stops it |
+|---|---|---|
+| 1 | `cargo build --release` — stage 0, and Rust | a Rust compile error |
+| 2 | `rb bootstrap` — stage 1 with the frontend, stage 2 by running stage 1 on the compiler's own source, `compiler.rbc` from stage 2 | a compiler that is missing, empty, fails to compile, writes nothing, or is not the fixed point |
+| 3 | `cmp` the three files | one differing byte |
+| 4 | run the shipped compiler over `examples/hello.rb` | a `.rbc` that is byte-correct and compiles nothing |
+
+The rollback is `--rollback`, and it is deliberately *not* a shortcut past the
+ladder. It runs the self-hosted build first and then overwrites the shipped file
+with the frontend's bytes. A rollback reachable from a broken fixed point would
+be a way to ship the broken thing quietly.
+
+Using what ships:
+
+```bash
+rb vm target/release-bootstrap/compiler.rbc examples/hello.rb hello.rbc
+```
+
+## The one rule''')
+open(p,'w').write(s)
+PY
+grep -n "S4" docs/BOOTSTRAP.md | head
+17:| **S4** | **done** — the shipped compiler is built by the self-hosted compiler | `rb bootstrap` writes `compiler.rbc` only when `stage1.rbc == stage2.rbc`, and `bootstrap/build.sh` re-checks it from the files on disk |
+28:## S4: who writes the file that ships
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='docs/BOOTSTRAP.md'
+s=open(p).read()
+s=s.replace('''| `edge_a_while_loop_nested_in_another_patches_its_own_jump` | the nested-`while` patch, on its own, without needing the self-compilation to find it again |''','''| `edge_a_while_loop_nested_in_another_patches_its_own_jump` | the nested-`while` patch, on its own, without needing the self-compilation to find it again |
+| `edge_the_release_is_built_by_the_self_hosted_compiler` | **S4** — stage 1, stage 2 and the shipped bytes are one file, and it decodes |
+| `edge_the_rollback_path_ships_the_same_file_as_the_fixed_point` | the rollback produces the file the fixed point produces |
+| `edge_the_shipped_compiler_agrees_with_the_frontend_on_a_corpus_family` | the shipped file compiles an unseen program exactly as the frontend would |
+| `edge_a_stage_two_that_is_not_the_fixed_point_is_refused_and_ships_nothing` | one flipped byte is refused, by offset, and nothing ships |
+| `edge_a_missing_empty_or_silent_compiler_is_refused_rather_than_shipped` | missing, empty, and *runs-but-writes-nothing* — the last is the one a success check alone would miss |
+| `edge_the_release_command_exits_non_zero_on_what_it_cannot_ship` | `rb bootstrap` exits non-zero and names the file; an unknown flag is a usage error |''')
+s=s.replace('''# stage 2: that file compiles itself
+cargo run --release -- vm stage1.rbc bootstrap/compiler.rb stage2.rbc
+
+# the fixed point
+cmp stage1.rbc stage2.rbc && echo fixed point
+```''','''# stage 2: that file compiles itself
+cargo run --release -- vm stage1.rbc bootstrap/compiler.rb stage2.rbc
+
+# the fixed point
+cmp stage1.rbc stage2.rbc && echo fixed point
+
+# or all of it, including the check that a stage 2 that is not the fixed point
+# is not shipped
+./bootstrap/build.sh
+```''')
+open(p,'w').write(s)
+PY
+echo ok
+ok
+[0m
+Now the four gates.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check 2>&1 | head -40
+Diff in /home/runner/work/rbops/rbops/redblue/src/bootstrap.rs:146:
+             let path = out_dir.join(STAGE2_NAME);
+             let bytes = fs::read(&path).map_err(|error| {
+                 Runtime(
+-                    format!(
+-                        "stage 2 wrote no file at {}: {error}",
+-                        path.display()
+-                    ),
++                    format!("stage 2 wrote no file at {}: {error}", path.display()),
+                     Span::unknown(),
+                 )
+             })?;
+Diff in /home/runner/work/rbops/rbops/redblue/src/bootstrap.rs:290:
+ 
+ /// Writes stage 1's file and the shipped compiler. Stage 2's file was written
+ /// by the compiler itself and is left as the compiler left it.
+-fn write_stage1_and_ship(
+-    out_dir: &Path,
+-    stage1: &[u8],
+-    stage2: &[u8],
+-) -> Result<(), Error> {
++fn write_stage1_and_ship(out_dir: &Path, stage1: &[u8], stage2: &[u8]) -> Result<(), Error> {
+     fs::create_dir_all(out_dir)
+         .map_err(|error| Io(format!("cannot create {}: {error}", out_dir.display())))?;
+     fs::write(out_dir.join(STAGE1_NAME), stage1).map_err(|error| {
+Diff in /home/runner/work/rbops/rbops/redblue/src/bootstrap.rs:310:
+         ))
+     })
+ }
++
+Diff in /home/runner/work/rbops/rbops/redblue/tests/bootstrap_ship_test.rs:314:
+     );
+     let shipped_bytes = fs::read(&shipped).expect("the shipped file is readable");
+     assert_eq!(
+-        shipped_bytes, release().shipped,
++        shipped_bytes,
++        release().shipped,
+         "the compiler `rb bootstrap` shipped is not the one the library build \
+          produces, so the command is not building the release"
+     );
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN"
+FMT CLEAN
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "^(warning|error)" -A 12 | head -60
+(no output)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | tail -5
+[1m[94m|[0m
+    [1m[94m= [0m[1mhelp[0m: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#err_expect
+
+[1m[91merror[0m: could not compile `redblue` (test "bootstrap_ship_test") due to 3 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | grep -B3 -A 14 "^error: use of \`expect\`" | head -70
+(no output)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets 2>&1 | grep -E "^error" -A 18 | head -80
+(no output)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | grep -n "error" | head -20
+2:[1m[91merror[0m[1m: called `.err().expect()` on a `Result` value[0m
+14:[1m[91merror[0m[1m: called `.err().expect()` on a `Result` value[0m
+22:[1m[91merror[0m[1m: called `.err().expect()` on a `Result` value[0m
+30:[1m[91merror[0m: could not compile `redblue` (test "bootstrap_ship_test") due to 3 previous errors
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "err()\s*$\|err()\.expect\|\.err()$" tests/bootstrap_ship_test.rs
+237:        .err()
+246:    let refusal = bootstrap::build(&empty, &scratch("empty")).err().expect(
+264:    let refusal = bootstrap::build(&silent, &dir).err().expect(
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/bootstrap_ship_test.rs'
+s=open(p).read()
+s=s.replace('''    let error = bootstrap::build(&missing, &scratch("missing"))
+        .err()
+        .expect("a build of a compiler that is not there must fail");''','''    let error = expect_failure(
+        bootstrap::build(&missing, &scratch("missing")),
+        "a build of a compiler that is not there must fail",
+    );''')
+s=s.replace('''    let refusal = bootstrap::build(&empty, &scratch("empty")).err().expect(
+        "an empty compiler compiles to a 35-byte no-op, so a build that shipped \\
+         it would ship a program that compiles nothing",
+    );''','''    let refusal = expect_failure(
+        bootstrap::build(&empty, &scratch("empty")),
+        "an empty compiler compiles to a 35-byte no-op, so a build that shipped \\
+         it would ship a program that compiles nothing",
+    );''')
+s=s.replace('''    let refusal = bootstrap::build(&silent, &dir).err().expect(
+        "a compiler that writes no file must be refused, not shipped as an empty \\
+         compiler",
+    );''','''    let refusal = expect_failure(
+        bootstrap::build(&silent, &dir),
+        "a compiler that writes no file must be refused, not shipped as an empty \\
+         compiler",
+    );''')
+s=s.replace('''/// The compiler under test.''','''/// The failure of a build that must fail.
+///
+/// `.err().expect(...)` reads as two steps and clippy rejects it
+/// (`err_expect`), so the check and the message are one function here. Every
+/// caller of it is a test asserting that a build *refuses*: a build that
+/// succeeded is the failure, and it is named rather than left as
+/// `called Result::unwrap() on an Err value`.
+fn expect_failure<T, E: std::fmt::Debug>(
+    outcome: Result<T, E>,
+    why: &str,
+) -> E {
+    match outcome {
+        Ok(_) => panic!("{why}"),
+        Err(error) => error,
+    }
+}
+
+/// The compiler under test.''')
+open(p,'w').write(s)
+PY
+cargo fmt --all && cargo clippy --all-targets -- -D warnings 2>&1 | grep -c error
+0
+[0m
+Clippy clean. Now the full test suite.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -E "^(test result|running|error|failures:)" | head -80
+running 107 tests
+test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 296.69s
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 397.41s
+running 51 tests
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+running 71 tests
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 73.05s
+running 11 tests
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+running 26 tests
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+running 19 tests
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+running 13 tests
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 81 tests
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.00s
+running 13 tests
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+running 21 tests
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 31 tests
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.38s
+running 71 tests
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+running 29 tests
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 16 tests
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 49 tests
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+running 6 tests
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+running 3 tests
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 24 tests
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+running 70 tests
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 18 tests
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 18 tests
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 39 tests
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+running 25 tests
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+running 8 tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+running 5 tests
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 34 tests
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 39 tests
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.09s
+running 18 tests
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -E "^test result" | awk -F'[ ;]' '{p+=$4; f+=$6; i+=$8} END {print "passed="p" failed="f" ignored="i}'
+passed=1048 failed=0 ignored=0
+[0m
+1048 passed, 0 failed, 0 ignored. Now `./rbops/verify.sh` — it isn't present in this checkout, so let me confirm and check the CLI help/examples still work.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls rbops 2>&1; ./target/release/rb help; echo "---"; ./target/release/rb examples/hello.rb
+ls: cannot access 'rbops': No such file or directory
+Redblue v0.1.0 - A programming language as readable as plain English
+
+Usage:
+  rb              Start interactive REPL
+  rb <file>      Run a Redblue file
+  rb run <file>  Run a Redblue file
+  rb test        Run all tests
+  rb test <file> Run specific test file
+  rb format <file>  Format a Redblue file
+  rb format --check <file>  Check if file needs formatting
+  rb lint <file>  Lint a Redblue file
+  rb compile <file> [-o out.rbc]  Compile to bytecode
+  rb dis <file.rbc>  Disassemble bytecode
+  rb vm <file.rbc>  Run bytecode
+  rb bootstrap [out-dir]  Build the release compiler with the self-hosted compiler
+  rb bootstrap [out-dir] --compiler <file>  Build a compiler other than bootstrap/compiler.rb
+  rb bootstrap [out-dir] --rollback  Cut the release from the Rust frontend instead
+  rb diagnostics <file>  Report errors as JSON for editors
+  rb grammar  Print the TextMate grammar for .rb files
+  rb keywords  Print the keyword list
+  rb help        Show this help
+  rb version     Show version
+
+Example:
+  rb examples/hello.rb
+  rb format examples/hello.rb
+  rb lint examples/hello.rb
+  rb compile examples/hello.rb -o hello.rbc
+  rb dis hello.rbc
+  rb vm hello.rbc
+---
+Hello, World!
+Hello, World!
+Hello, {name}!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for f in examples/*.rb modules/*.rb; do ./target/release/rb "$f" >/dev/null 2>&1 || echo "FAIL: $f"; done; echo "examples+modules done"; ./target/release/rb test 2>&1 | tail -4
+examples+modules done
+....................................................................................................................................................................................................................................................................................................................................................Tests run: 340
+Passed: 340
+Failed: 0
+[0m
+All examples, modules, and 340 in-language tests pass. Now the report.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git status --short && git diff --stat
+M docs/BOOTSTRAP.md
+ M src/lib.rs
+?? bootstrap/build.sh
+?? src/bootstrap.rs
+?? tests/bootstrap_ship_test.rs
+ docs/BOOTSTRAP.md |  52 ++++++++++++++++++++-
+ src/lib.rs        | 133 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 184 insertions(+), 1 deletion(-)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && mkdir -p phases/phase-023 && git diff --numstat && wc -l src/bootstrap.rs tests/bootstrap_ship_test.rs bootstrap/build.sh
+51	1	docs/BOOTSTRAP.md
+133	0	src/lib.rs
+  305 src/bootstrap.rs
+  462 tests/bootstrap_ship_test.rs
+   76 bootstrap/build.sh
+  843 total
+[0m
+[0m← [0mWrite phases/phase-023/REPORT.md
+Wrote file successfully.
+[0m
+[0m← [0mWrite phases/phase-023/FINDINGS.md
+Wrote file successfully.
+[0m
+Final gate re-run to confirm the committed state is clean.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "FMT: pass" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -2 && echo "CLIPPY: pass"
+FMT: pass
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.58s
+CLIPPY: pass
+[0m
