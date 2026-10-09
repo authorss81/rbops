@@ -1,0 +1,17 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Stale-fix claim under the microscope — pulling the changed files to hunt for holes.
+[0m→ [0mRead tests/loop_instruction_test.rs
+[0m→ [0mRead src/interpreter.rs
+[0m→ [0mRead src/bytecode/vm.rs
+Initial read shows the new instruction counters — now digging into their exact wiring.
+[0m✱ [0mGrep "break_instructions|break_statements|loop_control_counts|Opcode::Break|Opcode::Skip"[90m in src · 26 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=120, offset=1240][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=120, offset=1540][0m
+FINDINGS:
+1. [MAJOR] src/bytecode/vm.rs:754 — `BytecodeVm::run` clears frames/loops/handlers/stack/pending_objects/locals/outcome/abrupt_exit but never resets `break_instructions`/`skip_instructions` (fields at :607/:610, zeroed only in `new()` at :678), so counts are per-VM-lifetime, not per-program; a reused VM returns the sum of all runs — the differential-harness/REPL reuse case the new API exists for is untested because every test builds a fresh VM — concrete fix: reset both counters at the top of `run()` (same place frames are cleared) and add a reuse test that runs two programs on one VM and asserts the second reading is not cumulative
+2. [MAJOR] src/interpreter.rs:930 — `Vm::run` never resets `break_statements`/`skip_statements` (fields at :203/:205, zeroed only in `new()` at :389), same cumulative-count defect as (1) on the tree engine, so the cross-engine invariant `counts_on_both_engines` only holds for fresh VMs — concrete fix: reset both counters at the top of `run()` and assert `loop_control_counts()` after a second `run()` on the same `Vm`
+3. [MINOR] tests/loop_instruction_test.rs:218 — bare-refusal counting (`(1,0)` after an uncaught `break` outside any loop) is asserted only on `BytecodeVm`, while the tree VM documents the identical "including one that was then refused" contract at src/interpreter.rs:609 and implements increment-before-refuse at src/interpreter.rs:1269 — the uncaught-refusal path of `Vm::raise_loop_control` has no direct count assertion (only the caught form is covered on both engines at :268) — concrete fix: add a tree-VM mirror of `a_refused_break_still_dispatches_the_instruction_and_then_fails` asserting `Err` + `loop_control_counts()==(1,0)`, and likewise for `skip`
+REVIEW VERDICT: FINDINGS 3

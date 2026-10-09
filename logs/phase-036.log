@@ -1,0 +1,2340 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m$ [0mls target/debug/rb 2>/dev/null; ls tests/ | head -40
+target/debug/rb
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+differential_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+integration_test.rb
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+repl_test.rs
+span_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+test_control_flow.rb
+[0m
+[0m$ [0mgit log --oneline -3 && git status --short | head -20
+cc50661 rbops: phase-035 (2026-10-09T09:27:13Z)
+642c28f rbops: phase-023 (2026-10-09T07:18:20Z)
+daeb73b rbops: phase-023 (2026-10-09T05:40:37Z)
+[0m
+[0m$ [0mmkdir -p target/tmp/p036 && printf 'for each i in [1,2,3]\n    if i is 2 then break\n    say i\nend\n' > target/tmp/p036/brk.rb && printf 'repeat 5 times\n    break\n    say "never"\nend\n' > target/tmp/p036/rb.rb && printf 'for each i in [1,2,3]\n    if i is 2 then skip\n    say i\nend\n' > target/tmp/p036/skp.rb && echo "--- brk run:" && ./target/debug/rb run target/tmp/p036/brk.rb; echo "exit=$?"
+--- brk run:
+Error: ParserError: Expected End but got Eof
+  --> target/tmp/p036/brk.rb:5:1
+exit=1
+[0m
+[0m$ [0mgrep -n "Break\|Skip" src/interpreter.rs | head -40; echo "=== vm.rs"; grep -n "break_loop\|skip_loop\|Break\|Skip" src/bytecode/vm.rs | head -40
+271:    Break,
+273:    Skip,
+1169:                            == Some(LoopControl::Break)
+1209:                        == Some(LoopControl::Break)
+1230:                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+1240:                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+1246:            Statement::Break => {
+1247:                self.raise_loop_control("break", LoopControl::Break)?;
+1250:            Statement::Skip => {
+1251:                self.raise_loop_control("skip", LoopControl::Skip)?;
+=== vm.rs
+1550:            Opcode::Break => self.break_loop(frame),
+1551:            Opcode::Skip => self.skip_loop(frame),
+2006:    fn break_loop(&mut self, frame: usize) -> Result<()> {
+2023:    fn skip_loop(&mut self, frame: usize) -> Result<()> {
+2957:            // Skipped when the module is already loaded: running it twice
+[0m
+[0m$ [0msed -n '1140,1270p' src/interpreter.rs
+}
+            Statement::Unless { condition, body } => {
+                // The body is taken exactly when the condition is false, so a
+                // true condition leaves the interpreter where it was.
+                let cond = self.evaluate(condition)?;
+                if !cond.is_truthy() {
+                    // Through `run_block`, like the `if` branches above: an
+                    // `unless` body is a block, so a `break` or a `skip` written
+                    // in it ends the statements after it as well as the loop.
+                    // Run as a plain statement list it would leave the rest of
+                    // the body going while the signal was already raised, which
+                    // is a leak the bytecode VM — whose `unless` body compiles
+                    // into the enclosing block, so its `BREAK`/`SKIP` jumps
+                    // over the rest — does not have.
+                    self.run_block(body)?;
+                }
+                Ok(Value::Nothing)
+            }
+            Statement::ForEach {
+                variable,
+                iterable,
+                body,
+            } => {
+                let iterable_value = self.evaluate(iterable)?;
+                if let Value::List(items) = iterable_value {
+                    let mut loop_iterations = 0;
+                    for item in items.iter() {
+                        self.charge_iteration(&mut loop_iterations, "for each")?;
+                        if self.run_iteration(Some(variable), Some(item.clone()), body)?
+                            == Some(LoopControl::Break)
+                        {
+                            break;
+                        }
+                    }
+                }
+                Ok(Value::Nothing)
+            }
+            Statement::ForRange {
+                variable,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                let start_val = self.evaluate(start)?;
+                let end_val = self.evaluate(end)?;
+                let step_val = match step {
+                    Some(s) => self.evaluate(s)?,
+                    None => Value::Number(1.0),
+                };
+
+                let span = self.span();
+                let start = expect_range_number(&start_val, "from", span)?;
+                let end = expect_range_number(&end_val, "to", span)?;
+                let step = expect_range_number(&step_val, "by", span)?;
+
+                let mut i = start;
+                let mut loop_iterations = 0;
+                // The step's sign is the direction of travel, so a negative
+                // `by` counts down. A zero step never leaves the bound, and the
+                // iteration guard is what stops it: a range is not special
+                // enough to get its own escape.
+                while range_has_next(i, end, step) {
+                    self.charge_iteration(&mut loop_iterations, "for each from")?;
+                    let value = Value::number(i, self.span())?;
+                    // One turn through `run_iteration`, so a `break` or a
+                    // `skip` written in the body of this range leaves it, and
+                    // the loop's variable is bound and released on every path.
+                    if self.run_iteration(Some(variable), Some(value), body)?
+                        == Some(LoopControl::Break)
+                    {
+                        break;
+                    }
+                    // The stepped value is checked too: a step that
+                    // overflows the counter is the same failure as one that
+                    // would put an infinity in the loop variable.
+                    i = finite_number(i + step, self.span())?;
+                }
+                Ok(Value::Nothing)
+            }
+            Statement::Repeat { count, body } => {
+                let count_val = self.evaluate(count)?;
+                // The turn count is the count truncated towards zero, and a
+                // count that is not a number runs no times — see
+                // `expect_repeat_count`, which the bytecode VM reads the same
+                // count through.
+                let turns = expect_repeat_count(&count_val, self.span())?;
+                let mut loop_iterations = 0;
+                for _ in 0..turns {
+                    self.charge_iteration(&mut loop_iterations, "repeat")?;
+                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+                        break;
+                    }
+                }
+                Ok(Value::Nothing)
+            }
+            Statement::While { condition, body } => {
+                let mut loop_iterations = 0;
+                while self.evaluate(condition)?.is_truthy() {
+                    self.charge_iteration(&mut loop_iterations, "while")?;
+                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+                        break;
+                    }
+                }
+                Ok(Value::Nothing)
+            }
+            Statement::Break => {
+                self.raise_loop_control("break", LoopControl::Break)?;
+                Ok(Value::Nothing)
+            }
+            Statement::Skip => {
+                self.raise_loop_control("skip", LoopControl::Skip)?;
+                Ok(Value::Nothing)
+            }
+            Statement::Return(expr) | Statement::GiveBack(expr) => match expr {
+                Some(e) => self.evaluate(e),
+                None => Ok(Value::Nothing),
+            },
+            Statement::Function { name, params, body } => {
+                let function = self.make_function(name, params, body);
+                self.declare(name);
+                self.set_var(name, function)?;
+
+                Ok(Value::Nothing)
+            }
+            Statement::Method { name, params, body } => {
+                let method = self.make_function(name, params, body);
+                self.set_var(name, method)?;
+                Ok(Value::Nothing)
+            }
+            Statement::Has { name, .. } => Err(Error::Runtime(
+[0m
+[0m$ [0msed -n '1995,2060p' src/bytecode/vm.rs
+}
+
+    /// `BREAK`: leaves the innermost loop the instruction sits in.
+    ///
+    /// The loop is found from the offset of the instruction being executed, not
+    /// from the top of [`BytecodeVm::loops`]: a `while` draws its loop entry
+    /// when it turns over, so on its first turn there is no entry for it yet and
+    /// the innermost entry on the stack belongs to some *outer* loop. Leaving
+    /// that one would be the worst available answer — the wrong loop, silently
+    /// shortened — so the offset decides, and no loop at the offset is a refusal
+    /// rather than a jump.
+    fn break_loop(&mut self, frame: usize) -> Result<()> {
+        let Some(owner) = self.loop_at(frame) else {
+            return Err(Error::Runtime(
+                "'break' is only valid inside a loop".to_string(),
+                self.span(),
+            ));
+        };
+        self.leave_owned_loop(frame, owner)
+    }
+
+    /// `SKIP`: goes on to the next turn of the innermost loop the instruction
+    /// sits in, abandoning the rest of this turn's body.
+    ///
+    /// Going to the loop's `top` rather than past it is what makes a skipped turn
+    /// cost exactly what an ordinary one costs: a sequence loop draws and
+    /// charges its next value there, and a `while` evaluates its condition, so
+    /// neither spends an iteration the body never asked for.
+    fn skip_loop(&mut self, frame: usize) -> Result<()> {
+        let Some(owner) = self.loop_at(frame) else {
+            return Err(Error::Runtime(
+                "'skip' is only valid inside a loop".to_string(),
+                self.span(),
+            ));
+        };
+        self.turn_over_to(frame, owner)
+    }
+
+    /// Ends the loop `owner` names, from an instruction running in `frame`.
+    ///
+    /// Shared by `break` and `skip`, because everything the two have to do before
+    /// the jump is the same: create the entry if the loop has not drawn one yet,
+    /// run the `finally` of every `try` written inside the body being left, and
+    /// finish the frames between the instruction and the loop — a `catch`,
+    /// `finally`, `test` or `object` body the abrupt exit passes through on its
+    /// way out. What differs is only where the owning frame goes afterwards.
+    fn leave_owned_loop(&mut self, frame: usize, owner: LoopOwner) -> Result<()> {
+        self.prepare_exit(frame, owner)?;
+        // A `finally` that fails and is handled drops the loops its `try` was
+        // written inside, so the entry this jump was leaving can be gone by the
+        // time it gets here — and the handler that handled the failure has
+        // already put the frame where it belongs. Reaching for the entry anyway
+        // would be a removal from an empty stack.
+        if let Some(index) = self.loop_index(owner.frame, owner.site) {
+            self.leave_loop(owner.frame, index);
+        }
+        Ok(())
+    }
+
+    /// [`Self::leave_owned_loop`] for a `skip`: the loop is left by turning over
+    /// to its `top`, with its entry kept.
+    fn turn_over_to(&mut self, frame: usize, owner: LoopOwner) -> Result<()> {
+        self.prepare_exit(frame, owner)?;
+        // The same dropped entry as in [`Self::leave_owned_loop`]: a `finally`
+        // that failed and was handled has already turned the frame over, so
+        // there is no turn left to go on to.
+[0m
+[0m$ [0mwc -l tests/loop_control_test.rs tests/test_lists.rb; sed -n '85,115p' tests/test_lists.rb
+2839 tests/loop_control_test.rs
+   226 tests/test_lists.rb
+  3065 total
+test "lists: three levels of nesting resolve"
+    set deep to [[[1, 2], [3]], [[4]]]
+    expect deep[0][0][1] to be 2
+    expect deep[0][1][0] to be 3
+    expect deep[1][0][0] to be 4
+end
+
+test "lists: a skip inside a loop leaves its own iteration out"
+    // A `skip` ends the turn it is in, so the value of 2 contributes neither to
+    // the count nor to the sum: three values were seen and they add to 8.
+    set total to 0
+    set seen to 0
+    for each value in [1, 2, 3, 4]
+        if value is 2 then
+            skip
+        end
+        set seen to seen + 1
+        set total to total + value
+    end
+    expect seen to be 3
+    expect total to be 8
+end
+
+test "lists: break inside a loop ends it at the value that broke"
+    // Companion to the test above: a `break` ends the loop, so only 1 and 2 are
+    // ever added. Before `break` was implemented this added all four and the
+    // answer was 10.
+    set total to 0
+    for each value in [1, 2, 3, 4]
+        if value is 3 then
+            break
+[0m
+[0m$ [0mgrep -rn "TODO: Implement proper control flow" src/ tests/ | head; echo "---interp 690-710"; sed -n '690,710p' src/interpreter.rs; echo "--- git log for loop control"; git log --oneline -8 -- src/interpreter.rs tests/loop_control_test.rs
+tests/loop_control_test.rs:4://! `src/interpreter.rs` carried a `// TODO: Implement proper control flow` on each of
+---interp 690-710
+    /// names twice, and binding a name twice is what a `set` refuses to do and a
+    /// `constant` cannot do at all — the second declaration of the module's own
+    /// `TAU` would be refused as a duplicate of the one the first import bound.
+    ///
+    /// The file is read and parsed once: the bindings and the record that the
+    /// module is loaded both come out of that one `Program`. Reading it a second
+    /// time could fail after some of the bindings were already installed, which
+    /// would leave the program with half a module in it.
+    fn load_module(&mut self, path: &str, name: &str) -> Result<()> {
+        if self.modules.contains_key(name) {
+            return Ok(());
+        }
+
+        self.importing.push(name.to_string());
+        let program = match runtime::module_program(path) {
+            Ok(program) => program,
+            Err(error) => {
+                self.importing.pop();
+                return Err(error);
+            }
+        };
+--- git log for loop control
+054e0d6 rbops: phase-022 (2026-10-09T01:37:10Z)
+dff04f6 resume phase-022: adopt preserved work
+bba8b60 rename tree-walking vm.rs to interpreter.rs; README build section, error sample, corpus count pinned in CI
+861080d resume phase-025: adopt preserved work
+[0m
+[0m$ [0mgit log --oneline --all -- tests/test_lists.rb | head -5; echo "--- blame lines 92-120"; git log -1 --format='%h %s' -- tests/loop_control_test.rs
+861080d resume phase-025: adopt preserved work
+e9bf84b rbops: phase-008 (2026-10-04T09:24:48Z)
+5cec921 rbops: phase-007 (2026-10-04T09:09:03Z)
+da2ffba restore phase-003: the complete attempt, recovered from artifact
+--- blame lines 92-120
+bba8b60 rename tree-walking vm.rs to interpreter.rs; README build section, error sample, corpus count pinned in CI
+[0m
+[0m$ [0mls -la --time-style=+%s target/debug/rb 2>/dev/null; for f in src/interpreter.rs src/bytecode/vm.rs tests/loop_control_test.rs; do stat -c '%Y %n' $f; done; git log -1 --format='%ci %H'
+-rwxr-xr-x 2 runner runner 13307176 1791538121 target/debug/rb
+1791538097 src/interpreter.rs
+1791538097 src/bytecode/vm.rs
+1791538097 tests/loop_control_test.rs
+2026-10-09 09:27:13 +0000 cc5066100d25f81b0406d1e77146e11e5e025c6a
+[0m
+[0m$ [0msed -n '108,140p' tests/test_lists.rb
+test "lists: break inside a loop ends it at the value that broke"
+    // Companion to the test above: a `break` ends the loop, so only 1 and 2 are
+    // ever added. Before `break` was implemented this added all four and the
+    // answer was 10.
+    set total to 0
+    for each value in [1, 2, 3, 4]
+        if value is 3 then
+            break
+        end
+        set total to total + value
+    end
+    expect total to be 3
+end
+
+test "edge_lists_index_past_the_end_is_a_caught_error"
+    set items to [1, 2, 3]
+    set caught to no
+    try
+        set item to items[999]
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+    // A legal index on the same list still answers the element, so the error
+    // above is about the position and not about the list.
+    expect items[2] to be 3
+    expect items[-1] to be 3
+end
+
+test "edge_lists_index_into_an_empty_list_is_a_caught_error"
+    set items to []
+    set caught_zero to no
+    try
+[0m
+[0m$ [0mcd target/tmp/p036 && printf 'for each i in [1,2,3]\n    if i is 2 then\n        break\n    end\n    say i\nend\n' > brk.rb && printf 'for each i in [1,2,3]\n    if i is 2 then\n        skip\n    end\n    say i\nend\n' > skp.rb && printf 'repeat 5 times\n    break\n    say "never"\nend\n' > rb.rb && for f in brk skp rb; do echo "=== $f run:"; ../../../target/debug/rb run $f.rb; echo "exit=$?"; done
+=== brk run:
+1
+exit=0
+=== skp run:
+1
+3
+exit=0
+=== rb run:
+exit=0
+[0m
+[0m$ [0mgrep -c "fn edge_\|fn test_" tests/loop_control_test.rs; grep -n "outside any loop\|only valid inside a loop\|nested" tests/loop_control_test.rs | head -20
+40
+147:fn a_break_in_a_nested_loop_leaves_only_the_inner_one() {
+178:fn a_skip_in_a_nested_loop_advances_only_the_inner_one() {
+423:    let value = last_value(&format!("{source}n")).expect("a nested conditional should run");
+2000:        "'break' is only valid inside a loop",
+2111:            "a refusal outside any loop",
+2658:fn edge_a_break_in_a_nested_range_loop_leaves_only_the_inner_one() {
+[0m
+[0m$ [0mcd target/tmp/p036 && for f in brk skp rb; do echo "=== $f compile+vm:"; ../../../target/debug/rb compile $f.rb -o $f.rbc >/dev/null && ../../../target/debug/rb vm $f.rbc; echo "exit=$?"; done
+=== brk compile+vm:
+1
+exit=0
+=== skp compile+vm:
+1
+3
+exit=0
+=== rb compile+vm:
+exit=0
+[0m
+[0m$ [0mgrep -rn "counts.*BREAK\|BREAK.*count\|instruction_count\|Opcode::Break" tests/loop_control_test.rs | head -20; echo "=== test counts"; grep -c "#\[test\]" tests/loop_bounds_test.rs tests/bytecode_vm_test.rs
+=== test counts
+tests/loop_bounds_test.rs:24
+tests/bytecode_vm_test.rs:71
+[0m
+[0m$ [0mcd target/tmp/p036 && printf 'break\n' > out1.rb && printf 'skip\n' > out2.rb && for f in out1 out2; do echo "=== $f run:"; ../../../target/debug/rb run $f.rb; echo "exit=$?"; echo "=== $f vm:"; ../../../target/debug/rb compile $f.rb -o $f.rbc >/dev/null && ../../../target/debug/rb vm $f.rbc; echo "exit=$?"; done
+=== out1 run:
+Error: RuntimeError: 'break' is only valid inside a loop
+  --> out1.rb:1:1
+1 | break
+  | ^
+exit=1
+=== out1 vm:
+Error: RuntimeError: 'break' is only valid inside a loop
+  --> 1:1
+Error: RuntimeError: 'skip' is only valid inside a loop
+  --> out2.rb:1:1
+1 | skip
+  | ^
+exit=1
+=== out2 run:
+exit=1
+=== out2 vm:
+exit=1
+Error: RuntimeError: 'skip' is only valid inside a loop
+  --> 1:1
+[0m
+[0m$ [0mgrep -n "^fn \|^#\[test\]" tests/loop_control_test.rs | grep "^[0-9]*:fn" | wc -l; grep -n "Op\b\|Opcode\|dis\b\|opcode" tests/loop_control_test.rs | head -20
+81
+[0m
+[0m$ [0mcargo test --test loop_control_test 2>&1 | tail -20
+test edge_break_and_skip_over_unicode_values ... ok
+test edge_break_and_skip_in_a_stepped_range_loop ... ok
+test edge_break_and_skip_in_a_range_loop_written_as_source ... ok
+test edge_break_as_the_only_statement_of_a_loop_body ... ok
+test edge_break_as_the_first_and_last_statement_of_a_body ... ok
+test edge_break_in_an_object_body_is_refused ... ok
+test edge_break_in_a_loop_over_a_non_list_never_runs ... ok
+test edge_break_two_blocks_deep_inside_a_conditional ... ok
+test edge_break_and_skip_in_a_stepped_range_loop_written_as_source ... ok
+test edge_neither_break_nor_skip_takes_an_operand ... ok
+test edge_singleton_list_runs_one_turn_and_ends ... ok
+test edge_skip_on_the_final_value_of_a_range_loop_and_break_on_its_first ... ok
+test edge_skip_on_the_final_iteration_of_a_for_each ... ok
+test skip_outside_a_loop_is_a_clean_runtime_error ... ok
+test edge_the_range_loop_variable_is_out_of_scope_after_a_break ... ok
+test skip_goes_on_to_the_next_value ... ok
+test the_corrected_list_tests_still_exist_and_pass ... ok
+
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[0m
+[0m$ [0mgrep -n "Break\b\|Skip\b\|Opcode\|Instruction" tests/loop_control_test.rs | head -30; echo "=== helper fns"; grep -n "fn .*(" tests/loop_control_test.rs | head -12
+1658:/// promised a form the parser does not implement: `TokenKind::Skip` advances
+=== helper fns
+26:fn parse(source: &str) -> redblue::parser::Program {
+33:fn say_lines(source: &str) -> Result<Vec<String>, Error> {
+42:fn last_value(source: &str) -> Result<Value, Error> {
+49:fn run_capped(source: &str, max_iterations: usize) -> Result<Value, Error> {
+56:fn runtime_message(error: &Error) -> String {
+66:fn break_leaves_a_for_each_loop() {
+88:fn skip_goes_on_to_the_next_value() {
+110:fn break_and_skip_work_in_repeat_and_while() {
+147:fn a_break_in_a_nested_loop_leaves_only_the_inner_one() {
+178:fn a_skip_in_a_nested_loop_advances_only_the_inner_one() {
+207:fn break_outside_a_loop_is_a_clean_runtime_error() {
+221:fn skip_outside_a_loop_is_a_clean_runtime_error() {
+[0m
+[0m$ [0mcargo test 2>&1 | grep -E "^test result|Running|error|warning: unused" | head -60
+(no output)
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 120000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0msed -n '1640,1700p' tests/loop_control_test.rs
+None => ("1", "10"),
+            };
+            let source = range_loop("i", start, end, step, body, "say \"after\"\n");
+            let tree = say_lines_of(&source)
+                .unwrap_or_else(|e| panic!("{name} on the tree-walking VM: {e:?}"));
+            let byte = bytecode_say_lines(&source)
+                .unwrap_or_else(|e| panic!("{name} on the bytecode VM: {e:?}"));
+            assert_eq!(
+                tree, byte,
+                "the two VMs disagree about {name} in a range loop (step {step:?})\n{body}"
+            );
+        }
+    }
+}
+
+/// Neither `break` nor `skip` takes an operand.
+///
+/// `docs/GRAMMAR.md` wrote `skip_statement = 'skip' [ expression ]`, which
+/// promised a form the parser does not implement: `TokenKind::Skip` advances
+/// once and returns, so `skip 1` is two statements — the jump, and `1` as an
+/// expression statement of its own. The grammar is the thing that was wrong,
+/// since there is nothing for an operand to say; the loop a `skip` acts on is
+/// the one around it and the turn it goes to is the next one.
+#[test]
+fn edge_neither_break_nor_skip_takes_an_operand() {
+    // `skip 1` skips the turn, and the `1` after it is a statement of its own:
+    // the value that was skipped never reaches it.
+    let source = concat!(
+        "for each i in [1, 2, 3]\n",
+        "    if i is 2 then\n",
+        "        skip 1\n",
+        "    end\n",
+        "    say i\n",
+        "end\n",
+    );
+    assert_eq!(
+        say_lines(source).expect("a skip must not fail the program"),
+        vec!["1".to_string(), "3".to_string()],
+        "the operand of `skip` is not an operand: it is a separate statement"
+    );
+
+    // The same for `break`: `break 1` leaves the loop at the same place, and the
+    // `1` is never evaluated.
+    let source = concat!(
+        "for each i in [1, 2, 3]\n",
+        "    if i is 2 then\n",
+        "        break 1\n",
+        "    end\n",
+        "    say i\n",
+        "end\n",
+    );
+    assert_eq!(
+        say_lines(source).expect("a break must not fail the program"),
+        vec!["1".to_string()],
+        "the operand of `break` is not an operand: it is a separate statement"
+    );
+}
+
+/// A `skip` or a `break` followed by an expression the program cannot evaluate is
+/// still a clean skip or break, because the expression is a statement of its own
+/// that the turn never reaches.
+[0m
+[0m$ [0mgrep -rn "counters\|executed\|opcode_counts\|debug_counters\|OpcodeCounters" src/bytecode/vm.rs | head -20
+1999:    /// The loop is found from the offset of the instruction being executed, not
+2529:    /// where the declaration is executed.
+[0m
+Finding appears already fixed. Verifying thoroughly before deciding.
+[0m$ [0mgit log --oneline -1 --format='%h %s' bba8b60; git show --stat bba8b60 | head -20; echo "=== phase dirs"; ls phases/ | tail -8
+bba8b60 rename tree-walking vm.rs to interpreter.rs; README build section, error sample, corpus count pinned in CI
+commit bba8b60b4313a7c8cee0e0747620a0b1a31a5ed4
+Author: authorss81 <authorss81@users.noreply.github.com>
+Date:   Thu Oct 8 16:49:29 2026 +0530
+
+    rename tree-walking vm.rs to interpreter.rs; README build section, error sample, corpus count pinned in CI
+
+ .github/workflows/ci.yml      |  9 +++++++++
+ AGENTS.md                     |  6 +++---
+ README.md                     | 32 ++++++++++++++++++++++++++++----
+ src/analyzer.rs               |  4 ++--
+ src/bytecode/vm.rs            | 26 +++++++++++++-------------
+ src/{vm.rs => interpreter.rs} |  0
+ src/lib.rs                    | 10 +++++-----
+ src/repl/mod.rs               |  2 +-
+ src/testing/harness.rs        |  2 +-
+ src/value.rs                  |  2 +-
+ tests/bytecode_test.rs        |  2 +-
+ tests/linter_test.rs          |  2 +-
+ tests/loop_control_test.rs    |  4 ++--
+ 13 files changed, 67 insertions(+), 34 deletions(-)
+=== phase dirs
+phase-027
+phase-028
+phase-029
+phase-030
+phase-031
+phase-033
+phase-034
+phase-035
+[0m
+[0m$ [0mcargo test 2>&1 | grep -E "^test result|^error|FAILED|panicked" | tail -60
+test result: ok. 122 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 291.62s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 365.76s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.03s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.91s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.41s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.10s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+[0m
+Full suite green (0 failures). The finding's core claim is **stale** — `break`/`skip` are already implemented in both VMs. Let me verify each DoD item precisely.
+[0m$ [0msed -n '92,125p' tests/test_lists.rb | cat -n | sed 's/^/   /'; echo "=== exact 104/106:"; awk 'NR>=104 && NR<=107 {print NR": "$0}' tests/test_lists.rb
+1	test "lists: a skip inside a loop leaves its own iteration out"
+        2	    // A `skip` ends the turn it is in, so the value of 2 contributes neither to
+        3	    // the count nor to the sum: three values were seen and they add to 8.
+        4	    set total to 0
+        5	    set seen to 0
+        6	    for each value in [1, 2, 3, 4]
+        7	        if value is 2 then
+        8	            skip
+        9	        end
+       10	        set seen to seen + 1
+       11	        set total to total + value
+       12	    end
+       13	    expect seen to be 3
+       14	    expect total to be 8
+       15	end
+       16	
+       17	test "lists: break inside a loop ends it at the value that broke"
+       18	    // Companion to the test above: a `break` ends the loop, so only 1 and 2 are
+       19	    // ever added. Before `break` was implemented this added all four and the
+       20	    // answer was 10.
+       21	    set total to 0
+       22	    for each value in [1, 2, 3, 4]
+       23	        if value is 3 then
+       24	            break
+       25	        end
+       26	        set total to total + value
+       27	    end
+       28	    expect total to be 3
+       29	end
+       30	
+       31	test "edge_lists_index_past_the_end_is_a_caught_error"
+       32	    set items to [1, 2, 3]
+       33	    set caught to no
+       34	    try
+=== exact 104/106:
+104:     expect seen to be 3
+105:     expect total to be 8
+106: end
+107:
+[0m
+[0m$ [0mgrep -rn "opcode\|Opcode" src/bytecode/vm.rs | grep -i "count\|stat\|trace\|debug" | head; echo "=== pub fns on vm"; grep -n "pub fn \|pub struct \|pub enum " src/bytecode/vm.rs | head -30
+467:fn binary_operator(opcode: Opcode) -> &'static BinaryOp {
+501:fn unary_operator(opcode: Opcode) -> &'static UnaryOp {
+=== pub fns on vm
+531:pub struct BytecodeVm {
+650:    pub fn new() -> Self {
+683:    pub fn with_max_call_depth(max_call_depth: usize) -> Self {
+693:    pub fn with_max_steps(max_steps: usize) -> Self {
+701:    pub fn with_max_iterations(max_iterations: usize) -> Self {
+714:    pub fn with_limits(max_iterations: usize, max_steps: usize) -> Self {
+722:    pub fn set_echo(&mut self, echo: bool) {
+728:    pub fn take_expectation_failure(
+745:    pub fn run(&mut self, chunk: &Chunk) -> Result<Value> {
+770:    pub fn take_output(&mut self) -> Vec<String> {
+3267:pub struct Limits {
+3275:pub fn limits() -> Limits {
+3290:pub fn run(chunk: &Chunk) -> Result<Value> {
+[0m
+The finding's core claim is **stale** — already fixed by the adopted phase-022/025 work. Verifying the one DoD item that appears genuinely open.
+[0m$ [0msed -n '1,64p' tests/loop_control_test.rs
+//! `break` and `skip` must leave a loop, not sit in it doing nothing.
+//!
+//! Both words were lexed, parsed and then evaluated to `Nothing`:
+//! `src/interpreter.rs` carried a `// TODO: Implement proper control flow` on each of
+//! them and no loop ever consulted them. So `for each i in [1, 2, 3]` with a
+//! `break` when `i` is 2 printed 1, 2, 3 and exited 0 — a program that ran to
+//! completion, reported success, and gave the wrong answer. That is what these
+//! tests pin down.
+//!
+//! The Redblue-language versions of the same matrix live in
+//! `tests/test_loop_control.rb`, and `tests/test_lists.rb` carries the two
+//! `for each` cases that were corrected along with the implementation.
+
+use redblue::{Error, Value, Vm};
+
+/// The two `tests/test_lists.rb` cases this phase corrected. They were pinned
+/// against the no-op: one asserted every iteration ran (`seen` is 4), the other
+/// that a `break` did not truncate the loop (`total` is 10).
+const CORRECTED_LIST_TESTS: [&str; 2] = [
+    "lists: a skip inside a loop leaves its own iteration out",
+    "lists: break inside a loop ends it at the value that broke",
+];
+
+/// Lexes and parses `source`.
+#[track_caller]
+fn parse(source: &str) -> redblue::parser::Program {
+    let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
+    redblue::parser::parse(tokens).expect("source should parse")
+}
+
+/// Runs `source` and returns the lines `say` printed.
+#[track_caller]
+fn say_lines(source: &str) -> Result<Vec<String>, Error> {
+    let mut vm = Vm::new();
+    let result = vm.run(&parse(source));
+    let printed = vm.take_output();
+    result.map(|_| printed)
+}
+
+/// Runs `source` and returns the value of its last statement.
+#[track_caller]
+fn last_value(source: &str) -> Result<Value, Error> {
+    let mut vm = Vm::new();
+    vm.run(&parse(source))
+}
+
+/// Runs `source` in a VM whose per-loop iteration cap is `max_iterations`.
+#[track_caller]
+fn run_capped(source: &str, max_iterations: usize) -> Result<Value, Error> {
+    let mut vm = Vm::with_max_iterations(max_iterations);
+    vm.run(&parse(source))
+}
+
+/// The message of a `RuntimeError`, ignoring the span it carries.
+#[track_caller]
+fn runtime_message(error: &Error) -> String {
+    match error {
+        Error::Runtime(message, _) => message.clone(),
+        other => panic!("expected a RuntimeError, got {:?}", other),
+    }
+}
+
+/// The reproduction: a `break` on the second element prints the first and stops.
+/// Before the fix this printed 1, 2 and 3 and exited 0.
+[0m
+[0m$ [0mgrep -rn "executed\|count_op\|opcode_count\|instruction_count\|Opcode::Break\|Opcode::Skip" tests/ src/ --include=*.rs | grep -iv "for item\|executed one\|// " | head -20; echo "=== none means no counter"
+tests/bootstrap_selfhost_test.rs:1502:                let executed = child.wait_with_output().unwrap_or_else(|error| {
+tests/bootstrap_selfhost_test.rs:1507:                    stderr: String::from_utf8_lossy(&executed.stderr).into_owned(),
+tests/bootstrap_selfhost_test.rs:1508:                    succeeded: executed.status.success(),
+tests/repl_test.rs:223:        .assert_stdout_contains("executed successfully");
+tests/bytecode_vm_test.rs:2723:         at least {MINIMUM_CORPUS} to have been executed"
+tests/bytecode_test.rs:285:    let instruction_count_at = first_opcode_offset() - 4;
+tests/bytecode_test.rs:287:    lying[instruction_count_at..instruction_count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+tests/discovery_test.rs:288:fn edge_crlf_rb_file_is_discovered_and_executed() {
+src/repl/commands.rs:574:    fn edge_bare_sigil_is_reported_not_executed() {
+src/repl/mod.rs:675:            Ok(_) => println!("File '{}' executed successfully.", path),
+src/bytecode/vm.rs:1550:            Opcode::Break => self.break_loop(frame),
+src/bytecode/vm.rs:1551:            Opcode::Skip => self.skip_loop(frame),
+src/bytecode/format.rs:579:        let instruction_count = self.u32()?;
+src/bytecode/format.rs:581:            instruction_count,
+src/bytecode/codegen.rs:394:            Statement::Break => emit(code, Opcode::Break, 0, 0, line),
+src/bytecode/codegen.rs:395:            Statement::Skip => emit(code, Opcode::Skip, 0, 0, line),
+src/bytecode/opcode.rs:249:        Opcode::Break,
+src/bytecode/opcode.rs:250:        Opcode::Skip,
+src/bytecode/opcode.rs:314:            Opcode::Break => "BREAK",
+src/bytecode/opcode.rs:315:            Opcode::Skip => "SKIP",
+=== none means no counter
+[0m
+Core finding is **stale** — already fixed. But one DoD item is genuinely missing: no test counts executed BREAK/SKIP instructions. Let me check the VM's step accounting to build that.
+[0m$ [0mgrep -n "steps\b\|max_steps\|charge_step\|self.steps" src/bytecode/vm.rs | head -25
+47:    resolve_max_call_depth, resolve_max_iterations, resolve_max_iterations_from, resolve_max_steps,
+48:    resolve_max_steps_from, MAX_CALL_DEPTH, MAX_ITERATIONS, MAX_STEPS,
+606:    steps: usize,
+607:    max_steps: usize,
+672:            steps: 0,
+673:            max_steps: resolve_max_steps(),
+693:    pub fn with_max_steps(max_steps: usize) -> Self {
+695:        vm.max_steps = resolve_max_steps_from(Some(max_steps));
+710:    /// [`BytecodeVm::with_max_steps`] can be followed by the other — each builds
+714:    pub fn with_limits(max_iterations: usize, max_steps: usize) -> Self {
+717:        vm.max_steps = resolve_max_steps_from(Some(max_steps));
+885:    fn charge_step(&mut self) -> Result<()> {
+886:        if self.steps >= self.max_steps {
+890:                    self.max_steps
+895:        self.steps += 1;
+943:        self.charge_step()
+1401:                    self.charge_step()?;
+2888:    /// nesting count is for: it steps over those and finds the end of this one.
+3268:    pub max_steps: usize,
+3277:        max_steps: resolve_max_steps(),
+[0m
+[0m$ [0msed -n '531,660p' src/bytecode/vm.rs
+pub struct BytecodeVm {
+    globals: HashMap<String, Value>,
+    /// The names bound by a `constant` declaration. The value lives in
+    /// [`BytecodeVm::globals`] so a read resolves through one name-resolution
+    /// path; what this table adds is the refusal to rebind the name.
+    constants: HashSet<String>,
+    /// The live local scopes, outermost first. A call's parameters are the
+    /// innermost scope, and a closure pushes the scopes it captured above its
+    /// caller's frames — see [`BytecodeVm::call_function`].
+    locals: Vec<CapturedScope>,
+    /// The lines `say` has produced. Printed when the program finishes, which is
+    /// where the tree-walking VM prints them too, so a program that mixes `say`
+    /// and `print` writes its lines in the same order either way.
+    output: Vec<String>,
+    /// Every `object` declaration, by type name. See [`ObjectType`].
+    objects: HashMap<String, ObjectType>,
+    /// The modules an `import` has already run, by the name the program wrote.
+    ///
+    /// A module is run once, because running it twice declares its names twice:
+    /// a `constant` cannot be declared twice at all, so a second `import` of the
+    /// same module would fail on the module's own first declaration. The
+    /// tree-walking VM keeps the parsed program here for the same reason — see
+    /// [`crate::interpreter::Vm::load_module`], which answers the second import with a
+    /// no-op.
+    modules: HashSet<String>,
+    /// The name each imported module is called by, to the module it names.
+    ///
+    /// An `import X as Y` binds `Y`, and a call written `Y.member` has to reach
+    /// the same function `X.member` does — which is a function named
+    /// `X_member`, not `Y_member`. The tree-walking VM keeps the same table; see
+    /// [`crate::interpreter::Vm`]'s `module_aliases`.
+    module_aliases: HashMap<String, String>,
+    /// Every `module` declaration that has run, by module name.
+    ///
+    /// An entry is what a second declaration of the same name is refused
+    /// against, what `is_module_name` counts, and what an `import` of the name
+    /// finds in place of a file. The tree-walking VM keeps the same table; see
+    /// [`crate::interpreter::Vm`].
+    declared_modules: HashMap<String, DeclaredModule>,
+    /// How many `module` bodies are running. Above zero a `set` binds in the
+    /// module's own scope rather than becoming a global, which is what makes a
+    /// module declaration a boundary rather than a run of top-level statements.
+    module_depth: usize,
+    /// The chain of modules currently being loaded, outermost first.
+    ///
+    /// A module that reaches one already in the chain is a cycle. See
+    /// [`BytecodeVm::import`].
+    importing: Vec<String>,
+    expectation_failure: Option<crate::testing::assertions::TestAssertionError>,
+    current_span: Span,
+    /// The operand stack. Every block is entered with an empty one; the bases
+    /// live in [`Frame`].
+    stack: Vec<Value>,
+    /// The active call frames, the program's own at the bottom.
+    frames: Vec<Frame>,
+    /// The loops currently running, innermost last.
+    loops: Vec<Loop>,
+    /// The `try` handlers currently installed, innermost last.
+    handlers: Vec<Handler>,
+    /// The `object` declarations the open object bodies are assembling,
+    /// outermost first.
+    ///
+    /// A **stack**, not a slot. Two things nest: an `object` declared inside
+    /// another `object`'s body is a second declaration being assembled while the
+    /// first is still open, and a `has` field's `default` is compiled as an
+    /// ordinary expression, so it may call a function that declares an object of
+    /// its own while the enclosing one declares its next field. One slot let the
+    /// inner declaration take the outer one's place, so the outer body's
+    /// `DefField` wrote into the inner type and the outer body then finished a
+    /// declaration that was gone. See [`BytecodeVm::finish_object`].
+    pending_objects: Vec<ObjectPending>,
+    /// What the last frame to finish produced.
+    outcome: Value,
+    call_depth: usize,
+    max_call_depth: usize,
+    steps: usize,
+    max_steps: usize,
+    max_iterations: usize,
+    /// Whether [`BytecodeVm::run`] prints what the program said.
+    ///
+    /// On by default, because `rb vm` is the only way most callers run a `.rbc`
+    /// and a program that printed nothing is indistinguishable from one that was
+    /// never run. A caller that runs a program as a *library* — a differential
+    /// harness comparing two engines — turns it off, because the lines it wants
+    /// are the ones [`BytecodeVm::take_output`] hands back and a test run that
+    /// interleaved a program's own output with the failure report is a test run
+    /// nobody can read.
+    echo: bool,
+    /// Whether a `break` or a `skip` has moved a frame that is not the one the
+    /// instruction ran in — the sign that an abrupt exit has crossed a frame
+    /// boundary.
+    ///
+    /// Read by [`BytecodeVm::drive`] when it stops, which is the body that was
+    /// running when the exit happened, and nowhere else: a `catch` or `finally`
+    /// body is driven by its caller, and that caller has to know whether the
+    /// region it was going to resume is one the program has already gone past.
+    /// See [`Exit::Left`].
+    abrupt_exit: bool,
+    /// Whether a failure is between [`BytecodeVm::handle_failure`] and the `catch`
+    /// or `finally` body it is running.
+    ///
+    /// The `finally` a `break` in a `catch` body is owed runs inside this window,
+    /// and it reads the loop's variable as the tree-walking VM reads it — still
+    /// bound, because the turn the `break` stopped has not ended yet. See
+    /// [`BytecodeVm::put_back_binding`].
+    handling_failure: bool,
+    /// Loop-variable bindings waiting for the failure handling that owes them —
+    /// see [`BytecodeVm::put_back_binding`].
+    deferred_bindings: Vec<LoopVariable>,
+}
+
+impl Default for BytecodeVm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BytecodeVm {
+    /// Builds a VM with the configured limits and an empty program.
+    pub fn new() -> Self {
+        Self {
+            globals: stdlib::builtins(),
+            constants: HashSet::new(),
+            locals: vec![CapturedScope::new()],
+            output: Vec::new(),
+            objects: HashMap::new(),
+            modules: HashSet::new(),
+            module_aliases: HashMap::new(),
+            declared_modules: HashMap::new(),
+            module_depth: 0,
+[0m
+Core finding is **stale** (fixed by adopted phase-022/025 work). The genuinely open DoD item is the instruction counter. Writing the failing test first.
+[0m$ [0mtail -20 tests/loop_control_test.rs; echo "=== lib exports"; grep -n "bytecode" src/lib.rs | head
+bytecode_say_lines(&program).expect("the bytecode VM should agree"),
+        expected,
+        "the bytecode VM ran past the break\n{breaking}"
+    );
+
+    let program = parse(caught);
+    assert_eq!(
+        say_lines_of(&program).expect("the same program without a break"),
+        vec![
+            "caught".to_string(),
+            "1".to_string(),
+            "caught".to_string(),
+            "2".to_string(),
+            "caught".to_string(),
+            "3".to_string(),
+            "after".to_string(),
+        ],
+        "the loop did not run every value\n{caught}"
+    );
+}
+=== lib exports
+3:pub mod bytecode;
+33:pub use bytecode::{compile_source, Chunk, Opcode};
+453:fn bytecode_path_for(source: &str) -> String {
+463:    let chunk = bytecode::compile_source(&text).map_err(|e| e.render(&text, Some(source)))?;
+466:        .unwrap_or_else(|| bytecode_path_for(source));
+478:            "Error: {path} is not a bytecode file; compile it first and disassemble the .rbc"
+482:    let chunk = bytecode::Chunk::decode(&bytes).map_err(|e| e.to_string())?;
+484:    print!("{}", bytecode::disassemble(&chunk));
+488:/// `rb vm <file.rbc>` — the bytecode VM, which is bootstrap stage S1b.
+492:/// caret `rb run` draws: a bytecode file has no text to draw them from. The
+[0m
+[0m$ [0mgrep -n "bytecode_say_lines\|fn compile_source\|use redblue" tests/loop_control_test.rs | head
+14:use redblue::{Error, Value, Vm};
+287:        bytecode_say_lines(&parse(source)).expect("the bytecode VM must catch a refused skip too");
+328:    let compiled = bytecode_say_lines(&parse(source))
+1346:        let byte = bytecode_say_lines(&program)
+1458:    use redblue::parser::{Statement, Stmt};
+1489:fn bytecode_say_lines(program: &redblue::parser::Program) -> Result<Vec<String>, Error> {
+1513:/// [`bytecode_say_lines`] with the per-loop iteration cap lowered.
+1515:fn capped_bytecode_say_lines(
+1645:            let byte = bytecode_say_lines(&source)
+1846:        let byte = bytecode_say_lines(&program)
+[0m
+[0m$ [0msed -n '1485,1530p' tests/loop_control_test.rs; echo "=== 147 nested"; sed -n '140,210p' tests/loop_control_test.rs
+/// Runs a program on the bytecode VM, through the compiler the `rb compile`
+/// path uses, and returns the lines `say` printed.
+#[track_caller]
+fn bytecode_say_lines(program: &redblue::parser::Program) -> Result<Vec<String>, Error> {
+    let chunk = redblue::bytecode::compile_program(program)?;
+    let mut vm = redblue::bytecode::vm::BytecodeVm::new();
+    let result = vm.run(&chunk);
+    let printed = vm.take_output();
+    result.map(|_| printed)
+}
+
+/// [`say_lines_of`] with the per-loop iteration cap lowered to `max_iterations`.
+///
+/// A cap of a million is what a program meets, and nothing a test writes can
+/// reach it, so a disagreement about how many turns a cap allows needs the cap
+/// lowered to be asked about at all.
+#[track_caller]
+fn capped_say_lines_of(
+    program: &redblue::parser::Program,
+    max_iterations: usize,
+) -> Result<Vec<String>, Error> {
+    let mut vm = Vm::with_max_iterations(max_iterations);
+    let result = vm.run(program);
+    let printed = vm.take_output();
+    result.map(|_| printed)
+}
+
+/// [`bytecode_say_lines`] with the per-loop iteration cap lowered.
+#[track_caller]
+fn capped_bytecode_say_lines(
+    program: &redblue::parser::Program,
+    max_iterations: usize,
+) -> Result<Vec<String>, Error> {
+    let chunk = redblue::bytecode::compile_program(program)?;
+    let mut vm = redblue::bytecode::vm::BytecodeVm::with_max_iterations(max_iterations);
+    let result = vm.run(&chunk);
+    let printed = vm.take_output();
+    result.map(|_| printed)
+}
+
+/// A `break` in a `for each i from a to b` loop ends it, and both VMs say so.
+///
+/// The form is built as an AST rather than written as source because the parser
+/// has no `from` production; see [`range_loop`].
+#[test]
+=== 147 nested
+    }
+}
+
+/// A `break` in the inner loop leaves the inner loop. The outer one goes on:
+/// before the fix, the two loops ran to completion and the inner one only
+/// appeared to because nothing could end it early.
+#[test]
+fn a_break_in_a_nested_loop_leaves_only_the_inner_one() {
+    let source = concat!(
+        "set outer to 0\n",
+        "set inner to 0\n",
+        "for each a in [1, 2, 3]\n",
+        "    for each b in [1, 2, 3]\n",
+        "        if b is 2 then\n",
+        "            break\n",
+        "        end\n",
+        "        set inner to inner + 1\n",
+        "    end\n",
+        "    set outer to outer + 1\n",
+        "end\n",
+    );
+
+    // Three outer turns, one inner turn each: the outer loop is not shortened
+    // by a break that happened two loops down.
+    for (name, expected) in [("outer", 3.0), ("inner", 3.0)] {
+        let value = last_value(&format!("{source}{name}"))
+            .unwrap_or_else(|e| panic!("{name} failed: {e:?}"));
+        assert_eq!(
+            value,
+            Value::Number(expected),
+            "the outer loop must keep going after the inner one is broken out of"
+        );
+    }
+}
+
+/// The same nesting for `skip`, where the inner loop must turn over but the
+/// outer one must not lose a turn.
+#[test]
+fn a_skip_in_a_nested_loop_advances_only_the_inner_one() {
+    let source = concat!(
+        "set outer to 0\n",
+        "set inner to 0\n",
+        "for each a in [1, 2]\n",
+        "    set outer to outer + 1\n",
+        "    for each b in [1, 2]\n",
+        "        set inner to inner + 1\n",
+        "        skip\n",
+        "    end\n",
+        "end\n",
+    );
+
+    // Two outer turns of two inner turns is four: a skipped turn is still a
+    // turn, so the inner loop is not shortened by it either.
+    for (name, expected) in [("outer", 2.0), ("inner", 4.0)] {
+        let value = last_value(&format!("{source}{name}"))
+            .unwrap_or_else(|e| panic!("{name} failed: {e:?}"));
+        assert_eq!(
+            value,
+            Value::Number(expected),
+            "two outer turns of two inner turns is four, and a skip is still a turn"
+        );
+    }
+}
+
+/// A `break` written where there is no loop is a mistake in the program, and it
+/// is reported as one. It used to be a no-op: the program ran on and exited 0.
+#[test]
+fn break_outside_a_loop_is_a_clean_runtime_error() {
+    let error = last_value("break").expect_err("a break in no loop must not be a no-op");
+
+    let message = runtime_message(&error);
+[0m
+Core finding is **stale** — already fixed by adopted phase-022/025 work; full suite is green. One DoD item is genuinely unmet: the executed-instruction counter. Checking the opcode type.
+[0m$ [0msed -n '1540,1560p' src/bytecode/vm.rs; echo "=== run fn"; sed -n '740,790p' src/bytecode/vm.rs
+Opcode::Neg | Opcode::Not => {
+                let value = self.pop()?;
+                let value = runtime::unary_op(self.span(), unary_operator(opcode), value)?;
+                self.push(value);
+                self.advance(frame);
+                Ok(())
+            }
+            Opcode::Call => self.call(instruction, frame),
+            Opcode::CallMethod => self.call_method(instruction, frame),
+            Opcode::Return => self.return_value(frame),
+            Opcode::Break => self.break_loop(frame),
+            Opcode::Skip => self.skip_loop(frame),
+            Opcode::Jump => self.jump(instruction, frame),
+            Opcode::JumpIfFalse => {
+                let target = instruction.arg as usize;
+                let value = self.pop()?;
+                if value.is_truthy() {
+                    // A `while`'s condition is where a turn *begins*, so it is
+                    // where a turn is charged — the same point the tree-walking
+                    // VM charges, immediately after its condition comes out
+                    // truthy and before the body runs. Charging anywhere else
+=== run fn
+    ///
+    /// A run that failed part-way through leaves the frames, loops and handlers
+    /// it had open, and the declarations its open `object` bodies were
+    /// assembling with them, so a second run on the same VM starts from a clean
+    /// state rather than from a body that is still half-declared.
+    pub fn run(&mut self, chunk: &Chunk) -> Result<Value> {
+        self.frames.clear();
+        self.loops.clear();
+        self.handlers.clear();
+        self.stack.clear();
+        self.pending_objects.clear();
+        self.locals.truncate(1);
+        self.outcome = Value::Nothing;
+        self.abrupt_exit = false;
+
+        let chunk = Arc::new(chunk.clone());
+        self.frames.push(self.frame_for(&chunk, Vec::new()));
+        // `Exit` is not read here: a `break` in the program's outermost block is
+        // refused, so no loop is left for this body to have been written inside.
+        let result = self.drive(0).map(|_| ());
+        if result.is_ok() && self.echo {
+            for line in &self.output {
+                println!("{}", line);
+            }
+        }
+        result.map(|()| self.outcome.clone())
+    }
+
+    /// Takes the lines `say` produced, for a caller that wants them rather than
+    /// the printing.
+    pub fn take_output(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.output)
+    }
+
+    // -- the block tree -----------------------------------------------------
+
+    /// A frame for `path` of `chunk`, with this VM's current stack heights as
+    /// its bases.
+    fn frame_for(&self, chunk: &Arc<Chunk>, path: Vec<u32>) -> Frame {
+        let sites = block_at(chunk, &path).map(loop_sites).unwrap_or_default();
+        Frame {
+            chunk: chunk.clone(),
+            path,
+            ip: 0,
+            stack_base: self.stack.len(),
+            loop_base: self.loops.len(),
+            handler_base: self.handlers.len(),
+            locals_base: self.locals.len(),
+            object_body: false,
+            pending_base: self.pending_objects.len(),
+            module_body: None,
+[0m
+[0m$ [0mgrep -n "pub enum Opcode" -B3 src/bytecode/opcode.rs; grep -n "derive" src/bytecode/opcode.rs | head
+46-/// One instruction. The byte values are stable; see [`Opcode`].
+47-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+48-#[repr(u8)]
+49:pub enum Opcode {
+47:#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+[0m
+Core finding is **stale**. One DoD item is genuinely unmet: no test counts executed BREAK/SKIP instructions. Writing that test first.
+[0m$ [0msed -n '205,300p' tests/loop_control_test.rs
+/// is reported as one. It used to be a no-op: the program ran on and exited 0.
+#[test]
+fn break_outside_a_loop_is_a_clean_runtime_error() {
+    let error = last_value("break").expect_err("a break in no loop must not be a no-op");
+
+    let message = runtime_message(&error);
+    assert!(
+        message.contains("break"),
+        "the refusal must name the statement, got {:?}",
+        message
+    );
+}
+
+/// The same for `skip`, which is the word a reader is least likely to notice
+/// doing nothing.
+#[test]
+fn skip_outside_a_loop_is_a_clean_runtime_error() {
+    let error = last_value("say 1\nskip").expect_err("a skip in no loop must not be a no-op");
+
+    let message = runtime_message(&error);
+    assert!(
+        message.contains("skip"),
+        "the refusal must name the statement, got {:?}",
+        message
+    );
+}
+
+/// The refusal is catchable from inside the language, and the program carries on
+/// afterwards: a `try` that handled it does not end the program.
+#[test]
+fn edge_a_refused_break_is_catchable_with_try_catch_error() {
+    let source = concat!(
+        "set caught to no\n",
+        "set survived to no\n",
+        "try\n",
+        "    break\n",
+        "catch error\n",
+        "    set caught to yes\n",
+        "end\n",
+        "set survived to yes\n",
+    );
+
+    for (name, expected) in [
+        ("caught", Value::YesNo(true)),
+        ("survived", Value::YesNo(true)),
+    ] {
+        let value = last_value(&format!("{source}{name}"))
+            .unwrap_or_else(|e| panic!("a caught refusal must not fail the program: {e:?}"));
+        assert_eq!(value, expected, "{name} must show the failure was caught");
+    }
+}
+
+/// The `skip` companion of
+/// [`edge_a_refused_break_is_catchable_with_try_catch_error`]. The refusal is the
+/// same kind of `RuntimeError` and is catchable in the same way — a `skip` is
+/// not a failure only some VMs report, and it must not be a program-stopper
+/// where a `break` is not one. Both engines are compared, because `skip` reaches
+/// the loop lookup by a different path from `break`.
+#[test]
+fn edge_a_refused_skip_is_catchable_with_try_catch_error() {
+    let source = concat!(
+        "set caught to no\n",
+        "set survived to no\n",
+        "try\n",
+        "    skip\n",
+        "catch error\n",
+        "    set caught to yes\n",
+        "end\n",
+        "set survived to yes\n",
+        "say caught\n",
+        "say survived\n",
+    );
+    let expected = vec!["yes".to_string(), "yes".to_string()];
+
+    let printed = say_lines(source).expect("a caught refusal must not fail the program");
+
+    assert_eq!(
+        printed, expected,
+        "the refusal must be caught and the program must carry on"
+    );
+
+    let compiled =
+        bytecode_say_lines(&parse(source)).expect("the bytecode VM must catch a refused skip too");
+
+    assert_eq!(
+        compiled, expected,
+        "the two VMs must answer a refused skip the same way"
+    );
+}
+
+/// The `skip` companion of
+/// [`edge_a_break_in_a_function_body_is_refused_and_the_caller_survives`]: the
+/// placement where the refusal has a loop *near* it and must still be a refusal,
+/// because obeying it would end a turn the `skip` was not written in. Every turn
+/// is counted, so the caller's loop runs to its end on both engines.
+#[test]
+[0m
+[0m$ [0mgrep -n "raise_loop_control\|LoopControl" src/interpreter.rs | head -20
+264:    loop_control: Option<LoopControl>,
+269:enum LoopControl {
+487:    /// scope, runs `body`, and reports the [`LoopControl`] the body raised.
+504:    ) -> Result<Option<LoopControl>> {
+526:    ) -> Result<Option<LoopControl>> {
+549:    /// Runs `statements` and reports the [`LoopControl`] one of them raised,
+559:    fn run_block(&mut self, statements: &[Stmt]) -> Result<Option<LoopControl>> {
+570:    fn raise_loop_control(&mut self, keyword: &str, signal: LoopControl) -> Result<()> {
+1169:                            == Some(LoopControl::Break)
+1209:                        == Some(LoopControl::Break)
+1230:                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+1240:                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+1247:                self.raise_loop_control("break", LoopControl::Break)?;
+1251:                self.raise_loop_control("skip", LoopControl::Skip)?;
+[0m
+Now writing the failing test that counts executed BREAK/SKIP instructions — the one genuinely unmet DoD item.
+[0m$ [0mgrep -n "fn take_output\|fn take_expectation_failure\|pub fn steps\|fn steps" src/bytecode/vm.rs src/interpreter.rs | head
+src/bytecode/vm.rs:728:    pub fn take_expectation_failure(
+src/bytecode/vm.rs:770:    pub fn take_output(&mut self) -> Vec<String> {
+src/interpreter.rs:584:    pub fn take_expectation_failure(
+src/interpreter.rs:596:    pub fn take_output(&mut self) -> Vec<String> {
+[0m
+[0m$ [0mgrep -rn "opcode\|Opcode" tests/bytecode_vm_test.rs | head -8; echo "=== is Opcode exported?"; grep -n "pub use" src/bytecode/mod.rs
+19:use redblue::bytecode::{compile_source, Instruction, Opcode};
+2780:        .find(|instruction| instruction.opcode == Opcode::Store)
+2784:        opcode: Opcode::Call,
+2809:            opcode: Opcode::Jump,
+2815:            opcode: Opcode::Say,
+2867:        .position(|instruction| instruction.opcode == Opcode::GetIter)
+2875:        opcode: Opcode::Jump,
+3534:        .find(|instruction| instruction.opcode == Opcode::Store)
+=== is Opcode exported?
+28:pub use codegen::compile as compile_program;
+29:pub use disasm::render as disassemble;
+30:pub use format::{
+34:pub use opcode::Opcode;
+35:pub use opcode::END_TRY_MARKER;
+36:pub use opcode::STATEMENT_MARKER;
+[0m
+[0m← [0mWrite tests/loop_instruction_test.rs
+Wrote file successfully.
+[0m
+Now writing the failing test that counts executed BREAK/SKIP instructions.
+Now running it to watch it fail.
+[0m$ [0mcargo test --test loop_instruction_test 2>&1 | grep -E "^error|^warning: unused|-->" | head -20
+[1m[94m--> [0mtests/loop_instruction_test.rs:44:8
+  [1m[94m--> [0mtests/loop_instruction_test.rs:55:8
+   [1m[94m--> [0mtests/loop_instruction_test.rs:259:12
+   [1m[94m--> [0mtests/loop_instruction_test.rs:286:12
+   [1m[94m--> [0mtests/loop_instruction_test.rs:400:10
+   [1m[94m--> [0mtests/loop_instruction_test.rs:402:43
+[0m
+[0m$ [0mcargo test --test loop_instruction_test 2>&1 | grep -E "^error(\[|:)" -A3 | head -30
+(no output)
+[0m
+[0m$ [0mcargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^error|^ +-->" | head -20
+error[E0599]: no method named `loop_control_counts` found for struct `Vm` in the current scope
+  --> tests/loop_instruction_test.rs:44:8
+error[E0599]: no method named `loop_control_counts` found for struct `BytecodeVm` in the current scope
+  --> tests/loop_instruction_test.rs:55:8
+error[E0599]: no method named `loop_control_counts` found for struct `BytecodeVm` in the current scope
+   --> tests/loop_instruction_test.rs:259:12
+error[E0599]: no method named `loop_control_counts` found for struct `BytecodeVm` in the current scope
+   --> tests/loop_instruction_test.rs:286:12
+error[E0599]: no method named `instructions_for` found for struct `Chunk` in the current scope
+   --> tests/loop_instruction_test.rs:400:10
+error[E0614]: type `Opcode` cannot be dereferenced
+   --> tests/loop_instruction_test.rs:402:43
+error: could not compile `redblue` (test "loop_instruction_test") due to 6 previous errors
+[0m
+Red for the right reason: the counter does not exist. Now the smallest implementation.
+[0m$ [0mgrep -n "pub fn instructions\|instructions:" src/bytecode/mod.rs src/bytecode/codegen.rs | head; grep -n "pub struct Chunk" -A12 src/bytecode/*.rs | head -20
+src/bytecode/format.rs:238:pub struct Chunk {
+src/bytecode/format.rs-239-    /// Every value a `PUSH_CONST` can name, in the order they were first used.
+src/bytecode/format.rs-240-    ///
+src/bytecode/format.rs-241-    /// One pool for the whole file, shared by every block, so a name used in a
+src/bytecode/format.rs-242-    /// function body is the same constant as the same name used outside it.
+src/bytecode/format.rs-243-    pub constants: Vec<Constant>,
+src/bytecode/format.rs-244-    /// The program's own instructions.
+src/bytecode/format.rs-245-    pub main: Block,
+src/bytecode/format.rs-246-}
+src/bytecode/format.rs-247-
+src/bytecode/format.rs-248-/// Dropping a nested `Vec<Block>` would put one frame of drop glue on the stack
+src/bytecode/format.rs-249-/// per level of nesting, so a tree deeper than the compiler emits — the public
+src/bytecode/format.rs-250-/// fields let a caller build one — could abort the process in a destructor
+[0m
+[0m$ [0msed -n '580,600p' src/interpreter.rs
+/// Takes the structured failure from the most recent failed `expect`, so a
+    /// caller such as the test harness can report expected and actual values
+    /// instead of only a rendered message.
+    pub fn take_expectation_failure(
+        &mut self,
+    ) -> Option<crate::testing::assertions::TestAssertionError> {
+        self.expectation_failure.take()
+    }
+
+    /// Takes the lines `say` produced, for a caller that wants them rather than
+    /// the printing.
+    ///
+    /// The printing happens in [`Vm::run`], so this is only useful afterwards.
+    /// It exists so that a caller comparing this VM with the bytecode VM can see
+    /// what each printed without capturing a process's stdout.
+    pub fn take_output(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.output)
+    }
+
+    /// The names this VM has bound that the standard library did not: what a
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -596,8 +596,21 @@
+ pub fn take_output(&mut self) -> Vec<String> {
+     std::mem::take(&mut self.output)
+ }
+ 
++/// How many `break` and `skip` statements this VM has evaluated, as
++/// `(breaks, skips)`.
++///
++/// The printed lines say what a `break` *did*; this says whether the
++/// statement was reached at all, which is the half the output cannot
++/// distinguish. A `break` that was decoded and dropped and a `break` that
++/// ended a loop print the same lines in a loop that would have ended anyway.
++/// The bytecode VM counts the same two things over its opcodes, through
++/// [`crate::bytecode::vm::BytecodeVm::loop_control_counts`].
++pub fn loop_control_counts(&self) -> (usize, usize) {
++    (self.break_statements, self.skip_statements)
++}
++
+ /// The names this VM has bound that the standard library did not: what a
+ /// `set`, a `to` or an `import` put here.
+ ///
+ /// A REPL asks for this three times over — to seed the analyzer so the next
+
+[0m
+[0m$ [0mgrep -n "output: Vec<String>,\|output: Vec<String>" src/interpreter.rs | head -3; grep -n "output: Vec::new()," src/interpreter.rs | head -3
+199:    output: Vec<String>,
+381:            output: Vec::new(),
+[0m
+[0m$ [0msed -n '193,205p' src/interpreter.rs; echo "---"; sed -n '376,388p' src/interpreter.rs
+/// this table adds is the refusal to rebind the name.
+    constants: HashSet<String>,
+    /// The live local scopes, outermost first. A call's parameters are the
+    /// innermost scope, and a function value that closed over scopes pushes
+    /// them above its caller's frames — see [`Vm::call_user_function`].
+    locals: Vec<CapturedScope>,
+    output: Vec<String>,
+    /// The module programs already run, by the name the `import` that loaded
+    /// them goes by. An entry is what makes a second import of the same module a
+    /// no-op rather than a second binding of the same names.
+    modules: HashMap<String, Program>,
+    /// Every module name an `import` has bound, to the module it names.
+    ///
+---
+        let globals = stdlib::builtins();
+        Self {
+            globals,
+            constants: HashSet::new(),
+            locals: vec![CapturedScope::new()],
+            output: Vec::new(),
+            modules: HashMap::new(),
+            module_aliases: HashMap::new(),
+            importing: Vec::new(),
+            declared_modules: HashMap::new(),
+            module_depth: 0,
+            qualified_members: HashSet::new(),
+            objects: HashMap::new(),
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -196,8 +196,15 @@
+ /// innermost scope, and a function value that closed over scopes pushes
+ /// them above its caller's frames — see [`Vm::call_user_function`].
+ locals: Vec<CapturedScope>,
+ output: Vec<String>,
++/// How many `break` statements have been evaluated, including one that was
++/// then refused for being outside every loop. See
++/// [`Vm::loop_control_counts`].
++break_statements: usize,
++/// How many `skip` statements have been evaluated, on the same terms as
++/// [`Vm::break_statements`].
++skip_statements: usize,
+ /// The module programs already run, by the name the `import` that loaded
+ /// them goes by. An entry is what makes a second import of the same module a
+ /// no-op rather than a second binding of the same names.
+ modules: HashMap<String, Program>,
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -385,8 +385,10 @@
+ globals,
+ constants: HashSet::new(),
+ locals: vec![CapturedScope::new()],
+ output: Vec::new(),
++break_statements: 0,
++skip_statements: 0,
+ modules: HashMap::new(),
+ module_aliases: HashMap::new(),
+ importing: Vec::new(),
+ declared_modules: HashMap::new(),
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -1265,12 +1265,14 @@
+     }
+     Ok(Value::Nothing)
+ }
+ Statement::Break => {
++    self.break_statements += 1;
+     self.raise_loop_control("break", LoopControl::Break)?;
+     Ok(Value::Nothing)
+ }
+ Statement::Skip => {
++    self.skip_statements += 1;
+     self.raise_loop_control("skip", LoopControl::Skip)?;
+     Ok(Value::Nothing)
+ }
+ Statement::Return(expr) | Statement::GiveBack(expr) => match expr {
+
+[0m
+[0m← [0mEdit src/bytecode/vm.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+@@ -770,8 +770,21 @@
+ pub fn take_output(&mut self) -> Vec<String> {
+     std::mem::take(&mut self.output)
+ }
+ 
++/// How many `BREAK` and `SKIP` instructions this VM has dispatched, as
++/// `(breaks, skips)`.
++///
++/// Counted when the opcode is decoded and dispatched, so an instruction that
++/// is then refused for having no loop around it is counted too: the refusal
++/// is the handler having run. What a program printed says what a `break` did;
++/// this says whether one was ever reached, which is the half the output
++/// cannot distinguish. The tree-walking VM counts the same two things over
++/// its statements, through [`crate::interpreter::Vm::loop_control_counts`].
++pub fn loop_control_counts(&self) -> (usize, usize) {
++    (self.break_instructions, self.skip_instructions)
++}
++
+ // -- the block tree -----------------------------------------------------
+ 
+ /// A frame for `path` of `chunk`, with this VM's current stack heights as
+ /// its bases.
+
+[0m
+Now incrementing at the two statement sites.
+[0m✗ [0mEdit src/bytecode/vm.rs failed
+[91m[1mError: [0mNo changes to apply: oldString and newString are identical.
+[0m
+[0m← [0mEdit src/bytecode/vm.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+@@ -600,8 +600,15 @@
+ /// declaration that was gone. See [`BytecodeVm::finish_object`].
+ pending_objects: Vec<ObjectPending>,
+ /// What the last frame to finish produced.
+ outcome: Value,
++/// How many `BREAK` instructions have been dispatched, including one that
++/// was then refused for having no loop around it. See
++/// [`BytecodeVm::loop_control_counts`].
++break_instructions: usize,
++/// How many `SKIP` instructions have been dispatched, on the same terms as
++/// [`BytecodeVm::break_instructions`].
++skip_instructions: usize,
+ call_depth: usize,
+ max_call_depth: usize,
+ steps: usize,
+ max_steps: usize,
+
+[0m
+[0m$ [0mgrep -n "call_depth: 0," src/bytecode/vm.rs | head -2
+670:            call_depth: 0,
+[0m
+[0m← [0mEdit src/bytecode/vm.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+@@ -674,8 +674,10 @@
+ handlers: Vec::new(),
+ pending_objects: Vec::new(),
+ outcome: Value::Nothing,
+ call_depth: 0,
++break_instructions: 0,
++skip_instructions: 0,
+ max_call_depth: resolve_max_call_depth(),
+ steps: 0,
+ max_steps: resolve_max_steps(),
+ max_iterations: resolve_max_iterations(),
+
+[0m
+[0m← [0mEdit src/bytecode/vm.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
++++ /home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs
+@@ -1568,10 +1568,16 @@
+ }
+ Opcode::Call => self.call(instruction, frame),
+ Opcode::CallMethod => self.call_method(instruction, frame),
+ Opcode::Return => self.return_value(frame),
+-Opcode::Break => self.break_loop(frame),
+-Opcode::Skip => self.skip_loop(frame),
++Opcode::Break => {
++    self.break_instructions += 1;
++    self.break_loop(frame)
++}
++Opcode::Skip => {
++    self.skip_instructions += 1;
++    self.skip_loop(frame)
++}
+ Opcode::Jump => self.jump(instruction, frame),
+ Opcode::JumpIfFalse => {
+     let target = instruction.arg as usize;
+     let value = self.pop()?;
+
+[0m
+Now fixing the test's Chunk API usage and the Opcode deref.
+[0m← [0mEdit tests/loop_instruction_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs
+@@ -396,11 +396,12 @@
+ )))
+ .expect("the program should compile");
+ 
+ let emitted: Vec<Opcode> = chunk
+-    .instructions_for(0)
++    .main
++    .instructions
+     .iter()
+-    .map(|Instruction { opcode, .. }| *opcode)
++    .map(|instruction| instruction.opcode)
+     .collect();
+ 
+ assert!(
+     emitted.contains(&Opcode::Break),
+
+[0m
+[0m$ [0mgrep -n "pub struct Block" -A10 src/bytecode/format.rs | head -16
+216:pub struct Block {
+217-    /// The declaration's name: the function, method, object or test name, and
+218-    /// `main` for the program's own code.
+219-    pub name: String,
+220-    pub kind: BlockKind,
+221-    /// How many parameters a function, method or test block takes. `0` for
+222-    /// every other kind.
+223-    pub arity: u32,
+224-    /// The parameter names, in order, for a function or method block.
+225-    ///
+226-    /// Names and not slots, for the reason [`Opcode::Load`](crate::bytecode::Opcode::Load)
+[0m
+[0m← [0mEdit tests/loop_instruction_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs
+@@ -381,10 +381,8 @@
+ /// instructions the compiler can actually emit — the count is not reading a
+ /// counter for an opcode that no program contains.
+ #[test]
+ fn edge_the_counted_opcodes_are_the_two_the_compiler_emits() {
+-    use redblue::bytecode::Instruction;
+-
+     let chunk = compile_program(&parse(concat!(
+         "for each i in [1, 2, 3]\n",
+         "    if i is 2 then\n",
+         "        break\n",
+
+[0m
+[0m$ [0mcargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^error|^test |^test result|^ +-->|panicked" | head -30
+error[E0308]: mismatched types
+  --> tests/loop_instruction_test.rs:44:5
+error[E0308]: mismatched types
+  --> tests/loop_instruction_test.rs:55:5
+error[E0308]: mismatched types
+   --> tests/loop_instruction_test.rs:260:9
+error[E0308]: mismatched types
+   --> tests/loop_instruction_test.rs:287:9
+error[E0609]: no field `instructions` on type `redblue::bytecode::Block`
+   --> tests/loop_instruction_test.rs:399:10
+error: could not compile `redblue` (test "loop_instruction_test") due to 5 previous errors
+[0m
+I made the API return a plain tuple. Fixing the test to use the tuple.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+p='tests/loop_instruction_test.rs'
+s=open(p).read()
+s=s.replace("""/// The two `break`/`skip` counts of one run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Counts {
+    breaks: usize,
+    skips: usize,
+}
+
+""","")
+s=s.replace("vm.loop_control_counts()\n}","loop_control_counts(&vm)\n}")
+s=s.replace("vm.loop_control_counts(),","loop_control_counts(&vm),")
+s=s.replace("""fn tree_counts(source: &str) -> Counts {""","""fn tree_counts(source: &str) -> (usize, usize) {""")
+s=s.replace("""fn bytecode_counts(source: &str) -> Counts {""","""fn bytecode_counts(source: &str) -> (usize, usize) {""")
+s=s.replace("""fn counts_on_both_engines(source: &str) -> Counts {""","""fn counts_on_both_engines(source: &str) -> (usize, usize) {""")
+s=re.sub(r"Counts \{\s*breaks: (\d+),\s*skips: (\d+),\s*\}", r"(\1, \2)", s)
+s=s.replace(".main\n        .instructions\n        .iter()\n        .map(|instruction| instruction.opcode)\n        .collect();",".main\n        .code\n        .iter()\n        .map(|instruction| instruction.opcode)\n        .collect();")
+open(p,'w').write(s)
+EOF
+grep -n "code\b" src/bytecode/format.rs | sed -n '1,6p'
+5://! everything else works in terms of [`Chunk`], [`Block`] and [`Opcode`].
+14:use crate::bytecode::opcode::Opcode;
+28:/// Changing anything that an older file would decode differently must bump
+87:/// can never hold: [`Chunk::decode`] refuses a pool that reaches it, so the
+91:/// Bytes per instruction record: opcode, `arg`, `aux`, `line`.
+119:/// itself, so a decode of a chunk that holds one would not equal the chunk it
+[0m
+[0m$ [0msed -n '216,240p' src/bytecode/format.rs
+pub struct Block {
+    /// The declaration's name: the function, method, object or test name, and
+    /// `main` for the program's own code.
+    pub name: String,
+    pub kind: BlockKind,
+    /// How many parameters a function, method or test block takes. `0` for
+    /// every other kind.
+    pub arity: u32,
+    /// The parameter names, in order, for a function or method block.
+    ///
+    /// Names and not slots, for the reason [`Opcode::Load`](crate::bytecode::Opcode::Load)
+    /// keeps names: a body reads its own arguments by name, so the file has to
+    /// say which name each argument is bound to. Empty for every other kind.
+    pub params: Vec<String>,
+    pub code: Vec<Instruction>,
+    /// Nested blocks, in the order the compiler emitted them. An instruction
+    /// refers to one by its index here, so this order is part of the format.
+    pub blocks: Vec<Block>,
+}
+
+/// A compiled program: one constant pool and the block tree that uses it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chunk {
+    /// Every value a `PUSH_CONST` can name, in the order they were first used.
+    ///
+[0m
+`.code` is correct. Running the test.
+[0m$ [0mcargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^error|^test |^test result|^ +-->|panicked|left|right" | head -40
+error[E0425]: cannot find function `loop_control_counts` in this scope
+  --> tests/loop_instruction_test.rs:37:5
+error[E0425]: cannot find function `loop_control_counts` in this scope
+  --> tests/loop_instruction_test.rs:48:5
+error[E0425]: cannot find function `loop_control_counts` in this scope
+   --> tests/loop_instruction_test.rs:234:9
+error[E0425]: cannot find function `loop_control_counts` in this scope
+   --> tests/loop_instruction_test.rs:258:9
+error: could not compile `redblue` (test "loop_instruction_test") due to 4 previous errors
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='tests/loop_instruction_test.rs'
+s=open(p).read()
+s=s.replace("loop_control_counts(&vm)","vm.loop_control_counts()")
+open(p,'w').write(s)
+EOF
+cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^error|^test |^test result|^ +-->|panicked|left|right" | head -40
+test a_refused_break_still_dispatches_the_instruction_and_then_fails ... ok
+test a_break_in_a_for_each_loop_dispatches_exactly_one_break ... ok
+test a_break_in_a_nested_loop_dispatches_one_break_and_the_outer_turns_continue ... ok
+test a_skip_in_a_for_each_loop_dispatches_exactly_one_skip ... ok
+test edge_a_caught_break_still_dispatches_the_instruction ... ok
+test edge_a_loop_with_no_break_or_skip_dispatches_none ... ok
+test edge_a_refused_skip_still_dispatches_the_instruction_and_then_fails ... ok
+test edge_both_words_in_one_program_each_dispatch_once ... ok
+test edge_a_skip_on_the_final_value_dispatches_one_skip_and_no_break ... ok
+test edge_the_counted_opcodes_are_the_two_the_compiler_emits ... ok
+test a_break_written_after_the_loop_ends_is_never_dispatched ... FAILED
+test edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting ... FAILED
+thread 'a_break_written_after_the_loop_ends_is_never_dispatched' (18156) panicked at tests/loop_instruction_test.rs:36:29:
+thread 'edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting' (18159) panicked at tests/loop_instruction_test.rs:334:9:
+test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+error: test failed, to rerun pass `--test loop_instruction_test`
+[0m
+10 pass, 2 fail. Checking what each failure actually reports before adjusting.
+[0m$ [0mcargo test --test loop_instruction_test function_body 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -A10 "panicked" | head -16
+thread 'edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting' (18211) panicked at tests/loop_instruction_test.rs:334:9:
+source should parse: Parser("Unexpected token End", Span { line: 4, column: 1 })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::result::unwrap_failed
+   3: <core::result::Result<redblue::parser::Program, redblue::error::Error>>::expect
+   4: loop_instruction_test::parse
+   5: loop_instruction_test::tree_counts
+   6: loop_instruction_test::counts_on_both_engines
+   7: loop_instruction_test::edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting
+[0m
+[0m$ [0mcargo test --test loop_instruction_test a_break_written_after 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -A8 "panicked" | head -14
+thread 'a_break_written_after_the_loop_ends_is_never_dispatched' (18214) panicked at tests/loop_instruction_test.rs:36:29:
+the tree-walking VM must run the program: Runtime("'break' is only valid inside a loop", Span { line: 7, column: 1 })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: loop_instruction_test::tree_counts::{closure#0}
+   3: <core::result::Result<redblue::value::Value, redblue::error::Error>>::unwrap_or_else::<loop_instruction_test::tree_counts::{closure#0}>
+   4: loop_instruction_test::tree_counts
+   5: loop_instruction_test::counts_on_both_engines
+[0m
+Both failures are my test bugs, not implementation. Checking the real syntax.
+[0m$ [0mgrep -n "a_break_in_a_function_body_is_refused" -A 25 tests/loop_control_test.rs | head -32
+296:/// [`edge_a_break_in_a_function_body_is_refused_and_the_caller_survives`]: the
+297-/// placement where the refusal has a loop *near* it and must still be a refusal,
+298-/// because obeying it would end a turn the `skip` was not written in. Every turn
+299-/// is counted, so the caller's loop runs to its end on both engines.
+300-#[test]
+301-fn edge_a_refused_skip_inside_a_loop_leaves_the_loop_running() {
+302-    let source = concat!(
+303-        "to advance()\n",
+304-        "    skip\n",
+305-        "end\n",
+306-        "set n to 0\n",
+307-        "set caught to no\n",
+308-        "repeat 3 times\n",
+309-        "    set n to n + 1\n",
+310-        "    try\n",
+311-        "        advance()\n",
+312-        "    catch error\n",
+313-        "        set caught to yes\n",
+314-        "    end\n",
+315-        "end\n",
+316-        "say n\n",
+317-        "say caught\n",
+318-    );
+319-    let expected = vec!["3".to_string(), "yes".to_string()];
+320-
+321-    let printed = say_lines(source).expect("a refused skip must not end the caller's loop");
+--
+341:fn edge_a_break_in_a_function_body_is_refused_and_the_caller_survives() {
+342-    let source = concat!(
+343-        "to escape()\n",
+344-        "    break\n",
+345-        "end\n",
+[0m
+Syntax is `to name()`, and a trailing top-level `break` is correctly refused. Fixing both test bugs.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/loop_instruction_test.rs'
+s=open(p).read()
+
+old_a = '''/// A `break` the loop never reaches dispatches zero instructions.
+///
+/// The mirror of the first test, and the one that actually distinguishes the two
+/// ways a no-op can hide: here the `break` is written *after* the statements that
+/// would have ended the loop anyway, so a decoded-but-dropped `break` and a
+/// working one are indistinguishable from the output. Only the count separates
+/// them, and zero is right here — the loop ends at `break`, so the second one is
+/// never evaluated.
+#[test]
+fn a_break_written_after_the_loop_ends_is_never_dispatched() {
+    let source = concat!(
+        "for each i in [1, 2, 3]\\n",
+        "    if i is 3 then\\n",
+        "        break\\n",
+        "    end\\n",
+        "    say i\\n",
+        "end\\n",
+        "break\\n",
+    );
+
+    assert_eq!(
+        counts_on_both_engines(source),
+        (1, 0),
+        "only the break inside the loop runs; the one after it is never reached"
+    );
+}'''
+
+new_a = '''/// A `break` that ends the loop on its *first* value still dispatches once — the
+/// count is a statement count, not a per-element one.
+///
+/// The mirror of the first test, and the one that separates a working `break`
+/// from a dropped one in the shape that hides best: here the loop would have
+/// printed `1` and stopped either way if the instruction were dropped, because
+/// `break` is the last statement reached before the third turn prints. Only the
+/// instruction count shows that a handler ran at all.
+#[test]
+fn a_break_on_the_first_value_still_dispatches_exactly_once() {
+    let source = concat!(
+        "for each i in [1, 2, 3]\\n",
+        "    if i is 1 then\\n",
+        "        break\\n",
+        "    end\\n",
+        "    say i\\n",
+        "end\\n",
+    );
+
+    assert_eq!(
+        counts_on_both_engines(source),
+        (1, 0),
+        "a break on the first of three values runs once, not once per value"
+    );
+}'''
+
+assert old_a in s
+s = s.replace(old_a, new_a)
+
+old_b = '''        "set turns to 0\\n",
+        "define leaky\\n",
+        "    break\\n",
+        "end\\n",'''
+new_b = '''        "set turns to 0\\n",
+        "to leaky\\n",
+        "    break\\n",
+        "end\\n",'''
+assert old_b in s
+s = s.replace(old_b, new_b)
+open(p,'w').write(s)
+PY
+cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^error|^test result|FAILED|panicked" -A4 | head -20
+test edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting ... FAILED
+
+failures:
+
+---- edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting stdout ----
+--
+thread 'edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting' (18323) panicked at tests/loop_instruction_test.rs:332:5:
+assertion `left == right` failed: each of the three turns calls the function and is refused once
+  left: (0, 0)
+ right: (3, 0)
+stack backtrace:
+--
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test loop_instruction_test`
+[0m
+[0m$ [0msed -n '341,375p' tests/loop_control_test.rs
+fn edge_a_break_in_a_function_body_is_refused_and_the_caller_survives() {
+    let source = concat!(
+        "to escape()\n",
+        "    break\n",
+        "end\n",
+        "set n to 0\n",
+        "set caught to no\n",
+        "repeat 2 times\n",
+        "    set n to n + 1\n",
+        "    try\n",
+        "        escape()\n",
+        "    catch error\n",
+        "        set caught to yes\n",
+        "    end\n",
+        "end\n",
+    );
+
+    for (name, expected) in [("n", Value::Number(2.0)), ("caught", Value::YesNo(true))] {
+        let value = last_value(&format!("{source}{name}")).unwrap_or_else(|e| {
+            panic!("a refused break in a call must not end the caller's loop: {e:?}")
+        });
+        assert_eq!(
+            value, expected,
+            "a refused break must be caught, not obeyed"
+        );
+    }
+}
+
+/// A `break` whose whole body is itself: nothing else in the body can run, and
+/// the loop must still end rather than spin.
+#[test]
+fn edge_break_as_the_only_statement_of_a_loop_body() {
+    let source = "set n to 0\nfor each i in [1, 2, 3]\n    break\nend\nset n to 1\nn";
+
+    let value = last_value(source).expect("a one-statement body should run");
+[0m
+The call syntax is `leaky()` not `call leaky`. Fixing.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 -c "
+p='tests/loop_instruction_test.rs'
+s=open(p).read()
+s=s.replace('        \"        call leaky\\\\n\",','        \"        leaky()\\\\n\",')
+open(p,'w').write(s)
+" && grep -n "leaky()" tests/loop_instruction_test.rs && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^error|^test result|FAILED|left:|right:" | head
+323:        "        leaky()\n",
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+All 12 green. Verifying the tests genuinely fail if the handlers are neutered.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cp src/bytecode/vm.rs target/tmp/vm.bak && cp src/interpreter.rs target/tmp/interp.bak && python3 -c "
+p='src/bytecode/vm.rs'
+s=open(p).read()
+s=s.replace('''Opcode::Break => {
+                self.break_instructions += 1;
+                self.break_loop(frame)
+            }''','''Opcode::Break => {
+                self.break_instructions += 1;
+                self.advance(frame)
+            }''')
+open(p,'w').write(s)
+" && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result|FAILED" | head
+(no output)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | tail -25
+Compiling redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+error[E0308]: mismatched types
+    --> src/bytecode/vm.rs:1574:17
+     |
+1410 |     fn execute(&mut self, instruction: Instruction, frame: usize) -> Result<()> {
+     |                                                                      ---------- expected `std::result::Result<(), error::Error>` because of return type
+...
+1574 |                 self.advance(frame)
+     |                 ^^^^^^^^^^^^^^^^^^^ expected `Result<(), Error>`, found `()`
+     |
+     = note:   expected enum `std::result::Result<(), error::Error>`
+             found unit type `()`
+note: method `advance` modifies its receiver in-place
+    --> src/bytecode/vm.rs:1574:22
+     |
+1574 |                 self.advance(frame)
+     |                      ^^^^^^^ this call modifies `self` in-place
+help: try adding an expression at the end of the block
+     |
+1574 ~                 self.advance(frame);
+1575 +                 Ok(())
+     |
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `redblue` (lib) due to 1 previous error
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 -c "
+p='src/bytecode/vm.rs'
+s=open(p).read()
+s=s.replace('''                self.advance(frame)
+            }
+            Opcode::Skip => {''','''                self.advance(frame);
+                Ok(())
+            }
+            Opcode::Skip => {''')
+open(p,'w').write(s)
+" && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result|FAILED$" | head
+(no output)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test |^test result" | head -20
+(no output)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | tail -30
+Compiling redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+error: methods `break_loop` and `leave_owned_loop` are never used
+    --> src/bytecode/vm.rs:2035:8
+     |
+ 655 | impl BytecodeVm {
+     | --------------- methods in this implementation
+...
+2035 |     fn break_loop(&mut self, frame: usize) -> Result<()> {
+     |        ^^^^^^^^^^
+...
+2070 |     fn leave_owned_loop(&mut self, frame: usize, owner: LoopOwner) -> Result<()> {
+     |        ^^^^^^^^^^^^^^^^
+     |
+     = note: `-D dead-code` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+error: could not compile `redblue` (lib) due to 1 previous error
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 -c "
+p='src/bytecode/vm.rs'
+s=open(p).read()
+s=s.replace('''    fn leave_owned_loop(&mut self, frame: usize, owner: LoopOwner) -> Result<()> {''','''    #[allow(dead_code)]
+    fn leave_owned_loop(&mut self, frame: usize, owner: LoopOwner) -> Result<()> {''')
+s=s.replace('''    fn break_loop(&mut self, frame: usize) -> Result<()> {''','''    #[allow(dead_code)]
+    fn break_loop(&mut self, frame: usize) -> Result<()> {''')
+open(p,'w').write(s)
+" && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test |^test result" | head -20
+test a_break_on_the_first_value_still_dispatches_exactly_once ... ok
+test a_break_in_a_for_each_loop_dispatches_exactly_one_break ... ok
+test a_break_in_a_nested_loop_dispatches_one_break_and_the_outer_turns_continue ... ok
+test a_skip_in_a_for_each_loop_dispatches_exactly_one_skip ... ok
+test edge_a_caught_break_still_dispatches_the_instruction ... ok
+test edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting ... ok
+test edge_a_refused_skip_still_dispatches_the_instruction_and_then_fails ... ok
+test edge_a_loop_with_no_break_or_skip_dispatches_none ... ok
+test edge_a_skip_on_the_final_value_dispatches_one_skip_and_no_break ... ok
+test edge_both_words_in_one_program_each_dispatch_once ... ok
+test a_refused_break_still_dispatches_the_instruction_and_then_fails ... FAILED
+test edge_the_counted_opcodes_are_the_two_the_compiler_emits ... ok
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Good — neutering the BREAK handler turns a test red. Restoring the real implementation.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cp target/tmp/vm.bak src/bytecode/vm.rs && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result|FAILED" | head
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Restored and green. Now verifying the tree-VM counter is also load-bearing.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 -c "
+p='src/interpreter.rs'
+s=open(p).read()
+s=s.replace('self.break_statements += 1;','self.break_statements += 0;')
+open(p,'w').write(s)
+" && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result|^    [a-z_]+$|FAILED$" | head -12; cp target/tmp/interp.bak src/interpreter.rs
+test a_break_on_the_first_value_still_dispatches_exactly_once ... FAILED
+test a_break_in_a_for_each_loop_dispatches_exactly_one_break ... FAILED
+test a_break_in_a_nested_loop_dispatches_one_break_and_the_outer_turns_continue ... FAILED
+test edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting ... FAILED
+test edge_a_caught_break_still_dispatches_the_instruction ... FAILED
+test edge_both_words_in_one_program_each_dispatch_once ... FAILED
+    end
+    end
+    end
+    break
+    try
+    end
+[0m
+Both counters are load-bearing. Restoring and running the four gates.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff --stat && cargo fmt --all -- --check 2>&1 | head -20; echo "fmt exit=$?"
+src/bytecode/vm.rs | 32 ++++++++++++++++++++++++++++++--
+ src/interpreter.rs | 24 ++++++++++++++++++++++++
+ 2 files changed, 54 insertions(+), 2 deletions(-)
+Diff in /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs:16:
+ //! dispatched, and a disagreement between the two is a disagreement about the
+ //! language rather than about the plumbing.
+ 
+-use redblue::bytecode::{compile_program, Opcode};
+ use redblue::bytecode::vm::BytecodeVm;
++use redblue::bytecode::{compile_program, Opcode};
+ use redblue::parser::Program;
+ use redblue::{Error, Vm};
+ 
+Diff in /home/runner/work/rbops/rbops/redblue/tests/loop_instruction_test.rs:369:
+         "the compiler must emit SKIP for a skip: {emitted:?}"
+     );
+ }
++
+fmt exit=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -rn "TODO: Implement proper control flow" src/ ; echo "grep-exit=$? (1 means nothing found)"
+grep-exit=1 (1 means nothing found)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all && cargo fmt --all -- --check && echo "FMT PASS"
+FMT PASS
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^(error|warning)" | head -20; echo "CLIPPY DONE"
+CLIPPY DONE
+[0m
+Clippy clean. Now the full suite and the binary checks.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result: FAILED|failures:|^error" | head -20; echo "=== summary"; cargo test --all-targets 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result" | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "TOTAL passed="p" failed="f}'
+=== summary
+TOTAL passed=1095 failed=0
+[0m
+1095 passed, 0 failed. Now the DoD's binary verification and the phase gate.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo build --bin rb 2>&1 | tail -2
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.08s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue/target/tmp/p036 && for f in brk skp rb; do echo "### $f — rb run:"; ../../../target/debug/rb run $f.rb; echo "[exit=$?]"; echo "### $f — rb vm (from rb compile):"; ../../../target/debug/rb compile $f.rb -o $f.rbc >/dev/null && ../../../target/debug/rb vm $f.rbc; echo "[exit=$?]"; done
+### brk — rb run:
+1
+[exit=0]
+### brk — rb vm (from rb compile):
+1
+[exit=0]
+### skp — rb run:
+1
+3
+[exit=0]
+### skp — rb vm (from rb compile):
+1
+3
+[exit=0]
+### rb — rb run:
+[exit=0]
+### rb — rb vm (from rb compile):
+[exit=0]
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls phases/ | grep 036; cat phases/phase-035/REPORT.md 2>/dev/null | head -30
+# Phase 035 — Remove the reachable panics in the time builtins
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| `src/runtime.rs` | +181 −28 | Added `since_epoch(instant, span)`, the seconds-since-epoch conversion behind a seam that takes the instant as an argument; added `seconds_for_format(timestamp, span)`, which refuses a timestamp that names no date; routed all five clock sites and `time_format` through them; four unit tests in `mod tests` |
+| `tests/time_builtin_test.rs` | +168 (new) | 8 end-to-end tests through the Redblue pipeline |
+
+The clock conversion now reads:
+
+```
+fn since_epoch(instant: SystemTime, span: Span) -> Result<Duration> {
+    instant.duration_since(UNIX_EPOCH).map_err(|_| {
+        Error::Runtime(
+            "The system clock is set before 1970-01-01T00:00:00Z, so time cannot be read from it"
+                .to_string(),
+            span,
+        )
+    })
+}
+```
+
+`SystemTime::now()` is passed *in* rather than called inside, so a test can hand it a
+pre-epoch instant directly and never touch the machine's clock.
+
+## Finding re-verification — the cited evidence was stale, the class was live
+
+The phase cites `src/interpreter.rs:924, 1089, 1238, 1250, 1263` calling
+`SystemTime::now().duration_since(UNIX_EPOCH).unwrap()`.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && mkdir -p phases/phase-036 && ./rbops/verify.sh phase-036 2>&1 | tail -40
+/bin/bash: line 1: ./rbops/verify.sh: No such file or directory
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls rbops/ 2>&1; ls *.sh 2>&1
+ls: cannot access 'rbops/': No such file or directory
+export.sh
+[0m
+`rbops/verify.sh` does not exist in this checkout — the fourth gate is unrunnable. Recording that honestly and gathering exact diff facts.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "ignore\|allow(clippy" tests/loop_instruction_test.rs | head; echo "none = clean"; grep -n "loop_control_counts" src/interpreter.rs src/bytecode/vm.rs
+224:    let error = result.expect_err("a break outside every loop must be refused, not ignored");
+248:    let error = result.expect_err("a skip outside every loop must be refused, not ignored");
+none = clean
+src/interpreter.rs:202:    /// [`Vm::loop_control_counts`].
+src/interpreter.rs:617:    /// [`crate::bytecode::vm::BytecodeVm::loop_control_counts`].
+src/interpreter.rs:618:    pub fn loop_control_counts(&self) -> (usize, usize) {
+src/bytecode/vm.rs:606:    /// [`BytecodeVm::loop_control_counts`].
+src/bytecode/vm.rs:791:    /// its statements, through [`crate::interpreter::Vm::loop_control_counts`].
+src/bytecode/vm.rs:792:    pub fn loop_control_counts(&self) -> (usize, usize) {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff --numstat && echo "=== new file" && wc -l tests/loop_instruction_test.rs && echo "=== new tests" && grep -c "^fn \|^    fn " tests/loop_instruction_test.rs && grep -c "#\[test\]" tests/loop_instruction_test.rs && echo "=== edge count" && grep -c "^fn edge_" tests/loop_instruction_test.rs
+30	2	src/bytecode/vm.rs
+24	0	src/interpreter.rs
+=== new file
+371 tests/loop_instruction_test.rs
+=== new tests
+16
+12
+=== edge count
+7
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "expect_err" tests/loop_instruction_test.rs | head; echo "=== failure-asserting tests"; grep -n "^fn .*refus\|^fn .*fails" tests/loop_instruction_test.rs
+224:    let error = result.expect_err("a break outside every loop must be refused, not ignored");
+248:    let error = result.expect_err("a skip outside every loop must be refused, not ignored");
+=== failure-asserting tests
+218:fn a_refused_break_still_dispatches_the_instruction_and_then_fails() {
+242:fn edge_a_refused_skip_still_dispatches_the_instruction_and_then_fails() {
+315:fn edge_a_break_in_a_function_body_is_refused_once_and_the_caller_keeps_counting() {
+[0m
+[0m← [0mWrite phases/phase-036/FINDINGS.md
+Wrote file successfully.
+[0m
+Now writing FINDINGS.md and REPORT.md.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "GATE1 fmt: PASS"; cargo clippy --all-targets -- -D warnings 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -cE "^(warning|error)"; echo "GATE2 clippy: warnings/errors counted above (0 = pass)"
+GATE1 fmt: PASS
+0
+GATE2 clippy: warnings/errors counted above (0 = pass)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result" | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "GATE3 cargo test: "p" passed, "f" failed"}'; ls rbops/verify.sh 2>&1
+GATE3 cargo test: 1095 passed, 0 failed
+ls: cannot access 'rbops/verify.sh': No such file or directory
+[0m
+Now writing REPORT.md with the real numbers.
+[0m← [0mWrite phases/phase-036/REPORT.md
+Wrote file successfully.
+[0m
+Verifying every factual claim in the report before I claim it.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff --numstat src/; echo "--- edge_ tests in loop_control:"; grep -c "fn edge_break_and_skip_over_unicode_values\|fn edge_neither_break_nor_skip_takes_an_operand" tests/loop_control_test.rs; grep -n "fn edge_break_and_skip_over_unicode_values\|fn edge_neither_break_nor_skip_takes_an_operand" tests/loop_control_test.rs
+30	2	src/bytecode/vm.rs
+24	0	src/interpreter.rs
+--- edge_ tests in loop_control:
+2
+667:fn edge_break_and_skip_over_unicode_values() {
+1664:fn edge_neither_break_nor_skip_takes_an_operand() {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && echo "--- interpreter break/skip line numbers:"; grep -n "Statement::Break =>\|Statement::Skip =>" src/interpreter.rs; echo "--- vm break_loop/skip_loop:"; grep -n "fn break_loop\|fn skip_loop" src/bytecode/vm.rs; echo "--- test_lists 104/119:"; awk 'NR==104||NR==119 {print NR": "$0}' tests/test_lists.rb
+--- interpreter break/skip line numbers:
+1268:            Statement::Break => {
+1273:            Statement::Skip => {
+--- vm break_loop/skip_loop:
+2034:    fn break_loop(&mut self, frame: usize) -> Result<()> {
+2051:    fn skip_loop(&mut self, frame: usize) -> Result<()> {
+--- test_lists 104/119:
+104:     expect seen to be 3
+119:     expect total to be 3
+[0m
+Three of my cited line numbers are off by two. Correcting them — AGENTS.md forbids fabricated `file:line`.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+fixes = [
+ ("src/interpreter.rs:1270`, `:1275`", "src/interpreter.rs:1268`, `:1273`"),
+ ("`src/interpreter.rs:1270` and `:1275`", "`src/interpreter.rs:1268` and `:1273`"),
+ ("`src/bytecode/vm.rs:2035` and `:2052`", "`src/bytecode/vm.rs:2034` and `:2051`"),
+]
+for p in ["phases/phase-036/REPORT.md","phases/phase-036/FINDINGS.md"]:
+    s=open(p).read()
+    for a,b in fixes:
+        s=s.replace(a,b)
+    open(p,'w').write(s)
+PY
+grep -n "1268\|1273\|2034\|2051" phases/phase-036/REPORT.md phases/phase-036/FINDINGS.md
+phases/phase-036/REPORT.md:10:- `Statement::Break`/`Statement::Skip` (`src/interpreter.rs:1268`, `:1273`) call
+phases/phase-036/FINDINGS.md:10:| `src/interpreter.rs:697-704` — `Statement::Break`/`Statement::Skip` are each a `// TODO: Implement proper control flow` evaluating to `Ok(Value::Nothing)` | **No such text exists.** `grep -rn 'TODO: Implement proper control flow' src/` printed nothing before this phase made any edit. The statements are at `src/interpreter.rs:1268` and `:1273` and they call `raise_loop_control`, which is the real implementation. |
+phases/phase-036/FINDINGS.md:11:| `src/bytecode/vm.rs:1496-1505` — `break_loop`/`skip_loop` are each just `self.advance(frame)` | **No.** They are at `src/bytecode/vm.rs:2034` and `:2051`. Both find the owning loop by instruction offset and then call `leave_owned_loop` / `turn_over_to`, which run the `finally` of every `try` crossed and pop the frames between the instruction and the loop. |
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '92,93p' tests/test_lists.rb; echo "--- 81 test fns in loop_control:"; grep -c "^fn " tests/loop_control_test.rs; echo "--- final src diff check"; git diff --numstat src/; git status --short
+test "lists: a skip inside a loop leaves its own iteration out"
+    // A `skip` ends the turn it is in, so the value of 2 contributes neither to
+--- 81 test fns in loop_control:
+81
+--- final src diff check
+30	2	src/bytecode/vm.rs
+24	0	src/interpreter.rs
+ M src/bytecode/vm.rs
+ M src/interpreter.rs
+?? phases/phase-036/
+?? tests/loop_instruction_test.rs
+[0m
+All claims verified. Final gate re-run to confirm the tree is clean after my edits.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && rm -rf target/tmp/vm.bak target/tmp/interp.bak && grep -rn "TODO: Implement proper control flow" src/; echo "grep clean (exit $?)"
+grep clean (exit 1)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "FMT: PASS" && cargo test --test loop_instruction_test 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E "^test result"
+FMT: PASS
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Done.
+
+## Summary
+
+**The finding was stale — `break`/`skip` were already implemented on both VMs.** I reproduced the phase's three programs before editing anything and all three were already correct (`brk` printed `1`, `repeat5 times` printed nothing, `skp` printed `1` then `3`). The `// TODO: Implement proper control flow` text does not exist anywhere in `src/`, and `tests/test_lists.rb:104` already read `expect seen to be 3`.
+
+phase-022 adopted phase-025's preserved work (commits `861080d`, `054e0d6`), so the prompt's premise is right about the *id* being blocked and wrong about the *work* being missing. Per the phase's own instruction — "a stale phase must never be 'fixed' by inventing a change" — **I changed no production behaviour.**
+
+**What was genuinely unmet** was the phase's last DoD line: nothing counted executed BREAK/SKIP instructions. That is a real gap, because *printed output cannot distinguish a working `break` from a dropped one* wherever the loop would have ended anyway — the exact shape the original defect took, so it could regress with the suite green. I closed that:
+
+- `Vm::loop_control_counts` / `BytecodeVm::loop_control_counts` — counters incremented **before** each handler, so a refused `break` outside any loop still counts (the refusal *is* the handler having run)
+- `tests/loop_instruction_test.rs` — 12 tests, 7 `edge_*`, 3 asserting failure; every behavioural case runs on **both** engines and asserts the tuples match
+
+**Mutation-checked both counters**: neutering `Opcode::Break`'s handler turned a test red; zeroing the tree-VM increment turned 6 red. Reverted both.
+
+**Gates**: fmt pass · clippy 0 warnings · `cargo test --all-targets` **1095 passed, 0 failed**.
+
+**Two things I did not paper over:**
+1. **`./rbops/verify.sh` does not exist in this checkout** — `rbops/` is absent entirely. Gate 4 is recorded as **NOT RUN**, not as a pass. I did not create it and did not touch `.github/` or `.opencode/`.
+2. Three `file:line` citations I first wrote were off by two; I checked and corrected them rather than leave fabricated lines in the report.
+
+Both, plus the recommendation to mark phase-025 `.done` and add a stale-citation check to the dispatcher (this is the second such phase in a row), are in `phases/phase-036/FINDINGS.md`.
+
+DONE
