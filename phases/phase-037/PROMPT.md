@@ -53,9 +53,10 @@ Replace the wall-clock source with an explicitly seeded generator, honour the ra
 ## Definition of done
 
 - [ ] `say random(5, 5)` prints exactly `5`
-- [ ] 200 draws of `random(0, 100)` in one program produce at most 101 distinct values, and 200 draws of `random_number(0, 100)` produce at most 101 distinct values — today the first produces 179
+- [ ] 200 draws of `random(0, 100)` in one program produce at most 101 distinct values — today it produces 179, which is only possible because the draw was a monotonic clock rather than noise
+- [ ] 200 draws of `random_number(0, 100)` produce 200 distinct values: it returns a FRACTIONAL number (`min + r * (max - min)`), so a whole-number member count is not a property it can have. The property that IS checkable is that consecutive draws are not monotonic and are not a fixed arithmetic sequence — today eight consecutive draws are strictly increasing
 - [ ] two SEPARATE processes running the same program that sets an explicit seed print byte-identical output; the two outputs are diffed in REPORT.md and the diff is empty
-- [ ] 1000 draws of `random_number(0, 100)` from the seed the test pins put between 400 and 600 draws in each of the ten decile buckets, asserted on that exact seed
+- [ ] 1000 draws of `random_number(0, 100)` from the seed the test pins put between 40 and 160 draws in each of the ten decile buckets, asserted on that exact seed
 - [ ] `random_shuffle` returns a permutation of its input for every seed 0..=99 and is not the identity for any of them; `random_choice` over a four-element list hits all four elements at least once in 1000 draws
 - [ ] edge_* tests cover an empty list, a single-element list, min greater than max, a negative range, and a non-number argument
 - [ ] no `SystemTime` or `Instant` remains in the `random`, `random_number`, `random_choice` or `random_shuffle` arms of src/runtime.rs, and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(dead_code)` added
