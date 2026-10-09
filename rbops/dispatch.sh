@@ -669,6 +669,18 @@ done
 cmd_review() {
   local phase="${1:?phase required}"
   mkdir -p "$LOG_DIR"
+
+  # `.stop` is honoured here too. `cmd_select` and `cmd_run` both check it, so a
+  # halt during the implement step stopped the pipeline — but a halt that landed
+  # while `cmd_review` was already looping did not, and the review went on
+  # spending rounds (and model calls) against a tree nobody intends to ship. The
+  # gate has already passed at this point, so nothing is lost by stopping: the
+  # next tick re-enters review from round 1 on the same tree.
+  if [ -f "$RBOPS_ROOT/phases/.stop" ]; then
+    log "review halted by phases/.stop — $phase keeps its gate-passed tree for a later tick"
+    return 0
+  fi
+
   local base; base="$(in_project git rev-parse HEAD)"
   local round=0
 
