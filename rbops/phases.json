@@ -1227,6 +1227,469 @@
         "a phase that adds a REPORT row about an uncommitted file is named in FINDINGS.md as the process defect behind this finding, so the next one does not repeat it"
       ],
       "timeout_min": 90
+    },
+    {
+      "id": "phase-052",
+      "title": "Wire the REPL to a real line editor: TAB completion, persistent history, sane interrupts",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "high",
+      "finding": "src/repl/mod.rs:166 reads every line with `io::stdin().read_line(&mut input)` — cooked-mode stdin, so no keystroke ever reaches the program: TAB arrives as a literal tab character, Up-arrow arrives as escape bytes, and Ctrl-C kills the process. `Repl::complete()` at src/repl/mod.rs:112 is a tested completion engine (src/repl/completer.rs, case-insensitive, keywords + builtins + session names) that nothing calls on a keypress — the same dead-code shape as the `builtin_function` defect phase-032 fixed. `src/repl/history.rs` keeps an in-memory `VecDeque` with `save_to_file`/`load_from_file` (history.rs:76) that only the explicit `:save`/`:restore` commands touch (mod.rs:594, mod.rs:623) — no `~/.redblue/history` is ever loaded at startup or written at exit, so every session starts amnesiac. `Cargo.toml` depends on regex, chrono, reqwest and indexmap only: no line-editing crate exists anywhere in the tree. Verified by running the binary: piped input works, interactive keys cannot.",
+      "goal": "Replace the `read_line` loop with a line editor (rustyline) so TAB completes through the existing `ReplCompleter`, Up/Down walks a history file at `~/.redblue/history`, and Ctrl-C abandons the line instead of the session. No language change: the editor is I/O around the unchanged `execute_line` path.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "typing `say to_up` + TAB offers `to_uppercase` (and only live names: a `set foo` line makes TAB after `fo` offer `foo`)",
+        "`Cargo.toml` gains one line-editing dependency and `cargo build --offline` is NOT required to pass — the dep must resolve from crates.io on CI, pinned with a lockfile entry",
+        "exiting and restarting the REPL preserves history: the acceptance test writes a line, drops the session, builds a new one against the same history file, and asserts the line is offered",
+        "Ctrl-C on an empty line keeps the session alive and Ctrl-D still exits cleanly with `Goodbye!`, each pinned by a test that drives the editor layer rather than a TTY",
+        "when stdin is not a TTY (piped input, CI) the session behaves byte-identically to today: the existing `repl_test.rs` suite passes unmodified",
+        "edge_* tests cover TAB on an empty prefix, TAB with no match (bell, no crash), a history file that does not exist yet, and a history file that is not writable"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-053",
+      "title": "Give the REPL a color system: TTY detection, forced modes, and one theme",
+      "severity": "major",
+      "depends_on": [
+        "phase-052"
+      ],
+      "risk": "medium",
+      "finding": "The REPL emits no color anywhere: the only ANSI sequence in src/repl/ is the clear-screen `\\x1B[2J\\x1B[H` at src/repl/mod.rs:209. The prompt (`>>> ` at mod.rs:158), results (`= value` at mod.rs:402), and errors (`Error: {}` at mod.rs:407) are all unstyled plaintext, and there is no module, no `NO_COLOR`/`TERM`/`COLORTERM` handling, and no Windows console setup — so even added colors would misbehave on half the platforms the project ships to (CI pins Windows-green builds). Ipp colors every one of these through a central palette with TTY gating and a `.colors` override; inscript gates every code on `isatty()`. Redblue has neither the palette nor the gate.",
+      "goal": "Add one central color module (palette + theme struct + TTY/NO_COLOR/TERM gating + Windows ANSI enablement) and apply it to the prompt, results, errors, and the `:help`/`:vars` listings. Add a `:colors` command (on/off/auto) and ship exactly one theme; theme files and switching belong to a later phase.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "with output piped (not a TTY) every byte the REPL prints is identical to before the phase — asserted by a test that captures a session transcript with colors forced off and diffs it against the checked-in expectation",
+        "`NO_COLOR=1` and `TERM=dumb` each disable all color even on a TTY, pinned by unit tests against the gating function (no TTY required)",
+        "`:colors off`, `:colors on` and `:colors auto` switch modes inside a live session, and the mode is reported in `:help` output",
+        "errors print in the error color with the same text as before (color codes around the existing message, never replacing it), so every existing error-text assertion keeps passing unmodified",
+        "edge_* tests cover an unparsable `TERM`, a Windows build without virtual-terminal processing (degrades to plain, never emits raw escapes into a non-ANSI console), and `:colors` with a bogus argument refused by name"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-054",
+      "title": "Highlight Redblue code live as it is typed, using Redblue's own lexer",
+      "severity": "major",
+      "depends_on": [
+        "phase-053"
+      ],
+      "risk": "medium",
+      "finding": "Phase-053 colors the REPL's chrome (prompt, results, errors) but the code being typed stays monochrome: the editor inserted by phase-052 has no highlighter, and nothing maps `TokenKind` to a color. Redblue already owns the classifier it needs — `src/lexer.rs` tokenizes the language — while Ipp ships a 474-line hand-written `IppLexer` for prompt_toolkit because it has no such reuse available. The gap is purely wiring: lexer token classes to theme colors inside the editor's highlight hook.",
+      "goal": "Feed the editor's live highlight hook from Redblue's own lexer: keywords, strings, numbers, comments and builtin names each take the theme's color; anything the lexer rejects renders plain rather than erroring. Highlighting is display-only and must never change what gets executed.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "typing `say \"hi\"` shows `say` in the keyword color and `\"hi\"` in the string color — asserted through the highlighter function on the string, not through a TTY screenshot",
+        "a line the lexer rejects (e.g. an unterminated string) renders entirely plain and still executes exactly as before; the highlight path returns the input untouched on any lexer error",
+        "highlighting 2000 lines of `bootstrap/compiler.rb` content takes under a second (a benchmark test, so a pathological regex can never silently land here)",
+        "piped/non-TTY sessions emit zero escape codes from the highlighter even with colors forced on — the hook is display-only and the executed string is byte-identical",
+        "edge_* tests cover an empty line, a 10KB single line (no quadratic blowup), emoji/CJK inside strings (colors must not split graphemes), and a theme missing a token class (falls back to plain, never panics)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-055",
+      "title": "Polish the session surface: banner, prompt, numbered continuations, and `!!`",
+      "severity": "major",
+      "depends_on": [
+        "phase-054"
+      ],
+      "risk": "medium",
+      "finding": "The session surface is three unstyled lines: `Welcome to Redblue v0.1.0` at src/repl/mod.rs:147 (which disagrees with `Cargo.toml:3`, version 0.2.0 — the banner is stale on its face), the `>>> ` prompt at mod.rs:158, and the flat `..  ` continuation at the same line. There is no mode/version truth in the banner, no line-numbered continuations (`... 2`, `... 3` as inscript prints, so a pasted traceback maps to a line), no `!!` repeat of the last command (both Ipp and inscript have it), and nothing tells a new user what TAB does. The multiline engine itself (`needs_continuation`, token-based) is sound and stays untouched.",
+      "goal": "Print a banner with the real Cargo version, the engine in use, and the TAB/history hint; color the prompt through the theme; number continuation lines; add `!!` repeating the last non-`!!` line. Display-only: no execution-path changes. A `:prompt <fmt>` command customizes the prompt from a format string (engine, version, and history-count placeholders), so the prompt is user-owned rather than merely colored.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "the banner prints the version from `CARGO_PKG_VERSION` (never a hardcoded string — a test asserts the printed version equals the crate version, so it cannot drift again)",
+        "a three-line block shows `.. 2` and `.. 3` continuations, asserted by driving `execute_line` and capturing the emitted prompts",
+        "`!!` re-runs the last non-`!!`, non-empty line including its output; `!!` as the first line of a session is a clean error naming `!!`, not a panic on an empty history",
+        "the hint line names TAB completion and Up-arrow history, so a first-time user discovers both without reading docs",
+        "edge_* tests cover `!!` after a failed line (re-runs, does not skip), `!!` after `:reset` (history survives reset per the existing rule, so it still works), and a banner rendered with colors forced off (plain, aligned, no stray escapes)",
+        "`:prompt` with a format string changes the live prompt (asserted by capturing the next emitted prompt); `:prompt` with an unknown placeholder is refused naming the placeholder, and `:prompt` with no argument restores the default"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-056",
+      "title": "Teach the REPL to answer questions about code: `.type`, `.doc`, `.which`, `.sighelp`",
+      "severity": "major",
+      "depends_on": [
+        "phase-055"
+      ],
+      "risk": "medium",
+      "finding": "The command table in src/repl/commands.rs has seventeen commands and not one that inspects code: a loop over the table for `type`, `doc`, `which`, `time`, `bench`, `bytecode`, `asm`, `export`, `edit`, `tutorial`, `theme`, `colors`, `undo` and `last` finds every one absent. Answering `what is X` today means leaving the REPL: `say type_of(x)` prints a word with no span and no definition site, module members are invisible (`:vars` lists session names only, mod.rs:119-127), and a builtin's signature lives only in `src/runtime.rs` match arms. Both Ipp (`.doc`, `.which`, `.sighelp`, `.typehints`) and inscript (`.inspect`, `.type`, `.doc <module>`, `.which` equivalent) treat this as core REPL work.",
+      "goal": "Add four read-only introspection commands: `.type <expr>` (value + kind + span), `.doc <module>` (module members from the registry), `.which <name>` (builtin vs session vs module-member vs unknown, with file:line for session definitions), `.sighelp <name>` (arity/shape from the implementation). None may execute user code beyond evaluating the inspected expression.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.type [1,2]` prints the value, its kind, and where it was written; `.type nosuchname` is a clean unknown-name error, not a panic",
+        "`.doc json` lists exactly the members `stdlib::MODULES`/`builtins()` register for it — the test derives the expectation from the registry rather than hardcoding it, so the two cannot drift",
+        "`.which uppercase` names the builtin and `.which nosuchname` says unknown; a session `set` shadows correctly (`.which` reports the session binding, proving the lookup order)",
+        "`.sighelp split` shows the separator form; every new command appears in `:help` output (a test asserts the help text names all four, so help cannot silently omit a command again)",
+        "edge_* tests cover `.type` with no argument, `.doc` with an unknown module, `.which` with an empty string, and `.sighelp` on a keyword rather than a callable"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-057",
+      "title": "Let the REPL measure code: `.time` and `.bench`",
+      "severity": "major",
+      "depends_on": [
+        "phase-056"
+      ],
+      "risk": "medium",
+      "finding": "There is no way to measure anything without leaving the REPL: `commands.rs` has no timing command (verified absent above), so `how slow is this` means shelling out to `time` or hand-rolling a loop with `time.now()` — which itself reads the wall clock the determinism rules forbid in tests (phase-037). Both Ipp (`.time` over 10 runs, `.bench` over 100 with statistics) and inscript (`.time`/`.bench` over 10/100 runs) ship this as a REPL primitive, and both run it against the live session state rather than a fresh interpreter.",
+      "goal": "Add `.time <expr>` (runs N times, reports wall time + per-run mean) and `.bench <expr>` (100 runs, min/median/max/mean) against the live session VM. Timing uses the host clock explicitly and labels the numbers as wall time; timed code runs in the session so session bindings are visible, and a failing expression reports its error once instead of timing the failure loop.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.time 1 + 1` prints a wall-time total and a per-run mean with the unit labeled; the numbers are positive and finite (asserted structurally, never exact — wall time is nondeterministic by nature)",
+        "`.bench say 1` over 100 runs prints min, median, max and mean with min <= median <= max asserted on the parsed output",
+        "a failing expression under `.time` reports the underlying error once and does not run N times (asserted by timing a counter-incrementing expression and checking the counter moved exactly once)",
+        "session bindings are visible to timed code (`set x to 3` then `.time x + 1` works), proving it runs in the session VM rather than a throwaway",
+        "edge_* tests cover `.time` with no argument, `.bench` with a non-number run count, and a 0-run request refused by name rather than dividing by zero"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-058",
+      "title": "Show the compiler inside the REPL: `.bytecode` and `.asm`",
+      "severity": "major",
+      "depends_on": [
+        "phase-057"
+      ],
+      "risk": "medium",
+      "finding": "The disassembler exists and the REPL cannot reach it: `bytecode::disassemble` at src/bytecode/disasm.rs:27 renders a `Chunk` to text, `rb dis` uses it from the CLI, and no REPL command calls it — so `what does this compile to` requires leaving the session, compiling to a file, and disassembling the artifact by hand. inscript ships exactly this pair (`.bytecode` compact listing, `.asm` full annotated assembly) because metaprogramming curiosity is a REPL-native question; redblue's S1/S2 ladder makes it load-bearing here too, since the REPL is where users first meet the bytecode their code becomes.",
+      "goal": "Add `.bytecode <expr>` (compact instruction listing) and `.asm <expr>` (annotated assembly with constants and spans) that compile the expression through the same frontend the session executes and render through the existing disassembler. Read-only: nothing is written to disk and the session VM is untouched.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.bytecode say 1` prints an instruction listing containing a constant load and asserts the version line matches `FORMAT_VERSION` (derived, not hardcoded)",
+        "`.asm` on the same input prints strictly more than `.bytecode` (constants table + spans), asserted by comparing line counts on one fixed input",
+        "an expression that fails to compile reports the compile error instead of disassembling nothing — `.bytecode might fail 1 +` names the parser error rather than printing an empty listing",
+        "both commands agree with `rb dis` on the same source byte-for-byte modulo the REPL header (one test compiles a temp file both ways and diffs)",
+        "edge_* tests cover `.bytecode` with no argument, a 2000-line generated program (renders without hanging), and non-UTF8-safe constant content (never panics on display)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-059",
+      "title": "Make REPL errors point at the code: source context through the color system",
+      "severity": "major",
+      "depends_on": [
+        "phase-058"
+      ],
+      "risk": "medium",
+      "finding": "REPL errors discard the rendering the language already owns: `execute_code` at src/repl/mod.rs:407 prints `Error: {}` via `Display`, while `Error::render()` at src/error.rs:105 builds the full diagnostic — label, message, `--> location`, source line, and caret gutter (error.rs:105-125). Every REPL failure therefore shows less than `rb run` shows for the same program: no source line, no caret, no span, no color. inscript prints the offending line plus caret in-REPL for exactly this reason; a REPL that hides locations teaches users to leave it when something breaks.",
+      "goal": "Route REPL error output through `Error::render()` with the session's current buffer as the source, colored through the phase-053 system (label + location in the error color, source line plain, caret line highlighted). The message text stays identical — color wraps it, never rewrites it.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "typing `say nosuchvar` prints the source line `say nosuchvar` plus a caret line under `nosuchvar` — asserted on the rendered string with colors stripped, so the test is immune to palette changes",
+        "the same error through `rb run` and through the REPL carries the same `--> line:column` location (one test runs both and diffs the location line)",
+        "with colors forced off the REPL error is byte-identical to `Error::render()` output for the same input (no REPL-specific reformatting hiding behind the colors)",
+        "both engines agree: an error raised under the bytecode VM path renders with the same location as under the tree-walker (the session executes through one engine; the test runs the other and compares locations)",
+        "edge_* tests cover a multiline-block error (caret points into the right buffered line, not line 1), an error with no span (renders message-only, never panics on a missing location), and a 500-character line (caret alignment survives wide content)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-060",
+      "title": "Export sessions and complete file paths: `.export` plus TAB for `:load`/`:save`",
+      "severity": "major",
+      "depends_on": [
+        "phase-059"
+      ],
+      "risk": "medium",
+      "finding": "A session cannot leave the terminal except as raw history: no `.export` command exists in commands.rs (verified absent), so sharing a session means copy-pasting terminal scrollback, colors and prompts included. And the file-argument commands (`:load`, `:save`, `:run`, `:restore`) take paths the editor cannot complete — the completer at src/repl/completer.rs handles `:`/`.` command sigils only (completer.rs:297-302) with no path handling at all, so every filename is typed blind. Ipp completes paths for `.load`/`.save`/`.cd`/`.ls`/`.edit` including directory traversal; inscript persists sessions to `.ins` files.",
+      "goal": "Add `.export [file]` writing the session (inputs, outputs, errors) as Markdown with Redblue fences and no escape codes, defaulting to stdout when no file is given; and teach TAB to complete filesystem paths after the four file-argument commands, with directories offered with a trailing separator.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.export` to stdout of a two-line session produces Markdown with exactly two ` ```redblue ` fences and the outputs as text blocks — asserted structurally, with all escapes stripped first so color codes can never leak into an export",
+        "TAB after `:load ` offers files in the current directory and TAB after `:load sr` narrows to the `src/` directory with its trailing separator",
+        "TAB path completion never escapes the argument: completing inside `say \"a` does not offer files (the path logic fires only after the four file commands)",
+        "round-trip: `.export session.md` then a fresh session reads the fenced blocks back and reproduces the outputs (pinned on a fixed two-line session, not on wall time)",
+        "edge_* tests cover `.export` to an unwritable path (clean error naming the path), TAB after `:load ` in an empty directory (no candidates, no crash), and a filename containing a space (offered quoted or escaped, never split)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-061",
+      "title": "Complete after the dot, edit in `$EDITOR`, and teach newcomers: member completion, `.edit`, `:tutorial`",
+      "severity": "major",
+      "depends_on": [
+        "phase-060"
+      ],
+      "risk": "medium",
+      "finding": "Three discoverability gaps share one root — the REPL knows things it will not offer. Member completion: typing `json.` offers nothing although `json_parse`/`json_stringify` are registered builtins and `.doc json` (phase-056) lists them; the completer has no dot handling (verified above). External editing: a 50-line block can only be typed or `:load`ed, because no `.edit` command exists (verified absent) — both Ipp and inscript shell out to `$EDITOR` for exactly this. Guided entry: no `:tutorial`/`:examples` exists (verified absent) although `:example` does, so a newcomer gets one static dump rather than a walkthrough; Ipp's `.tutorial` and inscript's guided tour are the model.",
+      "goal": "Complete member names after a module dot (`json.` offers `parse`/`stringify`); add `.edit` opening `$EDITOR` on the current buffer (or a scratch file) and executing the result on save; add `:tutorial` as a short guided tour ending in `:examples`. Each is independently useful and independently tested. A `.hint` command prints the current tutorial lesson's hint, and typing `(` after a callable name shows its signature inline (the `(` row of Ipp's own help table).",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`json.` + TAB offers `parse` and `stringify` and exactly the members the registry holds for `json` (expectation derived from `builtins()`, so registry and completion cannot drift); `nosuchmodule.` + TAB offers nothing and does not error",
+        "`.edit` with `EDITOR=true` round-trips the multiline buffer through the editor and executes what comes back (pinned with a script editor, never a real TTY editor)",
+        "`:tutorial` prints a numbered multi-step tour whose final step names `:examples`, and every snippet it shows executes cleanly when pasted (a test runs each fenced block through the session)",
+        "member completion and file-path completion do not fight: `json.` completes members while `:load j` completes paths, each gated on its own context",
+        "edge_* tests cover `.edit` with `EDITOR` unset (clean error naming the variable, session buffer preserved), TAB after a bare `.` (offers module names), and `:tutorial` with colors forced off (numbering intact, no escapes)",
+        "`.hint` outside the tutorial names `:tutorial` instead of failing blank; typing `(` after `split` surfaces its separator form before the call runs (asserted through the signature hook, not a TTY)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-062",
+      "title": "Open a debug sub-REPL: `.debug` with `.watch`, `.stack` and `.locals`",
+      "severity": "major",
+      "depends_on": [
+        "phase-061"
+      ],
+      "risk": "medium",
+      "finding": "Debugging means leaving the REPL: no `.debug` command exists in commands.rs (verified absent along with `watch`, `stack`, `locals`), so inspecting a failing program means re-running it under `rb run` with `say` statements added — the print-debugging the REPL exists to obsolete. Both Ipp (debug REPL with `.watch`/`.locals`/`.stack`, VM-debug wired through the highlighted session) and inscript (frame debugger with `.watch`/`.stack`/`.locals`/`.globals`/`.type`, plus REPL-polish tests asserting each handler exists) treat an in-session debugger as REPL work, not VM work.",
+      "goal": "Add `.debug <expr|file>` entering a sub-REPL that evaluates with tracing on: `.watch <expr>` re-evaluates an expression after every step and reports changes, `.stack` lists the live call frames, `.locals` lists frame bindings, and exiting returns to the parent session with its state untouched. Scope is observe-only: no breakpoints, no stepping primitives — those are their own phase if the debugger proves its worth.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.debug` on a three-deep call chain followed by `.stack` names all three functions in order (asserted through the sub-REPL driver, not a TTY)",
+        "`.watch x` reports exactly the steps where `x` changed value across a loop, and stays silent on steps where it did not (a test counts the report lines)",
+        "`.locals` inside a function frame shows parameters and locals and nothing from the caller's frame (frame isolation asserted, not assumed)",
+        "exiting the sub-REPL leaves the parent session byte-identical to before `.debug` ran (bindings, history and last-result all diffed, not eyeballed)",
+        "edge_* tests cover `.debug` with no argument, `.watch` with an expression that fails (reports the error once per step without aborting the session), and `.stack` with no live frames (empty, named as such, never a panic)"
+      ],
+      "timeout_min": 150
+    },
+    {
+      "id": "phase-063",
+      "title": "Print values three ways: `.pretty`, `.json`, `.table`",
+      "severity": "major",
+      "depends_on": [
+        "phase-062"
+      ],
+      "risk": "medium",
+      "finding": "Every value the REPL prints goes through one shape: `println!(\"= {}\", value)` at src/repl/mod.rs:402, the single-line `Display`. A 200-element list, a nested record, and a table-shaped list of records all print as one unreadable line, and there is no way to ask for JSON or columns — `pretty`, `json` and `table` are all absent from src/repl/commands.rs (verified by name loop). Ipp ships exactly this trio (`.pretty`, `.json` viewer, `.table <var>` for lists of dicts) because data inspection is REPL-native work; `:inspect` answers for one variable but formats nothing.",
+      "goal": "Add `.pretty <expr>` (indented structure), `.json <expr>` (JSON rendering of the value), and `.table <list>` (list-of-records as aligned columns). All three reuse the value's existing rendering and only reflow it; none executes anything beyond evaluating its argument.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.pretty` on a nested record indents one level per depth and the output parses back to an equal value (round-trip asserted, not eyeballed)",
+        "`.json` output is valid JSON per `serde_json` (already a dev-dependency) on numbers, texts, lists, records and `nothing` (as `null`)",
+        "`.table` on a list of records with a shared key set aligns columns and names the keys once in a header row; ragged rows (missing keys) render empty cells rather than erroring",
+        "every new command appears in `:help` (same help-completeness test pattern as phase-056)",
+        "edge_* tests cover `.pretty` of a 10-deep nesting (terminates, bounded width), `.json` of a non-finite number (refused or null per the SPEC rule, never `NaN` literal), and `.table` of an empty list (header-only or a named empty, never a panic)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-064",
+      "title": "Close the file loop: `.reload`, `.format`, and format-on-enter",
+      "severity": "major",
+      "depends_on": [
+        "phase-063"
+      ],
+      "risk": "medium",
+      "finding": "The file workflow is write-only in the wrong direction: `:load`/`:run` read files in, but nothing re-reads one (`reload` absent from commands.rs, verified), and nothing formats what was typed — `format` is absent too, although `src/formatter.rs` implements `rbfmt` and `rb format` ships it from the CLI. So a session that iterates on a file re-types `:load` by hand and pastes unformatted code it can never normalize without leaving. Ipp's `.format` goes one step further: auto-format on Enter as a toggle, so pasted code normalizes itself line by line.",
+      "goal": "Add `.reload` (re-runs the last `:load`ed/`:run` file, erroring cleanly when there is none), `.format` (pretty-prints the current multiline buffer through `rbfmt` without executing it), and a `.format on|off` toggle that formats each entered line before execution. All three reuse the existing formatter; none changes what the formatter accepts.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.reload` after `:load` re-executes the file and reproduces its output; `.reload` with no file loaded is a clean error naming `:load`, not a panic on missing state",
+        "`.format` on an ugly-but-valid buffer prints the canonical form and leaves the buffer unexecuted (asserted: bindings unchanged after `.format`)",
+        "with the toggle on, entering `set   x    to   1` executes `set x to 1` (proved by the binding existing afterwards); with it off, the line executes verbatim",
+        "a buffer the formatter rejects is executed (or refused) exactly as with the toggle off — the toggle never converts a formatter error into a silent acceptance",
+        "edge_* tests cover `.reload` after the file was deleted since loading (clean IO error with the path), `.format` on an empty buffer (no-op, no crash), and toggle state surviving `:reset` (it is a session preference, asserted on both sides)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-065",
+      "title": "Let users extend the REPL: `.alias` and `.macro`",
+      "severity": "major",
+      "depends_on": [
+        "phase-064"
+      ],
+      "risk": "medium",
+      "finding": "`alias` and `macro` are both absent from src/repl/commands.rs (verified), so every repeated workflow is retyped in full: there is no short name for a long command and no way to record a sequence once and replay it. Ipp ships both (`.alias n cmd`, `.macro` define/list) for exactly this reason. The machinery is small — the command table already parses aliases (`:hist`, `:v`, `:f` work today), so user aliases are the same table with user rows — but the absence forces repetition onto every session.",
+      "goal": "Add `.alias <name> <command>` (user-named command shortcuts, listed in `:help`, shadowing nothing built in) and `.macro` (record the session's lines between start/stop, replay them by name, list them). Aliases and macros live in the session and die with it unless `:save`d; a name colliding with a builtin is refused.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.alias ll :vars` makes `ll` behave exactly as `:vars` (outputs diffed, not eyeballed); `.alias :vars :help` is refused naming the collision with a builtin",
+        "a recorded macro of three lines replays all three in order with identical outputs (asserted by diffing two transcripts); `.macro` with no recording in progress is a clean usage error",
+        "aliases and macros appear in `:help` output under their own section (help-completeness pattern), and TAB completes user macro names as well as builtins",
+        "`:save` persists aliases and macros and `:restore` brings them back (round-trip asserted on a session carrying one of each)",
+        "edge_* tests cover an alias whose value is another alias (resolves, exactly one level, no infinite loop on `.alias a b` + `.alias b a` — refused as a cycle), a macro recording across `:reset` (recording survives, bindings do not), and `.alias` with no arguments (lists current aliases, empty list named as such)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-066",
+      "title": "Settle engine arguments with evidence: `.compare` runs both engines",
+      "severity": "major",
+      "depends_on": [
+        "phase-065"
+      ],
+      "risk": "medium",
+      "finding": "`compare` is absent from commands.rs (verified), so the two engines can only be compared by leaving the REPL: redblue owns a tree-walking VM (`self.vm.run`, src/repl/mod.rs:443-451 — the only engine the session uses) and a bytecode VM, and today `do they agree on this program` means compiling to a file and running `rb vm` by hand. The differential-test suite proves agreement in CI, but the curious user at the prompt has no such tool. Ipp's `.compare a b` compares two expressions; redblue's sharper question is one expression on two engines.",
+      "goal": "Add `.compare <expr>` compiling and running the expression on the tree-walker and the bytecode VM, printing both values side by side and saying AGREE or naming the difference. Read-only: neither engine's state may leak into the session (both run on clones), and a compile failure reports instead of comparing nothing.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.compare 1 + 2` prints both values and AGREE (asserted on the verdict word, not the values alone, so a test cannot pass by printing one side twice)",
+        "a construct the engines genuinely differ on (seeded from the differential corpus, e.g. a known edge file) prints DIFFER with both values named — the command must be able to fail, so the happy path alone does not pin it",
+        "running `.compare` leaves the session VM untouched (bindings before and after diffed — the comparison clones state, never borrows it)",
+        "an expression that fails to compile reports the compile error once rather than comparing two absences",
+        "edge_* tests cover `.compare` with no argument, `.compare` on a program with side effects (`say` runs exactly once per engine — asserted on output line counts, so effects are never doubled into the session), and a 10KB generated program (both engines finish, verdict printed)"
+      ],
+      "timeout_min": 150
+    },
+    {
+      "id": "phase-067",
+      "title": "Give the session a memory: `.checkpoint`, `.restore`, `.undo`, `.redo`, `.sessions`",
+      "severity": "major",
+      "depends_on": [
+        "phase-066"
+      ],
+      "risk": "medium",
+      "finding": "Session state has exactly one granularity — everything (`:save`/`:restore` whole-session files, mod.rs:594-633) or nothing — and `checkpoint`, `restore`, `undo`, `redo` and `sessions` are all absent from commands.rs (verified; the `:restore` hit is the file command, a different feature). So there is no way to try something destructive and step back: a `set` that clobbers a binding, an import that shadows, a 200-line paste that half-fails — all permanent until `:reset` wipes everything. Ipp ships `.checkpoint`/`.restore` (environment snapshots), `.undo`/`.redo` (single-step), and `.sessions` (listing) as one family; redblue needs the family, named to never collide with the file commands.",
+      "goal": "Add named in-memory snapshots (`.checkpoint <name>`, `.restore <name>`, `.sessions` listing them) plus single-step `.undo`/`.redo` over binding changes. Snapshots capture bindings, last-result and history position; they are session-local (never files, never committed) and die with the session. Names colliding with file-restore semantics are refused by the help text, which states the file/memory split once.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.checkpoint a`, clobber a binding, `.restore a` brings the old value back exactly (asserted on the value, and on `_` last-result too — the snapshot is the whole state, not just the map)",
+        "`.undo` after one `set` removes exactly that binding and `.redo` brings it back; `.undo` with an empty undo stack is a named empty, never a panic",
+        "`.sessions` lists checkpoint names in creation order with the current one marked; with no checkpoints it says so rather than printing a blank table",
+        "`:save`/`:restore` file semantics are untouched (the existing save/restore tests pass unmodified) and the help text states the file-vs-memory split in one sentence (asserted by a help-text test)",
+        "edge_* tests cover `.restore` of an unknown name, `.checkpoint` with a duplicate name (refused, old one kept — never silent overwrite), undo across 50 bindings (stack bounded, oldest dropped with a notice, never unbounded growth), and `.redo` after a new change (redo stack cleared, stated in the message)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-068",
+      "title": "Talk to the shell without leaving: `!cmd`, `.pipe`, `.cd`, `.pwd`, `.ls`",
+      "severity": "major",
+      "depends_on": [
+        "phase-067"
+      ],
+      "risk": "medium",
+      "finding": "The session is sealed from its own machine: `pipe`, `cd`, `pwd` and `ls` are all absent from commands.rs (verified), and no `!` shell escape exists — so running a file listing, checking a path, or sending output through a pager means suspending the REPL and opening a second terminal. Ipp ships `! <cmd>` (shell execute), `.pipe <cmd>` (output to shell), and `.cd`/`.ls`/`.pwd` (navigation) as REPL-native because file arguments (`:load`, `:save`, `:export`) are typed blind without them — which phase-060's path completion only half fixes: completion needs a visible directory.",
+      "goal": "Add `!cmd` (run a shell command, show its output and exit code), `.pipe <cmd>` (send the last result/output through a shell command), and `.cd`/`.pwd`/`.ls` (session working directory affecting all relative file arguments). Shell features are host-only and labeled as such; on targets without a shell they refuse cleanly rather than failing obscurely.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`!echo hi` prints `hi` and a zero exit (asserted on both, so a silent failure cannot pass); a failing command prints its exit code rather than the REPL's error format",
+        "`.pipe` sends the last `_` value to the command's stdin (pinned with a stdin-echo command, proving the direction); with no last result it says so instead of piping emptiness",
+        "`.cd` into a temp dir makes `:load` resolve there (proved by loading a file by bare name after `.cd`), and `.pwd` prints the session directory distinctly from the process directory",
+        "`.ls` lists the session directory with directories marked (trailing separator, matching the phase-060 completion contract so the two agree)",
+        "edge_* tests cover `!` with an empty command (usage, no shell spawned), `.pipe` to a command that fails (exit code surfaces, session survives), `.cd` to a missing directory (clean error naming the path, directory unchanged), and a 1MB piped payload (streams, never loads whole into a string twice)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-069",
+      "title": "Find things without leaving: `.search` across docs, history, bindings and help",
+      "severity": "major",
+      "depends_on": [
+        "phase-068"
+      ],
+      "risk": "medium",
+      "finding": "`search` is absent from commands.rs (verified), so every lookup is a different tool: builtin docs need `.doc` with the exact name, history needs eyeballing `:history`, session bindings need eyeballing `:vars`, and help needs reading end to end. `which builtin does string splitting` has no answer inside the session although the data is all there — the registry, the help table, the history buffer and the session map. Ipp's `.search <kw>` searches builtin documentation in one place for exactly this reason.",
+      "goal": "Add `.search <keyword>` ranking matches across four sources — builtin docs/signatures, `:help` text, session bindings, and history — with the source labeled per hit. Read-only: searching never executes, binds, or reorders anything.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.search split` finds the `split` builtin, the phase-056 `.sighelp` entry if present, and any history line mentioning it, each labeled with its source (asserted per-source, so a source going dark fails the test)",
+        "`.search` ranks exact-name matches above substring matches (pinned on a fixed query with both kinds present)",
+        "`.search` with no argument prints usage rather than dumping every source (a full dump is a denial-of-patience, not a search)",
+        "history matches show their history numbers so the hit can be re-run with `!!`-style recall or by number",
+        "edge_* tests cover a keyword matching nothing (named empty per source, never a blank page), a 1-character keyword (refused as too short with the minimum stated, so single letters never dump the registry), and regex-significant characters in the keyword (treated literally, never as a pattern)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-070",
+      "title": "Weigh the session: `.mem` and `.profile`",
+      "severity": "major",
+      "depends_on": [
+        "phase-069"
+      ],
+      "risk": "medium",
+      "finding": "`mem` and `profile` are both absent from commands.rs (verified): a session that grows strange — a runaway history, a binding holding megabytes, a line that takes seconds — offers no instrument except leaving and guessing. Ipp's `.mem` (memory usage) and `.profile` (last-command profile) exist because interactive performance questions are REPL-native; redblue's `.time`/`.bench` (phase-057) time expressions but say nothing about where the session's own weight lives.",
+      "goal": "Add `.mem` (bindings count + largest bindings by size, history entries + bytes, VM heap estimate, each labeled) and `.profile` (per-line timing breakdown of the last multiline block, slowest first). Both observe: measuring must not mutate bindings, history, or last-result.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.mem` after binding a 10KB text reports it as the largest binding with its byte size within 10% (approximate honestly — the test asserts the ranking and the order of magnitude, never an exact allocator number)",
+        "`.profile` on a three-line block attributes time per line summing to within 20% of the block total (asserted on the arithmetic relationship, which holds regardless of machine speed)",
+        "running `.mem` twice in a row changes neither the binding count nor `_` (observation is side-effect-free, proved by diffing full session state around the command)",
+        "sizes render in human units (B/KB/MB) with the raw bytes in parentheses, so small and large sessions read alike",
+        "edge_* tests cover `.mem` on a fresh session (zeros named as zeros, never blank), `.profile` with no previous block (names `:history`-visible absence instead of profiling nothing), and a binding holding a 5MB text (reported, session stays responsive — no full clone into the report)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-071",
+      "title": "Map the whole environment: `.env`, `.types`, `.dir`, `.typehints`",
+      "severity": "major",
+      "depends_on": [
+        "phase-070"
+      ],
+      "risk": "medium",
+      "finding": "`env`, `types`, `dir` and `typehints` are all absent from commands.rs (verified): `.vars` lists names, `.type` (phase-056) answers for one expression, and between them lies everything structural — the full binding tree, every record/object shape in the session, every field of one value, every session variable's type at a glance. inscript's `.env` (full environment tree) and `.types` (struct/enum listing) plus Ipp's `.dir` (object attributes) and `.typehints` (variable types) are that middle layer, and redblue's records/objects make it more necessary here, not less.",
+      "goal": "Add `.env` (binding tree: session vars, imports, module members, each with kind), `.types` (every distinct record/object shape in the session with field names), `.dir <value>` (fields + methods of one value), and `.typehints` (every session variable with its current type in one table). All four derive from live session state — hardcoded expectations are forbidden; the tests build state then assert the listing reflects it.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "after `set r to {a: 1, b: \"x\"}`, `.types` names a shape with fields `a, b` and `.dir r` lists both fields with their values' kinds",
+        "`.env` shows a session var, an imported module member, and a builtin under three labeled sections (asserted per-section, so a silent source regresses loudly)",
+        "`.typehints` lists every session variable with its type; rebinding a var to another type updates its row (proved by binding, listing, rebinding, listing)",
+        "importing a module adds its section to `.env` without duplicating session vars (asserted by counting rows before and after the import)",
+        "edge_* tests cover `.env` on a fresh session (builtins section present, session section named-empty), `.dir` on a non-record (fields section absent, methods/kind still shown), `.types` with no records bound (named empty), and a record with 100 fields (renders complete, no truncation without notice)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-072",
+      "title": "Let the session switch engines: `.vm` toggles tree-walker and bytecode VM",
+      "severity": "major",
+      "depends_on": [
+        "phase-071"
+      ],
+      "risk": "medium",
+      "finding": "The session runs one engine and cannot meet the other: `run_program` at src/repl/mod.rs:443-451 calls `self.vm.run(program)` unconditionally, and no `BytecodeVm`, engine flag, or toggle exists anywhere in src/repl/ (verified by grep) — although the language ships two engines and phase-066's `.compare` will prove they can disagree. Both Ipp (`.vm interpreter/vm`, shown in the banner with a switch hint) and inscript (`.vm` toggle) treat engine choice as session state, because `which engine am I talking to` is the first question behind every behavioral surprise.",
+      "goal": "Add `.vm [walker|bytecode]` showing the current engine or switching it, with the banner and prompt naming the engine at all times. Bindings survive the switch (both engines read the same session state); history and last-result are engine-independent and untouched. The default stays the tree-walker: the documented language semantics.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`.vm` with no argument names the current engine; `.vm bytecode` then `say 1+1` prints `3` through the bytecode VM (proved by an engine-marker in a test hook, not by trusting the prompt text)",
+        "bindings survive both directions (`set x to 9`, switch, `say x` prints `9`, switch back, still `9` — asserted on values, so state is shared and never re-seeded)",
+        "an engine-specific divergence is reported with the engine named (seeded from a differential-corpus edge both engines treat differently, so the test cannot pass on one engine twice)",
+        "`.vm` with a third engine name is refused listing the two valid ones; the prompt shows the engine after every switch without needing `:help` to confirm",
+        "edge_* tests cover switching mid-multiline-block (block preserved, engine applies at execution), `.vm` inside a `:save`d session (engine choice persists through save/restore), and rapid double-switch (idempotent, session identical)"
+      ],
+      "timeout_min": 150
     }
   ]
 }
