@@ -606,7 +606,10 @@ TPL
       # slips through. The human note outranks the old report: when they
       # disagree, the note and your own PROMPT.md are authoritative.
       if [ -f "$RBOPS_ROOT/phases/$phase/RETRY-NOTE.md" ]; then
-        printf '\n### HUMAN RETRY NOTE — read this before the old REPORT below\n\n```\n'
+        printf '\n### HUMAN RETRY NOTE — read this before the old REPORT below\n\n'
+        printf 'A human ordered this retry and wrote why. When this note, your\n'
+        printf 'PROMPT.md and the old REPORT below disagree, this note and your\n'
+        printf 'PROMPT.md outrank the old report.```\n'
         emit_capped 8000 "RETRY-NOTE.md for $phase" < "$RBOPS_ROOT/phases/$phase/RETRY-NOTE.md"
         printf '\n```\n'
       fi

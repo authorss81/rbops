@@ -641,6 +641,32 @@ if [ "$ctx_bytes" -lt 100000 ]; then
 else
   no "the request is $ctx_bytes bytes — over budget"
 fi
+# A human-ordered retry carries a RETRY-NOTE.md, and phase-037 proved a note
+# nobody reads might as well not exist: the retry never saw the manifest
+# correction and re-asserted the previous REPORT.md's stale complaint about
+# criteria that no longer existed. The note must be IN the resume context.
+printf 'READ THIS FIRST: the manifest changed under this phase.\n' > "$PIPE/phases/phase-001/RETRY-NOTE.md"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+[ "$rc" = "42" ] || no "expected deferral with note present, got $rc"
+if grep -q 'HUMAN RETRY NOTE' "$PIPE"/logs/phase-001.ctx 2>/dev/null \
+   && grep -q 'READ THIS FIRST' "$PIPE"/logs/phase-001.ctx 2>/dev/null; then
+  ok "RETRY-NOTE.md is included in the resume context"
+else
+  no "RETRY-NOTE.md did not reach the resume context"
+fi
+if grep -q 'outrank the old report' "$PIPE"/logs/phase-001.ctx 2>/dev/null; then
+  ok "the note states its precedence over the old report"
+else
+  no "the note's precedence rule is missing from the context"
+fi
+# And absent without the file: no phantom note section on a normal resume.
+rm -f "$PIPE/phases/phase-001/RETRY-NOTE.md"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+if grep -q 'HUMAN RETRY NOTE' "$PIPE"/logs/phase-001.ctx 2>/dev/null; then
+  no "phantom retry-note section without the file"
+else
+  ok "no retry-note section without the file"
+fi
 
 # =========================================================== 14. honesty
 head_ "14. report honesty is asymmetric: over-claim fails, under-claim warns"
