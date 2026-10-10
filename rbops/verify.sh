@@ -314,14 +314,23 @@ FAILASSERT_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .fai
 # missing here entirely — the one construct Redblue offers for asserting a fault.
 # Anchored to the line start so a test whose *data* mentions `catch error` cannot
 # buy a pass.
-
+#
+# Rust also has the `eval_err` idiom: a helper that evaluates a program
+# expecting an error, followed by `assert!(matches!(e, Error::...))`. Phase-037
+# blocked a 1200-green phase on this rule with 12 such assertions in the diff
+# and zero recognized strings — `let e = eval_err("random_choice([])");
+# assert!(matches!(e, Error::Runtime(_, _)))` asserts a failure is produced as
+# surely as `is_err()` does. Same class as the #[test]-attribute fix (007) and
+# the bilingual rules: the detector was narrower than the language's real
+# failure-asserting idioms. The reviewer remains the ceiling — a bare
+# `let _ = eval_err(x);` with no assertion is gaming, and it reads as gaming.
 if [ "$FAILASSERT_MODE" = "not_applicable" ]; then
   # Skipped, and said out loud. A silent pass here would be indistinguishable
   # from the rule being satisfied.
   warn "failure-assertion rule NOT APPLICABLE to this phase (failure_assert: not_applicable) — the reviewer still judges whether the tests can fail"
 else
   FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
-    | grep -cE '^\+.*(is_err|expect_err|should_panic|expect .* to fail|assert_throws)|^\+[[:space:]]*catch[[:space:]]+error')"
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|expect .* to fail|assert_throws)|^\+[[:space:]]*catch[[:space:]]+error')"
   if [ "$FAILASSERT" -ge 1 ]; then
     ok "failure-asserting test present: $FAILASSERT"
   else

@@ -794,6 +794,75 @@ case "$out" in
   *"VERIFY FAIL"*) ok "verdict is FAIL for a phase that asserts nothing about faults" ;;
   *) no "verdict was not FAIL" ;;
 esac
+# The Rust side had the same narrowness disease: the failure pattern knew
+# is_err/expect_err/should_panic but not the `eval_err` idiom — a helper that
+# evaluates a program expecting an error, followed by assert!(matches!()).
+# Phase-037 blocked a 1200-green phase with 12 such assertions in its diff and
+# zero recognized strings. Same fix, same proof shape as the bilingual rules.
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+cat > "$PIPE/phases/phase-001/REPORT.md" <<'EOR'
+# Phase 001 — eval_err probe
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| tests/eval_probe.rs | +20 −0 | failure-asserting tests in the eval_err idiom |
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| edge_empty_choice_is_refused | out of bounds |
+
+## Gates
+| Gate | Result |
+|---|---|
+| cargo test | 12 passed, 0 failed |
+
+## Known gaps / follow-ups
+- none
+EOR
+cat > "$PROJ/tests/eval_probe.rs" <<'EOR'
+fn eval_err(source: &str) -> String {
+    format!("error for {source}")
+}
+
+#[test]
+fn edge_empty_choice_is_refused() {
+    let empty = eval_err("choose([])");
+    assert!(empty.contains("error"), "empty choice should fail, got {empty}");
+}
+
+#[test]
+fn two_plus_two() { assert!(true); }
+
+#[test]
+fn another_plain_case() { assert!(true); }
+EOR
+out="$( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip )"
+case "$out" in
+  *"failure-asserting test present"*) ok "eval_err idiom satisfies the failure-assertion rule" ;;
+  *) no "eval_err idiom still rejected"; printf '%s\n' "$out" | grep -E 'failure|FAIL' | head -4 | sed 's/^/      /' ;;
+esac
+# Control: the same shape with the assertion removed must still fail — the
+# rule counts the idiom, not the filename, and bare success-only tests buy nothing.
+cat > "$PROJ/tests/eval_probe.rs" <<'EOR'
+#[test]
+fn edge_empty_choice_is_fine() { assert!(true); }
+
+#[test]
+fn two_plus_two() { assert!(true); }
+
+#[test]
+fn another_plain_case() { assert!(true); }
+EOR
+out="$( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip )"
+case "$out" in
+  *"no test asserts a failure"*) ok "assert-only tests still fail the failure rule" ;;
+  *) no "failure rule stopped biting on Rust"; printf '%s\n' "$out" | grep -E 'failure|FAIL' | head -4 | sed 's/^/      /' ;;
+esac
 # And the anchored catch must not be buyable from a string literal or prose.
 printf 'test "edge_catch_error is mentioned in the docs"\n    set note to "catch error"\n    expect note to be "catch error"\n' \
   > "$PROJ/tests/sample.rb"

@@ -47,3 +47,18 @@ honestly.
   have, and the bucket band reads 40–160.
 - `.failed` cleared with `.blocked`; a fresh failure re-sets both through the
   normal path.
+
+## Addendum: the third trap (gate regex vs `eval_err`), fixed in verify.sh
+
+The retry that followed this note did everything right — withdrew the stale
+complaint, verified every DoD line against the corrected brief, found a real
+shuffle-reach gap, proved it red-before-green — and STILL blocked, on the
+fourth gate: `no test asserts a failure is produced`. The diff held 12
+failure assertions in the `eval_err` idiom (`let e =
+eval_err("random_choice([])"); assert!(matches!(e, Error::Runtime(_, _)))`)
+and the gate's regex knew only `is_err|expect_err|should_panic`. Same bug
+class as the 007 `#[test]`-attribute fix: the detector was narrower than the
+language's real idioms. `verify.sh` now counts `eval_err`, with smoke cover
+(171 checks) for both the idiom passing and bare success-only tests still
+failing. If the gate fails you on failure-assert again, quote its exact line —
+do not re-litigate the DoD text; that part is settled.
