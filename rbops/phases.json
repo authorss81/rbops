@@ -1803,6 +1803,120 @@
         "edge_* tests cover `sort` of an empty list, `zip` of unequal lengths (stops at the shorter, stated in SPEC), `enumerate` start index, `reduce` on an empty list with and without an initial value (the two cases differ and both are pinned), and `filter` whose function fails mid-list (the failure aborts with the error, partial results never surface)"
       ],
       "timeout_min": 120
+    },
+    {
+      "id": "phase-078",
+      "title": "Make the checkpoint ancestry in redblue main detectable instead of a comment",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "rbops/dispatch.sh:442-447 admits it in prose and nothing measures it, so the number can only grow silently: 'six of them are in redblue's history today, carrying unreviewed code.' Measured this audit: `git -C redblue log --oneline main | grep checkpoint` prints 4 lines - 7fdea15 and 074c95e `rbops: phase-019 checkpoint`, 563a351 `rbops: phase-018 checkpoint`, 286fccd `rbops: phase-016 checkpoint` - and `git -C redblue log --oneline main | grep -c \"Merge remote-tracking branch\"` prints 4, the real `git merge` commits that put them there (e97983a, d664d3c, 2179034, 255816e). rbops/dispatch.sh:439-486 now resumes with `git merge --squash`, so the recurrence path is closed and this is a measurement that has never existed, not a live bug. phase-051 is a different defect (uncommitted work, not ancestry) and does not cover it.",
+      "goal": "Add an executable check that fails when any `rbops: phase-NNN checkpoint` commit that is an ancestor of redblue main is not on a hand-maintained acknowledgement list, and record in the repository that the four existing ones carry unreviewed code and were not rewritten.",
+      "must_touch": [
+        "tests/"
+      ],
+      "accept": [
+        "a Rust test shells out to `git log --oneline main` in this repository, selects every commit whose subject matches `rbops: phase-[0-9]+ checkpoint`, and fails naming any SHA that is not in a checked-in acknowledgement list; an edge_* test feeds the selector a fixture history containing one unlisted SHA and asserts the check fails",
+        "run against redblue main as it stands the test passes, and the list it reports contains all four measured SHAs (7fdea15, 074c95e, 563a351, 286fccd) each with the reason it is tolerated - the list is data in the repository, not a comment",
+        "the same test counts `Merge remote-tracking branch 'origin/rbops-wip/*'` commits on main (4 today) and prints the count, so a recurrence through a different resume path is visible rather than silent",
+        "a record in the test module states plainly that the four checkpoint commits carry unreviewed code, that published history was deliberately NOT rewritten, and that no force-push is attempted by this phase or any gate",
+        "on a shallow or absent history the test never reports a pass: it prints the reason it could not read the full history and fails, rather than treating a short log as a clean one",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added and no `#[ignore]`"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-079",
+      "title": "Land phase-041's work behind a commit, or take back its `.done`",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "phases/phase-041/.done exists and `git -C redblue log --oneline main --grep='phase-041 '` prints nothing. The work is sitting in the working tree: `git -C redblue status --porcelain` reports ` M src/parser.rs`, `A tests/text_split_join_test.rs`, `A phases/phase-041/REPORT.md`, `A phases/phase-041/FINDINGS.md`, and `git -C redblue diff --stat HEAD` totals 1800 insertions and 17 deletions, of which tests/text_split_join_test.rs is 1235 lines that no commit contains. The state store says the phase is complete, its REPORT describes a change that exists in no commit, and `cargo test` is green partly because 1235 lines of test code were never committed. The next `git checkout`, the next fresh CI clone, or the next phase that starts from a clean tree loses all of it. This is the defect class phase-051 names, but phase-051 names phase-022 specifically, and phase-022's work has since landed as 054e0d6 - so phase-051's finding no longer reproduces and this is the live instance.",
+      "goal": "Get phase-041's implementation onto redblue main behind a commit its own REPORT describes, so the gate is green from history rather than from an uncommitted working tree.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`git -C redblue status --porcelain` prints nothing for `src/` or `tests/text_split_join_test.rs`, and `git -C redblue log --oneline main --grep='phase-041 '` prints at least one line",
+        "that commit's file list is compared BY NAME against the `What changed` table in phases/phase-041/REPORT.md - every file the table claims is in the commit and every file in the commit is in the table - and the comparison is asserted in the phase's own test, not left to review",
+        "the phase asserts `git status --porcelain` is EMPTY before running `cargo test --test text_split_join_test`, so a green run from a dirty tree cannot satisfy this criterion",
+        "the commit is single-parent on top of the previous main commit, and `git log --oneline main | grep -c checkpoint` is still 4 afterwards - this phase must not add checkpoint ancestry while fixing uncommitted work",
+        "the committed tests are audited against the AGENTS.md 3.2 edge matrix and any uncovered row is added: at minimum `split` on empty text, `split` with a separator absent from the text, and `join` on an empty list, each asserted to a named value",
+        "if the work cannot honestly be landed, `phases/phase-041/.done` is REMOVED and the phase ends with the phase re-runnable; it does not end with an uncommitted tree a second time",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added and no `#[ignore]`"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-080",
+      "title": "Make `items at N` and `length of X` real, or strike them from SPEC.md",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "SPEC.md:319 `set first to items at 0`, SPEC.md:320 `set last to items at -1` and SPEC.md:327 `set count to length of items` are written as working syntax under `### List Operations`. None of them works. Verified against the built binary: after `set items to [1,2,3]`, `set first to items at 0` gives `AnalyzerError: Unknown variable 'at'` (src/analyzer.rs:436) and `set count to length of items` gives `AnalyzerError: Unknown variable 'of'`. The cause is src/parser.rs:664-667 - the `_` arm of `parse_statement_inner` falls through to `parse_expression()` and wraps whatever it finds as `Statement::Expr`, so `set first to items at 0` is not a parse error at all, it is THREE statements: `set first to items`, `at`, `0`. Two tools then make it worse: `rb format` prints those three lines back (verified - `rb format` on that file emits `set first to items` / `at` / `0`), and `rb lint` reports no diagnostic at all on a file `rb` cannot run (verified - lint prints only `Unused variable: 'first'` and exits 0). No corpus, example or module program uses either form, so nothing else in the suite notices.",
+      "goal": "Either implement the two documented forms or correct SPEC.md, and stop the parser from silently turning an unconsumed line into stray expression statements.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "for each of SPEC.md:319, SPEC.md:320 and SPEC.md:327 individually: the program as written runs and prints the documented value, or SPEC.md is corrected and the correction is listed in REPORT.md - the three are decided one by one, not as a group",
+        "`set first to items at 0` is either the documented indexing form or a spanned ParserError, and it is never three statements: asserted by counting statements in the parsed `Program`, not by matching on the error text",
+        "`rb lint` reports at least one diagnostic for any file `rb` cannot run and none for a file it can; an edge_* test pairs each of the three forms above with its lint result and with its run result",
+        "`rb format` never changes a program's statement count: an edge_* test formats a program containing all three forms and asserts the formatted `Program`'s body length equals the source's",
+        "out-of-bounds stays a clean runtime error in whichever spelling survives - index `-1`, index `len` and index `999` each produce a spanned RuntimeError and never a panic, asserted per spelling",
+        "the corpus gains at least one program per surviving spelling so the differential harness exercises it on BOTH engines, and the engine answers are diffed rather than eyeballed",
+        "`cargo test` reports 0 failures, `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added, and every file in `examples/` and `modules/` still exits 0"
+      ],
+      "timeout_min": 180
+    },
+    {
+      "id": "phase-081",
+      "title": "Execute every ```redblue block in the five documents that define the language",
+      "severity": "major",
+      "depends_on": [
+        "phase-080"
+      ],
+      "risk": "medium",
+      "finding": "97 ```redblue blocks exist across the documents that define Redblue - SPEC.md 64, docs/GRAMMAR.md 9, PHILOSOPHY.md 9, HANDOUT.md 8, README.md 7 - and no test runs any of them. Every existing reference is a hand-quoted single example (tests/for_range_test.rs:2 cites SPEC.md:380-391, tests/formatter_test.rs:2008 cites SPEC.md:383). Measured this audit by extracting and running every block: 58 of 97 do not run, among them SPEC.md:319 and SPEC.md:327 (the phase-080 forms), SPEC.md:1068 (`LexerError: Unexpected character '\\''` - Redblue has no single-quoted string), SPEC.md:1066 (`ParserError: Unexpected token Wait`, owned by phase-049) and HANDOUT.md:155 (`filter was called with arguments it cannot use`, owned by phase-077). Many of the 58 are fragments rather than defects - docs/GRAMMAR.md:526-532's example omits its `end` - so the first deliverable is an honest classification, NOT 58 features. The rotted examples are exactly the ones that cost an audit to find: `items at 0` sat in SPEC.md undetected until now.",
+      "goal": "Build the test that extracts and classifies every documentation code block, so a documentation promise cannot rot unnoticed, and turn the first true classification into a report a human can act on.",
+      "must_touch": [
+        "tests/"
+      ],
+      "accept": [
+        "a test extracts every ```redblue block from SPEC.md, README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md, recording doc and line for each; the extracted count is asserted to be at least the 97 measured today, so deleting an example cannot silently shrink the suite",
+        "each block is classified into exactly one of three checked-in buckets - RUNS (executed, exit 0), FRAGMENT (a snippet, with a written reason such as 'elided end' for docs/GRAMMAR.md:526), or KNOWN-FAIL (doc:line plus the exact first line of stderr); a block in no bucket fails the test, so the lists cannot rot either",
+        "the buckets are DATA checked into the repository, matched by doc:line, not a permissive pattern re-derived at test time",
+        "REPORT.md states the true measured classification - how many RUNS, how many FRAGMENT, how many KNOWN-FAIL - and does NOT claim the 58 are 58 features; SPEC.md:319 and SPEC.md:327 are resolved by phase-080 before this phase is marked done",
+        "edge_* tests cover the extractor itself: a block with no closing fence, an empty block, a fenced block not tagged `redblue` (must be ignored), and a doc file that does not exist (must not panic)",
+        "the test asserts a failure is produced: a KNOWN-FAIL entry's recorded first stderr line must match what the block actually prints today, and mutating that line in the data fails the test",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added and no `#[ignore]`"
+      ],
+      "timeout_min": 180
+    },
+    {
+      "id": "phase-082",
+      "title": "Make every place the project states what works, true",
+      "severity": "major",
+      "depends_on": [
+        "phase-081"
+      ],
+      "risk": "low",
+      "finding": "Five documents state what Redblue does and all five are wrong somewhere. SPEC.md:1068 writes `json.parse('{\"name\": \"Alice\"}')` with single quotes and the lexer rejects `'` - `LexerError: Unexpected character '\\''`, raised at src/lexer.rs:506 - because Redblue has no single-quoted string. SPEC.md:1073 states 'There is no `formats` module' while HANDOUT.md:149 and HANDOUT.md:154 document `formats.parse_json` and `formats.to_json`. HANDOUT.md:155-157 document `list.map` and `list.filter`, and `list.filter` answers `filter was called with arguments it cannot use`; both names are listed as known gaps at tests/stdlib_module_docs_test.rs:259-261. README.md:237 lists `src/vm.rs` in the project structure and that file does not exist - it was renamed to `src/interpreter.rs`. README.md:279 still marks self-hosting 'in progress' although bootstrap/compiler.rb is 2854 lines and tests/bootstrap_selfhost_test.rs already asserts stage-2 and stage-3 byte-identical output (edge_stage2_is_byte_identical_on_every_corpus_program, edge_the_self_compiled_compiler_compiles_itself_byte_identical). Worst of all, tests/stdlib_module_docs_test.rs:270-274 exempts console_clear, time_unix, csv_parse, network_get and network_post as 'documented but not implemented', and ALL FIVE work at runtime: `console.clear()` clears, `time.unix(\"2024-01-01 00:00:00\")` answers 1704067200, `csv.parse(\"a,b\\n1,2\")` answers `[[a, b], [1, 2]]`, `json.parse` answers a record. An exemption list that is stale in the PERMISSIVE direction stops testing things that work.",
+      "goal": "Correct every false statement in SPEC.md, README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md and shrink the stale KNOWN_GAPS list, so no document claims a capability the binary lacks and no gate-supporting test exempts a working builtin.",
+      "must_touch": [
+        "tests/"
+      ],
+      "accept": [
+        "tests/stdlib_module_docs_test.rs no longer exempts console_clear, time_unix, csv_parse, network_get or network_post from the registry walk at tests/stdlib_module_docs_test.rs:277; all five are removed from KNOWN_GAPS and are now covered by that walk",
+        "every name removed from KNOWN_GAPS has a dedicated test that calls it and asserts its value - a name that merely stops being exempt is not enough, and the test names are listed in REPORT.md",
+        "the remaining KNOWN_GAPS entries each still carry their stated reason, and any that are now implemented are removed rather than left to excuse a later change",
+        "SPEC.md:1068 is corrected to Redblue's real string syntax, or single-quoted strings are implemented; either way the corrected example is in a RUNS or FRAGMENT bucket produced by phase-081 and a test executes it",
+        "HANDOUT.md:149 and HANDOUT.md:154 either drop `formats.*` (SPEC.md:1073 says the module does not exist) or SPEC.md is corrected, and REPORT.md names which document moved - the two must not disagree afterwards",
+        "README.md:237 names `src/interpreter.rs`, the file that exists, and README.md:279's self-hosting line reflects what bootstrap/compiler.rb and tests/bootstrap_selfhost_test.rs already do",
+        "edge_* tests cover the corrections: a doc example using single quotes, one naming `formats`, and one naming `list.filter` - each is either executed or listed with a reason, so a correction cannot be reverted silently",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added and no `#[ignore]`"
+      ],
+      "timeout_min": 120
     }
   ]
 }
