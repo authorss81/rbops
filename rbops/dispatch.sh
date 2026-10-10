@@ -597,6 +597,19 @@ TPL
         printf 'Report the test counts you actually observe. Do not claim a gate you\n'
         printf 'did not run. Only then consider whether the work itself needs changes.\n'
       fi
+      # A human-ordered retry carries a RETRY-NOTE.md. Phase-037 proved why it
+      # must be IN the context rather than beside it: the note said the manifest
+      # had been corrected, but nothing reads it, so the retry never saw it and
+      # re-asserted the previous REPORT.md's stale complaint about criteria that
+      # no longer exist. The REPORT warning above says not to trust gate claims;
+      # a manifest-defect complaint reads as context rather than a claim, so it
+      # slips through. The human note outranks the old report: when they
+      # disagree, the note and your own PROMPT.md are authoritative.
+      if [ -f "$RBOPS_ROOT/phases/$phase/RETRY-NOTE.md" ]; then
+        printf '\n### HUMAN RETRY NOTE — read this before the old REPORT below\n\n```\n'
+        emit_capped 8000 "RETRY-NOTE.md for $phase" < "$RBOPS_ROOT/phases/$phase/RETRY-NOTE.md"
+        printf '\n```\n'
+      fi
     fi
   } > "$LOG_DIR/$phase.ctx"
   cat "$LOG_DIR/$phase.ctx" > "$LOG_DIR/$phase.prompt"   # audit record

@@ -1,4 +1,20 @@
-# phase-037 — unblocked for one more attempt, with the reason
+# phase-037 — READ THIS FIRST. Your PROMPT.md is newer than the old REPORT.
+
+## The trap the last retry fell into (do not repeat it)
+
+The previous REPORT.md says two Definition-of-Done lines are arithmetically
+unsatisfiable. **That complaint is stale.** The manifest was corrected and your
+`PROMPT.md` was re-rendered from it (parity-checked by validate): the
+101-distinct bound now attaches to `random()` only, `random_number` gets the
+checkable non-monotonicity property, and the bucket band reads 40–160 — the
+band the previous attempt itself measured ([105, 95, 103, 94, 101, 98, 116,
+100, 89, 99], mean 100.0).
+
+The last retry had the corrected manifest and STILL quoted the old lines,
+because the resume context leads with the previous REPORT.md and the old
+complaint reads as context rather than a claim. When this note, your PROMPT.md
+and the old REPORT disagree, this note and your PROMPT.md win. Verify each
+accept line against YOUR brief, not against the old report's arithmetic.
 
 ## Why attempts went 3 → 2 and `.blocked` was lifted
 
@@ -9,14 +25,11 @@ missed (`random(0, 100.5)` answering `100.5` at seed 581), fixed it by counting
 seeds, and parked everything on `rbops-recovery/phase-037`. None of that is the
 problem.
 
-The problem is what it was *told*: the run cloned the manifest **before** the
-Definition-of-Done correction landed (`e534844` and the re-rendered
-`phases/phase-037/PROMPT.md`). Its log quotes the old criteria verbatim —
-"log line ~800: 200 draws of `random_number(0, 100)` produce at most 101
-distinct values" and "400–600 per bucket over 1000 draws" — the two lines that
-are arithmetically impossible for a fractional draw and a 1000-draw total, and
-that the correction had already replaced with the 40–160 band the agent itself
-measured ([105, 95, 103, 94, 101, 98, 116, 100, 89, 99], mean 100.0).
+The problem is what it was *told*: the resume context leads with the previous
+attempt's REPORT.md, which carries the stale complaint about criteria that no
+longer exist — and the agent treated that context as current without
+reconciling it against its own re-rendered PROMPT.md. Its log quotes the old
+criteria verbatim while the corrected brief sat unread in the same context.
 
 So attempt 3 was spent satisfying instructions that no longer exist. Burning it
 against the phase's retry budget would punish correct work for a scheduling
