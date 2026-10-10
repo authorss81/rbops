@@ -1690,6 +1690,119 @@
         "edge_* tests cover switching mid-multiline-block (block preserved, engine applies at execution), `.vm` inside a `:save`d session (engine choice persists through save/restore), and rapid double-switch (idempotent, session identical)"
       ],
       "timeout_min": 150
+    },
+    {
+      "id": "phase-073",
+      "title": "Measure before optimizing: a benchmark harness with a checked-in baseline",
+      "severity": "major",
+      "depends_on": [
+        "phase-072"
+      ],
+      "risk": "medium",
+      "finding": "Redblue has no benchmark harness at all: no `benches/` or `benchmarks/` directory exists, `Cargo.toml` names no criterion/divan dependency, and no BASELINE file records how fast anything is. Ipp ships `benchmarks/run_benchmarks.py` plus a checked-in `BENCHMARKS.md` table (fibonacci, prime counting, mandelbrot, string concat across interpreter/VM/Python/Node) for exactly this reason — and phase-022's 29.0s-to-3.5s speedup claim had nowhere to live except a FINDINGS paragraph, so no later phase can tell whether it regressed. Performance work without a harness is unmeasurable by construction.",
+      "goal": "Add a benchmark harness (named workloads: fibonacci, prime counting, string concat, lex-heavy compile) that prints a timing table and records it in a checked-in `BENCH.md`, with every workload asserting the CORRECTNESS of its output (fib(20)==6765 etc. — deterministic, never flaky). Wall time is printed and recorded but never asserted: timing assertions are flakes wearing a gate's clothes.",
+      "must_touch": [
+        "tests/"
+      ],
+      "accept": [
+        "four named workloads run to completion and print one table with per-workload wall time (asserted present in output, never asserted exact)",
+        "every workload asserts its computed answer against a literal (fib(20) is 6765, the prime count is exact, the concat is exact) — a benchmark that computes the wrong answer fast is the failure this pins",
+        "`BENCH.md` is checked in with the measured table from the landing machine plus its hardware note, and a test asserts the file exists and names all four workloads (content may move, coverage may not)",
+        "the harness runs outside the `cargo test` gate path (it measures, it does not gate) while its correctness assertions run inside it — one mechanism never serves both masters",
+        "edge_* tests cover an empty workload name (clean usage error listing the four), a workload given a size of zero (completes, answer asserted trivially true), and a 60-second budget the harness enforces itself (a hung workload fails loudly instead of hanging CI)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-074",
+      "title": "Hash the self-hosted compiler's intern table instead of scanning it",
+      "severity": "major",
+      "depends_on": [
+        "phase-073"
+      ],
+      "risk": "high",
+      "finding": "`to intern(raw)` at bootstrap/compiler.rb:2285 walks the whole table on every name emitted: `while intern_i < length(G_INTERN)` with `if G_INTERN[intern_i].k is raw` at :2290-2291, returning the index or appending. Every name in the program — via `emit_name` at :2310, called for modules (:2473, :2480), objects (:2529, :2532) and every other named emit — pays a scan of the 1000+-entry table, which phase-022 FINDINGS section 4 measured as most of codegen's remaining 6 seconds and explicitly deferred: `A hash map in the language would fix it; that is a language change and belongs in its own phase.` That phase is this one. The fixed-point suite (stage1.rbc == stage2.rbc byte for byte) guards the change: a faster compiler that emits different bytes is a failure, not an optimization.",
+      "goal": "Replace the linear `G_INTERN` scan with a hash lookup in the language (a name-to-index record probed by a string hash the language can compute), keeping every emitted byte identical. Codegen time on `bootstrap/compiler.rb` must drop measurably on the phase-073 harness; the fixed point must hold exactly.",
+      "must_touch": [
+        "src/",
+        "bootstrap/"
+      ],
+      "accept": [
+        "`edge_the_self_hosted_compiler_compiles_itself_byte_identically` passes unmodified — the optimization changes zero emitted bytes, proved by the standing fixed point rather than a new assertion",
+        "codegen wall time on `bootstrap/compiler.rb` drops by at least 25% measured by the phase-073 harness on the same machine back-to-back (recorded in REPORT.md with both numbers, not asserted in a test — machine variance is real)",
+        "interning the same name twice returns the same index without growing the table (a test interns 1000 repetitions and asserts table growth of exactly the distinct count)",
+        "hash collisions resolve correctly: a test interns two names engineered to share a bucket and asserts both retrieve their own index (the test constructs the collision rather than hoping for one)",
+        "edge_* tests cover interning the empty string, a 10KB name (hashes, never truncates), and interning during a self-compile (the fixed point covers it, plus one direct test asserting `stage2` bytes equal `stage1` bytes for a name-heavy fixture file)"
+      ],
+      "timeout_min": 150
+    },
+    {
+      "id": "phase-075",
+      "title": "Teach the language server navigation: goto-definition, references, completion",
+      "severity": "major",
+      "depends_on": [
+        "phase-074"
+      ],
+      "risk": "medium",
+      "finding": "src/lsp.rs answers questions about a file but cannot move inside it: its public surface is `diagnostics`, `diagnostics_json`, `keyword_pattern`, `escape_json` and `textmate_grammar` (lsp.rs:44-233) — diagnostics plus editor assets, no navigation. Ipp's `lsp/server.py` ships `goto_definition` (:113), `find_references` (:131) and `get_completions` (:149) with enhanced context awareness, because diagnostics without navigation is a linter with a wire protocol: the editor can underline the error but cannot jump to the definition. Phase-017 scaffolded the server; this is the first capability beyond scaffolding.",
+      "goal": "Add goto-definition (name at position to its binding span), find-references (all uses of the binding at position), and completion (keywords + builtins + in-scope names at position) to `src/lsp.rs`, each as a pure function over source text returning JSON the existing `diagnostics_json` shape extends. No server loop changes: capabilities first, transport later.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "goto-definition on a `set` variable's use returns its declaration span (line + column asserted exactly on a fixed fixture — positions are deterministic, never approximate)",
+        "find-references on one binding returns every use and no use of a same-named binding in another scope (shadowing fixture: inner `x` and outer `x` distinguished)",
+        "completion at an empty prefix offers keywords, builtins and in-scope session names; completion inside a string literal offers nothing (context awareness asserted, not just prefix matching)",
+        "all three return the existing `{line, column, ...}` JSON shape extended per capability, and malformed positions (line 0, column past end) are clean errors, never panics",
+        "edge_* tests cover goto-definition on a builtin (resolves to the builtin registry, not a file span), references to an imported module member (spans the import, not the definition site), completion at EOF without trailing newline, and a 5000-line file (all three answer in under a second — a benchmark assertion, not a wall-time gate)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-076",
+      "title": "Scaffold projects: `rb new`, root discovery, and a project-aware `rb test`",
+      "severity": "major",
+      "depends_on": [
+        "phase-075",
+        "phase-044"
+      ],
+      "risk": "medium",
+      "finding": "Redblue has files but no projects: `rb test [path]` at src/lib.rs:127 runs one path or the suite, and nothing discovers a project root, creates one, or runs a project's own tests — while Ipp ships `ipp new <name>` (scaffold.py: layout + `ipp.toml` + `src/` + `tests/`) with walk-up root discovery (`find_project_root` in project.py) as the normal way to start. Depending on phase-044 is load-bearing, not ceremonial: 044 owns the manifest schema (name/version/deps), so this phase reads that schema and must add no version/deps fields of its own — inventing a second schema here is exactly the collision the dependency exists to prevent.",
+      "goal": "Add `rb new <name>` (layout + entry + tests dir + manifest in 044's schema), walk-up project-root discovery used by every file-argument command, and bare `rb test` running the discovered project's `tests/` directory. If phase-044's schema is not yet on main, this phase waits rather than inventing: the dependency says so.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`rb new hello` creates the layout and `rb test` inside it runs the scaffolded tests green (end-to-end asserted on a temp dir, never the real tree)",
+        "`rb new` into an existing non-empty directory is refused naming the directory (never merges into occupied ground, never overwrites)",
+        "root discovery walks up: running `rb test` from a nested `src/` finds the project root and runs the root's tests (pinned on a three-deep fixture tree)",
+        "`rb test <path>` behavior is byte-identical to today (the existing test-runner tests pass unmodified — discovery only fills in the path when none is given)",
+        "the manifest written by `rb new` validates against phase-044's schema test unchanged (no new fields, no renamed fields — asserted by running 044's own schema test over the fresh file)",
+        "edge_* tests cover `rb new` with no name, with a name containing a path separator (refused, stays in cwd), `rb test` outside any project (clean error naming `rb new`, exit non-zero), and a project whose manifest is malformed (names the file and the offending line)"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-077",
+      "title": "Finish the list surface: `sort`, `reverse`, `zip`, `enumerate`, `filter`, `reduce`",
+      "severity": "major",
+      "depends_on": [
+        "phase-076"
+      ],
+      "risk": "medium",
+      "finding": "The list surface stops halfway: `map` works (with `list_map`), `pop`/`shift` were wired in phase-032, and `filter`, `reduce`, `sort`, `reverse`, `zip` and `enumerate` are all missing — `filter`/`reduce`/`list_map` sit in `tests/stdlib_module_docs_test.rs::KNOWN_GAPS` explicitly deferred as higher-order work needing a walker's captured scopes. inscript ships map/filter/reduce/zip/enumerate/sort/reverse as core builtins because list transformation is everyday code, not a special occasion. The first-order four are pure functions on values; the higher-order two follow the `map_builtin` precedent in both VMs.",
+      "goal": "Implement `sort`, `reverse`, `zip`, `enumerate` as pure builtins and `filter`, `reduce` as higher-order builtins in both engines next to `map_builtin`, then remove all six from `KNOWN_GAPS` (which is what makes the surface test cover them instead of excusing them). Dotted module spellings (`list.sort`) resolve through the existing `stdlib::resolve` path.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`sort`, `reverse`, `zip` and `enumerate` answer on both engines with identical output (one differential test per builtin across the two VMs, values diffed not eyeballed)",
+        "`filter` and `reduce` call Redblue functions per element in order on both engines, proved by a side-effect-counting function (counter asserted exact — order and count both pinned)",
+        "all six are removed from `KNOWN_GAPS`, so the registry-walk test now covers them; the remaining gaps stay listed with their reasons (the list shrinks, never silently)",
+        "`sort` is stable (equal elements keep their order — asserted on records sharing a key) and refuses mixed-type lists by name rather than ordering across kinds",
+        "edge_* tests cover `sort` of an empty list, `zip` of unequal lengths (stops at the shorter, stated in SPEC), `enumerate` start index, `reduce` on an empty list with and without an initial value (the two cases differ and both are pinned), and `filter` whose function fails mid-list (the failure aborts with the error, partial results never surface)"
+      ],
+      "timeout_min": 120
     }
   ]
 }
