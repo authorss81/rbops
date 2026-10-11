@@ -1,0 +1,25 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-3 audit — hunting what's still broken beneath the green gate.
+[0m→ [0mRead src/vfs.rs
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/interpreter.rs
+[0m→ [0mRead src/manifest.rs
+[0m→ [0mRead src/analyzer.rs
+First sweep shows the manifest core — now digging into the wiring that could still be off.
+[0m→ [0mRead tests/manifest_test.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead src/interpreter.rs[90m [offset=1108][0m
+[0m✱ [0mGrep "module_program|module_path|pinned_module|resolve_in|resolve_without|check_lockfile|parse_lockfile|write_lockfile"[90m in src · 30 matches[0m
+[0m✱ [0mGrep "std::fs|fs::|unwrap\(\)|expect\(|panic!|unreachable!|todo!|HashMap|as cast"[90m in src/manifest.rs · 100 matches[0m
+[0m→ [0mRead tests/manifest_test.rs[90m [offset=1295][0m
+Core manifest checks are mapped — now verifying the filesystem boundary and remaining edge cases.
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=3420, limit=340][0m
+FINDINGS:
+1. [MAJOR] src/manifest.rs:706 — `DirRegistry::module_path` probes with `self.full_path(&relative).is_file()` (std disk) while the import search it feeds uses `crate::vfs::is_file` (src/interpreter.rs:493); `versions` at src/manifest.rs:690 uses `fs::read_dir` + `is_dir`, `module_manifest` at src/manifest.rs:711 uses `fs::read_to_string`, and `manifest_in`/`check_lockfile`/`write_lockfile` at src/manifest.rs:723, src/manifest.rs:792, src/manifest.rs:848 use `std::fs` — bypassing the abstraction src/vfs.rs:28 mandates ("Every path into the filesystem goes through here"). Natively `vfs==std::fs` so tests pass; on wasm32 the registry reads disk (always missing/unsupported) while the loader reads the memory map, so pinned `*` resolves to nothing and transitive manifests are unreadable even when the module file is present — why it matters: registry and loader disagree on the one target nobody tests. Fix: route all manifest/registry/lockfile I/O through `crate::vfs` (add the missing `read_dir`/`is_dir` affordance or inject the FS) so both sides read one filesystem.
+2. [MAJOR] tests/manifest_test.rs:1915 — `edge_no_module_loader_reads_a_file_behind_the_filesystem_abstraction` scans only `interpreter.rs`/`runtime.rs`/`bytecode/vm.rs` for only two needles (`std::fs::read_to_string`, `Path::new(&path).is_file()`), omitting `src/manifest.rs` and the operations it actually uses (`fs::read_dir`, `fs::write`, `is_dir`/`is_file` via `Path`). A `std::fs` read reintroduced in the resolver passes the gate and fails only on wasm32 — why it matters: the invariant test cannot catch finding 1 by construction, so REPORT's "no loader reaches past the abstraction" claim is unguarded. Fix: include `src/manifest.rs` in the scanned files and extend needles to `read_dir`, `write`, `is_dir`, `is_file`.
+3. [MAJOR] src/manifest.rs:805 — `check_lockfile` compares only `module.version == locked.version` and iterates only locked entries, never comparing `locked.path` against `module.path`. The lockfile `path` column is write-only dead data: a registry returning a different file for the same version, or a hand-edited lock path, is silently honoured, and the loader runs the registry path, not the locked one — why it matters: the lock does not lock the file loaded. Fix: refuse on path mismatch naming module, locked path, and resolved path (and pin a test for resolution-extra modules vs locked-extra modules so the addition direction is specified, not silent).
+REVIEW VERDICT: FINDINGS 3
