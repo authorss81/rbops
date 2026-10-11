@@ -1,0 +1,56 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-2 adversarial review — hunting for what the green gate missed.
+[0m→ [0mRead src/parser.rs[90m [limit=100, offset=2420][0m
+[0m→ [0mRead src/parser.rs[90m [limit=200, offset=2519][0m
+[0m✱ [0mGrep "MAX_NESTING_DEPTH|interp_depth|InterpolatedText"[90m in src · 34 matches[0m
+[0m→ [0mRead tests/interpolation_test.rs
+[0m→ [0mRead src/parser.rs[90m [limit=80, offset=1][0m
+[0m→ [0mRead src/parser.rs[90m [limit=260, offset=360][0m
+[0m→ [0mRead src/parser.rs[90m [limit=130, offset=3030][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=60, offset=1845][0m
+I’ve mapped the new interpolation paths — now digging into the engines and edge cases for hidden defects.
+[0m→ [0mRead src/linter.rs[90m [limit=40, offset=380][0m
+[0m→ [0mRead src/analyzer.rs[90m [limit=40, offset=595][0m
+[0m→ [0mRead src/formatter.rs[90m [limit=60, offset=745][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [limit=50, offset=720][0m
+[0m→ [0mRead tests/test_text.rb
+[0m→ [0mRead src/formatter.rs[90m [limit=60, offset=965][0m
+[0m✱ [0mGrep "BuildText|escape_text|fn.*interp|to_string\(\)"[90m in src · 100 matches[0m
+[0m→ [0mRead src/value.rs[90m [limit=60, offset=300][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=130, offset=2054][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=40, offset=1780][0m
+[0m✱ [0mGrep "fn lex|fn parse_expression|fn token_kind|BUILD_TEXT|BuildText"[90m in src · 6 matches[0m
+[0m→ [0mRead src/parser.rs[90m [limit=50, offset=540][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=60, offset=1980][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=60, offset=270][0m
+[0m→ [0mRead src/parser.rs[90m [limit=120, offset=1773][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=120, offset=1][0m
+[0m✱ [0mGrep "to (lex|parse_expression|token_kind|parse_primary|parse_text)"[90m in bootstrap · 77 matches[0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=80, offset=414][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=80, offset=1665][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=50, offset=741][0m
+The stage-2 divergence is getting clearer — now verifying the remaining failure modes.
+[0m→ [0mRead src/parser.rs[90m [limit=80, offset=2290][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=60, offset=2035][0m
+[0m✱ [0mGrep "might|MightFail|BUILD_TEXT|interp"[90m in bootstrap · 35 matches[0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=90, offset=2886][0m
+[0m✱ [0mGrep "mightfail|to parse_unary|to parse_postfix|to compile_expr"[90m in bootstrap · 12 matches[0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=120, offset=1850][0m
+[0m→ [0mRead src/parser.rs[90m [limit=100, offset=2369][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=60, offset=2880][0m
+[0m✱ [0mGrep "InterpolatedText|fn emit|match.*expr|unreachable|todo!|unimplemented!"[90m in src · 29 matches[0m
+[0m→ [0mRead tests/wasm_test.rs
+Spotted a likely gap in WASM coverage — confirming whether it actually breaks.
+[0m→ [0mRead src/wasm.rs
+[0m✱ [0mGrep "nterpolat"[90m in . · 43 matches[0m
+[0m→ [0mRead SPEC.md[90m [limit=40, offset=293][0m
+[0m→ [0mRead src/parser.rs[90m [limit=50, offset=3000][0m
+FINDINGS:
+1. [MAJOR] src/parser.rs:2498 — `interpolated_parts` falls back to `literal.push('{'); index += 1` after a forward depth-count scan, so a matched-but-not-expression open rescans its whole span — nested failing braces like `"{{{x y}}}"` cost O(n) per open, O(n²) total — the doc at `src/parser.rs:2457` claims the walk is linear with disjoint scans, which is false on this shape; neither `edge_a_very_long_literal_of_braces_is_text_and_is_scanned_once` (`"{}"` pairs) nor the unmatched-opens test reaches it — time parsing a failing-nested literal of a few ten thousand opens to settle it — skip to `scan` on failure or record the failed span as consumed text.
+2. [MAJOR] src/formatter.rs:759 — `InterpolatedText` writes nested expressions with raw `"` delimiters (`"{" + format_expression(part) + "}"`), and `escape_text` at `src/formatter.rs:979` only escapes direct `Text` parts — a substitution holding a string (e.g. `say "{uppercase("{x}")}"`, the nesting this phase enables) formats to outer quotes terminated early by inner quotes, which does not re-parse — run `format` on a nested-substitution program then re-`parse` it to settle it — escape inner string delimiters or refuse to format nested interpolation losslessly.
+3. [MAJOR] src/lexer.rs:296 — `read_text` catch-all `Some(c) => text.push(c)` turns `\{` into `{` with no escape, so after this phase `"\{x\}"` with `x` bound substitutes (or AnalyzerErrors when unbound) where it previously printed literally as `{x}` — there is now no spelling for a literal brace pair that reads as an expression, admitted in `phases/phase-047/FINDINGS.md` §3 but untested and a silent behavior change for programs that ran yesterday — decide `\{` escapes a brace (lexer case + `escape_text` round-trip) or pin the new meaning with a test on both engines.
+4. [MAJOR] bootstrap/compiler.rb:2070 — `interp_close` walks forward counting depth from every `{`, called per open at `bootstrap/compiler.rb:2128`, with no port of `unmatched_opens` — a literal of all opens costs the rest of the literal per open (quadratic), executed under the tree-walking interpreter via `rb run bootstrap/compiler.rb` — admitted in `phases/phase-047/FINDINGS.md` §6 but still ships stage-2 quadratic while stage 1 claims linear — port the backward `unmatched` pass as `interp_unmatched(b)` and consult it before `interp_close`.
+REVIEW VERDICT: FINDINGS 4

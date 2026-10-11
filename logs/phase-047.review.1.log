@@ -1,0 +1,35 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the interpolation gaps — digging into the parser and engines for what the green gate missed.
+[0m→ [0mRead tests/interpolation_test.rs
+[0m→ [0mRead tests/test_text.rb
+[0m→ [0mRead phases/phase-047/REPORT.md
+[0m→ [0mRead src/parser.rs[90m [limit=150, offset=2420][0m
+Spotted a test that may not test what it claims — now verifying the engines, error paths, and spec alignment.
+[0m✱ [0mGrep "InterpolatedText"[90m in src · 8 matches[0m
+[0m→ [0mRead tests/bytecode_test.rs
+[0m→ [0mRead tests/common/generator.rs
+[0m→ [0mRead src/parser.rs[90m [limit=80, offset=2568][0m
+[0m→ [0mRead src/linter.rs[90m [limit=30, offset=383][0m
+[0m→ [0mRead src/formatter.rs[90m [limit=50, offset=750][0m
+[0m→ [0mRead src/analyzer.rs[90m [limit=40, offset=595][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [limit=40, offset=720][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=60, offset=1850][0m
+[0m✱ [0mGrep "MAX_NESTING_DEPTH|interp_depth"[90m in src · 15 matches[0m
+[0m→ [0mRead tests/wasm_test.rs
+[0m✱ [0mGrep "String Interpolation|\{expr\}|\{name\}"[90m in . · 100 matches[0m
+[0m→ [0mRead src/formatter.rs[90m [limit=40, offset=965][0m
+[0m→ [0mRead src/parser.rs[90m [limit=60, offset=1][0m
+Initial sweep shows formatter, analyzer, and bytecode paths line up — now checking the spec and leftover edge cases.
+[0m→ [0mRead SPEC.md[90m [limit=40, offset=290][0m
+[0m→ [0mRead src/parser.rs[90m [limit=60, offset=360][0m
+[0m→ [0mRead src/parser.rs[90m [limit=60, offset=535][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=90, offset=2085][0m
+FINDINGS:
+1. [BLOCKER] tests/test_text.rb:228 — `edge_text_an_unknown_name_inside_braces_is_never_printed` never uses braces: body binds `known` to `"printed"`, sets it to `"still printed"` inside `try`, expects no failure — it passes whether interpolation resolves unknown names, errors, or prints literally — why it matters: REPORT.md claims this test pins the unknown-name edge, so the Redblue-side coverage for analyzer rejection inside `{…}` is vacuous — concrete fix: make it exercise the feature (`say "{nope}"` under `try`/`catch` asserting `caught`) or delete/rename it and drop the claim
+2. [MAJOR] src/parser.rs:2525 — `if level >= MAX_NESTING_DEPTH` error branch is admitted unreachable (phases/phase-047/FINDINGS.md §2: no source reaches it, no test pins it) — why it matters: new branch with no test on either side; a dead limit rots and a future grammar change makes the recursion it claims to bound reachable without coverage — concrete fix: add a unit test driving `read_interpolated` past 64 via the shared `Rc<Cell>` directly, or remove the branch and document the recursion as bounded by grammar
+3. [MAJOR] src/parser.rs:2475 — brace-match scan `while scan < chars.len() && depth > 0` restarts at every `{`, so `"{{{{…"` with no close is O(n²) (each of n opens scans to end, then `literal.push('{')`) — why it matters: parser time is set by input length with no cap; the only resource test covers matched `"{}"`×10000 (linear) not unmatched opens — concrete fix: single-pass scan remembering unmatched opens, or cap literal length / scan steps with a spanned Limit error, plus a test for 10k unmatched `{`
+4. [MINOR] tests/interpolation_test.rs:329 — `edge_a_very_long_literal_of_braces_is_text_and_is_scanned_once` runs `tree_walk` only, contradicting the file header at `:9` that every assertion runs on both engines — why it matters: bytecode VM shares the parser but BUILD_TEXT path is unexercised for the large literal, and the test asserts length not linearity so a quadratic regression still passes — concrete fix: also run `bytecode(source)` and assert both outputs, or correct the header claim
+REVIEW VERDICT: FINDINGS 4
