@@ -1,0 +1,4686 @@
+[0m
+> build · space-bunny-free
+[0m
+[0m$ [0mls src/repl/ 2>/dev/null; echo "---"; ls phases/ 2>/dev/null | tail -20
+commands.rs
+completer.rs
+history.rs
+mod.rs
+---
+phase-025
+phase-026
+phase-027
+phase-028
+phase-029
+phase-030
+phase-031
+phase-032
+phase-033
+phase-034
+phase-035
+phase-036
+phase-037
+phase-038
+phase-039
+phase-040
+phase-041
+phase-042
+phase-043
+phase-044
+[0m
+I'll start by reproducing the finding.
+[0m$ [0mgrep -n "enum Command" -A 40 src/repl/commands.rs 2>/dev/null | head -60
+(no output)
+[0m
+[0m$ [0mwc -l src/repl/*.rs; echo "---"; grep -n "enum \|^pub " src/repl/commands.rs | head -40
+686 src/repl/commands.rs
+   446 src/repl/completer.rs
+   433 src/repl/history.rs
+  1719 src/repl/mod.rs
+  3284 total
+---
+2:pub enum ReplCommand {
+67:pub const ALT_SIGIL: char = '.';
+75:pub const SIGILS: [char; 2] = [':', ALT_SIGIL];
+[0m
+[0m$ [0mcat phases/phase-044/REPORT.md 2>/dev/null | head -40; echo "=== phases.json 045 ==="; grep -n "phase-045" -A 25 rbops/phases.json | head -40
+# Phase 044 — Package manager: manifest, versions and lockfile
+
+## Finding reproduced
+
+```
+$ ls modules/
+MathUtils.rb  SuiteKit.rb
+$ find . -path ./target -prune -o \( -name "*manifest*" -o -name "*.lock" \) -print
+(nothing)
+$ grep -rn "pinned\|version" src/interpreter.rs | head
+(nothing)
+```
+
+No manifest format, no version and no lockfile existed anywhere in the checkout,
+and `import Foo` resolved to exactly one file under exactly one name. Two
+programs could not depend on two versions of one module, and there was nothing
+to resolve. Verified on `main` before any change; the finding stands.
+
+## What changed
+
+Four runs produced this phase. The first built the manifest, the resolver and
+the lockfile. The second reported the resolver's failures to the program being
+analyzed. The third closed what the review of the second found. This fourth run
+closed what the review of the third found: `rb run` never derived a root from the
+program it was running, two module readers reached past the filesystem
+abstraction to `std::fs`, the lockfile was written and never read, and the
+resolver picked a version by trusting the order a registry handed it rather than
+by asking for the highest one.
+
+| File | Run | What |
+|---|---|---|
+| `src/manifest.rs` | 1st | `Version`, `Requirement`, `Manifest`, the `Registry` trait, `Resolution`, `resolve`, `resolve_in`, `DirRegistry`, `pinned_module_path` |
+| `src/lib.rs` | 1st | `pub mod manifest;` |
+| `src/interpreter.rs` | 1st | the manifest first in the import search; a directory is skipped, not opened |
+| `src/bytecode/vm.rs` | 1st | the same search in the bytecode VM, so both engines resolve an import identically |
+| `src/manifest.rs` | 2nd | `pinned_module_path_in` and `failure_in` — the same two answers, asked of a named directory rather than of the working directory |
+| `src/interpreter.rs` | 2nd | `module_search_paths`, `module_source` and `module_bound_names` take that directory, so the analyzer reads the pins of the program it is asked about |
+| `src/analyzer.rs` | 2nd | `analyze_in`; `Analyzer` holds a root; an `import` whose manifest cannot be resolved is the failure the walk stops for |
+| `src/analyzer.rs` | 3rd | the walk stops *at every depth*: `analyze_body` is the one way a body is walked, and `analyze_statement` is the one place the stop is checked. The pins are read once per analysis (`pins`, `failure`) instead of once per import |
+| `src/manifest.rs` | 3rd | `MAX_RESOLUTION_DEPTH` counts chain depth per queued edge; `MAX_RESOLUTION_STEPS` counts steps; both are `pub` so a test builds the graph that trips each. `resolve_without_writing` is the read-only resolve for passes that only ask; `resolve_in` keeps the lockfile for the loader. The thread-local resolution cache is gone |
+=== phases.json 045 ===
+grep: rbops/phases.json: No such file or directory
+[0m
+[0m$ [0mpwd; ls; echo "--- phases.json ---"; ls rbops 2>/dev/null; echo "--- phase dir ---"; ls phases/ | head; ls phases/phase-044 2>/dev/null
+/home/runner/work/rbops/rbops/redblue
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+--- phases.json ---
+--- phase dir ---
+phase-002
+phase-003
+phase-004
+phase-006
+phase-007
+phase-008
+phase-009
+phase-010
+phase-011
+phase-012
+FINDINGS.md
+REPORT.md
+[0m
+[0m$ [0mgrep -n "Quit\|Help\|Clear\|History\|Vars\|Functions\|Inspect\|Break\|Step\|Continue\|Watch\|Backtrace\|Frame" src/repl/commands.rs | head -40
+9:    Quit,
+10:    Help,
+11:    Clear,
+12:    History,
+13:    Vars,
+14:    Functions,
+26:    Inspect(String),
+83:        build: |_| ReplCommand::Quit,
+89:        build: |_| ReplCommand::Help,
+93:        description: "Clear the screen",
+95:        build: |_| ReplCommand::Clear,
+101:        build: |_| ReplCommand::History,
+107:        build: |_| ReplCommand::Vars,
+113:        build: |_| ReplCommand::Functions,
+153:        description: "Inspect a variable",
+155:        build: |argument| ReplCommand::Inspect(argument.unwrap_or_default()),
+328:            (":quit", "Quit", ""),
+329:            (":exit", "Quit", ""),
+330:            (":q", "Quit", ""),
+331:            (":help", "Help", ""),
+332:            (":h", "Help", ""),
+333:            (":?", "Help", ""),
+334:            (":clear", "Clear", ""),
+335:            (":cls", "Clear", ""),
+336:            (":history", "History", ""),
+337:            (":hist", "History", ""),
+338:            (":vars", "Vars", ""),
+339:            (":variables", "Vars", ""),
+340:            (":v", "Vars", ""),
+341:            (":functions", "Functions", ""),
+342:            (":funcs", "Functions", ""),
+343:            (":f", "Functions", ""),
+353:            (":inspect x", "Inspect", "x"),
+354:            (":i x", "Inspect", "x"),
+376:                | ReplCommand::Inspect(value)
+414:            ReplCommand::Inspect("counter".to_string()),
+419:            ReplCommand::Quit,
+[0m
+[0m$ [0mprintf ':break 3\n:step\n:continue\n:frame\n' | cargo run --quiet --bin rb 2>&1 | head -20
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Unknown command 'break'. Type :help for available commands.
+>>> Unknown command 'step'. Type :help for available commands.
+>>> Unknown command 'continue'. Type :help for available commands.
+>>> Unknown command 'frame'. Type :help for available commands.
+>>> Goodbye!
+[0m
+[0m→ [0mRead src/repl/commands.rs[90m [limit=200][0m
+**Reproduced.** No `Break`/`Step`/`Continue`/`Watch`/`Backtrace`/`Frame` variant exists.
+[0m
+[0m$ [0mwc -l src/*.rs; echo "---"; grep -n "pub fn interpret\|pub fn run\|fn execute_statement\|fn exec_\|pub struct Interpreter" src/interpreter.rs | head -60
+829 src/analyzer.rs
+   852 src/bootstrap.rs
+   184 src/error.rs
+  1007 src/formatter.rs
+  2246 src/interpreter.rs
+   541 src/lexer.rs
+   585 src/lib.rs
+   478 src/linter.rs
+   290 src/lsp.rs
+     3 src/main.rs
+   998 src/manifest.rs
+  2834 src/parser.rs
+  2163 src/runtime.rs
+   675 src/stdlib.rs
+   387 src/value.rs
+   274 src/vfs.rs
+   878 src/wasm.rs
+ 15224 total
+---
+153:pub fn run_isolated(program: &Program) -> (Vm, Result<Value>) {
+164:pub fn run_isolated_in(program: &Program, root: &std::path::Path) -> (Vm, Result<Value>) {
+169:pub fn run_isolated_with_depth(program: &Program, depth: usize) -> (Vm, Result<Value>) {
+182:pub fn run_isolated_with_depth_in(
+1140:    pub fn run(&mut self, program: &Program) -> Result<Value> {
+1309:    fn execute_statement(&mut self, stmt: &Stmt) -> Result<Value> {
+1324:    fn execute_statement_body(&mut self, stmt: &Statement) -> Result<Value> {
+1742:    fn execute_statements(&mut self, statements: &[Stmt]) -> Result<Value> {
+[0m
+Reproduced. Now let me understand the interpreter's execution model.
+[0m$ [0mgrep -n "line\|Line" src/parser.rs | head -40; echo "=== AST ==="; grep -n "pub struct\|pub enum" src/parser.rs | head -40
+182:    // repeat ... until condition — no `end`: the `until` line closes it
+186:        /// Where the condition was written, which is the `until` line rather than
+187:        /// the `repeat` line the statement's own span names.
+191:        /// the line its author wrote it on. The counted form's condition is on
+192:        /// its `while`'s keyword line, which is why every other loop's span and
+358:/// unbounded depth turns a long line of source into "has overflowed its stack"
+435:    /// [`MAX_NESTING_DEPTH`], so a pathological source line is a diagnostic
+495:    fn skip_newlines(&mut self) {
+497:            kind: TokenKind::Newline,
+508:        self.skip_newlines();
+520:            self.skip_newlines();
+660:            TokenKind::Newline => {
+774:        self.skip_newlines();
+776:        self.skip_newlines();
+786:            self.skip_newlines();
+797:            self.skip_newlines();
+805:                self.skip_newlines();
+829:        self.skip_newlines();
+831:        self.skip_newlines();
+840:            self.skip_newlines();
+965:    /// A newline after `by` is skipped on both sides of the decision: the
+967:    /// after the `advance()`. Classifying the label by looking past a newline
+974:        while ahead < self.tokens.len() && matches!(self.tokens[ahead].kind, TokenKind::Newline) {
+1000:        self.skip_newlines();
+1009:            self.skip_newlines();
+1024:        self.skip_newlines();
+1033:            self.skip_newlines();
+1045:    /// apart. The counted form is `repeat <expression> times`, all on one line,
+1052:    /// stops at the end of the line, where the counted form's `times` and the
+1056:            // A `repeat` on a line of its own opens a body the lines after it
+1057:            // hold; the counted form always has its count on the keyword's line.
+1058:            Some(TokenKind::Newline) => true,
+1064:            Some(_) => self.line_ends_in_until(),
+1068:    /// Whether the first of `until` and `times` written on the current line is
+1071:    /// Only this line is looked at, for the reason
+1072:    /// [`Parser::opens_post_test_loop`] gives: a keyword on a later line belongs
+1073:    /// to a statement this parser has not reached. Within the line, the first of
+1076:    fn line_ends_in_until(&self) -> bool {
+1080:        let line = first.line;
+1082:            if token.line != line {
+=== AST ===
+5:pub enum Expr {
+87:pub enum BinaryOp {
+105:pub enum UnaryOp {
+111:pub enum Statement {
+273:pub struct ImportItem {
+280:pub struct Stmt {
+286:pub struct Program {
+377:pub struct Parser {
+[0m
+[0m→ [0mRead src/parser.rs[90m [offset=270, limit=110][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=100, limit=230][0m
+[0m
+[0m$ [0mgrep -n "CapturedScope" -A 25 src/interpreter.rs | head -60
+16:    CapturedScope, Fields, FunctionBody, FunctionValue, Value,
+17-};
+18-use std::collections::{HashMap, HashSet};
+19-use std::path::Path;
+20-use std::sync::Arc;
+21-
+22-// The HTTP timeouts belong to the builtin library, which is `runtime`'s; they
+23-// are part of this module's public surface because they were declared here
+24-// before the move.
+25-pub use crate::runtime::{NETWORK_CONNECT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS};
+26-
+27-// The call-depth limit and the stack one call frame is allowed are declared in
+28-// `build.rs`, which writes them into `$OUT_DIR/stack_budget.rs` for the
+29-// `include!` below.
+30-//
+31-// They live there and not here because they are the same number twice: the
+32-// interpreter counts calls against `MAX_CALL_DEPTH`, and the linker sizes the
+33-// WebAssembly shadow stack at `MAX_CALL_DEPTH * STACK_BYTES_PER_CALL` so that
+34-// counter is physically reachable there. Two copies could drift, and drift
+35-// between them would make the playground trap on a program the native binary
+36-// reports a catchable `Limit` for.
+37-include!(concat!(env!("OUT_DIR"), "/stack_budget.rs"));
+38-
+39-/// The environment variable that overrides [`MAX_CALL_DEPTH`].
+40-pub const MAX_CALL_DEPTH_ENV: &str = "REDBLUE_MAX_CALL_DEPTH";
+41-
+--
+273:    locals: Vec<CapturedScope>,
+274-    /// The lines `say` has produced, printed when the program finishes — see
+275-    /// [`Vm::run`]. Bounded by [`Vm::output_bytes`] and [`Vm::output_full`];
+276-    /// see [`Vm::charge_output`].
+277-    output: Vec<String>,
+278-    /// How many bytes [`Vm::output`] holds, the newline [`Vm::run`] will append
+279-    /// to each line included.
+280-    ///
+281-    /// The lines are *buffered*, so charging at [`crate::wasm::emit`] bounds
+282-    /// the capture and not this: a program whose `say` never reached the
+283-    /// boundary — because it failed before the end, or because it never
+284-    /// finished — would still have grown a `Vec<String>` without limit while it
+285-    /// did. This is the counter that stops that, and it is why a `repeat` of
+286-    /// [`MAX_ITERATIONS`] long lines fails instead of exhausting memory before
+287-    /// any output is ever written.
+288-    output_bytes: usize,
+289-    /// Whether [`Vm::charge_output`] has already stopped a `say` in this run.
+290-    ///
+291-    /// Once the bound has stopped one line it stops every later one. The
+292-    /// alternative — letting a shorter line through into whatever room the last
+293-    /// long line happened to leave — would make what a program can still say
+294-    /// depend on how its earlier lines divided the limit, which is not a
+295-    /// property anyone can rely on or write a test against.
+296-    output_full: bool,
+297-    /// How many `break` statements have been evaluated, including one that was
+298-    /// then refused for being outside every loop. See
+--
+562:            locals: vec![CapturedScope::new()],
+563-            output: Vec::new(),
+564-            output_bytes: 0,
+565-            output_full: false,
+566-            break_statements: 0,
+567-            skip_statements: 0,
+[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1300, limit=120][0m
+[0m
+[0m$ [0msed -n '1130,1310p' src/interpreter.rs
+}
+
+        self.declared_modules
+            .insert(name.to_string(), DeclaredModule { members });
+        self.module_aliases
+            .entry(name.to_string())
+            .or_insert_with(|| name.to_string());
+        Ok(Value::Nothing)
+    }
+
+    pub fn run(&mut self, program: &Program) -> Result<Value> {
+        let mut result = Value::Nothing;
+
+        for statement in &program.statements {
+            result = self.execute_statement(statement)?;
+        }
+
+        // Print collected output. Through the one boundary a program writes
+        // through, so the WebAssembly playground can collect what the native
+        // binary would have printed.
+        for line in &self.output {
+            crate::wasm::emit(&format!("{}\n", line));
+        }
+
+        Ok(result)
+    }
+
+    fn push_scope(&mut self) {
+        self.locals.push(CapturedScope::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.locals.pop();
+    }
+
+    /// Builds the function value for a declaration, closing over every local
+    /// scope that is live where the declaration is executed.
+    ///
+    /// The capture is a copy taken at declaration time, so a variable the
+    /// function reads is the value it had where the function was written, and
+    /// a variable it assigns is assigned only for that one call. Globals are
+    /// not captured and are read live, which is what a declaration that
+    /// changes a global — a counter, a registry — is written to do.
+    fn make_function(&self, name: &str, params: &[String], body: &[Stmt]) -> Value {
+        let captured: Captured = self.locals.clone();
+        Value::Function(FunctionValue {
+            name: name.to_string(),
+            params: params.to_vec(),
+            body: FunctionBody::Statements(Arc::new(body.to_vec())),
+            captured: Arc::new(captured),
+        })
+    }
+
+    fn get_var(&self, name: &str) -> Option<Value> {
+        self.get_var_ref(name).cloned()
+    }
+
+    /// The binding a read of `name` resolves to, mutably.
+    ///
+    /// This is the one door a value is changed *through* rather than copied
+    /// into, and `append` is the only caller: handing back a `&mut` is what
+    /// lets it grow a list in place, because a `Value` read out of a scope has
+    /// one more handle on the storage than the scope itself and `make_mut`
+    /// would copy for it. The name resolves exactly as [`Vm::get_var`] does,
+    /// and nothing is ever created here — a name that is not bound stays not
+    /// bound, because growing a name into existence would be a `set`.
+    fn get_var_mut(&mut self, name: &str) -> Option<&mut Value> {
+        for scope in self.locals.iter_mut().rev() {
+            if scope.contains_key(name) {
+                return scope.get_mut(name);
+            }
+        }
+        self.globals.get_mut(name)
+    }
+
+    /// [`Vm::get_var`] without the copy, for a caller that is only going to look
+    /// at what is bound — `:vars` and `:inspect` both are.
+    fn get_var_ref(&self, name: &str) -> Option<&Value> {
+        // Check local scopes first
+        for scope in self.locals.iter().rev() {
+            if let Some(v) = scope.get(name) {
+                return Some(v);
+            }
+        }
+        // Check globals
+        self.globals.get(name)
+    }
+
+    /// Binds `name` to `value` as a constant, refusing a second declaration of
+    /// a name that already holds one.
+    ///
+    /// The value goes into [`Vm::globals`] so that a read resolves through the
+    /// one name-resolution path [`Vm::get_var`] already has, and the name goes
+    /// into [`Vm::constants`] so that a later assignment is refused. A refused
+    /// declaration leaves the first binding in place, so a module that
+    /// declares the same name twice keeps the value it had.
+    fn bind_constant(&mut self, name: &str, value: Value) -> Result<()> {
+        if !self.constants.insert(name.to_string()) {
+            return Err(Error::Runtime(
+                format!("Constant '{name}' is already declared"),
+                self.span(),
+            ));
+        }
+        self.globals.insert(name.to_string(), value);
+        Ok(())
+    }
+
+    /// Binds `name` in the innermost live scope that already has it, and in a
+    /// global when no local scope does.
+    ///
+    /// This resolves a name exactly as [`Vm::get_var`] does, so a read and a
+    /// write of one name agree. It used to write only into the innermost scope
+    /// and fall straight through to a global otherwise, which meant that
+    /// assigning to a variable of an enclosing scope — a parameter from inside
+    /// a loop body, or a captured name from inside a function that closed over
+    /// it — silently created a global of that name instead.
+    ///
+    /// A write that would land on a global is refused when that global is a
+    /// constant, which is what makes `constant` a constant. A name a live local
+    /// scope already holds is that local's, so it is written there and a
+    /// constant is shadowed rather than overwritten.
+    /// The refusal every write onto a constant shares: `Cannot assign to
+    /// constant 'NAME'`.
+    ///
+    /// Split out because there are two places a write can reach a program-level
+    /// name — an assignment ([`Vm::set_var`]) and a module's own `set` run by
+    /// [`Vm::load_module`] — and a name the program has bound as a constant is
+    /// read-only whichever of them arrives.
+    fn refuse_constant_rebind(&self, name: &str) -> Result<()> {
+        if self.constants.contains(name) {
+            return Err(Error::Runtime(
+                format!("Cannot assign to constant '{name}'"),
+                self.span(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Binds a name an `import` contributes to the program, refusing to write
+    /// onto a constant the program has already bound.
+    ///
+    /// The write lands in [`Vm::globals`] and not through [`Vm::set_var`],
+    /// because a module's names are names of the whole program: the import may
+    /// run inside a function body, and a local of the same name would otherwise
+    /// capture the module's binding for the length of that scope.
+    fn bind_module_name(&mut self, name: &str, value: Value) -> Result<()> {
+        self.refuse_constant_rebind(name)?;
+        self.globals.insert(name.to_string(), value);
+        Ok(())
+    }
+
+    fn set_var(&mut self, name: &str, value: Value) -> Result<()> {
+        for scope in self.locals.iter_mut().rev() {
+            if scope.contains_key(name) {
+                scope.insert(name.to_string(), value);
+                return Ok(());
+            }
+        }
+        if self.module_depth > 0 {
+            // A `set` in a module body is the module's own name, not a global
+            // of the program that declared it — the boundary `module ... end`
+            // exists to draw. A name already held by an enclosing scope is
+            // still that scope's, which the loop above has already answered.
+            if let Some(scope) = self.locals.last_mut() {
+                scope.insert(name.to_string(), value);
+            }
+            return Ok(());
+        }
+        self.refuse_constant_rebind(name)?;
+        self.globals.insert(name.to_string(), value);
+        Ok(())
+    }
+
+    fn declare(&mut self, name: &str) {
+        if let Some(scope) = self.locals.last_mut() {
+            scope.insert(name.to_string(), Value::Nothing);
+        }
+    }
+
+    fn execute_statement(&mut self, stmt: &Stmt) -> Result<Value> {
+        let previous_span = std::mem::replace(&mut self.current_span, stmt.span);
+[0m
+[0m$ [0msed -n '1740,1790p' src/interpreter.rs; echo "=== CapturedScope ==="; grep -n "struct CapturedScope" -A 40 src/value.rs
+/// caller to hand over, rather than returned here, so that every block in
+    /// the language stops at one and none of them can swallow it.
+    fn execute_statements(&mut self, statements: &[Stmt]) -> Result<Value> {
+        let mut result = Value::Nothing;
+        for stmt in statements {
+            result = self.execute_statement(stmt)?;
+            if self.loop_control.is_some() {
+                return Ok(result);
+            }
+        }
+        Ok(result)
+    }
+
+    fn evaluate(&mut self, expr: &Expr) -> Result<Value> {
+        match expr {
+            Expr::Number(n) => Value::number(*n, self.span()),
+            Expr::Text(s) => Ok(Value::Text(s.clone())),
+            Expr::YesNo(b) => Ok(Value::YesNo(*b)),
+            Expr::Nothing => Ok(Value::Nothing),
+            Expr::Variable(name) => self
+                .get_var(name)
+                .ok_or_else(|| Error::Runtime(format!("Unknown variable '{}'", name), self.span())),
+            Expr::Binary { op, left, right } => {
+                let l = self.evaluate(left)?;
+                let r = self.evaluate(right)?;
+                self.binary_op(op, l, r)
+            }
+            Expr::Unary { op, expr } => {
+                let v = self.evaluate(expr)?;
+                self.unary_op(op, v)
+            }
+            Expr::Call { name, args } => {
+                let arg_values: Result<Vec<Value>> =
+                    args.iter().map(|a| self.evaluate(a)).collect();
+                self.call(name, &arg_values?)
+            }
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+            } => self.call_method(receiver, method, args),
+            Expr::Property { object, property } => {
+                let obj = self.evaluate(object)?;
+                runtime::property(self.span(), obj, property)
+            }
+            Expr::Index { object, index } => {
+                let obj = self.evaluate(object)?;
+                let idx = self.evaluate(index)?;
+                runtime::index(self.span(), obj, idx)
+            }
+            Expr::InterpolatedText(parts) => {
+=== CapturedScope ===
+[0m
+[0m$ [0mgrep -rn "struct CapturedScope\|pub type CapturedScope" src/ | head; echo "---"; grep -n "pub fn globals\|pub fn variables\|fn variables\|pub fn locals\|fn scope_names\|pub fn all_vars\|pub fn get_var_ref\|pub fn get_var" src/interpreter.rs | head -20
+src/value.rs:23:pub type CapturedScope = IndexMap<String, Value>;
+---
+[0m
+[0m$ [0mgrep -n "ReplCommand::Debug\|ReplCommand::Inspect\|ReplCommand::Run\b\|fn execute\|fn handle" src/repl/mod.rs | head -30
+198:    fn handle_command(&mut self, input: &str) -> bool {
+245:            ReplCommand::Run(path) => {
+249:            ReplCommand::Debug => {
+253:            ReplCommand::Inspect(name) => {
+292:    fn execute_line(&mut self, input: &str) {
+396:    fn execute_code(&mut self, code: &str) {
+840:    fn handle_command_consumes_a_command_and_leaves_source_alone() {
+855:    fn handle_command_of_quit_stops_the_session() {
+867:    fn handle_command_reports_a_command_missing_its_argument() {
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=300, offset=150][0m
+[0m
+[0m$ [0mls tests/; echo "---"; grep -rln "Command::new\|env!(\"CARGO_BIN_EXE" tests/ src/ | head -20
+assertions_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+differential_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+integration_test.rb
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+might_fail_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+random_builtin_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+repeat_until_test.rs
+repl_test.rs
+span_test.rs
+stdlib_module_docs_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+test_control_flow.rb
+test_functions.rb
+test_lists.rb
+test_loop_control.rb
+test_mod_in.rb
+test_modules.rb
+test_numeric_edges.rb
+test_object_model.rb
+test_objects.rb
+test_records.rb
+test_text.rb
+text_split_join_test.rs
+time_builtin_test.rs
+tooling_extension_test.rs
+tooling_grammar_test.rs
+unless_test.rs
+wasm_test.rs
+---
+tests/function_literal_test.rs
+tests/loop_bounds_test.rs
+tests/stdlib_module_docs_test.rs
+tests/comparison_words_test.rs
+tests/record_order_test.rs
+tests/bootstrap_ship_test.rs
+tests/linter_test.rs
+tests/text_split_join_test.rs
+tests/bootstrap_selfhost_test.rs
+tests/random_builtin_test.rs
+tests/repl_test.rs
+tests/formatter_test.rs
+tests/mod_in_test.rs
+tests/comparison_lex_test.rs
+tests/call_depth_test.rs
+tests/bytecode_vm_test.rs
+tests/repeat_until_test.rs
+tests/bytecode_test.rs
+tests/common/vm.rs
+[0m
+[0m$ [0msed -n '450,560p' src/repl/mod.rs; echo "=== debug_mode/run_file ==="; grep -n "fn debug_mode\|fn run_file\|fn print_variables\|fn inspect_value\|fn print_help\|fn print_functions" src/repl/mod.rs
+}
+        result
+    }
+
+    fn print_help(&self) {
+        println!("Redblue REPL Commands:");
+        println!();
+        // Every line of this list comes from the one table the parser accepts
+        // commands in, aliases included. It was written out separately, so `:q`,
+        // `:h`, `:hist`, `:v`, `:f`, `:cls`, `:l`, `:s` and `:i` all worked and
+        // none of them was documented.
+        for line in ReplCommand::help_lines() {
+            println!("{}", line);
+        }
+        println!();
+        // The second sigil is parsed by [`ReplCommand::parse`] and completed by
+        // the completer, so a table that lists only `:` leaves half of what the
+        // REPL answers to unexplained. One sentence says it once rather than
+        // printing every command twice.
+        let alt = commands::ALT_SIGIL;
+        println!(
+            "  Every command also answers to '{alt}' in place of ':' \
+             — {alt}quit is :quit."
+        );
+        println!();
+        println!("Quick Reference:");
+        for (caption, source) in QUICK_REFERENCE {
+            println!("  // {}", caption);
+            for line in source.lines() {
+                println!("  {}", line);
+            }
+        }
+        println!();
+    }
+
+    /// Every name the session has bound, with the value it holds, in name order.
+    ///
+    /// The REPL's own `variables` map is nearly empty — it holds `_`, the last
+    /// result — because a `set`, a `to` and an `import` all bind in the VM, which
+    /// is why `:vars` used to be able to print one line for a session that had
+    /// bound a dozen names. The VM's bindings are read as well.
+    ///
+    /// Sorted because both maps are `HashMap`s and their iteration order is not a
+    /// result: printing it directly gave one session a different listing from the
+    /// next for the same bindings. Built here rather than printed inline so the
+    /// order is something a test can read back.
+    fn session_bindings(&self) -> Vec<(String, Value)> {
+        let mut bindings: HashMap<String, Value> = self.variables.clone();
+        for name in self.vm.user_names() {
+            if let Some(value) = self.vm.user_value(&name) {
+                // The REPL's own entry for a name wins: `_` is the last result,
+                // and the VM holds a `Nothing` for it rather than the value.
+                bindings.entry(name).or_insert_with(|| value.clone());
+            }
+        }
+
+        let mut bindings: Vec<(String, Value)> = bindings.into_iter().collect();
+        bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        bindings
+    }
+
+    /// The `:vars` listing, or `None` when the session holds nothing at all.
+    fn variable_lines(&self) -> Option<Vec<String>> {
+        let bindings = self.session_bindings();
+        if bindings.is_empty() {
+            return None;
+        }
+
+        Some(
+            bindings
+                .iter()
+                .map(|(name, value)| format!("  {} = {}", name, value))
+                .collect(),
+        )
+    }
+
+    fn print_variables(&self) {
+        let Some(lines) = self.variable_lines() else {
+            println!("No variables defined.");
+            return;
+        };
+
+        println!("Variables:");
+        for line in lines {
+            println!("{}", line);
+        }
+    }
+
+    /// The `:funcs` listing: every function the session declared, in name order,
+    /// or `None` when it has declared none.
+    ///
+    /// It used to print "User-defined functions are stored in the VM" and nothing
+    /// else, which named no function and told the user nothing they could not read
+    /// off the same line — and the test that ran `:funcs` asserted that sentence,
+    /// so the missing listing could not fail anything.
+    fn function_lines(&self) -> Option<Vec<String>> {
+        let functions = self.vm.user_functions();
+        if functions.is_empty() {
+            return None;
+        }
+
+        Some(functions.iter().map(|name| format!("  {}", name)).collect())
+    }
+
+    fn print_functions(&self) {
+        let Some(lines) = self.function_lines() else {
+            println!("No functions defined.");
+            return;
+        };
+
+        println!("Functions:");
+=== debug_mode/run_file ===
+454:    fn print_help(&self) {
+526:    fn print_variables(&self) {
+554:    fn print_functions(&self) {
+673:    fn run_file(&self, path: &str) {
+680:    fn debug_mode(&self) {
+711:    fn inspect_value(&self, name: &str) {
+[0m
+[0m$ [0msed -n '660,740p' src/repl/mod.rs; echo "=== repl_test.rs head ==="; sed -n '1,60p' tests/repl_test.rs
+let mut replayed = 0;
+        let mut skipped = 0;
+        for line in lines {
+            if matches!(ReplCommand::parse(line), ReplCommand::NotACommand) {
+                self.execute_line(line);
+                replayed += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        (replayed, skipped)
+    }
+
+    fn run_file(&self, path: &str) {
+        match crate::run_file(path) {
+            Ok(_) => println!("File '{}' executed successfully.", path),
+            Err(e) => println!("Error running file: {}", e),
+        }
+    }
+
+    fn debug_mode(&self) {
+        println!("Debug mode - Not implemented yet");
+        println!("Press Ctrl+C to exit debug mode");
+    }
+
+    /// The `:inspect` listing for `name`, or `None` when nothing in the session is
+    /// bound to it.
+    ///
+    /// The lookup asks the VM as well as the REPL's own map. `set`, `to` and
+    /// `import` all bind in the VM, and the REPL's map held only `_`, so
+    /// `:inspect <session-name>` answered "Variable not found" for every name the
+    /// session had actually bound — including one it had bound a line earlier.
+    ///
+    /// The type is the Redblue one, from [`Value::type_name`]: the name `type_of`
+    /// reports and a `Runtime` error quotes. It used to be
+    /// `std::any::type_name_of_val`, which is the *Rust* type of every value the
+    /// VM holds — so `:inspect counter` answered `Type: "redblue::value::Value"`
+    /// for a number, a text, a list and a function alike, and told the user
+    /// nothing about any of them.
+    ///
+    /// Built here rather than printed inline so the wording is something a test
+    /// can read back.
+    fn inspect_lines(&self, name: &str) -> Option<Vec<String>> {
+        let value = self.lookup(name)?;
+        Some(vec![
+            format!("{}: {}", name, value),
+            format!("Type: {}", value.type_name()),
+        ])
+    }
+
+    /// Prints what [`Repl::inspect_lines`] has to say about `name`.
+    fn inspect_value(&self, name: &str) {
+        match self.inspect_lines(name) {
+            Some(lines) => {
+                for line in lines {
+                    println!("{}", line);
+                }
+            }
+            None => {
+                println!("Variable '{}' not found.", name);
+            }
+        }
+    }
+
+    /// The value bound to `name` anywhere in this session, VM included.
+    fn lookup(&self, name: &str) -> Option<&Value> {
+        self.variables
+            .get(name)
+            .or_else(|| self.vm.user_value(name))
+    }
+
+    fn print_ast(&self, code: &str) {
+        match Lexer::tokenize(code) {
+            Ok(tokens) => {
+                let mut parser = Parser::new(tokens);
+                match parser.parse() {
+                    Ok(program) => {
+                        println!("{:#?}", program);
+                    }
+                    Err(e) => {
+                        println!("Parse error: {}", e);
+=== repl_test.rs head ===
+//! End-to-end tests for the REPL: `rb` with no arguments, driven over a pipe.
+//!
+//! The REPL is the one surface a user touches first and the one with no
+//! coverage at all — every claim about it was previously made by reading
+//! `src/repl/mod.rs` rather than by running it. These tests pipe a session into
+//! the real binary and assert on what it printed and on how it exited.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long a session may take before it counts as hung.
+///
+/// This is a liveness bound, not a performance assertion: nothing here claims a
+/// session is *fast*, only that it *finishes*. The pre-fix REPL spins forever on
+/// EOF printing prompts, so without a bound a regression would be an unkillable
+/// test rather than a failing one.
+const SESSION_LIMIT: Duration = Duration::from_secs(20);
+
+/// What one piped REPL session produced.
+struct Session {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl Session {
+    /// Asserts the session exited cleanly, quoting both streams.
+    fn assert_exited_ok(&self) -> &Self {
+        assert_eq!(
+            self.code,
+            Some(0),
+            "the REPL should exit 0\nstdout:\n{}\nstderr:\n{}",
+            self.stdout,
+            self.stderr
+        );
+        self
+    }
+
+    fn assert_stdout_contains(&self, needle: &str) -> &Self {
+        assert!(
+            self.stdout.contains(needle),
+            "stdout should contain {:?}\n--- actual ---\n{}",
+            needle,
+            self.stdout
+        );
+        self
+    }
+
+    fn assert_stdout_lacks(&self, needle: &str) -> &Self {
+        assert!(
+            !self.stdout.contains(needle),
+            "stdout should not contain {:?}\n--- actual ---\n{}",
+            needle,
+            self.stdout
+        );
+        self
+[0m
+[0m$ [0msed -n '60,200p' tests/repl_test.rs
+self
+    }
+
+    /// How many times `needle` appears, for the assertions that are about *how
+    /// often* a session says something rather than whether it says it at all.
+    fn count_stdout(&self, needle: &str) -> usize {
+        self.stdout.matches(needle).count()
+    }
+}
+
+/// Pipes `input` into `rb` with no arguments and collects the session.
+///
+/// stdin is closed as soon as `input` is written, so the REPL sees EOF exactly
+/// as it would from Ctrl-D at a terminal. Reading stdout on its own thread means
+/// a child that fills the pipe buffer cannot deadlock the test while the parent
+/// waits for it to exit.
+fn session(input: &str) -> Session {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the rb binary should start");
+
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let payload = input.to_string();
+    let writer = thread::spawn(move || {
+        let _ = stdin.write_all(payload.as_bytes());
+        drop(stdin);
+    });
+
+    let mut stdout = child.stdout.take().expect("stdout should be piped");
+    let reader = thread::spawn(move || read_all(&mut stdout));
+    let mut stderr = child.stderr.take().expect("stderr should be piped");
+    let errors = thread::spawn(move || read_all(&mut stderr));
+
+    let deadline = Instant::now() + SESSION_LIMIT;
+    let status = loop {
+        match child.try_wait().expect("child status should be readable") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                writer.join().ok();
+                let _ = reader.join();
+                panic!(
+                    "the REPL did not exit within {:?} of its input closing: it \
+                     hangs instead of terminating on EOF.\ninput:\n{}",
+                    SESSION_LIMIT, input
+                );
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+
+    writer.join().expect("the writer thread should not panic");
+    let stdout = reader.join().expect("the reader thread should not panic");
+    let stderr = errors.join().expect("the stderr thread should not panic");
+
+    Session {
+        code: status.code(),
+        stdout,
+        stderr,
+    }
+}
+
+/// Drains a pipe on its own thread: a child writing more than the pipe buffer
+/// holds would otherwise block forever waiting for a reader.
+fn read_all(pipe: &mut impl Read) -> String {
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Where `.rb` files under test are written, inside the project checkout.
+fn scratch_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/repl");
+    std::fs::create_dir_all(&dir).expect("scratch directory should be creatable");
+    dir
+}
+
+fn scratch_file(name: &str, source: &str) -> PathBuf {
+    let path = scratch_path(name, "rb");
+    std::fs::write(&path, source).expect("the program should be writable");
+    path
+}
+
+/// A path for a file that is not a program — a saved session, mostly — created
+/// empty so it exists before a session is asked to save over it.
+fn scratch_path(name: &str, extension: &str) -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let path = scratch_dir().join(format!(
+        "{}-{}-{}.{}",
+        name,
+        std::process::id(),
+        serial,
+        extension
+    ));
+    std::fs::write(&path, "").expect("the file should be creatable");
+    path
+}
+
+#[test]
+fn repl_runs_commands_and_quits() {
+    let s = session(":help\n:vars\n:funcs\n:history\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("Redblue REPL Commands:")
+        .assert_stdout_contains(":history")
+        .assert_stdout_contains("No variables defined.")
+        .assert_stdout_contains("No functions defined.")
+        .assert_stdout_contains("     1  :help")
+        .assert_stdout_contains("     4  :history")
+        .assert_stdout_contains("Goodbye!");
+}
+
+#[test]
+fn repl_shows_the_result_of_an_expression_under_vars() {
+    let s = session("2 + 3\n:vars\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("= 5")
+        .assert_stdout_contains("  _ = 5");
+}
+
+#[test]
+fn repl_runs_a_multiline_block() {
+    let s = session("if 1 is greater than 0 then\n    say \"yes\"\nend\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("yes")
+        .assert_stdout_lacks("Error");
+}
+
+#[test]
+fn repl_reports_an_uncaught_error_and_stays_alive() {
+    let s = session("1 / 0\nsay \"alive\"\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("Division by zero")
+[0m
+[0m$ [0mgrep -n "call_depth\|depth" src/interpreter.rs | grep -v "^.*///" | head -30; echo "=== Span ==="; grep -n "pub struct Span" -A 25 src/error.rs | head -35
+27:// The call-depth limit and the stack one call frame is allowed are declared in
+137:pub fn resolve_max_call_depth() -> usize {
+165:    run_isolated_with_depth_in(program, resolve_max_call_depth(), root)
+169:pub fn run_isolated_with_depth(program: &Program, depth: usize) -> (Vm, Result<Value>) {
+170:    run_isolated_with_depth_in(program, depth, std::path::Path::new("."))
+182:pub fn run_isolated_with_depth_in(
+184:    depth: usize,
+187:    let limit = depth.max(1);
+347:    module_depth: usize,
+373:    call_depth: usize,
+374:    max_call_depth: usize,
+388:    loop_depth: usize,
+574:            module_depth: 0,
+580:            call_depth: 0,
+581:            max_call_depth: resolve_max_call_depth(),
+585:            loop_depth: 0,
+591:    pub fn with_max_call_depth(max_call_depth: usize) -> Self {
+593:        if max_call_depth > 0 {
+594:            vm.max_call_depth = max_call_depth;
+694:        self.loop_depth += 1;
+696:        self.loop_depth -= 1;
+760:        if self.loop_depth == 0 {
+1070:        self.module_depth += 1;
+1114:        self.module_depth -= 1;
+1288:        if self.module_depth > 0 {
+1825:            // at the call-depth limit has not "carried on", and yielding `nothing`
+2177:        if self.call_depth >= self.max_call_depth {
+2180:                    "Maximum call depth of {} reached while calling '{}'",
+2181:                    self.max_call_depth, name
+2191:        let caller_depth = self.locals.len();
+=== Span ===
+8:pub struct Span {
+9-    pub line: usize,
+10-    pub column: usize,
+11-}
+12-
+13-impl Span {
+14-    pub fn new(line: usize, column: usize) -> Self {
+15-        Self { line, column }
+16-    }
+17-
+18-    /// A position that is not attached to any source text. Only for failures
+19-    /// that happen before a token exists, such as a module file that cannot be
+20-    /// read.
+21-    pub fn unknown() -> Self {
+22-        Self { line: 0, column: 0 }
+23-    }
+24-
+25-    pub fn is_known(&self) -> bool {
+26-        self.line > 0
+27-    }
+28-}
+29-
+30-impl fmt::Display for Span {
+31-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+32-        write!(f, "{}:{}", self.line, self.column)
+33-    }
+[0m
+[0m$ [0mgrep -n "pub fn run_file\|pub fn analyze\|pub fn run_file_in" -A 30 src/lib.rs | head -80
+55:pub fn run_file(path: &str) -> Result<(), Error> {
+56-    let source = fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
+57-
+58-    run_source_in(&source, root_of(path))
+59-}
+60-
+61-/// The directory a program at `path` resolves its dependencies from: the one
+62-/// holding it.
+63-///
+64-/// `Path::parent` answers `""` for a bare `prog.rb`, which is the working
+65-/// directory written as nothing; `.` is the same answer spelled as a path, and
+66-/// is what everything downstream compares against.
+67-fn root_of(path: &str) -> &Path {
+68-    Path::new(path)
+69-        .parent()
+70-        .filter(|parent| !parent.as_os_str().is_empty())
+71-        .unwrap_or_else(|| Path::new("."))
+72-}
+73-
+74-/// Runs `path` and, when it fails, renders the source line and caret for the
+75-/// failure next to the message.
+76-fn run_file_with_diagnostic(path: &str) -> std::result::Result<(), String> {
+77-    let source = match fs::read_to_string(path) {
+78-        Ok(source) => source,
+79-        Err(e) => return Err(Error::Io(e.to_string()).to_string()),
+80-    };
+81-
+82-    run_source_in(&source, root_of(path)).map_err(|e| e.render(&source, Some(path)))
+83-}
+84-
+85-fn report(rendered: &str) -> ! {
+[0m
+[0m$ [0msed -n '1,55p' src/lib.rs; echo "=== run_source_in ==="; grep -n "fn run_source_in" -A 40 src/lib.rs
+pub mod analyzer;
+pub mod bootstrap;
+pub mod bytecode;
+mod error;
+pub mod formatter;
+mod interpreter;
+pub mod lexer;
+pub mod linter;
+pub mod lsp;
+pub mod manifest;
+pub mod parser;
+pub mod repl;
+mod runtime;
+pub mod stdlib;
+pub mod testing;
+mod value;
+pub mod vfs;
+pub mod wasm;
+
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::process;
+
+use crate::lexer::Lexer;
+use testing::reporter::Reporter;
+
+pub use error::{Error, Span};
+pub use lsp::{
+    diagnostics, diagnostics_json, diagnostics_to_json, textmate_grammar, Diagnostic, Severity,
+    GRAMMAR_PATH, LANGUAGE_CONFIG_PATH,
+};
+// `FunctionValue` is re-exported because it is the payload of the public
+// `Value::Function` variant: a caller that matches that variant has to be able
+// to name the type it binds.
+pub use bytecode::{compile_source, Chunk, Opcode};
+pub use interpreter::{
+    resolve_max_iterations, resolve_max_iterations_from, resolve_max_steps, resolve_max_steps_from,
+    run_isolated, run_isolated_in, run_isolated_with_depth, run_isolated_with_depth_in, Vm,
+    MAX_CALL_DEPTH, MAX_CALL_DEPTH_ENV, MAX_ITERATIONS, MAX_ITERATIONS_ENV, MAX_STEPS,
+    MAX_STEPS_ENV, NETWORK_CONNECT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS,
+};
+pub use value::{expect_repeat_count, FunctionBody, FunctionValue, Value};
+
+/// Runs the program at `path`.
+///
+/// The directory holding the program is where its imports are resolved from: its
+/// `redblue.manifest` is the one that pins them, and a path an `import` returns
+/// is read against it. So `rb run subdir/prog.rb` consults
+/// `subdir/redblue.manifest` and opens `subdir/modules/Foo.rb` — the same pins
+/// `analyze_in(&program, "subdir")` and `BytecodeVm::new_in("subdir")` are
+/// given, so all three agree about one program rather than the first two
+/// consulting the program's own manifest and the rest consulting the working
+/// directory's.
+pub fn run_file(path: &str) -> Result<(), Error> {
+=== run_source_in ===
+100:pub fn run_source_in(source: &str, root: &Path) -> Result<(), Error> {
+101-    let tokens = Lexer::tokenize(source)?;
+102-    let ast = parser::parse(tokens)?;
+103-    analyzer::analyze_in(&ast, root)?;
+104-
+105-    let (_vm, result) = interpreter::run_isolated_in(&ast, root);
+106-    result.map(|_| ())
+107-}
+108-
+109-/// The whole pipeline on `source` — lexer, parser, analyzer, then the VM — and
+110-/// the value of its last statement.
+111-///
+112-/// [`run_source`] is the same pipeline and reports only whether it succeeded.
+113-/// This returns what the program evaluated to, so a caller can assert on a run
+114-/// that went through the analyzer rather than around it: a test that skips the
+115-/// analyzer cannot fail on what the analyzer refuses.
+116-pub fn run_source_value(source: &str) -> Result<Value, Error> {
+117-    run_source_value_in(source, Path::new("."))
+118-}
+119-
+120-/// [`run_source_value`] against `root` — see [`run_source_in`].
+121-pub fn run_source_value_in(source: &str, root: &Path) -> Result<Value, Error> {
+122-    let tokens = Lexer::tokenize(source)?;
+123-    let ast = parser::parse(tokens)?;
+124-    analyzer::analyze_in(&ast, root)?;
+125-
+126-    let (_vm, result) = interpreter::run_isolated_in(&ast, root);
+127-    result
+128-}
+129-
+130-pub fn run_repl() {
+131-    let mut repl = repl::Repl::new();
+132-    repl.run();
+133-}
+134-
+135-pub fn run_test(path: Option<&str>) -> Result<(), Error> {
+136-    let mut harness = testing::TestHarness::new();
+137-
+138-    match path {
+139-        Some(p) => {
+140-            harness.run_file(p)?;
+[0m
+[0m$ [0msed -n '2170,2240p' src/interpreter.rs; echo "=== Vm::new_in ==="; sed -n '550,600p' src/interpreter.rs
+fn call_user_function(
+        &mut self,
+        name: &str,
+        function: &FunctionValue,
+        args: &[Value],
+    ) -> Result<Value> {
+        if self.call_depth >= self.max_call_depth {
+            return Err(Error::Limit(
+                format!(
+                    "Maximum call depth of {} reached while calling '{}'",
+                    self.max_call_depth, name
+                ),
+                self.span(),
+            ));
+        }
+
+        // The captured scopes go on the stack *above* the caller's frames, and
+        // the parameters above those, so the body reads its own environment
+        // rather than a same-named binding of whoever called it, and a
+        // parameter shadows what it captured.
+        let caller_depth = self.locals.len();
+        for scope in function.captured.iter() {
+            self.locals.push(scope.clone());
+        }
+        self.push_scope();
+        for (index, param) in function.params.iter().enumerate() {
+            let value = args.get(index).cloned().unwrap_or(Value::Nothing);
+            self.declare(param);
+            self.set_var(param, value)?;
+        }
+        self.call_depth += 1;
+        // A function body is not lexically inside the caller's loop, so a
+        // `break` written there has no loop of its own and must be refused
+        // rather than reaching out and ending the caller's iteration. The
+        // depth is restored on the way out, including the failing path.
+        //
+        // The pending signal is saved with it: a call made while a `break` or a
+        // `skip` is raised — from a `finally` running on the way out of a loop —
+        // is still inside the region that raised it, so the signal belongs to
+        // the loop's caller and the call must not touch it.
+        let caller_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        let caller_loop_control = self.loop_control.take();
+        // A function value the bytecode VM built names a compiled block instead
+        // of statements, and cannot be run by this walker. `rb run` only ever
+        // builds statements itself, so reaching this is a caller mixing the two
+        // VMs rather than a program that did something.
+        let FunctionBody::Statements(body) = &function.body else {
+            self.call_depth -= 1;
+            self.loop_depth = caller_loop_depth;
+            self.loop_control = caller_loop_control;
+            self.locals.truncate(caller_depth);
+            return Err(Error::Runtime(
+                format!(
+                    "'{}' has a compiled body, which only `rb vm` can run",
+                    function.name
+                ),
+                self.span(),
+            ));
+        };
+        let result = self.execute_statements(body);
+        self.call_depth -= 1;
+        self.loop_depth = caller_loop_depth;
+        self.loop_control = caller_loop_control;
+        // Truncated rather than popped one at a time, so the stack is balanced
+        // even when the body failed part way through and left a scope behind.
+        self.locals.truncate(caller_depth);
+
+        result
+    }
+}
+=== Vm::new_in ===
+    ///
+    /// The manifest in `root` is the one that decides which version of a module
+    /// an `import` binds, and it is the manifest
+    /// [`crate::analyzer::analyze_in`] reads when it was asked about the same
+    /// program. A VM that resolved against `.` instead would load a different
+    /// file than the analyzer checked, for every program not run from its own
+    /// directory.
+    pub fn new_in(root: &std::path::Path) -> Self {
+        let globals = stdlib::builtins();
+        Self {
+            globals,
+            constants: HashSet::new(),
+            locals: vec![CapturedScope::new()],
+            output: Vec::new(),
+            output_bytes: 0,
+            output_full: false,
+            break_statements: 0,
+            skip_statements: 0,
+            modules: HashMap::new(),
+            root: root.to_path_buf(),
+            pins: crate::manifest::Pins::for_running(root),
+            module_aliases: HashMap::new(),
+            importing: Vec::new(),
+            declared_modules: HashMap::new(),
+            module_depth: 0,
+            qualified_members: HashSet::new(),
+            objects: HashMap::new(),
+            expectation_failure: None,
+            assertions_failed: 0,
+            current_span: Span::unknown(),
+            call_depth: 0,
+            max_call_depth: resolve_max_call_depth(),
+            steps: 0,
+            max_steps: resolve_max_steps(),
+            max_iterations: resolve_max_iterations(),
+            loop_depth: 0,
+            loop_control: None,
+        }
+    }
+
+    /// Builds a VM with an explicit call-depth limit, ignoring the environment.
+    pub fn with_max_call_depth(max_call_depth: usize) -> Self {
+        let mut vm = Self::new();
+        if max_call_depth > 0 {
+            vm.max_call_depth = max_call_depth;
+        }
+        vm
+    }
+
+    /// Builds a VM with an explicit per-loop iteration cap, ignoring the
+    /// environment. A cap of zero is ignored: it would make every loop illegal,
+[0m
+[0m← [0mWrite tests/debugger_test.rs
+Wrote file successfully.
+[0m
+Now the failing test, first.
+[0m$ [0mcargo test --test debugger_test 2>&1 | tail -30
+>>> ..  ..  1
+2
+3
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+
+  left: 0
+ right: 3
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: debugger_test::breakpoint_in_a_loop_fires_on_every_iteration
+   5: debugger_test::breakpoint_in_a_loop_fires_on_every_iteration::{closure#0}
+   6: <debugger_test::breakpoint_in_a_loop_fires_on_every_iteration::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    breakpoint_in_a_loop_fires_on_every_iteration
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[91merror[0m: test failed, to rerun pass `--test debugger_test`
+[0m
+Red for the right reason (`:break` is an unknown command). Now the implementation.
+[0m← [0mWrite src/debugger.rs
+Wrote file successfully.
+[0m
+[0m$ [0mgrep -n "pub fn user_names\|pub fn user_value\|use crate::" src/interpreter.rs | head -20
+8:use crate::error::{Error, Result, Span};
+9:use crate::lexer::Lexer;
+10:use crate::parser as redblue_parser;
+11:use crate::parser::{BinaryOp, Expr, Program, Statement, Stmt, UnaryOp};
+12:use crate::runtime;
+13:use crate::stdlib;
+14:use crate::value::{
+25:pub use crate::runtime::{NETWORK_CONNECT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS};
+858:    pub fn user_names(&self) -> Vec<String> {
+892:    pub fn user_value(&self, name: &str) -> Option<&Value> {
+[0m
+Now the VM hook in the interpreter.
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -4,8 +4,9 @@
+ //! [`crate::bytecode::vm`] has to answer the same way, so the operations both
+ //! need — arithmetic, indexing, the builtin library — live in
+ //! [`crate::runtime`] and are read from here rather than written twice.
+ 
++use crate::debugger::{DebugAction, DebugEvent};
+ use crate::error::{Error, Result, Span};
+ use crate::lexer::Lexer;
+ use crate::parser as redblue_parser;
+ use crate::parser::{BinaryOp, Expr, Program, Statement, Stmt, UnaryOp};
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -370,8 +370,15 @@
+ /// too — including ones that are not test results at all. See
+ /// [`Expr::MightFail`].
+ assertions_failed: usize,
+ current_span: Span,
++/// The debugger watching this VM, if one is attached — see
++/// [`Vm::set_debug_hook`].
++///
++/// `None` for every program that is not being debugged, which is what makes
++/// [`Vm::debug_before`] a single predictable branch on the hot path and
++/// nothing else.
++debug_hook: Option<DebugHook>,
+ call_depth: usize,
+ max_call_depth: usize,
+ /// Statements executed so far, against [`Vm::max_steps`]. Monotonic for the
+ /// life of the VM and never restored by `try`, so a caught error cannot buy
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -584,8 +584,9 @@
+ objects: HashMap::new(),
+ expectation_failure: None,
+ assertions_failed: 0,
+ current_span: Span::unknown(),
++debug_hook: None,
+ call_depth: 0,
+ max_call_depth: resolve_max_call_depth(),
+ steps: 0,
+ max_steps: resolve_max_steps(),
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -37,10 +37,9 @@
+     Step(StepMode),
+ }
+ 
+ /// One statement the VM is about to evaluate, as the debugger sees it.
+-pub struct DebugEvent<'a> {
+-    /// The 1-based source line the statement was written on.
++pub struct DebugEvent<'a> {    /// The 1-based source line the statement was written on.
+     pub line: usize,
+     /// How many function calls deep this statement is. Top level is `0`.
+     pub depth: usize,
+     /// The live local scopes, outermost first.
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -36,10 +36,18 @@
+     /// Keep going until the next statement the mode names.
+     Step(StepMode),
+ }
+ 
++/// The hook the VM calls before every statement it is about to evaluate.
++///
++/// A plain boxed closure rather than a trait object with an implementation on
++/// the VM: the debugger is one caller, and the hook is what a host installs to
++/// be *told* what the program is doing rather than what it produced.
++pub type DebugHook = Box<dyn FnMut(DebugEvent<'_>) -> DebugAction>;
++
+ /// One statement the VM is about to evaluate, as the debugger sees it.
+-pub struct DebugEvent<'a> {    /// The 1-based source line the statement was written on.
++pub struct DebugEvent<'a> {
++    /// The 1-based source line the statement was written on.
+     pub line: usize,
+     /// How many function calls deep this statement is. Top level is `0`.
+     pub depth: usize,
+     /// The live local scopes, outermost first.
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -1316,15 +1316,51 @@
+ }
+ 
+ fn execute_statement(&mut self, stmt: &Stmt) -> Result<Value> {
+     let previous_span = std::mem::replace(&mut self.current_span, stmt.span);
++    self.debug_before(stmt.span.line);
+     let result = self
+         .charge_step()
+         .and_then(|()| self.execute_statement_body(&stmt.statement));
+     self.current_span = previous_span;
+     result
+ }
+ 
++/// Installs the debugger, or takes it away again with `None`.
++///
++/// The hook is asked before every statement and may only answer what to do
++/// next. It cannot change what a statement evaluates to, cannot raise an
++/// error and cannot skip a step charge — a program run with a debugger
++/// attached is the same program, observed.
++pub fn set_debug_hook(&mut self, hook: Option<DebugHook>) {
++    self.debug_hook = hook;
++}
++
++/// Gives the attached debugger the chance to stop before this statement on
++/// `line` runs.
++///
++/// Called first in [`Vm::execute_statement`], before the step charge and
++/// before the statement body, so a breakpoint on a line stops *on* that
++/// line rather than after it. Every diagnostic a program can raise still
++/// comes from the statement itself: the hook has no way to answer with an
++/// error.
++fn debug_before(&mut self, line: usize) {
++    if self.debug_hook.is_none() {
++        return;
++    }
++    // Two fields of the same VM at once: the hook is taken mutably and the
++    // scopes it reads immutably, which is fine because they are disjoint.
++    let event = DebugEvent {
++        line,
++        depth: self.call_depth,
++        scopes: &self.locals,
++        globals: &self.globals,
++    };
++    if let Some(hook) = self.debug_hook.as_mut() {
++        let _ = hook(event);
++    }
++}
++
+ /// The source position of the statement being executed. Every runtime
+ /// failure is reported against it.
+ fn span(&self) -> Span {
+     self.current_span
+
+[0m
+[0m$ [0mgrep -n "^use crate::debugger" src/interpreter.rs; grep -rn "Vm {" src/ --include=*.rs | grep -v "struct\|//" | head
+8:use crate::debugger::{DebugAction, DebugEvent};
+src/interpreter.rs:552:impl Vm {
+src/interpreter.rs:2287:impl Default for Vm {
+src/bytecode/vm.rs:773:impl Default for BytecodeVm {
+src/bytecode/vm.rs:779:impl BytecodeVm {
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -4,9 +4,9 @@
+ //! [`crate::bytecode::vm`] has to answer the same way, so the operations both
+ //! need — arithmetic, indexing, the builtin library — live in
+ //! [`crate::runtime`] and are read from here rather than written twice.
+ 
+-use crate::debugger::{DebugAction, DebugEvent};
++use crate::debugger::{DebugAction, DebugEvent, DebugHook};
+ use crate::error::{Error, Result, Span};
+ use crate::lexer::Lexer;
+ use crate::parser as redblue_parser;
+ use crate::parser::{BinaryOp, Expr, Program, Statement, Stmt, UnaryOp};
+
+[0m
+[0m← [0mEdit src/lib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lib.rs
+@@ -1,7 +1,8 @@
+ pub mod analyzer;
+ pub mod bootstrap;
+ pub mod bytecode;
++pub mod debugger;
+ mod error;
+ pub mod formatter;
+ mod interpreter;
+ pub mod lexer;
+
+[0m
+[0m$ [0mcargo check --lib 2>&1 | tail -30
+[1m[94m|[0m
+[1m[94m8[0m [1m[94m|[0m use crate::debugger::{DebugAction, DebugEvent, DebugHook};
+  [1m[94m|[0m                       [1m[91m^^^^^^^^^^^[0m
+  [1m[94m|[0m
+  [1m[94m= [0m[1mnote[0m: `-D unused-imports` implied by `-D warnings`
+  [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(unused_imports)]`
+
+[1m[91merror[E0277][0m[1m: `(dyn for<'a> FnMut(DebugEvent<'a>) -> DebugAction + 'static)` cannot be sent between threads safely[0m
+   [1m[94m--> [0msrc/interpreter.rs:195:32
+    [1m[94m|[0m
+[1m[94m195[0m [1m[94m|[0m     let joined = match builder.spawn({
+    [1m[94m|[0m                                [1m[91m^^^^^[0m [1m[91m`(dyn for<'a> FnMut(DebugEvent<'a>) -> DebugAction + 'static)` cannot be sent between threads safely[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mhelp[0m: the trait `Send` is not implemented for `(dyn for<'a> FnMut(DebugEvent<'a>) -> DebugAction + 'static)`
+    [1m[94m= [0m[1mnote[0m: required for `std::ptr::Unique<(dyn for<'a> FnMut(DebugEvent<'a>) -> DebugAction + 'static)>` to implement `Send`
+[1m[92mnote[0m: required because it appears within the type `Box<(dyn for<'a> FnMut(DebugEvent<'a>) -> DebugAction + 'static)>`
+   [1m[94m--> [0m/rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library/alloc/src/boxed.rs:236:11
+[1m[92mnote[0m: required because it appears within the type `Option<Box<(dyn for<'a> FnMut(DebugEvent<'a>) -> DebugAction + 'static)>>`
+   [1m[94m--> [0m/rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library/core/src/option.rs:598:9
+[1m[92mnote[0m: required because it appears within the type `Vm`
+   [1m[94m--> [0msrc/interpreter.rs:265:12
+    [1m[94m|[0m
+[1m[94m265[0m [1m[94m|[0m pub struct Vm {
+    [1m[94m|[0m            [1m[92m^^[0m
+    [1m[94m= [0m[1mnote[0m: required because it appears within the type `(Vm, std::result::Result<Value, error::Error>)`
+[1m[92mnote[0m: required by a bound in `Builder::spawn`
+   [1m[94m--> [0m/rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library/std/src/thread/builder.rs:185:4
+
+[1mFor more information about this error, try `rustc --explain E0277`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib) due to 2 previous errors
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -4,9 +4,9 @@
+ //! [`crate::bytecode::vm`] has to answer the same way, so the operations both
+ //! need — arithmetic, indexing, the builtin library — live in
+ //! [`crate::runtime`] and are read from here rather than written twice.
+ 
+-use crate::debugger::{DebugAction, DebugEvent, DebugHook};
++use crate::debugger::{DebugEvent, DebugHook};
+ use crate::error::{Error, Result, Span};
+ use crate::lexer::Lexer;
+ use crate::parser as redblue_parser;
+ use crate::parser::{BinaryOp, Expr, Program, Statement, Stmt, UnaryOp};
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -41,9 +41,14 @@
+ ///
+ /// A plain boxed closure rather than a trait object with an implementation on
+ /// the VM: the debugger is one caller, and the hook is what a host installs to
+ /// be *told* what the program is doing rather than what it produced.
+-pub type DebugHook = Box<dyn FnMut(DebugEvent<'_>) -> DebugAction>;
++///
++/// `Send` because the [`Vm`](crate::Vm) carrying it is sent to the sized thread
++/// `rb run` executes a program on. A `DebugSession` the hook closes over is
++/// therefore an [`Arc`] rather than an [`Rc`]; the REPL runs its program on its
++/// own thread, and only the type has to satisfy the stricter rule.
++pub type DebugHook = Box<dyn FnMut(DebugEvent<'_>) -> DebugAction + Send>;
+ 
+ /// One statement the VM is about to evaluate, as the debugger sees it.
+ pub struct DebugEvent<'a> {
+     /// The 1-based source line the statement was written on.
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -118,13 +118,11 @@
+ 
+ /// Everything a debugging session holds: where the breakpoints are, what the
+ /// next step should do, and the frame the program last stopped at.
+ ///
+-/// Shared with the VM through an [`Rc`], because the hook the VM calls is
+-/// installed by the REPL that also has to answer `:frame` after the run. The
+-/// REPL runs the program on its own thread — not the sized one `rb run` uses —
+-/// so `Rc` is the right handle and `Arc<Mutex<_>>` would buy nothing.
+-pub type SharedDebugSession = Rc<RefCell<DebugSession>>;
++/// Shared with the VM through an [`Arc`], because the hook the VM calls is
++/// installed by the REPL that also has to answer `:frame` after the run.
++pub type SharedDebugSession = Arc<Mutex<DebugSession>>;
+ 
+ /// A handle a caller keeps across the program's run.
+ #[derive(Debug, Clone)]
+ pub struct DebugSession {
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -10,12 +10,21 @@
+ //! cannot be written from Redblue source at all.
+ 
+ use std::cell::RefCell;
+ use std::collections::{BTreeSet, HashMap};
+-use std::rc::Rc;
++use std::sync::{Arc, Mutex, MutexGuard};
+ 
+ use crate::value::{CapturedScope, Value};
+ 
++/// Locks a session, ignoring a poisoned lock.
++///
++/// A hook that panicked while holding the lock has already failed the program
++/// the user was debugging; refusing every later `:frame` because of it would
++/// turn one failure into a session that can no longer be read at all.
++pub fn lock(session: &SharedDebugSession) -> MutexGuard<'_, DebugSession> {
++    session.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
++}
++
+ /// What the debugger does at the next statement it is shown.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum StepMode {
+     /// Run until a breakpoint or a step is reached. Not stepping.
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -173,9 +173,9 @@
+ }
+ 
+ /// A session the hook and its caller share.
+ pub fn shared() -> SharedDebugSession {
+-    Rc::new(RefCell::new(Self::new()))
++    Arc::new(Mutex::new(Self::new()))
+ }
+ 
+ /// Whether the VM has to be asked about the next statement at all.
+ ///
+
+[0m
+[0m$ [0mcargo check --lib 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: unused import: `std::cell::RefCell`[0m
+  [1m[94m--> [0msrc/debugger.rs:12:5
+   [1m[94m|[0m
+[1m[94m12[0m [1m[94m|[0m use std::cell::RefCell;
+   [1m[94m|[0m     [1m[91m^^^^^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `-D unused-imports` implied by `-D warnings`
+   [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(unused_imports)]`
+
+[1m[91merror[0m: could not compile `redblue` (lib) due to 1 previous error
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -8,9 +8,8 @@
+ //! REPL's `:break` / `:step` / `:next` / `:continue` / `:frame` commands, which
+ //! reach this through [`ReplCommand`](crate::repl::commands::ReplCommand) and
+ //! cannot be written from Redblue source at all.
+ 
+-use std::cell::RefCell;
+ use std::collections::{BTreeSet, HashMap};
+ use std::sync::{Arc, Mutex, MutexGuard};
+ 
+ use crate::value::{CapturedScope, Value};
+
+[0m
+[0m$ [0mcargo check --lib 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.73s
+[0m
+[0m→ [0mRead src/repl/commands.rs[90m [offset=200, limit=200][0m
+[0m
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -22,8 +22,22 @@
+ Restore(String),
+ Reset,
+ Run(String),
+ Debug,
++/// Sets a breakpoint on a line, or clears one that is already set there.
++Break(String),
++/// Lists the lines the session has breakpoints on.
++Breaks,
++/// Removes the breakpoint on a line.
++Delete(String),
++/// Arms a step into the next call, for the next program the session runs.
++Step,
++/// Arms a step over the next call, for the next program the session runs.
++Next,
++/// Runs the program to its end, or to the next breakpoint.
++Continue,
++/// Prints the frame the program last stopped in.
++Frame,
+ Inspect(String),
+ Ast(String),
+ Tokens(String),
+ Example,
+
+[0m
+Now the REPL command table entries.
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -162,8 +162,50 @@
+     usage: None,
+     build: |_| ReplCommand::Debug,
+ },
+ CommandSpec {
++    names: &["break", "b"],
++    description: "Stop at a line, or clear the breakpoint there",
++    usage: Some("<line>"),
++    build: |argument| ReplCommand::Break(argument.unwrap_or_default()),
++},
++CommandSpec {
++    names: &["breaks", "bps"],
++    description: "List the lines breakpoints are set on",
++    usage: None,
++    build: |_| ReplCommand::Breaks,
++},
++CommandSpec {
++    names: &["delete", "d"],
++    description: "Remove the breakpoint on a line",
++    usage: Some("<line>"),
++    build: |argument| ReplCommand::Delete(argument.unwrap_or_default()),
++},
++CommandSpec {
++    names: &["step", "st"],
++    description: "Step into the next call",
++    usage: None,
++    build: |_| ReplCommand::Step,
++},
++CommandSpec {
++    names: &["next", "n"],
++    description: "Step over the next call",
++    usage: None,
++    build: |_| ReplCommand::Next,
++},
++CommandSpec {
++    names: &["continue", "c"],
++    description: "Run on to the next breakpoint",
++    usage: None,
++    build: |_| ReplCommand::Continue,
++},
++CommandSpec {
++    names: &["frame", "fr"],
++    description: "Show the frame the program last stopped in",
++    usage: None,
++    build: |_| ReplCommand::Frame,
++},
++CommandSpec {
+     names: &["inspect", "i"],
+     description: "Inspect a variable",
+     usage: Some("<variable>"),
+     build: |argument| ReplCommand::Inspect(argument.unwrap_or_default()),
+
+[0m
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -405,8 +405,22 @@
+ (":r out.txt", "Restore", "out.txt"),
+ (":reset", "Reset", ""),
+ (":run prog.rb", "Run", "prog.rb"),
+ (":debug", "Debug", ""),
++(":break 3", "Break", "3"),
++(":b 3", "Break", "3"),
++(":breaks", "Breaks", ""),
++(":bps", "Breaks", ""),
++(":delete 3", "Delete", "3"),
++(":d 3", "Delete", "3"),
++(":step", "Step", ""),
++(":st", "Step", ""),
++(":next", "Next", ""),
++(":n", "Next", ""),
++(":continue", "Continue", ""),
++(":c", "Continue", ""),
++(":frame", "Frame", ""),
++(":fr", "Frame", ""),
+ (":inspect x", "Inspect", "x"),
+ (":i x", "Inspect", "x"),
+ (":ast 1 + 1", "Ast", "1 + 1"),
+ (":tokens 1 + 1", "Tokens", "1 + 1"),
+
+[0m
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -445,8 +445,9 @@
+     | ReplCommand::Run(value)
+     | ReplCommand::Inspect(value)
+     | ReplCommand::Ast(value)
+     | ReplCommand::Tokens(value) => value.as_str(),
++    | ReplCommand::Break(value) | ReplCommand::Delete(value) => value.as_str(),
+     _ => "",
+ };
+ assert_eq!(
+     carried, argument,
+
+[0m
+[0m→ [0mRead src/repl/commands.rs[90m [offset=424, limit=20][0m
+[0m→ [0mRead src/repl/commands.rs[90m [limit=20, offset=441][0m
+[0m
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -444,10 +444,11 @@
+     | ReplCommand::Restore(value)
+     | ReplCommand::Run(value)
+     | ReplCommand::Inspect(value)
+     | ReplCommand::Ast(value)
+-    | ReplCommand::Tokens(value) => value.as_str(),
+-    | ReplCommand::Break(value) | ReplCommand::Delete(value) => value.as_str(),
++    | ReplCommand::Tokens(value)
++    | ReplCommand::Break(value)
++    | ReplCommand::Delete(value) => value.as_str(),
+     _ => "",
+ };
+ assert_eq!(
+     carried, argument,
+
+[0m
+[0m$ [0msed -n '1,150p' src/repl/mod.rs
+pub mod commands;
+pub mod completer;
+pub mod history;
+
+use std::collections::HashMap;
+use std::io::{self, Write};
+
+pub use commands::ReplCommand;
+pub use completer::ReplCompleter;
+pub use history::ReplHistory;
+
+use crate::analyzer;
+use crate::interpreter::Vm;
+use crate::lexer::Lexer;
+use crate::parser::{open_block_depth, Parser, Program};
+use crate::value::Value;
+
+/// How many lines a session keeps before the oldest is dropped. A terminal
+/// scrollback holds far more, so a session that outgrows this has already lost
+/// anything the user would go looking for.
+const HISTORY_LIMIT: usize = 1000;
+
+/// The most lines a block may hold before the session stops waiting for its
+/// `end`.
+///
+/// Nobody types five hundred lines into one block by accident, and a piped block
+/// that is never closed — `printf 'repeat 3 times\n' | rb`, or a generator that
+/// forgot its `end` — buffered without limit until the process ran out of memory.
+/// Past this the session says the block is incomplete and starts over, which is
+/// what the user would have to do by hand anyway.
+const MAX_BLOCK_LINES: usize = 500;
+
+/// The most bytes a block may hold, for the same reason and for the same inputs:
+/// a block of a few very long lines gets nowhere near [`MAX_BLOCK_LINES`] and can
+/// still be enormous.
+const MAX_BLOCK_BYTES: usize = 64 * 1024;
+
+/// How many lines of an unclosed block are echoed back when the session ends or
+/// gives up. The rest are counted and reported, so the report itself cannot be
+/// the thing that floods a terminal.
+const BLOCK_REPORT_LINES: usize = 20;
+
+/// The snippets `:help` prints under "Quick Reference", each one a complete
+/// program the session has run.
+///
+/// Kept as source rather than as a hand-written sentence so the help cannot
+/// promise something the interpreter does not do: `if x > 5 then` was printed for
+/// years and is not Redblue, and `say "Hello, {{name}}!"` promised an
+/// interpolation `say` does not perform.
+const QUICK_REFERENCE: &[(&str, &str)] = &[
+    ("Variable", "set x to 10"),
+    ("Print", r#"say "Hello""#),
+    ("Condition", "if x is greater than 5 then say \"big\" end"),
+    ("Loop", "for each i from 1 to 3\n    say i\nend"),
+];
+
+/// The code `:example` shows: a caption, the program, and the text that program
+/// prints.
+///
+/// Every entry has run in this session before it is printed here — the test at
+/// the bottom of this module analyzes each source and asserts it is accepted —
+/// so an example cannot promise a feature the interpreter does not have. The old
+/// examples promised string interpolation: `say "Hello, {{name}}!"` printed
+/// `Hello, {{name}}!`.
+const EXAMPLES: &[(&str, &str)] = &[
+    ("// Variables", "set name to \"World\"\nsay name"),
+    (
+        "// Print",
+        "set name to \"World\"\nsay \"Hello, \" + name + \"!\"",
+    ),
+    ("// Math", "set x to (10 + 5) * 2\nsay x"),
+    (
+        "// Conditionals",
+        "set age to 30\nif age is greater than 18 then\n    say \"Adult\"\nelse\n    say \"Minor\"\nend",
+    ),
+    (
+        "// Loops",
+        "repeat 3 times\n    say \"Hello!\"\nend",
+    ),
+    (
+        "// Functions",
+        "to greet(who)\n    say \"Hello, \" + who + \"!\"\nend\ngreet(\"World\")",
+    ),
+];
+
+pub struct Repl {
+    vm: Vm,
+    variables: HashMap<String, Value>,
+    history: ReplHistory,
+    completer: ReplCompleter,
+    running: bool,
+    multiline_buffer: Vec<String>,
+    in_multiline: bool,
+}
+
+impl Repl {
+    pub fn new() -> Self {
+        Self {
+            vm: Vm::new(),
+            variables: HashMap::new(),
+            history: ReplHistory::new(HISTORY_LIMIT),
+            completer: ReplCompleter::new(),
+            running: true,
+            multiline_buffer: Vec::new(),
+            in_multiline: false,
+        }
+    }
+
+    /// Completes `word` against the session: the language's own keywords and
+    /// builtins, the REPL's commands, and every name this session has bound.
+    pub fn complete(&self, word: &str) -> Vec<String> {
+        self.completer.complete_with(word, &self.session_names())
+    }
+
+    /// Every name a completion could offer from the live session: the REPL's own
+    /// variables, plus the VM's own bindings, which is where a `to` function and
+    /// an `import`ed module's own `set` and `constant` declarations live.
+    ///
+    /// The `module_member` names a module's functions are published under are not
+    /// here — see [`Vm::user_names`]. `MathUtils.circle_area` is what a program
+    /// writes, and `MathUtils_circle_area` is only how the VM reaches it.
+    fn session_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.variables.keys().cloned().collect();
+        names.extend(self.vm.user_names());
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Whether `code` is a program the user has not finished typing, and so wants
+    /// the session to read another line before running anything.
+    ///
+    /// The question is asked of the tokens rather than of the last word of the
+    /// line. Matching the last word got both directions wrong: `repeat 3 times`
+    /// ends in `times` and `for each i from 1 to 10` ends in `10`, so real blocks
+    /// were run half-written, while a stray `end` matched and captured every line
+    /// after it.
+    ///
+    /// A line the lexer cannot read is treated as finished. It is a line the user
+    /// is going to retype, and waiting for an `end` that will never balance it
+    /// would hang the session on it.
+    fn needs_continuation(code: &str) -> bool {
+        match Lexer::tokenize(code) {
+            Ok(tokens) => open_block_depth(&tokens) > 0,
+            Err(_) => false,
+        }
+    }
+
+    pub fn run(&mut self) {
+        println!("Welcome to Redblue v0.1.0 - Interactive REPL");
+[0m
+Now the REPL wiring: the session field, dispatch, and the interactive stop prompt.
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -90,8 +90,12 @@
+     completer: ReplCompleter,
+     running: bool,
+     multiline_buffer: Vec<String>,
+     in_multiline: bool,
++    /// The debugging session: its breakpoints, its pending step, and the frame
++    /// the last program stopped in. Shared with the hook the VM calls, so a
++    /// `:frame` typed after the program has run reads the frame that stop left.
++    debug: SharedDebugSession,
+ }
+ 
+ impl Repl {
+     pub fn new() -> Self {
+@@ -102,8 +106,9 @@
+             completer: ReplCompleter::new(),
+             running: true,
+             multiline_buffer: Vec::new(),
+             in_multiline: false,
++            debug: DebugSession::shared(),
+         }
+     }
+ 
+     /// Completes `word` against the session: the language's own keywords and
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -9,8 +9,9 @@
+ pub use completer::ReplCompleter;
+ pub use history::ReplHistory;
+ 
+ use crate::analyzer;
++use crate::debugger::{lock, DebugAction, DebugSession, SharedDebugSession, StepMode};
+ use crate::interpreter::Vm;
+ use crate::lexer::Lexer;
+ use crate::parser::{open_block_depth, Parser, Program};
+ use crate::value::Value;
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -255,8 +255,36 @@
+ ReplCommand::Debug => {
+     self.debug_mode();
+     true
+ }
++ReplCommand::Break(line) => {
++    self.toggle_breakpoint(&line);
++    true
++}
++ReplCommand::Breaks => {
++    self.print_breakpoints();
++    true
++}
++ReplCommand::Delete(line) => {
++    self.delete_breakpoint(&line);
++    true
++}
++ReplCommand::Step => {
++    self.arm_step(StepMode::Into);
++    true
++}
++ReplCommand::Next => {
++    self.arm_step(StepMode::Over);
++    true
++}
++ReplCommand::Continue => {
++    self.resume();
++    true
++}
++ReplCommand::Frame => {
++    self.print_frame();
++    true
++}
+ ReplCommand::Inspect(name) => {
+     self.inspect_value(&name);
+     true
+ }
+
+[0m
+Now the dispatch arms and the debugger driver in `mod.rs`.
+[0m$ [0msed -n '860,935p' src/interpreter.rs; echo "=== run_program callers ==="; grep -rn "run_program(" src/ | head
+///
+    /// The `module_member` names a module's members are published under are left
+    /// out — see [`Vm::qualified_members`]. They are in `globals` because that is
+    /// where [`Vm::call_method`] looks for them, and a name the program never
+    /// wrote is not one of its names: after `import MathUtils` this used to offer
+    /// `MathUtils_circle_area` to completion and list it in `:vars`, which is a
+    /// name no line of Redblue can call.
+    pub fn user_names(&self) -> Vec<String> {
+        let builtins = stdlib::builtins();
+        let mut names: Vec<String> = self
+            .globals
+            .keys()
+            .filter(|name| !builtins.contains_key(*name) && !self.qualified_members.contains(*name))
+            .cloned()
+            .collect();
+        for scope in &self.locals {
+            names.extend(scope.keys().cloned());
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Publishes `value` as the member `member` of `module`, under the
+    /// `module_member` name a call through the module resolves to.
+    ///
+    /// Every writer of such a name goes through here, so the set of them is
+    /// known exactly and [`Vm::user_names`] does not have to guess which globals
+    /// are mangled names and which are a program's own.
+    fn publish_member(&mut self, module: &str, member: &str, value: Value) {
+        let name = qualified_member(module, member);
+        self.qualified_members.insert(name.clone());
+        self.globals.insert(name, value);
+    }
+
+    /// The value bound to `name`, wherever this VM keeps it.
+    ///
+    /// What a REPL's `:inspect` and `:vars` read, and neither of them could
+    /// answer from its own bookkeeping: a `set`, a `to` and an `import` all bind
+    /// here, not in the REPL's own map, so `:inspect <session-name>` reported
+    /// "not found" for every name a session had actually bound.
+    pub fn user_value(&self, name: &str) -> Option<&Value> {
+        self.get_var_ref(name)
+    }
+
+    /// The names in [`Vm::user_names`] that hold a callable the program
+    /// declared, sorted.
+    ///
+    /// `:funcs` is a listing, so it reads this rather than printing a sentence
+    /// about where functions are stored: "User-defined functions are stored in
+    /// the VM" told the user nothing they could not already see from the same
+    /// line, and named none of the functions they had just written. A builtin is
+    /// a [`Value::Builtin`] and is already excluded from [`Vm::user_names`], so
+    /// what is left is what a `to` declared.
+    ///
+    /// A module's functions are not listed. They are reached as
+    /// `MathUtils.circle_area(..)`, and [`Vm::user_names`] deliberately holds the
+    /// published `MathUtils_circle_area` back rather than showing a name the user
+    /// cannot type; the module's own name is one of the session's names, so it is
+    /// still offered and inspectable.
+    pub fn user_functions(&self) -> Vec<String> {
+        self.user_names()
+            .into_iter()
+            .filter(|name| matches!(self.user_value(name), Some(Value::Function(_))))
+            .collect()
+    }
+
+    /// Runs a module's declarations into this VM, under the name the `import`
+    /// that reached it goes by.
+    ///
+    /// A module already loaded is left alone: importing it twice binds the same
+    /// names twice, and binding a name twice is what a `set` refuses to do and a
+    /// `constant` cannot do at all — the second declaration of the module's own
+    /// `TAU` would be refused as a duplicate of the one the first import bound.
+    ///
+    /// The file is read and parsed once: the bindings and the record that the
+=== run_program callers ===
+src/repl/mod.rs:462:        self.run_program(&program)
+src/repl/mod.rs:477:    fn run_program(&mut self, program: &Program) -> Result<Value, crate::error::Error> {
+src/wasm.rs:244:pub fn run_program(source: &str) -> Result<String, String> {
+[0m
+[0m$ [0mgrep -n "qualified_members" src/interpreter.rs
+359:    qualified_members: HashSet<String>,
+583:            qualified_members: HashSet::new(),
+862:    /// out — see [`Vm::qualified_members`]. They are in `globals` because that is
+872:            .filter(|name| !builtins.contains_key(*name) && !self.qualified_members.contains(*name))
+891:        self.qualified_members.insert(name.clone());
+[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=18, offset=350][0m
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -356,10 +356,9 @@
+ /// `MathUtils.circle_area`, so offering `MathUtils_circle_area` to
+ /// completion, `:vars`, `:funcs` and the analyzer's seed shows the program a
+ /// name it cannot write.
+ qualified_members: HashSet<String>,
+-/// Every `object` declaration, by type name. The table is the inheritance
+-/// model: an entry already holds its own fields and methods merged with
++/// Every `object` declaration, by type name. The table is the inheritance    /// model: an entry already holds its own fields and methods merged with
+ /// everything it inherits, nearest declaration first, so a lookup is a
+ /// single map read and cannot walk a cyclic parent chain.
+ objects: HashMap<String, ObjectType>,
+ expectation_failure: Option<crate::testing::assertions::TestAssertionError>,
+
+[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=8, offset=358][0m
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -356,9 +356,18 @@
+ /// `MathUtils.circle_area`, so offering `MathUtils_circle_area` to
+ /// completion, `:vars`, `:funcs` and the analyzer's seed shows the program a
+ /// name it cannot write.
+ qualified_members: HashSet<String>,
+-/// Every `object` declaration, by type name. The table is the inheritance    /// model: an entry already holds its own fields and methods merged with
++/// The names every VM is born holding: the builtins
++/// [`stdlib::builtins`] provides, by name.
++///
++/// A copy of the keys rather than a call to [`stdlib::builtins`] per
++/// question, because the debugger asks "which globals did the program
++/// write" at *every statement it is shown* and a frame listing two hundred
++/// builtins answers nothing.
++builtin_names: HashSet<String>,
++/// Every `object` declaration, by type name. The table is the inheritance
++/// model: an entry already holds its own fields and methods merged with
+ /// everything it inherits, nearest declaration first, so a lookup is a
+ /// single map read and cannot walk a cyclic parent chain.
+ objects: HashMap<String, ObjectType>,
+ expectation_failure: Option<crate::testing::assertions::TestAssertionError>,
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -588,8 +588,9 @@
+ importing: Vec::new(),
+ declared_modules: HashMap::new(),
+ module_depth: 0,
+ qualified_members: HashSet::new(),
++builtin_names: stdlib::builtins().keys().cloned().collect(),
+ objects: HashMap::new(),
+ expectation_failure: None,
+ assertions_failed: 0,
+ current_span: Span::unknown(),
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -1362,8 +1362,10 @@
+     line,
+     depth: self.call_depth,
+     scopes: &self.locals,
+     globals: &self.globals,
++    builtins: &self.builtin_names,
++    module_members: &self.qualified_members,
+ };
+ if let Some(hook) = self.debug_hook.as_mut() {
+     let _ = hook(event);
+ }
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -67,49 +67,60 @@
+     pub scopes: &'a [CapturedScope],
+     /// The program's globals, which top-level statements bind into rather than
+     /// into `scopes`.
+     pub globals: &'a HashMap<String, Value>,
++    /// The names the VM was born holding. A frame lists what the program wrote,
++    /// not the two hundred builtins it never touched.
++    pub builtins: &'a HashSet<String>,
++    /// The `Module_member` names a module's functions are published under — the
++    /// interior of `MathUtils.circle_area`, which no line of Redblue can write.
++    pub module_members: &'a HashSet<String>,
+ }
+ 
++impl DebugEvent<'_> {
++    /// Whether `name` is one the running program wrote, as opposed to something
++    /// the VM was born holding.
++    fn is_program_name(&self, name: &str) -> bool {
++        !self.builtins.contains(name) && !self.module_members.contains(name)
++    }
++}
++
+ /// A frame as it was when the program stopped: a copy, because the values in it
+ /// keep changing as soon as the program is resumed.
+ #[derive(Debug, Clone)]
+ pub struct Frame {
+     pub line: usize,
+     pub depth: usize,
+-    /// Every name visible at the stop, sorted by name so two stops with the same
+-    /// bindings list them the same way.
++    /// Every name the program wrote that is visible at the stop, sorted by name
++    /// so two stops with the same bindings list them the same way.
+     pub bindings: Vec<(String, Value)>,
+ }
+ 
+ impl Frame {
+-    fn capture(
+-        line: usize,
+-        depth: usize,
+-        scopes: &[CapturedScope],
+-        globals: &HashMap<String, Value>,
+-    ) -> Self {
++    fn capture(event: &DebugEvent<'_>) -> Self {
+         // The innermost scope that holds a name is the one a read would find, so
+         // the walk runs from the inside out and the first sighting of a name
+         // wins. Globals fill in the names no live scope holds.
+         let mut bindings: Vec<(String, Value)> = Vec::new();
+-        for scope in scopes.iter().rev() {
++        let mut hold = |bindings: &mut Vec<(String, Value)>, name: &str, value: Value| {
++            if !bindings.iter().any(|(held, _)| held == name) {
++                bindings.push((name.to_string(), value));
++            }
++        };
++        for scope in event.scopes.iter().rev() {
+             for (name, value) in scope.iter() {
+-                if !bindings.iter().any(|(held, _)| held == name) {
+-                    bindings.push((name.clone(), value.clone()));
+-                }
++                hold(&mut bindings, name, value.clone());
+             }
+         }
+-        for (name, value) in globals {
+-            if !bindings.iter().any(|(held, _)| held == name) {
+-                bindings.push((name.clone(), value.clone()));
++        for (name, value) in event.globals {
++            if event.is_program_name(name) {
++                hold(&mut bindings, name, value.clone());
+             }
+         }
+         bindings.sort_by(|left, right| left.0.cmp(&right.0));
+-        bindings.retain(|(name, _)| !name.starts_with('_'));
+         Frame {
+-            line,
+-            depth,
++            line: event.line,
++            depth: event.depth,
+             bindings,
+         }
+     }
+ 
+
+[0m
+Now update `debugger.rs` to match the richer event.
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -259,9 +259,10 @@
+ /// records the frame if it should.
+ ///
+ /// The answer is the only thing the hook gets, and returning `false` is the
+ /// whole of "carry on": the VM then evaluates what it was going to evaluate.
+-pub fn poll(&mut self, line: usize, depth: usize, scopes: &[CapturedScope], globals: &HashMap<String, Value>) -> bool {
++pub fn poll(&mut self, event: &DebugEvent<'_>) -> bool {
++    let (line, depth) = (event.line, event.depth);
+     let here = (line, depth);
+     // Leaving a statement re-arms the breakpoint it held, which is what
+     // makes a breakpoint in a loop fire on every iteration rather than on
+     // the first.
+
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -285,9 +285,9 @@
+     self.stop_depth = depth;
+     self.suppressed = Some(here);
+     self.stopped = true;
+     self.stops += 1;
+-    self.last_stop = Some(Frame::capture(line, depth, scopes, globals));
++    self.last_stop = Some(Frame::capture(event));
+     true
+ }
+ 
+ /// The answer the VM acts on after a stop: what `c` / `n` / `s` at the
+
+[0m
+[0m$ [0mcargo check --lib 2>&1 | tail -20
+[1m[96mhelp[0m: there is a method `print_ast` with a similar name, but with different arguments
+   [1m[94m--> [0msrc/repl/mod.rs:765:5
+    [1m[94m|[0m
+[1m[94m765[0m [1m[94m|[0m     fn print_ast(&self, code: &str) {
+    [1m[94m|[0m     [1m[96m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[91merror[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/debugger.rs:104:13
+    [1m[94m|[0m
+[1m[94m104[0m [1m[94m|[0m         let mut hold = |bindings: &mut Vec<(String, Value)>, name: &str, value: Value| {
+    [1m[94m|[0m             [1m[94m----[0m[1m[91m^^^^[0m
+    [1m[94m|[0m             [1m[94m|[0m
+    [1m[94m|[0m             [1m[94mhelp: remove this `mut`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `-D unused-mut` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(unused_mut)]`
+
+[1mSome errors have detailed explanations: E0425, E0599.[0m
+[1mFor more information about an error, try `rustc --explain E0425`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib) due to 11 previous errors
+[0m
+[0m← [0mEdit src/debugger.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/debugger.rs
++++ /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+@@ -100,9 +100,9 @@
+ // The innermost scope that holds a name is the one a read would find, so
+ // the walk runs from the inside out and the first sighting of a name
+ // wins. Globals fill in the names no live scope holds.
+ let mut bindings: Vec<(String, Value)> = Vec::new();
+-let mut hold = |bindings: &mut Vec<(String, Value)>, name: &str, value: Value| {
++let hold = |bindings: &mut Vec<(String, Value)>, name: &str, value: Value| {
+     if !bindings.iter().any(|(held, _)| held == name) {
+         bindings.push((name.to_string(), value));
+     }
+ };
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -711,12 +711,109 @@
+     }
+ }
+ 
+ fn debug_mode(&self) {
+-    println!("Debug mode - Not implemented yet");
+-    println!("Press Ctrl+C to exit debug mode");
++    let session = lock(&self.debug);
++    let lines = session.breakpoints();
++    println!(
++        "Debugger: {} breakpoint(s) set. `:break <line>` sets one, `:next` steps \
++         over a call, `:step` steps into it, `:continue` runs on.",
++        lines.len()
++    );
++    for line in lines {
++        println!("  line {}", line);
++    }
+ }
+ 
++/// Sets the breakpoint on `argument`, or clears one already set there.
++fn toggle_breakpoint(&self, argument: &str) {
++    match line_number(argument) {
++        Ok(line) => {
++            let mut session = lock(&self.debug);
++            if session.toggle_breakpoint(line) {
++                println!("Breakpoint set on line {}.", line);
++            } else {
++                println!("Breakpoint removed from line {}.", line);
++            }
++        }
++        Err(complaint) => println!("{}", complaint),
++    }
++}
++
++/// Removes the breakpoint on `argument`, saying so when there was none.
++fn delete_breakpoint(&self, argument: &str) {
++    match line_number(argument) {
++        Ok(line) => {
++            let mut session = lock(&self.debug);
++            if session.clear_breakpoint(line) {
++                println!("Breakpoint removed from line {}.", line);
++            } else {
++                println!("No breakpoint on line {}.", line);
++            }
++        }
++        Err(complaint) => println!("{}", complaint),
++    }
++}
++
++/// Lists where the breakpoints are, or that there are none.
++fn print_breakpoints(&self) {
++    let session = lock(&self.debug);
++    let lines = session.breakpoints();
++    if lines.is_empty() {
++        println!("No breakpoints set.");
++        return;
++    }
++    println!("Breakpoints:");
++    for line in lines {
++        println!("  line {}", line);
++    }
++}
++
++/// Arms a step for the next program the session runs.
++fn arm_step(&self, mode: StepMode) {
++    let mut session = lock(&self.debug);
++    session.arm_step(mode);
++    if session.is_stopped() {
++        session.record_action(DebugAction::Step(mode));
++    }
++    println!(
++        "{}",
++        match mode {
++            StepMode::Into => "Stepping into the next call.",
++            StepMode::Over => "Stepping over the next call.",
++            StepMode::None => "Continuing.",
++        }
++    );
++}
++
++/// Runs on to the next breakpoint, or reports that there is nothing stopped.
++fn resume(&self) {
++    let mut session = lock(&self.debug);
++    if session.is_stopped() {
++        for line in session.stop_report() {
++            println!("{}", line);
++        }
++        return;
++    }
++    if session.breakpoints().is_empty() && !session.active() {
++        println!("Nothing is stopped and no breakpoints are set.");
++        return;
++    }
++    println!("Running to the next breakpoint.");
++}
++
++/// Prints the frame the program last stopped in, or says there was none.
++fn print_frame(&self) {
++    let session = lock(&self.debug);
++    let Some(frame) = session.last_stop() else {
++        println!("Nothing has stopped yet.");
++        return;
++    };
++    for line in frame.lines() {
++        println!("{}", line);
++    }
++}
++
+ /// The `:inspect` listing for `name`, or `None` when nothing in the session is
+ /// bound to it.
+ ///
+ /// The lookup asks the VM as well as the REPL's own map. `set`, `to` and
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -40,10 +40,9 @@
+ /// gives up. The rest are counted and reported, so the report itself cannot be
+ /// the thing that floods a terminal.
+ const BLOCK_REPORT_LINES: usize = 20;
+ 
+-/// The snippets `:help` prints under "Quick Reference", each one a complete
+-/// program the session has run.
++/// The snippets `:help` prints under "Quick Reference", each one a complete/// program the session has run.
+ ///
+ /// Kept as source rather than as a hand-written sentence so the help cannot
+ /// promise something the interpreter does not do: `if x > 5 then` was printed for
+ /// years and is not Redblue, and `say "Hello, {{name}}!"` promised an
+
+[0m
+Now the driver itself: line-number parsing, the stop prompt, and hook installation.
+[0m$ [0mgrep -n "The snippets" -A 3 src/repl/mod.rs | head
+44:/// The snippets `:help` prints under "Quick Reference", each one a complete/// program the session has run.
+45-///
+46-/// Kept as source rather than as a hand-written sentence so the help cannot
+47-/// promise something the interpreter does not do: `if x > 5 then` was printed for
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -40,10 +40,113 @@
+ /// gives up. The rest are counted and reported, so the report itself cannot be
+ /// the thing that floods a terminal.
+ const BLOCK_REPORT_LINES: usize = 20;
+ 
+-/// The snippets `:help` prints under "Quick Reference", each one a complete/// program the session has run.
++/// The prompt a program stopped by the debugger waits at.
+ ///
++/// Distinct from `>>> ` and `..  ` because it is asked by a running program
++/// rather than typed at, and a session has to be able to tell the three apart.
++const DEBUG_PROMPT: &str = "(rb-debug) ";
++
++/// The answers a debugger prompt takes, and what each one asks the VM to do.
++///
++/// Read in [`debug_stop`]. Every word is also reachable with a sigil, because
++/// the same words are the REPL's `:continue`, `:step` and `:next` and a user who
++/// has learned one should not have to unlearn it in the other place.
++fn debug_answer(input: &str) -> Option<DebugAction> {
++    let word = input
++        .trim()
++        .trim_start_matches(|c| c == ':' || c == '.')
++        .split_whitespace()
++        .next()
++        .unwrap_or_default()
++        .to_ascii_lowercase();
++    match word.as_str() {
++        "c" | "continue" | "r" | "run" | "q" | "quit" | "detach" => Some(DebugAction::Run),
++        "s" | "step" | "into" => Some(DebugAction::Step(StepMode::Into)),
++        "n" | "next" | "over" => Some(DebugAction::Step(StepMode::Over)),
++        _ => None,
++    }
++}
++
++/// Whether `input` at a debugger prompt asked to be shown the frame again.
++fn debug_asks_for_frame(input: &str) -> bool {
++    let word = input
++        .trim()
++        .trim_start_matches(|c| c == ':' || c == '.')
++        .split_whitespace()
++        .next()
++        .unwrap_or_default()
++        .to_ascii_lowercase();
++    matches!(word.as_str(), "f" | "frame" | "where" | "bt" | "backtrace")
++}
++
++/// The interactive half of a stop: print where the program is, then read what to
++/// do about it.
++///
++/// This is the one place a running Redblue program reads the terminal, and it is
++/// here rather than anywhere in the interpreter so that the VM never learns that
++/// a terminal exists. Two reads end the wait rather than spinning on it: end of
++/// input, which is what a piped session runs into, and a terminal that has gone
++/// away. A debugger that kept asking a closed pipe for answers would hang the
++/// very sessions it is meant to be able to watch.
++fn debug_stop(report: &[String]) -> DebugAction {
++    for line in report {
++        println!("{}", line);
++    }
++    loop {
++        print!("{}", DEBUG_PROMPT);
++        if io::stdout().flush().is_err() {
++            return DebugAction::Run;
++        }
++        let mut input = String::new();
++        match io::stdin().read_line(&mut input) {
++            Ok(0) | Err(_) => {
++                println!();
++                return DebugAction::Run;
++            }
++            Ok(_) => {}
++        }
++        if debug_asks_for_frame(&input) {
++            for line in report {
++                println!("{}", line);
++            }
++            continue;
++        }
++        if let Some(action) = debug_answer(&input) {
++            return action;
++        }
++        if input.trim().is_empty() {
++            continue;
++        }
++        println!(
++            "Expected c (continue), s (step into), n (step over) or f (frame). \
++             A line with none of those is not a debugger answer."
++        );
++    }
++}
++
++/// Reads the line number a `:break` or `:delete` was given, or says why it is
++/// not one.
++///
++/// Nothing is guessed. An argument that does not parse is reported rather than
++/// read as line `0`, and `0` is refused rather than clamped up to `1`: a
++/// breakpoint on a line the program never has is a debugger that appears to
++/// ignore the user, which is worse than one that says the line is wrong.
++fn line_number(argument: &str) -> Result<usize, String> {
++    let trimmed = argument.trim();
++    let line: usize = trimmed
++        .parse()
++        .map_err(|_| format!("'{trimmed}' is not a line number"))?;
++    if line == 0 {
++        return Err("lines are counted from 1, so there is no line 0".to_string());
++    }
++    Ok(line)
++}
++
++/// The snippets `:help` prints under "Quick Reference", each one a complete
++/// program the session has run.
++///
+ /// Kept as source rather than as a hand-written sentence so the help cannot
+ /// promise something the interpreter does not do: `if x > 5 then` was printed for
+ /// years and is not Redblue, and `say "Hello, {{name}}!"` promised an
+ /// interpolation `say` does not perform.
+
+[0m
+Now wire the hook into `run_code` / `run_program`.
+[0m→ [0mRead src/repl/mod.rs[90m [limit=40, offset=540][0m
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -560,11 +560,36 @@
+     let mut parser = Parser::new(tokens);
+     let program = parser.parse()?;
+     let bound = self.session_names();
+     analyzer::analyze_with_bound_names(&program, &bound)?;
+-    self.run_program(&program)
++    self.run_program(&program, code)
+ }
+ 
++/// Installs the debugger on the session's VM for the program about to run,
++/// or takes it away again.
++///
++/// The hook is installed only when the session has something to stop for — a
++/// breakpoint, or a step armed at the prompt — so a session that never asked
++/// to debug pays a single `is_none` branch per statement and nothing else.
++fn arm_debugger(&mut self, source: &str) {
++    if !lock(&self.debug).active() {
++        self.vm.set_debug_hook(None);
++        return;
++    }
++    lock(&self.debug).set_source(source);
++    let session = std::sync::Arc::clone(&self.debug);
++    self.vm.set_debug_hook(Some(Box::new(move |event| {
++        let mut session = lock(&session);
++        if !session.poll(&event) {
++            return DebugAction::Run;
++        }
++        let report = session.stop_report();
++        let action = debug_stop(&report);
++        session.record_action(action);
++        action
++    })));
++}
++
+ /// Runs `program` in this session's VM and prints what it printed.
+ ///
+ /// [`Vm::run`] prints the VM's whole output buffer at the end of a program and
+ /// leaves the buffer alone, and that buffer belongs to the VM rather than to
+
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=25, offset=598][0m
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -600,11 +600,24 @@
+ /// Printing what is left on the error path is the other half: a program that
+ /// fails half way through never reaches [`Vm::run`]'s print loop, so the `say`
+ /// it had already run would otherwise be reported several lines later, by
+ /// whichever program ran next.
+-fn run_program(&mut self, program: &Program) -> Result<Value, crate::error::Error> {
++/// `source` is the text `program` was parsed from, which is what a stop shows
++/// the user so the line they are looking at is the line they wrote. It is
++/// the whole block the session buffered, so its line numbers are the block's
++/// own rather than the prompt's.
++fn run_program(
++    &mut self,
++    program: &Program,
++    source: &str,
++) -> Result<Value, crate::error::Error> {
++    self.arm_debugger(source);
+     self.vm.take_output();
+     let result = self.vm.run(program);
++    // The program has finished, so nothing is stopped any more. The frame the
++    // last stop left is kept: `:frame` typed at the prompt then reports the
++    // frame the program stopped in rather than pretending it never did.
++    lock(&self.debug).mark_resumed();
+     if result.is_err() {
+         for line in self.vm.take_output() {
+             println!("{}", line);
+         }
+
+[0m
+[0m$ [0mcargo check --lib 2>&1 | grep -E "^(error|warning)" -A 8 | head -60
+(no output)
+[0m
+[0m$ [0mcargo test --test debugger_test 2>&1 | tail -30
+[1m[94m|[0m
+[1m[96mhelp[0m: consider importing this struct
+   [1m[94m|[0m
+[1m[94m12[0m [92m+ use std::collections::HashSet;[0m
+   [1m[94m|[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `HashSet` in this scope[0m
+  [1m[94m--> [0msrc/debugger.rs:76:29
+   [1m[94m|[0m
+[1m[94m76[0m [1m[94m|[0m     pub module_members: &'a HashSet<String>,
+   [1m[94m|[0m                             [1m[91m^^^^^^^[0m [1m[91mnot found in this scope[0m
+   [1m[94m|[0m
+[1m[96mhelp[0m: consider importing this struct
+   [1m[94m|[0m
+[1m[94m12[0m [92m+ use std::collections::HashSet;[0m
+   [1m[94m|[0m
+
+[1m[91merror[0m[1m: variable does not need to be mutable[0m
+   [1m[94m--> [0msrc/repl/mod.rs:930:13
+    [1m[94m|[0m
+[1m[94m930[0m [1m[94m|[0m         let mut session = lock(&self.debug);
+    [1m[94m|[0m             [1m[94m----[0m[1m[91m^^^^^^^[0m
+    [1m[94m|[0m             [1m[94m|[0m
+    [1m[94m|[0m             [1m[94mhelp: remove this `mut`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `-D unused-mut` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(unused_mut)]`
+
+[1mFor more information about this error, try `rustc --explain E0425`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib) due to 3 previous errors
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+p='src/debugger.rs'
+s=open(p).read()
+s=s.replace("use std::collections::{BTreeSet, HashMap};","use std::collections::{BTreeSet, HashMap, HashSet};")
+open(p,'w').write(s)
+p='src/repl/mod.rs'
+s=open(p).read()
+s=s.replace("""    fn print_frame(&self) {
+        let session = lock(&self.debug);""","""    fn print_frame(&self) {
+        let session = lock(&self.debug);""")
+open(p,'w').write(s)
+EOF
+sed -n '925,940p' src/repl/mod.rs
+);
+    }
+
+    /// Runs on to the next breakpoint, or reports that there is nothing stopped.
+    fn resume(&self) {
+        let mut session = lock(&self.debug);
+        if session.is_stopped() {
+            for line in session.stop_report() {
+                println!("{}", line);
+            }
+            return;
+        }
+        if session.breakpoints().is_empty() && !session.active() {
+            println!("Nothing is stopped and no breakpoints are set.");
+            return;
+        }
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -926,9 +926,9 @@
+ }
+ 
+ /// Runs on to the next breakpoint, or reports that there is nothing stopped.
+ fn resume(&self) {
+-    let mut session = lock(&self.debug);
++    let session = lock(&self.debug);
+     if session.is_stopped() {
+         for line in session.stop_report() {
+             println!("{}", line);
+         }
+
+[0m
+[0m$ [0mcargo test --test debugger_test 2>&1 | tail -40
+---- breakpoint_in_a_loop_fires_on_every_iteration stdout ----
+
+thread 'breakpoint_in_a_loop_fires_on_every_iteration' (7313) panicked at tests/debugger_test.rs:96:5:
+assertion `left == right` failed: a breakpoint inside a loop should stop on all three iterations, and `c` should resume to the next
+--- actual ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 2.
+>>> ..  ..  Stopped at line 2: say x
+line 2 (depth 0)
+    x = 1
+(rb-debug) 1
+2
+3
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+
+  left: 1
+ right: 3
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: debugger_test::breakpoint_in_a_loop_fires_on_every_iteration
+   5: debugger_test::breakpoint_in_a_loop_fires_on_every_iteration::{closure#0}
+   6: <debugger_test::breakpoint_in_a_loop_fires_on_every_iteration::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    breakpoint_in_a_loop_fires_on_every_iteration
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[91merror[0m: test failed, to rerun pass `--test debugger_test`
+[0m
+The suppression rule needs the statement's nesting depth, not just (line, call-depth).
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/interpreter.rs'
+s=open(p).read()
+
+s=s.replace("""    current_span: Span,
+    /// The debugger watching this VM, if one is attached — see
+    /// [`Vm::set_debug_hook`].""","""    current_span: Span,
+    /// How many statements are executing right now, the one in
+    /// [`Vm::execute_statement`] itself counting as one.
+    ///
+    /// Distinct from [`Vm::call_depth`], which counts *calls*: a `say` nested in
+    /// a one-line `if` is one call deep but two statements deep, and the
+    /// debugger needs the second to tell a breakpoint on that line from a stop
+    /// it has already made inside the statement it is looking at.
+    statement_depth: usize,
+    /// The debugger watching this VM, if one is attached — see
+    /// [`Vm::set_debug_hook`].""")
+
+s=s.replace("""            current_span: Span::unknown(),
+            debug_hook: None,""","""            current_span: Span::unknown(),
+            statement_depth: 0,
+            debug_hook: None,""")
+
+s=s.replace("""    fn execute_statement(&mut self, stmt: &Stmt) -> Result<Value> {
+        let previous_span = std::mem::replace(&mut self.current_span, stmt.span);
+        self.debug_before(stmt.span.line);
+        let result = self
+            .charge_step()
+            .and_then(|()| self.execute_statement_body(&stmt.statement));
+        self.current_span = previous_span;
+        result
+    }""","""    fn execute_statement(&mut self, stmt: &Stmt) -> Result<Value> {
+        let previous_span = std::mem::replace(&mut self.current_span, stmt.span);
+        self.statement_depth += 1;
+        self.debug_before(stmt.span.line);
+        let result = self
+            .charge_step()
+            .and_then(|()| self.execute_statement_body(&stmt.statement));
+        // Restored on the failing path as well as the succeeding one: a
+        // statement that raised an error still finished, and leaving the counter
+        // raised would make every later statement look nested inside it.
+        self.statement_depth -= 1;
+        self.current_span = previous_span;
+        result
+    }""")
+
+s=s.replace("""        let event = DebugEvent {
+            line,
+            depth: self.call_depth,""","""        let event = DebugEvent {
+            line,
+            depth: self.call_depth,
+            statement_depth: self.statement_depth,""")
+open(p,'w').write(s)
+PY
+grep -n "statement_depth" src/interpreter.rs
+389:    statement_depth: usize,
+605:            statement_depth: 0,
+1338:        self.statement_depth += 1;
+1346:        self.statement_depth -= 1;
+1378:            statement_depth: self.statement_depth,
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/debugger.rs'
+s=open(p).read()
+
+s=s.replace("""    /// How many function calls deep this statement is. Top level is `0`.
+    pub depth: usize,""","""    /// How many function calls deep this statement is. Top level is `0`.
+    pub depth: usize,
+    /// How many statements are executing, this one included. Top level is `1`.
+    ///
+    /// What tells a statement nested inside the one that stopped from the same
+    /// statement reached again later: a block written on a single line puts a
+    /// `say` inside an `if` on the same line and the same depth, and a loop
+    /// reaches its body line afresh on every iteration at the same depth.
+    pub statement_depth: usize,""")
+
+s=s.replace("""    /// The `(line, depth)` whose breakpoint has already fired and must not fire
+    /// again until execution leaves it, so a block written on one line stops
+    /// once rather than once per statement inside it.
+    suppressed: Option<(usize, usize)>,""","""    /// The `(line, statement depth)` of the stop in progress. A breakpoint on
+    /// that line is not reported again while execution is still *inside* that
+    /// statement — a block written on one line stops once rather than once per
+    /// statement in it — but it is reported again once execution reaches the
+    /// line afresh, which is what makes a breakpoint in a loop fire on every
+    /// iteration.
+    suppressed: Option<(usize, usize)>,""")
+
+s=s.replace("""    /// Arms a step for the *next* program the session runs.
+    ///
+    /// At the prompt there is no frame to step out of, so the step starts at
+    /// depth `0` and stops at the first statement of the program.
+    pub fn arm_step(&mut self, mode: StepMode) {
+        self.pending = mode;
+        self.stop_depth = 0;
+        self.suppressed = None;
+    }""","""    /// Arms a step for the *next* program the session runs.
+    ///
+    /// At the prompt there is no frame to step out of, so the step starts at
+    /// depth `0` and stops at the first statement of the program.
+    pub fn arm_step(&mut self, mode: StepMode) {
+        self.pending = mode;
+        self.stop_depth = 0;
+    }""")
+
+s=s.replace("""    pub fn poll(&mut self, event: &DebugEvent<'_>) -> bool {
+        let (line, depth) = (event.line, event.depth);
+        let here = (line, depth);
+        // Leaving a statement re-arms the breakpoint it held, which is what
+        // makes a breakpoint in a loop fire on every iteration rather than on
+        // the first.
+        if self.suppressed.is_some() && self.suppressed != Some(here) {
+            self.suppressed = None;
+        }
+
+        let stepping = match self.pending {
+            StepMode::None => false,
+            StepMode::Into => depth >= self.stop_depth,
+            StepMode::Over => depth <= self.stop_depth,
+        };
+        let breakpoint = self.suppressed.is_none() && self.breakpoints.contains(&line);
+
+        if !stepping && !breakpoint {
+            return false;
+        }
+
+        self.pending = StepMode::None;
+        self.stop_depth = depth;
+        self.suppressed = Some(here);
+        self.stopped = true;
+        self.stops += 1;
+        self.last_stop = Some(Frame::capture(event));
+        true
+    }""","""    pub fn poll(&mut self, event: &DebugEvent<'_>) -> bool {
+        let (line, depth) = (event.line, event.depth);
+        // Inside the statement that already stopped, on the same line? Then this
+        // is a nested statement of it, not the line being reached again.
+        let inside_stop = match self.suppressed {
+            Some((stopped_line, stopped_depth)) => {
+                stopped_line == line && stopped_depth < event.statement_depth
+            }
+            None => false,
+        };
+
+        let stepping = match self.pending {
+            StepMode::None => false,
+            StepMode::Into => depth >= self.stop_depth,
+            StepMode::Over => depth <= self.stop_depth,
+        };
+        let breakpoint = !inside_stop && self.breakpoints.contains(&line);
+
+        if !stepping && !breakpoint {
+            return false;
+        }
+
+        self.pending = StepMode::None;
+        self.stop_depth = depth;
+        self.suppressed = Some((line, event.statement_depth));
+        self.stopped = true;
+        self.stops += 1;
+        self.last_stop = Some(Frame::capture(event));
+        true
+    }""")
+
+s=s.replace("""                self.pending = mode;
+                self.stop_depth = self.last_stop.as_ref().map_or(0, |frame| frame.depth);
+                self.suppressed = None;
+            }""","""                self.pending = mode;
+                self.stop_depth = self.last_stop.as_ref().map_or(0, |frame| frame.depth);
+            }""")
+open(p,'w').write(s)
+PY
+cargo test --test debugger_test 2>&1 | tail -25
+x = 3
+(rb-debug) 1
+2
+3
+>>> Goodbye!
+
+  left: 0
+ right: 1
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: debugger_test::breakpoint_in_a_loop_fires_on_every_iteration
+   5: debugger_test::breakpoint_in_a_loop_fires_on_every_iteration::{closure#0}
+   6: <debugger_test::breakpoint_in_a_loop_fires_on_every_iteration::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    breakpoint_in_a_loop_fires_on_every_iteration
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[91merror[0m: test failed, to rerun pass `--test debugger_test`
+[0m
+[0m← [0mEdit tests/debugger_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs
+@@ -107,11 +107,16 @@
+             value,
+             out
+         );
+     }
+-    assert_eq!(
+-        count(&out, "\n1\n"),
+-        1,
++    assert!(
++        out.contains("1\n2\n3\n"),
+         "the program should still print every value once\n--- actual ---\n{}",
+         out
+     );
++    assert_eq!(
++        count(&out, "(rb-debug) "),
++        3,
++        "each stop should ask once\n--- actual ---\n{}",
++        out
++    );
+ }
+
+[0m
+[0m$ [0mcargo test --test debugger_test 2>&1 | tail -10
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 1.70s
+[1m[92m     Running[0m tests/debugger_test.rs (target/debug/deps/debugger_test-f92695a0955e65d5)
+
+running 1 test
+test breakpoint_in_a_loop_fires_on_every_iteration ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+Green. Now the remaining edge-case tests.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':break 1\nto add(a, b)\n    say a + b\nend\nsay add(2, 3)\n:s\nn\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -40
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 1.
+>>> ..  ..  Stopped at line 1: to add(a, b)
+line 1 (depth 0)
+(rb-debug) Expected c (continue), s (step into), n (step over) or f (frame). A line with none of those is not a debugger answer.
+(rb-debug) >>> Error: AnalyzerError: Unknown variable 'n'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'to add(a, b)\n    set total to a + b\n    say total\nend\nsay add(2, 3)\n:s\nn\nn\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -40
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> ..  ..  ..  >>> 5
+nothing
+>>> Usage: :save <filename>
+>>> Error: AnalyzerError: Unknown variable 'n'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'n'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':step\nto add(a, b)\n    set total to a + b\n    say total\nend\nsay add(2, 3)\ns\nn\nn\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -50
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Stepping into the next call.
+>>> ..  ..  ..  Stopped at line 1: to add(a, b)
+line 1 (depth 0)
+(rb-debug) Expected c (continue), s (step into), n (step over) or f (frame). A line with none of those is not a debugger answer.
+(rb-debug) >>> Error: AnalyzerError: Unknown variable 'n'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'n'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':step\nto add(a, b)\n    set total to a + b\n    say total\nend\nsay add(2, 3)\nc\nc\nc\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -40
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Stepping into the next call.
+>>> ..  ..  ..  Stopped at line 1: to add(a, b)
+line 1 (depth 0)
+(rb-debug) Expected c (continue), s (step into), n (step over) or f (frame). A line with none of those is not a debugger answer.
+(rb-debug) >>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+[0m
+The block boundary confused my probe input. Let me test a real call step with a single block.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'repeat 1 times\n    to add(a, b)\n        set total to a + b\n        say total\n    end\n    say add(2, 3)\nend\n:step\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -40; echo "=== NOW step into ==="; printf 'repeat 1 times\n    to add(a, b)\n        set total to a + b\n        say total\n    end\n    say add(2, 3)\nend\n:step\nc\ns\nn\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -50
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> ..  ..  ..  ..  ..  ..  5
+nothing
+>>> Stepping into the next call.
+>>> Goodbye!
+=== NOW step into ===
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> ..  ..  ..  ..  ..  ..  5
+nothing
+>>> Stepping into the next call.
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 's'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'n'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':step\nrepeat 1 times\n    to add(a, b)\n        set total to a + b\n        say total\n    end\n    say add(2, 3)\nend\nc\nn\ns\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -60
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Stepping into the next call.
+>>> ..  ..  ..  ..  ..  ..  Stopped at line 1: repeat 1 times
+line 1 (depth 0)
+(rb-debug) 5
+nothing
+>>> Error: AnalyzerError: Unknown variable 'n'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 's'
+  --> 1:1
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':step\nrepeat 1 times\n    to add(a, b)\n        set total to a + b\n        say total\n    end\n    say add(2, 3)\nend\ns\nn\ns\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -60
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Stepping into the next call.
+>>> ..  ..  ..  ..  ..  ..  Stopped at line 1: repeat 1 times
+line 1 (depth 0)
+(rb-debug) Stopped at line 2: to add(a, b)
+line 2 (depth 0)
+(rb-debug) Stopped at line 6: say add(2, 3)
+line 6 (depth 0)
+    add = <function add>
+(rb-debug) Stopped at line 3: set total to a + b
+line 3 (depth 1)
+    a = 2
+    add = <function add>
+    b = 3
+(rb-debug) 5
+nothing
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':break 4\nrepeat 1 times\n    to countdown(n)\n        if n is greater than 0 then\n            countdown(n - 1)\n        end\n    end\n    countdown(2)\nend\nc\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -30; echo "=== oob / never-reached ==="; printf ':break 99\nset a to 1\nsay a\n:break 0\n:break abc\n:break\n:break 99999999999999999999999\n:breaks\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -30
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 4.
+>>> ..  ..  ..  ..  ..  ..  ..  Stopped at line 4: countdown(n - 1)
+line 4 (depth 1)
+    countdown = <function countdown>
+    n = 2
+(rb-debug) >>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+=== oob / never-reached ===
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 99.
+>>> >>> 1
+>>> lines are counted from 1, so there is no line 0
+>>> 'abc' is not a line number
+>>> Usage: :break <line>
+>>> '99999999999999999999999' is not a line number
+>>> Breakpoints:
+  line 99
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/debugger.rs'
+s=open(p).read()
+
+s=s.replace("""    /// The `(line, statement depth)` of the stop in progress. A breakpoint on
+    /// that line is not reported again while execution is still *inside* that
+    /// statement — a block written on one line stops once rather than once per
+    /// statement in it — but it is reported again once execution reaches the
+    /// line afresh, which is what makes a breakpoint in a loop fire on every
+    /// iteration.
+    suppressed: Option<(usize, usize)>,""","""    /// Where the stop in progress was: the line, the call depth, and how deep in
+    /// statements it was. A breakpoint on that line is not reported again while
+    /// execution is still *inside* that statement — a block written on one line
+    /// stops once rather than once per statement in it.
+    ///
+    /// All three are needed to tell the three ways the same line comes round
+    /// again. Same call depth and deeper into statements: a nested statement of
+    /// the block being run, which is not the line being reached. Deeper call
+    /// depth: a recursive call reaching the line afresh, which is. The same
+    /// statement depth in the same call: a loop body on its next iteration,
+    /// which is too.
+    suppressed: Option<Stop>,""")
+
+s=s.replace("""    /// Decides whether the VM should stop before the statement `line` runs, and
+    /// records the frame if it should.""","""    /// Decides whether the VM should stop before the statement `line` runs, and
+    /// records the frame if it should.""")
+
+s=s.replace("""    pub fn poll(&mut self, event: &DebugEvent<'_>) -> bool {
+        let (line, depth) = (event.line, event.depth);
+        // Inside the statement that already stopped, on the same line? Then this
+        // is a nested statement of it, not the line being reached again.
+        let inside_stop = match self.suppressed {
+            Some((stopped_line, stopped_depth)) => {
+                stopped_line == line && stopped_depth < event.statement_depth
+            }
+            None => false,
+        };
+""","""    pub fn poll(&mut self, event: &DebugEvent<'_>) -> bool {
+        let (line, depth) = (event.line, event.depth);
+        let here = Stop {
+            line,
+            depth,
+            statement_depth: event.statement_depth,
+        };
+        // Inside the statement that already stopped, on the same line and in the
+        // same call? Then this is a nested statement of it, not the line being
+        // reached again — see `DebugSession::suppressed`.
+        let inside_stop = self
+            .suppressed
+            .is_some_and(|stopped| stopped.line == here.line
+                && stopped.depth == here.depth
+                && stopped.statement_depth < here.statement_depth);
+""")
+
+s=s.replace("""        self.pending = StepMode::None;
+        self.stop_depth = depth;
+        self.suppressed = Some((line, event.statement_depth));""","""        self.pending = StepMode::None;
+        self.stop_depth = depth;
+        self.suppressed = Some(here);""")
+
+s=s.replace("""/// Everything a debugging session holds: where the breakpoints are, what the
+/// next step should do, and the frame the program last stopped at.""","""/// Where one stop was, in the three numbers that tell the ways the same line
+/// comes round again from one another — see [`DebugSession::suppressed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stop {
+    line: usize,
+    depth: usize,
+    statement_depth: usize,
+}
+
+/// Everything a debugging session holds: where the breakpoints are, what the
+/// next step should do, and the frame the program last stopped at.""")
+open(p,'w').write(s)
+PY
+cargo test --test debugger_test 2>&1 | tail -8
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 1.63s
+[1m[92m     Running[0m tests/debugger_test.rs (target/debug/deps/debugger_test-f92695a0955e65d5)
+
+running 1 test
+test breakpoint_in_a_loop_fires_on_every_iteration ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':break 4\nrepeat 1 times\n    to countdown(n)\n        if n is greater than 0 then\n            countdown(n - 1)\n        end\n    end\n    countdown(2)\nend\nc\nc\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -30
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 4.
+>>> ..  ..  ..  ..  ..  ..  ..  Stopped at line 4: countdown(n - 1)
+line 4 (depth 1)
+    countdown = <function countdown>
+    n = 2
+(rb-debug) Stopped at line 4: countdown(n - 1)
+line 4 (depth 2)
+    countdown = <function countdown>
+    n = 1
+(rb-debug) >>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf ':break 1\nset x to 1 + "a"\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -20; echo "=== nosigil ==="; printf 'break 3\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -20; echo "=== max iter ==="; grep -n "MAX_ITERATIONS\b" src/interpreter.rs | head -5; echo "=== parse err ==="; printf ':break 1\nsay (\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -20
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 1.
+>>> Stopped at line 1: set x to 1 + "a"
+line 1 (depth 0)
+(rb-debug) Error: RuntimeError: Cannot add non-numbers
+  --> 1:1
+>>> Goodbye!
+=== nosigil ===
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Error: RuntimeError: 'break' is only valid inside a loop
+  --> 1:1
+>>> Goodbye!
+=== max iter ===
+47:pub const MAX_ITERATIONS: usize = 1_000_000;
+49:/// The environment variable that overrides [`MAX_ITERATIONS`].
+50:pub const MAX_ITERATIONS_ENV: &str = "REDBLUE_MAX_ITERATIONS";
+54:/// [`MAX_ITERATIONS`] bounds one loop; this bounds the program, because
+72:/// tighter one. Nothing else about the guard moved — [`MAX_ITERATIONS`] still
+=== parse err ===
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 1.
+>>> Error: ParserError: Unexpected token Eof
+  --> 1:6
+>>> Goodbye!
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'next\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -8; printf 'frame\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -8; printf 'continue\n:quit\n' | cargo run --quiet --bin rb 2>&1 | head -8
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Error: AnalyzerError: Unknown variable 'next'
+  --> 1:1
+>>> Goodbye!
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Error: AnalyzerError: Unknown variable 'frame'
+  --> 1:1
+>>> Goodbye!
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Error: AnalyzerError: Unknown variable 'continue'
+  --> 1:1
+>>> Goodbye!
+[0m
+Now the full test suite.
+[0m← [0mWrite tests/debugger_test.rs
+Wrote file successfully.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test debugger_test 2>&1 | tail -60
+>>> ..  ..  ..  ..  ..  ..  Stopped at line 1: repeat 1 times
+line 1 (depth 0)
+(rb-debug) Stopped at line 2: to add(a, b)
+line 2 (depth 0)
+(rb-debug) Stopped at line 6: say add(2, 3)
+line 6 (depth 0)
+    add = <function add>
+(rb-debug) Stopped at line 3: set total to a + b
+line 3 (depth 1)
+    a = 2
+    add = <function add>
+    b = 3
+(rb-debug) 5
+nothing
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: debugger_test::step_over_runs_the_call_and_step_into_descends_into_it
+   3: debugger_test::step_over_runs_the_call_and_step_into_descends_into_it::{closure#0}
+   4: <debugger_test::step_over_runs_the_call_and_step_into_descends_into_it::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- unicode_in_a_stopped_frame_is_shown_intact stdout ----
+
+thread 'unicode_in_a_stopped_frame_is_shown_intact' (8261) panicked at tests/debugger_test.rs:476:5:
+the stop should be on the line it was set for
+--- actual ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 2.
+>>> >>> héllo 🌍 世界
+>>> Error: AnalyzerError: Unknown variable 'c'
+  --> 1:1
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: debugger_test::unicode_in_a_stopped_frame_is_shown_intact
+   3: debugger_test::unicode_in_a_stopped_frame_is_shown_intact::{closure#0}
+   4: <debugger_test::unicode_in_a_stopped_frame_is_shown_intact::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_breakpoint_on_a_one_line_program_fires_once
+    edge_a_frame_lists_the_same_names_in_the_same_order_twice
+    edge_a_loop_over_the_iteration_cap_still_stops_and_still_ends
+    edge_break_on_a_line_the_program_never_reaches_is_simply_never_taken
+    edge_end_of_input_at_a_stop_resumes_rather_than_hanging
+    frame_at_the_prompt_reports_the_last_stop_and_nothing_before_one
+    step_over_runs_the_call_and_step_into_descends_into_it
+    unicode_in_a_stopped_frame_is_shown_intact
+
+test result: FAILED. 8 passed; 8 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+[1m[91merror[0m: test failed, to rerun pass `--test debugger_test`
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && REDBLUE_MAX_ITERATIONS=5 sh -c 'printf ":break 2\nrepeat 50 times\n    set k to 0\n    set k to k + 1\nend\nc\n:quit\n" | cargo run --quiet --bin rb' 2>&1 | head -20
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 2.
+>>> ..  ..  ..  Stopped at line 2: set k to 0
+line 2 (depth 0)
+(rb-debug) Stopped at line 2: set k to 0
+line 2 (depth 0)
+    k = 1
+(rb-debug) Stopped at line 2: set k to 0
+line 2 (depth 0)
+    k = 1
+(rb-debug) 
+Stopped at line 2: set k to 0
+line 2 (depth 0)
+    k = 1
+(rb-debug) 
+Stopped at line 2: set k to 0
+line 2 (depth 0)
+    k = 1
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && REDBLUE_MAX_ITERATIONS=3 sh -c 'printf ":break 3\nrepeat 50 times\n    set k to 0\n    set k to k + 1\nend\nc\n:quit\n" | cargo run --quiet --bin rb' 2>&1 | head -20
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 3.
+>>> ..  ..  ..  Stopped at line 3: set k to k + 1
+line 3 (depth 0)
+    k = 0
+(rb-debug) Stopped at line 3: set k to k + 1
+line 3 (depth 0)
+    k = 0
+(rb-debug) Stopped at line 3: set k to k + 1
+line 3 (depth 0)
+    k = 0
+(rb-debug) 
+Error: RuntimeError: Maximum of 3 iterations reached in a 'repeat' loop
+  --> 1:1
+>>> Goodbye!
+[0m
+Now fixing the tests that assumed each REPL line is a separate program.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/debugger_test.rs'
+s=open(p).read()
+
+s=s.replace('''    assert!(
+        out.contains("\\n5\\n"),
+        "the program should still finish and print\\n--- actual ---\\n{}",
+        out
+    );''','''    assert!(
+        out.contains("5\\nnothing\\n"),
+        "the program should still finish and print\\n--- actual ---\\n{}",
+        out
+    );''')
+
+s=s.replace('''    let out = session(":break 999\\nset a to 1\\nsay a\\n:breaks\\n:quit\\n");
+
+    assert_eq!(
+        count(&out, "Stopped at line"),
+        0,
+        "a breakpoint on a line no statement is written on must never stop \\
+         anything\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("\\n1\\n"),
+        "the program should run to its end regardless\\n--- actual ---\\n{}",
+        out
+    );''','''    let out = session(":break 999\\nrepeat 1 times\\n    say \\"a program ran\\"\\nend\\n:breaks\\n:quit\\n");
+
+    assert_eq!(
+        count(&out, "Stopped at line"),
+        0,
+        "a breakpoint on a line no statement is written on must never stop \\
+         anything\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("a program ran\\n"),
+        "the program should run to its end regardless\\n--- actual ---\\n{}",
+        out
+    );''')
+
+s=s.replace('''    let out = session(":break 1\\nsay \\"first\\"\\nc\\n:quit\\n");
+
+    assert!(
+        out.contains("Stopped at line 1: say \\"first\\"\\nline 1 (depth 0)\\n(rb-debug)"),''','''    let out = session(":break 1\\nrepeat 1 times\\n    say \\"first\\"\\nend\\nc\\n:quit\\n");
+
+    assert!(
+        out.contains("Stopped at line 1: repeat 1 times\\nline 1 (depth 0)\\n(rb-debug)"),''')
+
+s=s.replace('''    let out = session(":break 2\\nrepeat 3 times\\n    say \\"tick\\"\\nend\\n");''','''    let out = session(":break 2\\nrepeat 3 times\\n    say \\"tick\\"\\nend\\n");''')
+
+s=s.replace('''    let out = session(":break 2\\nsay \\"only\\"\\nc\\n:quit\\n");
+
+    assert_eq!(
+        count(&out, "Stopped at line 1"),
+        1,
+        "one statement is one stop, however many times the line was asked for\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("\\nonly\\n"),
+        "the program should still run to its end\\n--- actual ---\\n{}",
+        out
+    );''','''    let out = session(":break 1\\nsay \\"only\\"\\nc\\n:quit\\n");
+
+    assert_eq!(
+        count(&out, "Stopped at line 1"),
+        1,
+        "one statement is one stop, however many times the line was asked for\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("only\\n>>>"),
+        "the program should still run to its end\\n--- actual ---\\n{}",
+        out
+    );''')
+
+s=s.replace('''    let out = session(":break 2\\nset greeting to \\"héllo 🌍 世界\\"\\nsay greeting\\nc\\n:quit\\n");
+
+    assert!(
+        out.contains("Stopped at line 2: say greeting"),''','''    let out = session(":break 3\\nrepeat 1 times\\n    set greeting to \\"héllo 🌍 世界\\"\\n    say greeting\\nend\\nc\\n:quit\\n");
+
+    assert!(
+        out.contains("Stopped at line 3: say greeting"),''')
+
+s=s.replace('''    let out = session(concat!(
+        ":frame\\n",
+        ":break 3\\n",
+        "repeat 1 times\\n",
+        "    set total to 1 + 2\\n",
+        "end\\n",
+        "c\\n",
+        ":frame\\n",
+        ":quit\\n"
+    ));
+
+    assert!(
+        out.contains("Nothing has stopped yet."),
+        "before anything stops there is no frame to report\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("\\nline 3 (depth 0)\\n    total = nothing\\n"),
+        "`:frame` after the run should report the frame the last stop left\\n--- actual ---\\n{}",
+        out
+    );''','''    let out = session(concat!(
+        ":frame\\n",
+        ":break 3\\n",
+        "repeat 1 times\\n",
+        "    set total to 1 + 2\\n",
+        "    say total\\n",
+        "end\\n",
+        "c\\n",
+        ":frame\\n",
+        ":quit\\n"
+    ));
+
+    assert!(
+        out.contains("Nothing has stopped yet."),
+        "before anything stops there is no frame to report\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("\\nline 3 (depth 0)\\n    total = 3\\n"),
+        "`:frame` after the run should report the frame the last stop left\\n--- actual ---\\n{}",
+        out
+    );''')
+
+s=s.replace('''    let out = session_with(
+        ":break 2\\nrepeat 50 times\\n    set k to k + 1\\nend\\nc\\n:quit\\n",
+        &[("REDBLUE_MAX_ITERATIONS", "5")],
+    );
+
+    assert_eq!(
+        count(&out, "Stopped at line 2"),
+        1,
+        "the breakpoint should fire once before the cap is reached\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("Goodbye!"),
+        "the session should still finish\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        !out.contains("Stopped at line 2", ) && count(&out, "Stopped at line 2") == 1,
+        "the cap should stop the loop before it reaches the breakpoint again\\n--- actual ---\\n{}",
+        out
+    );''','''    let out = session_with(
+        ":break 3\\nrepeat 50 times\\n    set k to 0\\n    set k to k + 1\\nend\\nc\\n:quit\\n",
+        &[("REDBLUE_MAX_ITERATIONS", "3")],
+    );
+
+    assert_eq!(
+        count(&out, "Stopped at line 3"),
+        3,
+        "the breakpoint should fire on every iteration the cap allows\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("Maximum of 3 iterations reached in a 'repeat' loop"),
+        "the interpreter's own cap should still stop the loop; the debugger \\
+         must not lift it\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("Goodbye!"),
+        "the session should still finish\\n--- actual ---\\n{}",
+        out
+    );''')
+
+s=s.replace('''    let program = ":break 3\\nrepeat 1 times\\n    set zebra to 1\\n    set alpha to 2\\nend\\nc\\nc\\n:quit\\n";''','''    let program = concat!(
+        ":break 4\\n",
+        "repeat 1 times\\n",
+        "    set zebra to 1\\n",
+        "    set alpha to 2\\n",
+        "    say alpha\\n",
+        "end\\n",
+        "c\\n:quit\\n"
+    );''')
+open(p,'w').write(s)
+PY
+cargo test --test debugger_test 2>&1 | grep -E "^(test |failures:|---- )" | head -40
+test a_program_that_fails_still_reports_its_own_error_under_the_debugger ... ok
+test a_recursive_call_reaches_the_same_breakpoint_at_every_depth ... ok
+test breakpoint_in_a_loop_fires_on_every_iteration ... ok
+test a_program_that_will_not_parse_is_reported_without_ever_stopping ... ok
+test edge_a_breakpoint_on_a_one_line_program_fires_once ... FAILED
+test edge_a_line_number_that_is_not_a_line_is_refused ... ok
+test edge_a_loop_over_the_iteration_cap_still_stops_and_still_ends ... ok
+test edge_a_frame_lists_the_same_names_in_the_same_order_twice ... ok
+test edge_break_on_a_line_the_program_never_reaches_is_simply_never_taken ... ok
+test edge_break_twice_clears_the_breakpoint_and_delete_says_what_it_did ... ok
+test edge_end_of_input_at_a_stop_resumes_rather_than_hanging ... FAILED
+test edge_frame_of_a_stop_with_nothing_bound_lists_no_names ... ok
+test frame_at_the_prompt_reports_the_last_stop_and_nothing_before_one ... ok
+test step_over_runs_the_call_and_step_into_descends_into_it ... ok
+test the_debugger_is_not_reachable_from_redblue_source ... ok
+test unicode_in_a_stopped_frame_is_shown_intact ... ok
+failures:
+---- edge_a_breakpoint_on_a_one_line_program_fires_once stdout ----
+---- edge_end_of_input_at_a_stop_resumes_rather_than_hanging stdout ----
+failures:
+test result: FAILED. 14 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test debugger_test edge_end_of_input 2>&1 | sed -n '1,45p'
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.05s
+[1m[92m     Running[0m tests/debugger_test.rs (target/debug/deps/debugger_test-f92695a0955e65d5)
+
+running 1 test
+test edge_end_of_input_at_a_stop_resumes_rather_than_hanging ... FAILED
+
+failures:
+
+---- edge_end_of_input_at_a_stop_resumes_rather_than_hanging stdout ----
+
+thread 'edge_end_of_input_at_a_stop_resumes_rather_than_hanging' (8556) panicked at tests/debugger_test.rs:263:5:
+assertion `left == right` failed: there is only one answer in the input, so there is only one stop
+--- actual ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 2.
+>>> ..  ..  Stopped at line 2: say "tick"
+line 2 (depth 0)
+(rb-debug) 
+Stopped at line 2: say "tick"
+line 2 (depth 0)
+(rb-debug) 
+Stopped at line 2: say "tick"
+line 2 (depth 0)
+(rb-debug) 
+tick
+tick
+tick
+>>> Goodbye!
+
+  left: 3
+ right: 1
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: debugger_test::edge_end_of_input_at_a_stop_resumes_rather_than_hanging
+   5: debugger_test::edge_end_of_input_at_a_stop_resumes_rather_than_hanging::{closure#0}
+   6: <debugger_test::edge_end_of_input_at_a_stop_resumes_rather_than_hanging::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test debugger_test edge_a_breakpoint_on_a_one_line 2>&1 | sed -n '8,35p'
+---- edge_a_breakpoint_on_a_one_line_program_fires_once stdout ----
+
+thread 'edge_a_breakpoint_on_a_one_line_program_fires_once' (8588) panicked at tests/debugger_test.rs:467:5:
+the program should still run to its end
+--- actual ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 1.
+>>> Stopped at line 1: say "only"
+line 1 (depth 0)
+(rb-debug) only
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: debugger_test::edge_a_breakpoint_on_a_one_line_program_fires_once
+   3: debugger_test::edge_a_breakpoint_on_a_one_line_program_fires_once::{closure#0}
+   4: <debugger_test::edge_a_breakpoint_on_a_one_line_program_fires_once::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_breakpoint_on_a_one_line_program_fires_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/debugger_test.rs'
+s=open(p).read()
+s=s.replace('''        out.contains("only\\n>>>"),''','''        out.contains("(rb-debug) only\\n"),''')
+s=s.replace('''    assert_eq!(
+        count(&out, "Stopped at line 2"),
+        1,
+        "there is only one answer in the input, so there is only one stop\\n--- actual ---\\n{}",
+        out
+    );''','''    assert_eq!(
+        count(&out, "Stopped at line 2"),
+        3,
+        "end of input resumes each iteration, so the breakpoint is reached on \\
+         all three without a single answer being typed\\n--- actual ---\\n{}",
+        out
+    );
+    assert!(
+        out.contains("tick\\ntick\\ntick\\n"),
+        "the program should still run to its end\\n--- actual ---\\n{}",
+        out
+    );''')
+open(p,'w').write(s)
+PY
+cargo test --test debugger_test 2>&1 | grep -E "^(test |failures:|test result)" | head -25
+test a_program_that_will_not_parse_is_reported_without_ever_stopping ... ok
+test breakpoint_in_a_loop_fires_on_every_iteration ... ok
+test a_program_that_fails_still_reports_its_own_error_under_the_debugger ... ok
+test a_recursive_call_reaches_the_same_breakpoint_at_every_depth ... ok
+test edge_a_breakpoint_on_a_one_line_program_fires_once ... FAILED
+test edge_a_line_number_that_is_not_a_line_is_refused ... ok
+test edge_a_loop_over_the_iteration_cap_still_stops_and_still_ends ... ok
+test edge_break_on_a_line_the_program_never_reaches_is_simply_never_taken ... ok
+test edge_a_frame_lists_the_same_names_in_the_same_order_twice ... ok
+test edge_break_twice_clears_the_breakpoint_and_delete_says_what_it_did ... ok
+test edge_end_of_input_at_a_stop_resumes_rather_than_hanging ... ok
+test edge_frame_of_a_stop_with_nothing_bound_lists_no_names ... ok
+test frame_at_the_prompt_reports_the_last_stop_and_nothing_before_one ... ok
+test step_over_runs_the_call_and_step_into_descends_into_it ... ok
+test the_debugger_is_not_reachable_from_redblue_source ... ok
+test unicode_in_a_stopped_frame_is_shown_intact ... ok
+failures:
+failures:
+test result: FAILED. 15 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test debugger_test edge_a_breakpoint_on_a_one_line 2>&1 | sed -n '8,30p'
+---- edge_a_breakpoint_on_a_one_line_program_fires_once stdout ----
+
+thread 'edge_a_breakpoint_on_a_one_line_program_fires_once' (8801) panicked at tests/debugger_test.rs:473:5:
+the program should still run to its end
+--- actual ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Breakpoint set on line 1.
+>>> Stopped at line 1: say "only"
+line 1 (depth 0)
+(rb-debug) only
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: debugger_test::edge_a_breakpoint_on_a_one_line_program_fires_once
+   3: debugger_test::edge_a_breakpoint_on_a_one_line_program_fires_once::{closure#0}
+   4: <debugger_test::edge_a_breakpoint_on_a_one_line_program_fires_once::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '455,480p' tests/debugger_test.rs | cat -A | grep -n "only" 
+7:/// A breakpoint on the only line of a one-line program: the singleton, at both$
+11:    let out = session(":break 1\nsay \"only\"\nc\n:quit\n");$
+20:        out.contains("\nonly\n"),$
+[0m
+[0m← [0mEdit tests/debugger_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs
+@@ -470,9 +470,9 @@
+         "one statement is one stop, however many times the line was asked for\n--- actual ---\n{}",
+         out
+     );
+     assert!(
+-        out.contains("\nonly\n"),
++        out.contains("(rb-debug) only\n"),
+         "the program should still run to its end\n--- actual ---\n{}",
+         out
+     );
+ }
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test debugger_test 2>&1 | grep -E "^(test result)" 
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+[0m
+All 16 green. Now the four gates.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check 2>&1 | head -60
+Diff in /home/runner/work/rbops/rbops/redblue/src/debugger.rs:20:
+ /// the user was debugging; refusing every later `:frame` because of it would
+ /// turn one failure into a session that can no longer be read at all.
+ pub fn lock(session: &SharedDebugSession) -> MutexGuard<'_, DebugSession> {
+-    session.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
++    session
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner())
+ }
+ 
+ /// What the debugger does at the next statement it is shown.
+Diff in /home/runner/work/rbops/rbops/redblue/src/debugger.rs:293:
+         // Inside the statement that already stopped, on the same line and in the
+         // same call? Then this is a nested statement of it, not the line being
+         // reached again — see `DebugSession::suppressed`.
+-        let inside_stop = self
+-            .suppressed
+-            .is_some_and(|stopped| stopped.line == here.line
++        let inside_stop = self.suppressed.is_some_and(|stopped| {
++            stopped.line == here.line
+                 && stopped.depth == here.depth
+-                && stopped.statement_depth < here.statement_depth);
++                && stopped.statement_depth < here.statement_depth
++        });
+ 
+         let stepping = match self.pending {
+             StepMode::None => false,
+Diff in /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs:212:
+ /// program has but holds no statement on. Neither is a crash and neither stops.
+ #[test]
+ fn edge_break_on_a_line_the_program_never_reaches_is_simply_never_taken() {
+-    let out = session(":break 999\nrepeat 1 times\n    say \"a program ran\"\nend\n:breaks\n:quit\n");
++    let out =
++        session(":break 999\nrepeat 1 times\n    say \"a program ran\"\nend\n:breaks\n:quit\n");
+ 
+     assert_eq!(
+         count(&out, "Stopped at line"),
+Diff in /home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs:311:
+ 
+ #[test]
+ fn edge_break_twice_clears_the_breakpoint_and_delete_says_what_it_did() {
+-    let out = session(":break 2\n:breaks\n:break 2\n:breaks\n:delete 2\n:breaks\n:delete 2\n:quit\n");
++    let out =
++        session(":break 2\n:breaks\n:break 2\n:breaks\n:delete 2\n:breaks\n:delete 2\n:quit\n");
+ 
+     assert_eq!(
+         count(&out, "Breakpoint set on line 2."),
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all && cargo fmt --all -- --check && echo FMT_OK
+FMT_OK
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Checking[0m zmij v1.0.23
+[1m[92m    Checking[0m serde_json v1.0.151
+[1m[91merror[0m[1m: this manual char comparison can be written more succinctly[0m
+  [1m[94m--> [0msrc/repl/mod.rs:58:29
+   [1m[94m|[0m
+[1m[94m58[0m [1m[94m|[0m         .trim_start_matches(|c| c == ':' || c == '.')
+   [1m[94m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mhelp: consider using an array of `char`: `[':', '.']`[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mhelp[0m: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_pattern_char_comparison
+   [1m[94m= [0m[1mnote[0m: `-D clippy::manual-pattern-char-comparison` implied by `-D warnings`
+   [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(clippy::manual_pattern_char_comparison)]`
+
+[1m[91merror[0m[1m: this manual char comparison can be written more succinctly[0m
+  [1m[94m--> [0msrc/repl/mod.rs:75:29
+   [1m[94m|[0m
+[1m[94m75[0m [1m[94m|[0m         .trim_start_matches(|c| c == ':' || c == '.')
+   [1m[94m|[0m                             [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mhelp: consider using an array of `char`: `[':', '.']`[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mhelp[0m: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_pattern_char_comparison
+
+[1m[91merror[0m: could not compile `redblue` (lib) due to 2 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[1m[91merror[0m: could not compile `redblue` (lib test) due to 2 previous errors
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/repl/mod.rs'
+s=open(p).read()
+s=s.replace(".trim_start_matches(|c| c == ':' || c == '.')",".trim_start_matches([':', '.'])")
+open(p,'w').write(s)
+PY
+cargo clippy --all-targets -- -D warnings 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.36s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -E "^(test result|error|---- |failures:)" | head -60
+test result: ok. 126 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 153.32s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 198.99s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.28s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.90s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.52s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.04s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -E "FAILED|failed;|error: " | grep -v "0 failed" | head -20; echo "EXIT_CHECK"; cargo test --all-targets >/dev/null 2>&1; echo "exit=$?"
+EXIT_CHECK
+exit=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --doc 2>&1 | tail -5; echo "=== rbops ==="; ls -d rbops 2>&1; ls phases/phase-045 2>&1
+test src/bootstrap.rs - bootstrap (line 6) ... ok
+test src/bytecode/mod.rs - bytecode (line 12) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+=== rbops ===
+ls: cannot access 'rbops': No such file or directory
+ls: cannot access 'phases/phase-045': No such file or directory
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls phases/phase-044/; echo "=== gitignore ==="; cat .gitignore 2>/dev/null; echo "=== status ==="; git status --short | head -20
+FINDINGS.md
+REPORT.md
+=== gitignore ===
+# Build outputs
+/target/
+*.rbc
+a.out
+
+# Stray debug outputs - never commit these
+err.txt
+errors.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent/copilot files (local only, do not commit)
+AGENTS.md
+.skill/
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+
+# Secrets
+.env
+*.pem
+*.key
+credentials.json
+secrets.txt
+
+# Test outputs
+*.tmp
+*.log=== status ===
+ M src/interpreter.rs
+ M src/lib.rs
+ M src/repl/commands.rs
+ M src/repl/mod.rs
+?? src/debugger.rs
+?? tests/debugger_test.rs
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for f in examples/*.rb; do out=$(cargo run --quiet --bin rb -- run "$f" 2>&1); if [ $? -ne 0 ]; then echo "FAIL $f"; echo "$out" | head -3; fi; done; echo "EXAMPLES_DONE"
+EXAMPLES_DONE
+[0m
+Let me simplify the dead branches before finalizing.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/debugger.rs'
+s=open(p).read()
+
+s=s.replace("""    last_stop: Option<Frame>,
+    stopped: bool,
+    stops: usize,
+}""","""    last_stop: Option<Frame>,
+    stops: usize,
+}""")
+s=s.replace("""            last_stop: None,
+            stopped: false,
+            stops: 0,""","""            last_stop: None,
+            stops: 0,""")
+s=s.replace("""        self.suppressed = Some(here);
+        self.stopped = true;
+        self.stops += 1;""","""        self.suppressed = Some(here);
+        self.stops += 1;""")
+s=s.replace("""    /// Whether the program is stopped right now.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped
+    }
+
+""","""""")
+s=s.replace("""    /// Forgets the stopped state, for a program that has since finished.
+    pub fn mark_resumed(&mut self) {
+        self.stopped = false;
+        self.pending = StepMode::None;
+    }
+
+""","""""")
+open(p,'w').write(s)
+
+p='src/repl/mod.rs'
+s=open(p).read()
+s=s.replace("""    /// Arms a step for the next program the session runs.
+    fn arm_step(&self, mode: StepMode) {
+        let mut session = lock(&self.debug);
+        session.arm_step(mode);
+        if session.is_stopped() {
+            session.record_action(DebugAction::Step(mode));
+        }
+        println!(""","""    /// Arms a step for the next program the session runs.
+    fn arm_step(&self, mode: StepMode) {
+        lock(&self.debug).arm_step(mode);
+        println!(""")
+s=s.replace("""    /// Runs on to the next breakpoint, or reports that there is nothing stopped.
+    fn resume(&self) {
+        let session = lock(&self.debug);
+        if session.is_stopped() {
+            for line in session.stop_report() {
+                println!("{}", line);
+            }
+            return;
+        }
+        if session.breakpoints().is_empty() && !session.active() {
+            println!("Nothing is stopped and no breakpoints are set.");
+            return;
+        }
+        println!("Running to the next breakpoint.");
+    }""","""    /// Says what a program typed here would do.
+    ///
+    /// `:continue` at the prompt cannot resume a program — nothing is running
+    /// by then, because a stop is answered from inside the run — so this
+    /// reports the state it would find rather than pretending to act.
+    fn resume(&self) {
+        let session = lock(&self.debug);
+        if session.active() {
+            println!("Running to the next breakpoint.");
+        } else {
+            println!("No breakpoints set and no step armed.");
+        }
+    }""")
+s=s.replace("""        self.arm_debugger(source);
+        self.vm.take_output();
+        let result = self.vm.run(program);
+        // The program has finished, so nothing is stopped any more. The frame the
+        // last stop left is kept: `:frame` typed at the prompt then reports the
+        // frame the program stopped in rather than pretending it never did.
+        lock(&self.debug).mark_resumed();
+        if result.is_err() {""","""        self.arm_debugger(source);
+        self.vm.take_output();
+        let result = self.vm.run(program);
+        if result.is_err() {""")
+open(p,'w').write(s)
+PY
+cargo clippy --all-targets -- -D warnings 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.38s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo FMT_OK && cargo test --test debugger_test --test repl_test 2>&1 | grep -E "^(test result|---- )" 
+FMT_OK
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+[0m
+[0m→ [0mRead src/debugger.rs
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='src/debugger.rs'
+s=open(p).read()
+
+s=s.replace("""    /// Stop at the next statement at or below the depth the step was asked for —
+    /// or deeper, which is a call the step descends into.
+    Into,
+    /// Stop at the next statement at or above the depth the step was asked
+    /// for, so the statements inside a call are run without stopping.
+    Over,""","""    /// Stop at the next statement at or *deeper* than the frame the step was
+    /// asked in, so a call it makes is entered and its statements are shown one
+    /// at a time.
+    Into,
+    /// Stop at the next statement at or *shallower* than the frame the step was
+    /// asked in, so a call it makes is run to its end without stopping inside
+    /// it.
+    Over,""")
+
+s=s.replace("""/// A handle a caller keeps across the program's run.
+#[derive(Debug, Clone)]
+pub struct DebugSession {""","""#[derive(Debug, Clone)]
+pub struct DebugSession {""")
+
+s=s.replace("""    last_stop: Option<Frame>,
+    stops: usize,
+}""","""    last_stop: Option<Frame>,
+}""")
+s=s.replace("""            last_stop: None,
+            stops: 0,
+        }""","""            last_stop: None,
+        }""")
+s=s.replace("""        self.suppressed = Some(here);
+        self.stops += 1;
+        self.last_stop""","""        self.suppressed = Some(here);
+        self.last_stop""")
+s=s.replace("""    /// Drops every breakpoint.
+    pub fn clear_breakpoints(&mut self) -> usize {
+        let count = self.breakpoints.len();
+        self.breakpoints.clear();
+        count
+    }
+
+""","""""")
+s=s.replace("""    /// How many times the program has stopped.
+    pub fn stop_count(&self) -> usize {
+        self.stops
+    }
+
+""","""""")
+open(p,'w').write(s)
+PY
+cargo clippy --all-targets -- -D warnings 2>&1 | tail -20 && cargo fmt --all -- --check && echo FMT_OK
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.39s
+FMT_OK
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff --stat && echo "=== interpreter diff ===" && git diff src/interpreter.rs
+src/interpreter.rs   |  71 ++++++++++++++
+ src/lib.rs           |   1 +
+ src/repl/commands.rs |  74 +++++++++++++-
+ src/repl/mod.rs      | 269 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 410 insertions(+), 5 deletions(-)
+=== interpreter diff ===
+diff --git a/src/interpreter.rs b/src/interpreter.rs
+index 3a5597e..a336c8e 100644
+--- a/src/interpreter.rs
++++ b/src/interpreter.rs
+@@ -5,6 +5,7 @@
+ //! need — arithmetic, indexing, the builtin library — live in
+ //! [`crate::runtime`] and are read from here rather than written twice.
+ 
++use crate::debugger::{DebugEvent, DebugHook};
+ use crate::error::{Error, Result, Span};
+ use crate::lexer::Lexer;
+ use crate::parser as redblue_parser;
+@@ -356,6 +357,14 @@ pub struct Vm {
+     /// completion, `:vars`, `:funcs` and the analyzer's seed shows the program a
+     /// name it cannot write.
+     qualified_members: HashSet<String>,
++    /// The names every VM is born holding: the builtins
++    /// [`stdlib::builtins`] provides, by name.
++    ///
++    /// A copy of the keys rather than a call to [`stdlib::builtins`] per
++    /// question, because the debugger asks "which globals did the program
++    /// write" at *every statement it is shown* and a frame listing two hundred
++    /// builtins answers nothing.
++    builtin_names: HashSet<String>,
+     /// Every `object` declaration, by type name. The table is the inheritance
+     /// model: an entry already holds its own fields and methods merged with
+     /// everything it inherits, nearest declaration first, so a lookup is a
+@@ -370,6 +379,21 @@ pub struct Vm {
+     /// [`Expr::MightFail`].
+     assertions_failed: usize,
+     current_span: Span,
++    /// How many statements are executing right now, the one in
++    /// [`Vm::execute_statement`] itself counting as one.
++    ///
++    /// Distinct from [`Vm::call_depth`], which counts *calls*: a `say` nested in
++    /// a one-line `if` is one call deep but two statements deep, and the
++    /// debugger needs the second to tell a breakpoint on that line from a stop
++    /// it has already made inside the statement it is looking at.
++    statement_depth: usize,
++    /// The debugger watching this VM, if one is attached — see
++    /// [`Vm::set_debug_hook`].
++    ///
++    /// `None` for every program that is not being debugged, which is what makes
++    /// [`Vm::debug_before`] a single predictable branch on the hot path and
++    /// nothing else.
++    debug_hook: Option<DebugHook>,
+     call_depth: usize,
+     max_call_depth: usize,
+     /// Statements executed so far, against [`Vm::max_steps`]. Monotonic for the
+@@ -573,10 +597,13 @@ impl Vm {
+             declared_modules: HashMap::new(),
+             module_depth: 0,
+             qualified_members: HashSet::new(),
++            builtin_names: stdlib::builtins().keys().cloned().collect(),
+             objects: HashMap::new(),
+             expectation_failure: None,
+             assertions_failed: 0,
+             current_span: Span::unknown(),
++            statement_depth: 0,
++            debug_hook: None,
+             call_depth: 0,
+             max_call_depth: resolve_max_call_depth(),
+             steps: 0,
+@@ -1308,13 +1335,57 @@ impl Vm {
+ 
+     fn execute_statement(&mut self, stmt: &Stmt) -> Result<Value> {
+         let previous_span = std::mem::replace(&mut self.current_span, stmt.span);
++        self.statement_depth += 1;
++        self.debug_before(stmt.span.line);
+         let result = self
+             .charge_step()
+             .and_then(|()| self.execute_statement_body(&stmt.statement));
++        // Restored on the failing path as well as the succeeding one: a
++        // statement that raised an error still finished, and leaving the counter
++        // raised would make every later statement look nested inside it.
++        self.statement_depth -= 1;
+         self.current_span = previous_span;
+         result
+     }
+ 
++    /// Installs the debugger, or takes it away again with `None`.
++    ///
++    /// The hook is asked before every statement and may only answer what to do
++    /// next. It cannot change what a statement evaluates to, cannot raise an
++    /// error and cannot skip a step charge — a program run with a debugger
++    /// attached is the same program, observed.
++    pub fn set_debug_hook(&mut self, hook: Option<DebugHook>) {
++        self.debug_hook = hook;
++    }
++
++    /// Gives the attached debugger the chance to stop before this statement on
++    /// `line` runs.
++    ///
++    /// Called first in [`Vm::execute_statement`], before the step charge and
++    /// before the statement body, so a breakpoint on a line stops *on* that
++    /// line rather than after it. Every diagnostic a program can raise still
++    /// comes from the statement itself: the hook has no way to answer with an
++    /// error.
++    fn debug_before(&mut self, line: usize) {
++        if self.debug_hook.is_none() {
++            return;
++        }
++        // Two fields of the same VM at once: the hook is taken mutably and the
++        // scopes it reads immutably, which is fine because they are disjoint.
++        let event = DebugEvent {
++            line,
++            depth: self.call_depth,
++            statement_depth: self.statement_depth,
++            scopes: &self.locals,
++            globals: &self.globals,
++            builtins: &self.builtin_names,
++            module_members: &self.qualified_members,
++        };
++        if let Some(hook) = self.debug_hook.as_mut() {
++            let _ = hook(event);
++        }
++    }
++
+     /// The source position of the statement being executed. Every runtime
+     /// failure is reported against it.
+     fn span(&self) -> Span {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --all-targets 2>&1 | grep -E "^test result" | awk -F'[ ;]' '{p+=$4} END {print "TOTAL PASSED:", p}'; echo "---"; cargo test --all-targets 2>&1 | grep -cE "^test result: ok"; cargo test --all-targets 2>&1 | grep -E "^test result" | grep -v "ok\." | head
+TOTAL PASSED: 1331
+---
+49
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test 2>&1 | tail -3; echo "=== git line counts ==="; git diff --numstat; echo "new files:"; wc -l src/debugger.rs tests/debugger_test.rs
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+=== git line counts ===
+71	0	src/interpreter.rs
+1	0	src/lib.rs
+73	1	src/repl/commands.rs
+265	4	src/repl/mod.rs
+new files:
+  348 src/debugger.rs
+  526 tests/debugger_test.rs
+  874 total
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && mkdir -p phases/phase-045 && ls phases/phase-045
+(no output)
+[0m
+Now the report.
+[0m← [0mWrite phases/phase-045/REPORT.md
+Wrote file successfully.
+[0m
+[0m← [0mWrite phases/phase-045/FINDINGS.md
+Wrote file successfully.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '670,678p' src/repl/mod.rs; echo "--- lib 103-107"; sed -n '103,107p' src/lib.rs; echo "--- interp 192-204"; sed -n '192,204p' src/interpreter.rs; echo "--- arm_debugger"; grep -n "fn arm_debugger" src/repl/mod.rs
+// The REPL's own entry for a name wins: `_` is the last result,
+                // and the VM holds a `Nothing` for it rather than the value.
+                bindings.entry(name).or_insert_with(|| value.clone());
+            }
+        }
+
+        let mut bindings: Vec<(String, Value)> = bindings.into_iter().collect();
+        bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        bindings
+--- lib 103-107
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze_in(&ast, root)?;
+
+    let (_vm, result) = interpreter::run_isolated_in(&ast, root);
+    result.map(|_| ())
+--- interp 192-204
+        .name("redblue-vm".to_string())
+        .stack_size(limit.saturating_mul(STACK_BYTES_PER_CALL));
+
+    let joined = match builder.spawn({
+        let root = root.clone();
+        move || {
+            let mut vm = Vm::new_in(&root);
+            let result = vm.run(&threaded);
+            (vm, result)
+        }
+    }) {
+        Ok(handle) => handle.join(),
+        Err(_) => return run_without_a_sized_thread(program, limit, root),
+--- arm_debugger
+573:    fn arm_debugger(&mut self, source: &str) {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "fn run_file" src/repl/mod.rs; grep -n "run_isolated_in(&ast, root)" src/lib.rs; grep -n "let joined = match builder.spawn" src/interpreter.rs; grep -n "pub type DebugHook" src/debugger.rs
+843:    fn run_file(&self, path: &str) {
+106:    let (_vm, result) = interpreter::run_isolated_in(&ast, root);
+127:    let (_vm, result) = interpreter::run_isolated_in(&ast, root);
+195:    let joined = match builder.spawn({
+62:pub type DebugHook = Box<dyn FnMut(DebugEvent<'_>) -> DebugAction + Send>;
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='phases/phase-045/FINDINGS.md'
+s=open(p).read()
+s=s.replace("`src/repl/mod.rs:673` — `Repl::run_file` calls","`src/repl/mod.rs:843` — `Repl::run_file` calls")
+s=s.replace("which goes\nto `src/lib.rs:105`","which goes\nto `src/lib.rs:106`")
+s=s.replace("(`src/interpreter.rs:194-204`: `builder.spawn(move || { let mut vm =","(`src/interpreter.rs:195-203`: `builder.spawn(move || { let mut vm =")
+s=s.replace("(`src/debugger.rs:60`)","(`src/debugger.rs:62`)")
+open(p,'w').write(s)
+PY
+grep -n "src/repl/mod.rs:843\|src/lib.rs:106\|src/interpreter.rs:195-203\|src/debugger.rs:62" phases/phase-045/FINDINGS.md
+8:`src/repl/mod.rs:843` — `Repl::run_file` calls `crate::run_file(path)`, which goes
+9:to `src/lib.rs:106` → `interpreter::run_isolated_in(&ast, root)`. That function
+11:(`src/interpreter.rs:195-203`: `builder.spawn(move || { let mut vm =
+18:(`src/debugger.rs:62`) precisely so this is possible. That changes the `rb run`
+[0m
+Final gate run.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && echo "--- fmt ---" && cargo fmt --all -- --check && echo PASS && echo "--- clippy ---" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -3 && echo "--- test ---" && cargo test --all-targets 2>&1 | grep -E "^test result" | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed:", p, "failed:", f}'
+--- fmt ---
+PASS
+--- clippy ---
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.35s
+--- test ---
+passed: 1331 failed: 0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git status --short && echo "--- no new ignores/skips ---" && git diff | grep -nE "^\+.*(#\[ignore\]|// *skip|allow\(clippy)" | head; echo "(none above = clean)"
+M src/interpreter.rs
+ M src/lib.rs
+ M src/repl/commands.rs
+ M src/repl/mod.rs
+?? phases/phase-045/
+?? src/debugger.rs
+?? tests/debugger_test.rs
+--- no new ignores/skips ---
+(none above = clean)
+[0m
+DONE
+
+**Finding reproduced first:** `printf ':break 3\n:step\n:continue\n:frame\n' | rb` → `Unknown command 'break'` ×4; `ReplCommand` had no `Break`/`Step`/`Continue`/`Frame`, and `:debug` printed *"Debug mode - Not implemented yet"*.
+
+**Red before green:** `tests/debugger_test.rs::breakpoint_in_a_loop_fires_on_every_iteration` failed with `left: 0, right: 3` — `:break` was unknown and the `c` answers were fed to the analyzer.
+
+**Fix (src/, `+410 −5`, two new files):** new `src/debugger.rs` (`DebugSession`, `poll`, `Frame`), a `Vm::set_debug_hook` consulted first in `execute_statement` (additive only; the hook can only answer *what to do next*, never raise an error or skip a step charge), and 7 new REPL commands with aliases. No lexer/parser/AST/grammar change.
+
+Breakpoint suppression keys on **(line, call depth, statement depth)** — suppressing on statement depth alone broke recursion; on line+call alone it broke single-line blocks.
+
+**Gates:** `cargo fmt --check` pass · `cargo clippy --all-targets -D warnings` pass · `cargo test --all-targets` **1331 passed, 0 failed, 0 ignored** · `cargo test --doc` 2 passed · all `examples/*.rb` exit 0.
+
+`./rbops/verify.sh phase-045` **was not run** — `rbops/` does not exist in this checkout and the brief forbids reaching outside it. Reported as such in `REPORT.md` rather than claimed.
+
+**Tests:** 16 new `#[test]`s (8 `edge_*`), all driving the real `rb` binary over a pipe; 2 assert a failure is produced; the existing alias-table test was *strengthened* by 15 rows, not changed. `duplicate_missing_keys` is the one N/A, justified in the report. `phases/phase-045/FINDINGS.md` records the `:run <file>` gap (hook never reaches `run_isolated_in`'s threaded VM, `src/lib.rs:106`) and the `Watch` blocker (would require the hook to evaluate, breaking the observe-only contract).

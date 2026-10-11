@@ -1,0 +1,25 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Adversarial review underway — hunting the debugger diff for hidden faults.
+[0m→ [0mRead src/debugger.rs
+[0m→ [0mRead tests/debugger_test.rs
+[0m→ [0mRead src/interpreter.rs
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/repl/mod.rs
+Initial scan complete — now digging into the interpreter hooks and REPL wiring.
+[0m→ [0mRead src/lib.rs
+[0m✱ [0mGrep "debug_before|set_debug_hook|statement_depth|debug_hook"[90m in src · 21 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=1375][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=120, offset=1320][0m
+FINDINGS:
+1. [MAJOR] src/interpreter.rs:1385 — `let _ = hook(event);` discards the `DebugAction` the hook returns, so a custom `set_debug_hook` caller that returns `Step` gets a silent no-op — why it matters: the public `DebugHook = Box<dyn FnMut(DebugEvent) -> DebugAction + Send>` contract promises the return value drives the VM, and only the REPL works via its `record_action` side-channel — concrete fix: act on the returned value in `debug_before` (or change the type to return `()` and document that control flows only through `DebugSession`).
+2. [MAJOR] src/repl/mod.rs:64 — `debug_answer` maps `q | quit | r | run | detach` to `DebugAction::Run`, so typing `q`/`quit` at the `(rb-debug)` prompt to quit resumes the program instead — why it matters: `q` quits everywhere else and `r` is the `:restore` alias, so quit intent is silently swallowed mid-debug — concrete fix: accept only `c`/`continue` (and documented step words) at the debug prompt and reprint the `Expected c/s/n/f` hint for `q`/`r`/`run`/`detach`.
+3. [MAJOR] src/repl/mod.rs:80 — `debug_asks_for_frame` accepts `where | bt | backtrace` but just reprints the single stopped `Frame`, while `FINDINGS.md` says there is no backtrace — why it matters: it advertises a backtrace feature that does not exist, showing one frame under a call-chain name — concrete fix: accept only `f`/`frame` here until a real frame-chain is captured and printed.
+4. [MAJOR] src/repl/mod.rs:925 — `resume` (`:continue` at the prompt) only prints and never touches `pending`, so `:step` then `:continue` before a run still stops at the first statement — why it matters: the printed `Running to the next breakpoint.` is false when a step is still armed — concrete fix: have `resume` clear an armed step (`pending = None`) or report that a step is still armed.
+5. [MAJOR] src/repl/mod.rs:458 — `reset_session` replaces `self.vm` and clears variables/buffer but never clears `self.debug`, so `:frame` after `:reset` reports the pre-reset stop with dead bindings — why it matters: the doc comment promises it `Forgets everything the session has done`, and stale `breakpoints`/`suppressed`/`last_stop` leak into the fresh VM — concrete fix: clear (or recreate) the `DebugSession` in `reset_session`, or document that breakpoints/frames survive reset.
+6. [MAJOR] src/debugger.rs:140 — `Frame::lines` formats every binding with no truncation and `debug_stop` prints it on every stop, with no equivalent of the `say` path's `MAX_OUTPUT_BYTES` cap — why it matters: a breakpoint on a program holding a huge text/list, or inside a long loop, prints unbounded bytes (cloning the whole `Value` per stop) — concrete fix: cap/truncate frame rendering and document the limit, matching `Vm::charge_output`.
+7. [MINOR] src/repl/mod.rs:581 — `arm_debugger` holds `lock(&session)` across `debug_stop(&report)`, which blocks on stdin indefinitely — why it matters: it turns a short critical section into an interactive-length hold and guarantees a poisoned mutex if the print/read panics — concrete fix: `poll` under the lock, drop the guard, run `debug_stop`, then re-lock only for `record_action`.
+8. [MINOR] tests/debugger_test.rs:293 — `edge_a_line_number_that_is_not_a_line_is_refused` feeds six bad inputs (`abc`, `0`, `-1`, `1 2`, overflow) but asserts messages only for `abc` and `0` — why it matters: `-1`/`1 2`/overflow pass if merely non-crashing, and a future `+3`-parses-as-`3` or `1 2`-parses-as-`1` regression is not pinned per-input — concrete fix: assert the exact refusal string for each of the six inputs individually.
+REVIEW VERDICT: FINDINGS 8
