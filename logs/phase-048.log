@@ -1,0 +1,2396 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m→ [0mRead src/parser.rs[90m [offset=1400, limit=120][0m
+[0m
+[0m$ [0mls && cat Cargo.toml | head -30
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+[package]
+name = "redblue"
+version = "0.2.0"
+edition = "2021"
+authors = ["Redblue Contributors"]
+description = "A programming language as readable as plain English"
+license = "MIT"
+repository = "https://github.com/authorss81/redblue"
+keywords = ["programming-language", "compiler"]
+categories = ["compiler", "development-tools"]
+
+[[bin]]
+name = "rb"
+path = "src/main.rs"
+
+# `cdylib` is what makes the WebAssembly playground module: it is the crate type
+# that emits a `.wasm` and exports every `#[no_mangle]` symbol the library
+# defines, which is what `wasm/redblue.js` calls. Built with:
+#
+#   rustup target add wasm32-unknown-unknown
+#   cargo build --release --target wasm32-unknown-unknown --lib
+#
+# writing `target/wasm32-unknown-unknown/release/redblue.wasm`. `rlib` is kept
+# so the native `rb` binary and the test suite link exactly as they did.
+[lib]
+name = "redblue"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+[0m
+The line numbers in the finding point elsewhere. Let me find the actual catch parsing.
+[0m✱ [0mGrep "catch"[90m in src · 100 matches[0m
+[0m✱ [0mGrep "Catch|catch_var"[90m in src · 7 matches[0m
+[0m→ [0mRead src/parser.rs[90m [offset=1560, limit=130][0m
+[0m
+[0m$ [0mls target/debug/rb target/release/rb 2>&1 | head -5
+ls: cannot access 'target/release/rb': No such file or directory
+target/debug/rb
+[0m
+[0m$ [0mls tests/ && sed -n '780,820p' SPEC.md
+assertions_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+debugger_test.rs
+diagnostics_test.rs
+differential_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+integration_test.rb
+interpolation_test.rs
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+might_fail_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+random_builtin_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+repeat_until_test.rs
+repl_test.rs
+span_test.rs
+stdlib_module_docs_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+test_control_flow.rb
+test_functions.rb
+test_lists.rb
+test_loop_control.rb
+test_mod_in.rb
+test_modules.rb
+test_numeric_edges.rb
+test_object_model.rb
+test_objects.rb
+test_records.rb
+test_text.rb
+text_split_join_test.rs
+time_builtin_test.rs
+tooling_extension_test.rs
+tooling_grammar_test.rs
+unless_test.rs
+wasm_test.rs
+An `import` binds a module's `set` and `constant` names into the importing
+program, where they read as ordinary names from the `import` onwards, and
+importing the same module again is a no-op rather than a second binding of the
+same names.
+
+`rb compile` writes the declaration into the `.rbc` as its own instruction
+(`DECLARE_CONST`, format version 3), not as the store a `set` compiles to, so a
+compiled file says the name is read-only. See `docs/BYTECODE.md`.
+
+---
+
+## Error Handling
+
+### Try-Catch
+
+```redblue
+try
+    set data to might fail files.read("config.rb")
+    process data
+catch error
+    say "Error: {error message}"
+end
+```
+
+### Multiple Catch Blocks
+
+```redblue
+try
+    set result to might fail risky_operation()
+catch error of FileError
+    handle_file_error(error)
+catch error of NetworkError
+    handle_network_error(error)
+catch error
+    handle_generic_error(error)
+end
+```
+
+### Finally
+
+```redblue
+[0m
+[0m$ [0mmkdir -p target/tmp/p048 && printf 'try\n    set x to 1 / 0\ncatch error e\n    say e\nend\n' > target/tmp/p048/catch_error_name.rb && printf 'try\n    set x to 1 / 0\ncatch e\n    say e\nend\n' > target/tmp/p048/catch_name.rb && printf 'try\n    set x to 1 / 0\ncatch error\n    say "caught"\nend\n' > target/tmp/p048/catch_bare.rb && ./target/debug/rb run target/tmp/p048/catch_error_name.rb; echo "EXIT=$?"; ./target/debug/rb run target/tmp/p048/catch_name.rb; echo "EXIT=$?"; ./target/debug/rb run target/tmp/p048/catch_bare.rb; echo "EXIT=$?"
+Error: AnalyzerError: Unknown variable 'e'
+Unknown variable 'e'
+  --> target/tmp/p048/catch_error_name.rb:3:13
+3 | catch error e
+  |             ^
+EXIT=1
+error
+EXIT=0
+caught
+EXIT=0
+[0m
+Reproduced exactly. Now let me check the other claimed findings.
+[0m$ [0msed -n '470,500p' SPEC.md; echo "--- 880-905 ---"; sed -n '880,905p' SPEC.md; echo "--- README 5-70 ---"; sed -n '5,70p' README.md
+are gone.
+
+The loop is the one *around* the statement, wherever the statement was written: a
+`break` in a `catch`, `finally`, `test`, `object` or `module` body inside a loop
+leaves that loop. A module body is in it for the same reason an `object` body is:
+the declaration runs where it is written, so a `break` in the module body around a
+loop is a `break` in that loop — and the module is then left declaring nothing,
+because the statements that would have published it did not run.
+
+```redblue
+set saved to nothing
+for each name in names
+    try
+        set record to files.read("records/{name}.rb")
+    catch error
+        break
+    end
+    set saved to record
+end
+```
+
+With no enclosing loop there is nothing to leave, and saying so is the point: a
+`break` in no loop is a mistake in the program, and a mistake that runs to
+completion reporting success is worse than one that stops with a message naming
+the statement.
+
+```redblue
+break
+```
+
+```
+--- 880-905 ---
+read cleo
+missing cleo
+```
+
+`bob` contributes neither line. The cleanup was told to abandon that turn, and
+the turn was abandoned: the `catch` around the `try` did not run for it. Before
+this rule, the tree-walking VM ran that `catch` anyway and the bytecode VM did
+not — the same program, two answers, both exiting 0.
+
+### `might fail`
+
+`might fail <call>` discards a failure of that call and produces `nothing`, so
+the program carries on where it would otherwise have stopped:
+
+```redblue
+set config to might fail files.read("config.rb")
+if config is nothing
+    say "using defaults"
+end
+```
+
+It is two words. Neither half is the guard alone — `might read("x")` and
+`fail read("x")` are errors — and the guarded operand is a call. A number or a
+list literal cannot fail, so accepting one would read as though discarding a
+failure were something it could do; `might fail 1 + 1` is an error naming the
+operand that is not a call.
+--- README 5-70 ---
+[![CI](https://github.com/authorss81/redblue/actions/workflows/ci.yml/badge.svg)](https://github.com/authorss81/redblue/actions/workflows/ci.yml)
+
+**Redblue** is a programming language designed to be as readable as plain English. Write code that reads like natural sentences while maintaining the power of modern programming languages.
+
+```redblue
+try
+    say 1 / 0
+catch
+    say "recovered"
+end
+
+test "division by zero is caught, not fatal"
+    set caught to no
+    try
+        say 1 / 0
+    catch
+        set caught to yes
+    end
+    expect caught to be yes
+end
+```
+
+Errors are values you catch. Tests live beside the code and must assert something that can fail. That is the whole philosophy in fifteen lines.
+
+## What it can do
+
+**Readable control flow.** No braces, no semicolons — blocks close with `end`:
+
+```redblue
+set total to 0
+for each n in [1, 2, 3]
+    if n is 2 then
+        skip
+    end
+    set total to total + n
+end
+say total
+```
+
+**Errors that don't lie.** Every error carries a source span, failures are catchable, and a bare `catch` runs even with no name binding:
+
+```redblue
+set empty to []
+try
+    set x to empty[0]
+catch err
+    say err
+end
+```
+
+**Testing built in, not bolted on.** Test blocks use `expect ... to be ...` and every test must be able to fail:
+
+```redblue
+test "empty list index is an error"
+    set empty to []
+    try
+        set x to empty[0]
+    catch error
+        set caught to yes
+    end
+    expect caught to be yes
+end
+```
+
+**Values that behave.** Numbers are 64-bit floats and always finite — `1 / 0` is a clean runtime error, never infinity. Text is fully Unicode. Records keep insertion order. Objects support inheritance and method dispatch, closures capture lexically.
+[0m
+[0m$ [0mprintf 'give back error "boom"\n' > target/tmp/p048/raise.rb && ./target/debug/rb run target/tmp/p048/raise.rb; echo "EXIT=$?"; printf 'try\n  set x to files.read("/nope/zz")\ncatch error of FileError\n  say "f"\nend\n' > target/tmp/p048/of.rb && ./target/debug/rb run target/tmp/p048/of.rb; echo "EXIT=$?"
+Error: AnalyzerError: Unknown variable 'error'
+  --> target/tmp/p048/raise.rb:1:6
+1 | give back error "boom"
+  |      ^
+EXIT=1
+EXIT=1
+Error: AnalyzerError: Unknown variable 'of'; did you mean 'if'?
+Unknown variable 'FileError'
+  --> target/tmp/p048/of.rb:3:13
+3 | catch error of FileError
+  |             ^
+[0m
+[0m$ [0msed -n '780,820p' SPEC.md
+An `import` binds a module's `set` and `constant` names into the importing
+program, where they read as ordinary names from the `import` onwards, and
+importing the same module again is a no-op rather than a second binding of the
+same names.
+
+`rb compile` writes the declaration into the `.rbc` as its own instruction
+(`DECLARE_CONST`, format version 3), not as the store a `set` compiles to, so a
+compiled file says the name is read-only. See `docs/BYTECODE.md`.
+
+---
+
+## Error Handling
+
+### Try-Catch
+
+```redblue
+try
+    set data to might fail files.read("config.rb")
+    process data
+catch error
+    say "Error: {error message}"
+end
+```
+
+### Multiple Catch Blocks
+
+```redblue
+try
+    set result to might fail risky_operation()
+catch error of FileError
+    handle_file_error(error)
+catch error of NetworkError
+    handle_network_error(error)
+catch error
+    handle_generic_error(error)
+end
+```
+
+### Finally
+
+```redblue
+[0m
+[0m$ [0mgrep -n "give back" SPEC.md docs/GRAMMAR.md README.md | head -40; echo "=== src ==="; grep -rn "give back\|GiveBack\|Give" src/ --include=*.rs | head -30
+SPEC.md:74:| Jumps | break, skip, return, give back |
+SPEC.md:534:    give back a + b
+SPEC.md:539:        give back a
+SPEC.md:541:        give back b
+SPEC.md:563:    give back a + b
+SPEC.md:570:set double to to (x) give back x * 2
+SPEC.md:583:    give back x * 2
+SPEC.md:596:    give back to
+SPEC.md:597:        give back count
+SPEC.md:643:        give back this
+SPEC.md:658:        give back this.salary * 0.1
+SPEC.md:689:(`set this.name to name`) and hands the result back with `give back this`, which
+SPEC.md:709:        give back PI * this.radius * this.radius
+SPEC.md:725:        give back PI * radius * radius
+SPEC.md:758:    give back radians * 180 / TAU
+SPEC.md:934:    give back endless(n + 1)
+SPEC.md:956:        give back error "Cannot divide by zero"
+SPEC.md:958:    give back a / b
+SPEC.md:971:    give back formats.parse_json(response)
+SPEC.md:996:    give back combine(users, posts, comments)
+SPEC.md:1078:set doubled to list.map([1, 2, 3], to (x) give back x * 2)
+SPEC.md:1126:| return/give back | Function return |
+docs/GRAMMAR.md:45:         | 'break' | 'skip' | 'return' | 'give back'
+docs/GRAMMAR.md:257:                 | 'give back' [ expression ]
+docs/GRAMMAR.md:469:The parameter list is optional, so `to give back 42 end` and `to () give back
+docs/GRAMMAR.md:477:set double to to (x) give back x * 2
+docs/GRAMMAR.md:478:set doubled to list.map([1, 2, 3], to (x) give back x * 2)
+docs/GRAMMAR.md:544:    give back a + b
+=== src ===
+src/parser.rs:214:    // give back value
+src/parser.rs:215:    GiveBack(Option<Expr>),
+src/parser.rs:600:            TokenKind::GiveBack => {
+src/parser.rs:607:                Some(Statement::GiveBack(expr))
+src/parser.rs:1237:    /// The parameter list is optional, so `to give back 42 end` and
+src/parser.rs:1238:    /// `to () give back 42 end` are both literals of no parameters. The `end` is
+src/parser.rs:1263:            // The one-line form SPEC.md writes — `to (x) give back x * 2` and
+src/parser.rs:1264:            // `list.map([1, 2, 3], to (x) give back x * 2)` — where the end of
+src/parser.rs:1283:    /// the one-line `to (x) give back x * 2` whose line ends it — and which one
+src/parser.rs:1326:                | Some(TokenKind::GiveBack)
+src/parser.rs:1374:    /// optional, so `to f give back 1 end` and `to f() give back 1 end` are
+src/parser.rs:2970:            TokenKind::GiveBack,
+src/parser.rs:3008:            Lexer::tokenize("set double to to (x) give back x * 2").expect("the source should lex"),
+src/parser.rs:3012:            Lexer::tokenize("set double to to (x)\n    give back x * 2\nend")
+src/formatter.rs:228:    /// `give back x` is one line of source but two statements in the tree: the
+src/formatter.rs:229:    /// lexer reads `give` and `back` as the same token, so `give back` is a bare
+src/formatter.rs:232:    /// it re-reads as (`give` or `back x`), because `give back` on a line of
+src/formatter.rs:239:            let bare = matches!(stmt.statement, Statement::GiveBack(None));
+src/formatter.rs:242:                    .map(|next| matches!(next.statement, Statement::GiveBack(_)))
+src/formatter.rs:253:                self.write("give back");
+src/formatter.rs:254:                if let Statement::GiveBack(Some(expr)) = &body[i + 1].statement {
+src/formatter.rs:267:                Statement::GiveBack(None) => self.write("give"),
+src/formatter.rs:268:                Statement::GiveBack(Some(expr)) => {
+src/formatter.rs:432:            Statement::GiveBack(expr) => {
+src/formatter.rs:433:                self.write("give back");
+src/lexer.rs:37:    ("give", TokenKind::GiveBack),   // give back
+src/lexer.rs:38:    ("back", TokenKind::GiveBack),   // give back
+src/lexer.rs:108:    GiveBack,
+src/repl/completer.rs:35:                "give back".to_string(),
+src/repl/completer.rs:238:            vec!["give back".to_string()],
+[0m
+[0m$ [0mgrep -n "catch" SPEC.md | head -60
+79:| Errors | try, catch, finally, error |
+463:body, `catch` body, `finally` body or `test` body are part of the turn the signal
+473:`break` in a `catch`, `finally`, `test`, `object` or `module` body inside a loop
+484:    catch error
+515:The refusal is a runtime error rather than a compile error, so `try ... catch
+516:error` catches it like any other and the program carries on afterwards.
+799:catch error
+809:catch error of FileError
+811:catch error of NetworkError
+813:catch error
+831:The `finally` needs no `catch` beside it, and it is owed however its region is
+849:A `try` with no `catch` is not a handler and never was one: the failure belongs
+850:to whatever is written around it, so a `catch` there takes it, and a program with
+857:there is nothing for a `catch` written around this `try` to handle, and the
+870:    catch error
+885:the turn was abandoned: the `catch` around the `try` did not run for it. Before
+886:this rule, the tree-walking VM ran that `catch` anyway and the bytecode VM did
+1134:| try/catch/finally | Error handling |
+[0m
+[0m$ [0msed -n '925,975p' SPEC.md
+- **A resource limit.** The step budget, the call-depth limit, and a loop's
+  iteration cap are the host refusing to keep going, not the call going wrong. A
+  program stopped at the call-depth limit has not carried on — it has been
+  stopped — so reporting `nothing` for it would turn a runaway recursion into a
+  successful value and leave the program running against a bound it has already
+  reached:
+
+```redblue
+to endless(n)
+    give back endless(n + 1)
+end
+
+set stopped to might fail endless(1)
+```
+
+```
+RuntimeError: Maximum call depth of 1000 reached while calling 'endless'
+```
+
+The limit stops it either way; `might fail` is not an escape hatch from it. A
+failure of the call itself is still discarded:
+
+```redblue
+set stopped to might fail files.read("config.rb")   // -> nothing
+```
+
+### Raising Errors
+
+```redblue
+to might fail divide(a, b)
+    if b is equal to 0
+        give back error "Cannot divide by zero"
+    end
+    give back a / b
+end
+```
+
+---
+
+## Asynchronous Programming
+
+### Async Functions
+
+```redblue
+async to fetch_data(url)
+    set response to wait network.get(url)
+    give back formats.parse_json(response)
+end
+```
+
+### Await
+[0m
+[0m$ [0mgrep -rn "catch" tests/*.rs | head -50
+tests/bootstrap_selfhost_test.rs:206:            "try_catch",
+tests/bootstrap_selfhost_test.rs:207:            "try\n    say 1 / 0\ncatch error\n    say \"caught\"\nend\n",
+tests/bootstrap_selfhost_test.rs:1078:        // A `try`/`catch`/`finally`, and an `unless`: both compile to jumps whose
+tests/bootstrap_selfhost_test.rs:1082:            "try_catch_finally",
+tests/bootstrap_selfhost_test.rs:1083:            "to risky()\n    give back 1 / 0\nend\ntry\n    say risky()\ncatch failure\n    say \"caught\"\nfinally\n    say \"done\"\nend\nunless yes then\n    say \"no\"\nend\n",
+tests/bootstrap_ship_test.rs:298:/// This is the failure the whole ladder exists to catch, so it is tested by
+tests/bytecode_test.rs:884:        compile_source("try\n    say 1\ncatch problem\n    say problem\nfinally\n    say 2\nend\n")
+tests/bytecode_test.rs:894:    let catch = &chunk.main.blocks[try_instruction.arg as usize];
+tests/bytecode_test.rs:895:    assert_eq!(catch.kind, BlockKind::CatchBody);
+tests/bytecode_test.rs:911:    assert_eq!(try_instruction.arg, u32::MAX, "no catch block is absent");
+tests/bytecode_test.rs:932:        "try\n    say 1\ncatch\n    say 2\nfinally\n    say 3\nend\ntry\n    say 4\nend\n",
+tests/bytecode_test.rs:984:         The `catch` and `finally` bodies are blocks of their own, so their statements \
+tests/bytecode_test.rs:1846:                // A catch block that is not there, and a finally that is
+tests/bytecode_test.rs:1876:    for past in ["block 3", "block 7", "block 9", "catch block 4"] {
+tests/bytecode_vm_test.rs:541:        "set caught to no\ntry\n    say 1 / 0\ncatch error\n    set caught to yes\nend\nsay 2 + 2\nsay caught\n".to_string(),
+tests/bytecode_vm_test.rs:565:        "module Inner\n    set hidden to 42\n    to f\n        return hidden\n    end\n    export all\nend\nsay Inner.f()\ntry\n    say hidden\ncatch error\n    say \"caught\"\nend\n".to_string(),
+tests/bytecode_vm_test.rs:581:        "module Bad\n    to f\n        return 1\n    end\n    export nope\nend\ntry\n    say \"unreached\"\ncatch error\n    say \"caught\"\nend\n".to_string(),
+tests/bytecode_vm_test.rs:585:        "module Twice\n    to f\n        return 1\n    end\n    export f\nend\ntry\n    module Twice\n        to f\n            return 2\n        end\n        export f\n    end\ncatch error\n    say \"caught\"\nend\n".to_string(),
+tests/bytecode_vm_test.rs:629:        "shape/try-with-a-catch-and-a-finally",
+tests/bytecode_vm_test.rs:630:        "set log to \"\"\ntry\n    set log to log + \"t\"\ncatch\n    set log to log + \"c\"\nfinally\n    set log to log + \"f\"\nend\nsay log\n".to_string(),
+tests/bytecode_vm_test.rs:634:        "set log to \"\"\ntry\n    say 1 / 0\ncatch\n    set log to log + \"c\"\nfinally\n    set log to log + \"f\"\nend\nsay log\n".to_string(),
+tests/bytecode_vm_test.rs:638:        "set caught to \"\"\ntry\n    set caught to caught + \"t\"\ncatch\n    set caught to caught + \"c\"\nend\nsay caught\n".to_string(),
+tests/bytecode_vm_test.rs:641:        "shape/a-failure-inside-a-catch-is-not-swallowed",
+tests/bytecode_vm_test.rs:642:        "set log to \"\"\ntry\n    say 1 / 0\ncatch\n    say 1 / 0\nend\nsay log\n".to_string(),
+tests/bytecode_vm_test.rs:646:        "set log to \"\"\ntry\n    try\n        say 1 / 0\n    catch\n        set log to log + \"i\"\n    end\ncatch\n    set log to log + \"o\"\nend\nsay log\n".to_string(),
+tests/bytecode_vm_test.rs:649:        "shape/a-catch-binds-the-word-error",
+tests/bytecode_vm_test.rs:650:        "set caught to \"\"\ntry\n    say 1 / 0\ncatch problem\n    set caught to problem\nend\nsay caught\n".to_string(),
+tests/bytecode_vm_test.rs:822:        "try\n    for each i in [1, 2, 3]\n        if i is 2 then\n            break\n        end\n        say i\n    end\n    set bad to 1 + \"one\"\ncatch error\n    say \"caught\"\nfinally\n    say \"cleaned\"\nend\nsay \"done\"\n".to_string(),
+tests/bytecode_vm_test.rs:826:        "try\n    for each a in [1, 2]\n        for each b in [1, 2]\n            try\n                if b is 2 then\n                    break\n                end\n            finally\n                say \"inner cleaned\"\n            end\n        end\n        say \"outer turn\"\n    end\n    set bad to 1 + \"one\"\ncatch error\n    say \"caught\"\nfinally\n    say \"outer cleaned\"\nend\nsay \"done\"\n".to_string(),
+tests/bytecode_vm_test.rs:830:        "try\n    set n to 0\n    while n is not 4\n        set n to n + 1\n        if n is 2 then\n            break\n        end\n        say n\n    end\n    set bad to 1 + \"one\"\ncatch error\n    say \"caught\"\nfinally\n    say \"cleaned\"\nend\nsay \"done\"\n".to_string(),
+tests/bytecode_vm_test.rs:834:        "set caught to no\ntry\n    repeat 3 times\n        try\n            break\n        finally\n            set bad to 1 + \"one\"\n        end\n    end\ncatch error\n    set caught to yes\nend\nset n to 0\nrepeat 3 times\n    set n to n + 1\nend\nsay caught\nsay n\n".to_string(),
+tests/bytecode_vm_test.rs:838:        "try\n    for each i in [1, 2, 3]\n        if i is 2 then\n            skip\n        end\n        say i\n    end\n    set bad to 1 + \"one\"\ncatch error\n    say \"caught\"\nfinally\n    say \"cleaned\"\nend\nsay \"done\"\n".to_string(),
+tests/bytecode_vm_test.rs:912:        "set count to 0\nrepeat 2 times\n    set count to count + 1\n    module Gone\n        export value\n        set value to 1\n        break\n    end\nend\nsay count\ntry\n    import Gone\n    say \"imported\"\ncatch error\n    say \"no module\"\nend\n".to_string(),
+tests/bytecode_vm_test.rs:919:        "set log to \"\"\nrepeat 2 times\n    set log to log + \"t\"\n    try\n        module Inner\n            set held to 1\n            break\n        end\n        set log to log + \"unreachable\"\n    catch error\n        set log to log + \"c\"\n    finally\n        set log to log + \"f\"\n    end\n    set log to log + \".\"\nend\nsay log\n".to_string(),
+tests/bytecode_vm_test.rs:927:        "set caught to \"no\"\ntry\n    module Lone\n        break\n    end\ncatch error\n    set caught to \"yes\"\nend\nsay caught\n".to_string(),
+tests/bytecode_vm_test.rs:931:        "to declare()\n    module Inner\n        break\n    end\nend\nset n to 0\nset caught to \"no\"\nrepeat 2 times\n    set n to n + 1\n    try\n        declare()\n    catch error\n        set caught to \"yes\"\n    end\nend\nsay n\nsay caught\n".to_string(),
+tests/bytecode_vm_test.rs:935:    // A `test`, `catch`, `finally` or `object` body is a block with a frame of
+tests/bytecode_vm_test.rs:942:        "flow/a-break-in-a-catch-body-inside-a-loop-leaves-that-loop",
+tests/bytecode_vm_test.rs:943:        "set n to 0\nrepeat 3 times\n    set n to n + 1\n    try\n        set bad to 1 + \"one\"\n    catch error\n        if n is 2 then\n            break\n        end\n        say \"caught\"\n    end\nend\nsay n\n".to_string(),
+tests/bytecode_vm_test.rs:946:        "flow/a-skip-in-a-catch-body-inside-a-loop-advances-that-loop",
+tests/bytecode_vm_test.rs:947:        "set seen to \"\"\nfor each i in [\"one\", \"two\", \"three\"]\n    try\n        set bad to 1 + \"one\"\n    catch error\n        if i is \"two\" then\n            skip\n        end\n        set seen to seen + i\n    end\n    set seen to seen + \"!\"\nend\nsay seen\n".to_string(),
+tests/bytecode_vm_test.rs:970:        "to escape()\n    test \"a test inside a function inside a loop\"\n        break\n    end\nend\nset caught to no\nset n to 0\nrepeat 2 times\n    set n to n + 1\n    try\n        escape()\n    catch error\n        set caught to yes\n    end\nend\nsay n\nsay caught\n".to_string(),
+tests/bytecode_vm_test.rs:975:        "flow/a-catch-body-reads-the-loop-variable-before-the-turn-ends",
+tests/bytecode_vm_test.rs:976:        "set seen to \"none\"\nset i to \"outer\"\nfor each i in [1, 2]\n    try\n        set bad to 1 + \"one\"\n    catch error\n        break\n    finally\n        set seen to i\n    end\nend\nsay seen\nsay i\n".to_string(),
+tests/bytecode_vm_test.rs:979:        "flow/a-break-in-a-nested-try-inside-a-catch-runs-its-finally",
+tests/bytecode_vm_test.rs:980:        "set log to \"\"\nset n to 0\nrepeat 3 times\n    set n to n + 1\n    try\n        set bad to 1 + \"one\"\n    catch error\n        try\n            break\n        finally\n            set log to log + \"i\"\n        end\n        set log to log + \"unreachable\"\n    finally\n        set log to log + \"o\"\n    end\n    set log to log + \"after\"\nend\nsay log\nsay n\n".to_string(),
+tests/bytecode_vm_test.rs:983:        "flow/a-break-in-a-finally-inside-a-catch-runs-the-finally-it-passed-through",
+tests/bytecode_vm_test.rs:984:        "set seen to \"none\"\nset i to \"outer\"\nfor each i in [1, 2]\n    try\n        set bad to 1 + \"one\"\n    catch error\n        try\n            say \"caught\"\n        finally\n            break\n        end\n    finally\n        set seen to i\n    end\nend\nsay seen\nsay i\n".to_string(),
+tests/bytecode_vm_test.rs:987:        "flow/a-break-in-a-catch-inside-a-loop-inside-a-test-leaves-the-inner-loop",
+tests/bytecode_vm_test.rs:988:        "set log to \"\"\nrepeat 2 times\n    test \"a test around the loop\"\n        for each x in [1, 2, 3]\n            try\n                set bad to 1 + \"one\"\n            catch error\n                if x is 2 then\n                    break\n                end\n                set log to log + \"c\"\n            finally\n                set log to log + \"f\"\n            end\n            set log to log + \".\"\n        end\n        set log to log + \"|\"\n    end\n    set log to log + \";\"\nend\nsay log\n".to_string(),
+[0m
+[0m$ [0mgrep -n "catch_var\|Statement::Try" src/interpreter.rs | head -30
+1617:            Statement::Try {
+1619:                catch_var,
+1631:                // same as catch_var being Some: `catch` with no name binding parses
+1632:                // to catch_var == None with a non-empty body. Testing the Option
+1636:                let has_catch = catch_var.is_some() || !catch_body.is_empty();
+1667:                    self.run_catch_body(catch_var.as_deref(), catch_body)?;
+1761:    /// The `catch` body of a `try`, in a scope of its own, with `catch_var`
+1767:    fn run_catch_body(&mut self, catch_var: Option<&str>, catch_body: &[Stmt]) -> Result<()> {
+1770:        let outcome = match catch_var {
+[0m
+[0m$ [0msed -n '600,670p' tests/bytecode_vm_test.rs
+add("shape/for-each-over-a-list-of-records", "set xs to [{ n: 1 }, { n: 2 }]\nset total to 0\nfor each x in xs\n    set total to total + x.n\nend\nsay total\n".to_string());
+    add(
+        "shape/for-each-over-something-that-is-not-a-list",
+        "set n to 0\nfor each x in 5\n    set n to n + 1\nend\nsay n\n".to_string(),
+    );
+    add(
+        "shape/range-with-a-step",
+        "set out to \"\"\nfor each i from 0 to 10 by 3\n    set out to out + i\nend\nsay out\n"
+            .to_string(),
+    );
+    add("shape/range-backwards", "set total to 0\nfor each i from 5 to 1 by -1\n    set total to total + i\nend\nsay total\n".to_string());
+    add(
+        "shape/range-with-non-numeric-bounds",
+        "set n to 0\nfor each i from \"a\" to \"b\"\n    set n to n + 1\nend\nsay n\n".to_string(),
+    );
+    add(
+        "shape/repeat-a-non-number",
+        "set n to 0\nrepeat \"three\" times\n    set n to n + 1\nend\nsay n\n".to_string(),
+    );
+    add("shape/break-and-skip-inside-a-loop", "set total to 0\nfor each v in [1, 2, 3]\n    if v is 2 then\n        skip\n    end\n    set total to total + v\nend\nsay total\n".to_string());
+    add(
+        "shape/return-in-the-middle-of-a-body",
+        "to f()\n    give back 1\n    say \"after the return\"\nend\nsay f()\n".to_string(),
+    );
+    add(
+        "shape/a-function-without-a-body-value",
+        "to nothing_at_all()\n    set x to 1\nend\nsay nothing_at_all() is nothing\n".to_string(),
+    );
+    add(
+        "shape/try-with-a-catch-and-a-finally",
+        "set log to \"\"\ntry\n    set log to log + \"t\"\ncatch\n    set log to log + \"c\"\nfinally\n    set log to log + \"f\"\nend\nsay log\n".to_string(),
+    );
+    add(
+        "shape/try-where-the-protected-code-fails",
+        "set log to \"\"\ntry\n    say 1 / 0\ncatch\n    set log to log + \"c\"\nfinally\n    set log to log + \"f\"\nend\nsay log\n".to_string(),
+    );
+    add(
+        "shape/try-with-a-failure-after-it",
+        "set caught to \"\"\ntry\n    set caught to caught + \"t\"\ncatch\n    set caught to caught + \"c\"\nend\nsay caught\n".to_string(),
+    );
+    add(
+        "shape/a-failure-inside-a-catch-is-not-swallowed",
+        "set log to \"\"\ntry\n    say 1 / 0\ncatch\n    say 1 / 0\nend\nsay log\n".to_string(),
+    );
+    add(
+        "shape/nested-tries",
+        "set log to \"\"\ntry\n    try\n        say 1 / 0\n    catch\n        set log to log + \"i\"\n    end\ncatch\n    set log to log + \"o\"\nend\nsay log\n".to_string(),
+    );
+    add(
+        "shape/a-catch-binds-the-word-error",
+        "set caught to \"\"\ntry\n    say 1 / 0\ncatch problem\n    set caught to problem\nend\nsay caught\n".to_string(),
+    );
+    add(
+        "shape/object-with-fields-and-methods",
+        "object Point\n    has x default 0\n    has y default 0\n    to can describe()\n        give back \"point\"\n    end\nend\nset Point.x to 3\nsay Point.x\nsay Point.describe()\n".to_string(),
+    );
+    add(
+        "shape/object-extending-an-object",
+        "object Base\n    has name default \"base\"\n    to can greet()\n        give back \"from base\"\n    end\nend\nobject Child extends Base\n    has extra default 1\nend\nsay Child.name\nsay Child.extra\nsay Child.greet()\n".to_string(),
+    );
+    add(
+        "shape/object-this-is-the-binding",
+        "object Box\n    has item default \"nothing\"\n    to can get()\n        give back this.item\n    end\nend\nset Box.item to \"inside\"\nsay Box.get()\n".to_string(),
+    );
+    add(
+        "shape/an-object-a-method-does-not-have",
+        "object A\n    has n default 1\nend\nsay A.missing_method()\n".to_string(),
+    );
+    add(
+        "shape/a-method-on-something-that-is-not-an-object",
+        "set n to 5\nsay n.plus(1)\n".to_string(),
+[0m
+[0m$ [0msed -n '1755,1800p' src/interpreter.rs
+Ok(Value::Nothing)
+            }
+            Statement::Expr(expr) => self.evaluate(expr),
+        }
+    }
+
+    /// The `catch` body of a `try`, in a scope of its own, with `catch_var`
+    /// bound to the word `error` if there is one to bind.
+    ///
+    /// The scope is truncated rather than popped on the way out, so a `catch`
+    /// that fails part way through — or that a `break` leaves part way through
+    /// — does not leave the name it binds alive in the enclosing block.
+    fn run_catch_body(&mut self, catch_var: Option<&str>, catch_body: &[Stmt]) -> Result<()> {
+        let scope_base = self.locals.len();
+        self.push_scope();
+        let outcome = match catch_var {
+            Some(var) => {
+                self.declare(var);
+                self.set_var(var, Value::Text("error".to_string()))
+            }
+            None => Ok(()),
+        }
+        .and_then(|()| self.run_block(catch_body));
+        self.locals.truncate(scope_base);
+        outcome?;
+        Ok(())
+    }
+
+    /// The `finally` body of a `try`, on the way out of its region however the
+    /// region was left — by its own end, by a failure its `catch` handled, or by
+    /// a `break` or a `skip` passing through it.
+    ///
+    /// A pending signal is *held* across the body rather than left in place while
+    /// it runs. Two things depend on that. The cleanup is owed, so every
+    /// statement of it runs: a field left pending would stop the block after its
+    /// first statement, which is a `finally` that cleans up one thing and not the
+    /// other. And the `finally` is a block in its own right, so a `break` written
+    /// in it ends *it* — the statements after it in the same block — and names
+    /// the loop the signal already named, which is then still that loop's to
+    /// consume.
+    fn run_finally_body(&mut self, finally_body: &[Stmt]) -> Result<()> {
+        let pending = self.loop_control.take();
+        let outcome = self.run_block(finally_body);
+        // A signal the `finally` raised replaces the one it was holding rather
+        // than joining it: there is one loop to act on it, and the nearest
+        // statement to it asked for that.
+[0m
+[0m$ [0mgrep -n "pub struct Token" -A 12 src/lexer.rs; echo "=== Span ==="; grep -n "pub struct Span" -A 15 src/error.rs src/lexer.rs 2>/dev/null | head -30
+167:pub struct Token {
+168-    pub kind: TokenKind,
+169-    pub line: usize,
+170-    pub column: usize,
+171-}
+172-
+173-impl Token {
+174-    pub fn new(kind: TokenKind, line: usize, column: usize) -> Self {
+175-        Self { kind, line, column }
+176-    }
+177-
+178-    /// The source position this token was lexed from.
+179-    pub fn span(&self) -> Span {
+=== Span ===
+src/error.rs:8:pub struct Span {
+src/error.rs-9-    pub line: usize,
+src/error.rs-10-    pub column: usize,
+src/error.rs-11-    /// Where the offending thing stops, when it covers more than one line.
+src/error.rs-12-    ///
+src/error.rs-13-    /// A span that covers one line records no end, so a span and its position
+src/error.rs-14-    /// are the same value and everything that compared the two keeps meaning
+src/error.rs-15-    /// what it meant. Only a range — an unterminated string, which runs to the
+src/error.rs-16-    /// end of the file — records one, because only a range has to be *drawn*.
+src/error.rs-17-    pub end_line: usize,
+src/error.rs-18-    pub end_column: usize,
+src/error.rs-19-}
+src/error.rs-20-
+src/error.rs-21-impl Span {
+src/error.rs-22-    pub fn new(line: usize, column: usize) -> Self {
+src/error.rs-23-        Self {
+[0m
+[0m$ [0mprintf 'try\n    say 1\nend\nsay "after"\n' > target/tmp/p048/nocatch.rb && ./target/debug/rb run target/tmp/p048/nocatch.rb; echo "EXIT=$?"
+1
+after
+EXIT=0
+[0m
+[0m$ [0msed -n '1,60p' tests/parser_hardening_test.rs; echo "=== common ==="; ls tests/common; sed -n '1,80p' tests/common/mod.rs 2>/dev/null
+use redblue::lexer::Lexer;
+use redblue::parser::{parse, Parser, MAX_BLOCK_DEPTH, MAX_NESTING_DEPTH};
+use redblue::Error;
+
+fn lex_and_parse(source: &str) -> Result<redblue::parser::Program, Error> {
+    let tokens = Lexer::tokenize(source)?;
+    parse(tokens)
+}
+
+fn parser_error(source: &str) -> Error {
+    lex_and_parse(source).expect_err("source should fail to parse")
+}
+
+/// Builds `set x to ` followed by `open` repeated `depth` times, `1`, and
+/// `close` repeated `depth` times.
+fn nested(open: &str, close: &str, depth: usize) -> String {
+    format!(
+        "set x to {}{}{}\n",
+        open.repeat(depth),
+        "1",
+        close.repeat(depth)
+    )
+}
+
+fn assert_spanned_parser_error(error: &Error) {
+    match error {
+        Error::Parser(message, span) => {
+            assert!(
+                span.is_known(),
+                "parser error must carry a span, got {span:?} for {message:?}"
+            );
+            assert!(!message.is_empty(), "parser error must carry a message");
+        }
+        other => panic!("expected a Parser error, got {other:?}"),
+    }
+}
+
+// --- empty / degenerate input ------------------------------------------------
+
+#[test]
+fn edge_empty_file_parses_to_empty_program() {
+    let program = lex_and_parse("").expect("an empty file is valid Redblue");
+    assert!(
+        program.statements.is_empty(),
+        "empty file should produce no statements, got {}",
+        program.statements.len()
+    );
+}
+
+#[test]
+fn edge_whitespace_only_and_comment_only_are_empty_programs() {
+    for source in [
+        "   ",
+        "\n\n\n",
+        "\t \t",
+        " \r\n \r\n",
+        "// only a comment\n",
+    ] {
+        let program =
+            lex_and_parse(source).unwrap_or_else(|e| panic!("{source:?} should parse: {e}"));
+=== common ===
+corpus.rs
+generator.rs
+mod.rs
+rng.rs
+shrink.rs
+vm.rs
+//! The differential + property harness (phase-020).
+//!
+//! Four modules, each test-only, each next to the code it checks:
+//!
+//! - [`rng`] — SplitMix64, so a seed rebuilds the same bytes on any machine.
+//! - [`vm`] — one program, run on both engines, compared as one value.
+//! - [`corpus`] — the corpus on disk: its loader, golden format, writer, compare.
+//! - [`generator`] — the curated families and the seeded property grammar.
+//! - [`shrink`] — delta debugging, from a failing seed to the shortest program.
+//!
+//! Nothing here is production code. The harness runs two interpreters over a
+//! corpus and asks whether they said the same thing, and a caller that needed
+//! that outside a test would be a caller who needed a bug report, not a library.
+
+pub mod corpus;
+pub mod generator;
+pub mod rng;
+pub mod shrink;
+pub mod vm;
+[0m
+[0m$ [0msed -n '1,70p' tests/might_fail_test.rs; echo "=== vm.rs helper ==="; sed -n '1,60p' tests/common/vm.rs
+//! `might fail <call>` — the expression form that discards a failure.
+//!
+//! `might fail` was reserved by the lexer and read by nothing: `TokenKind::MightFail`
+//! appears in no `parse_*` method, so `set data to might fail files.read("x")` was a
+//! `ParserError: Unexpected token MightFail`. SPEC.md uses the form as an expression
+//! prefix, which is the only place a compiler can put an `emit` or a `write` that is
+//! allowed to fail.
+//!
+//! Every case here runs through **both** engines — the tree-walking VM and the
+//! bytecode compiler plus the bytecode VM — because a form that works on one and is a
+//! `ParserError` on the other is not a language feature, it is an accident of one
+//! frontend.
+
+use redblue::bytecode::vm::BytecodeVm;
+use redblue::bytecode::Instruction;
+use redblue::bytecode::MIGHT_FAIL_END_MARKER;
+use redblue::{compile_source, run_isolated, Error, Value};
+
+/// What one engine made of a program: the lines it printed, and either its value
+/// or the failure it reported.
+#[derive(Debug, Clone)]
+struct Outcome {
+    output: Vec<String>,
+    result: Result<Value, Error>,
+}
+
+fn tree_walk(source: &str) -> Outcome {
+    let failed = |error: Error| Outcome {
+        output: Vec::new(),
+        result: Err(error),
+    };
+    let tokens = match redblue::lexer::Lexer::tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(error) => return failed(error),
+    };
+    let ast = match redblue::parser::parse(tokens) {
+        Ok(ast) => ast,
+        Err(error) => return failed(error),
+    };
+    if let Err(error) = redblue::analyzer::analyze(&ast) {
+        return failed(error);
+    }
+    let (mut vm, result) = run_isolated(&ast);
+    Outcome {
+        output: vm.take_output(),
+        result,
+    }
+}
+
+fn bytecode(source: &str) -> Outcome {
+    let chunk = match compile_source(source) {
+        Ok(chunk) => chunk,
+        Err(error) => {
+            return Outcome {
+                output: Vec::new(),
+                result: Err(error),
+            }
+        }
+    };
+    let mut vm = BytecodeVm::new();
+    vm.set_echo(false);
+    let result = vm.run(&chunk);
+    Outcome {
+        output: vm.take_output(),
+        result,
+    }
+}
+
+/// [`tree_walk`] with both resource limits brought down.
+///
+=== vm.rs helper ===
+//! One program, run on both engines, compared as one value.
+//!
+//! The corpus compares two things about a run: the lines it printed and the
+//! value it was worth. Both are recorded, because a program that prints the
+//! right lines and ends with the wrong value is the shape of bug this harness
+//! exists to find, and a comparison of printed output alone cannot see it.
+//!
+//! `Typed` is the harness's own value type rather than `redblue::Value` for two
+//! reasons: `Value` carries an `f64` and so cannot be compared for equality in a
+//! test without a float comparison that can be fudged, and `Value::Object`
+//! renders as `<object>` — two different objects are indistinguishable. Here a
+//! record's keys are sorted, so a value that two VMs built in different orders
+//! still compares equal, and an object names itself.
+
+use std::fmt;
+
+use redblue::bytecode::vm::BytecodeVm;
+use redblue::bytecode::Chunk;
+use redblue::{compile_source, run_isolated, Error, Value};
+
+/// A value, with its type, comparable and printable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Typed {
+    Nothing,
+    Number(f64),
+    Text(String),
+    YesNo(bool),
+    List(Vec<Typed>),
+    /// Sorted by key, so insertion order cannot make two equal records look
+    /// different.
+    Record(Vec<(String, Typed)>),
+    /// An object, a function or a builtin: named, not rendered, so two of them
+    /// can be told apart.
+    Opaque(String),
+}
+
+impl Typed {
+    /// The harness's reading of a [`Value`].
+    pub fn of(value: &Value) -> Typed {
+        match value {
+            Value::Nothing => Typed::Nothing,
+            Value::Number(n) => Typed::Number(*n),
+            Value::Text(s) => Typed::Text(s.clone()),
+            Value::YesNo(b) => Typed::YesNo(*b),
+            Value::List(items) => Typed::List(items.iter().map(Typed::of).collect()),
+            Value::Record(fields) => {
+                let mut entries: Vec<(String, Typed)> = fields
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Typed::of(v)))
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                Typed::Record(entries)
+            }
+            Value::Object(name, _) => Typed::Opaque(format!("Object {name}")),
+            Value::Function(f) => Typed::Opaque(format!("Function {}", f.name)),
+            Value::Builtin(name) => Typed::Opaque(format!("Builtin {name}")),
+        }
+    }
+
+    /// The type's own name, as the golden format records it.
+[0m
+[0m← [0mWrite tests/catch_binding_test.rs
+Wrote file successfully.
+[0m
+Reproduced all three. Now the failing test.
+[0m$ [0mcargo test --test catch_binding_test 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: function `expect_err` is never used[0m
+  [1m[94m--> [0mtests/catch_binding_test.rs:96:4
+   [1m[94m|[0m
+[1m[94m96[0m [1m[94m|[0m fn expect_err(source: &str) -> Error {
+   [1m[94m|[0m    [1m[91m^^^^^^^^^^[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mnote[0m: `-D dead-code` implied by `-D warnings`
+   [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+[1m[91merror[0m: could not compile `redblue` (test "catch_binding_test") due to 1 previous error
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m← [0mEdit tests/catch_binding_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+@@ -92,8 +92,9 @@
+         Err(error) => panic!("the program should have succeeded, got: {error}\n{source}"),
+     }
+ }
+ 
++#[allow(dead_code)]
+ fn expect_err(source: &str) -> Error {
+     let outcome = both_engines(source);
+     match outcome.result {
+         Ok(_) => panic!("the program should have failed, it printed: {}\n{source}", outcome.output.join("\n")),
+
+[0m
+[0m$ [0mcargo test --test catch_binding_test 2>&1 | tail -30
+failures:
+
+---- catch_error_name_binds_the_message stdout ----
+
+thread 'catch_error_name_binds_the_message' (5849) panicked at tests/catch_binding_test.rs:92:23:
+the program should have succeeded, got: AnalyzerError: Unknown variable 'e'
+Unknown variable 'e'
+  --> 3:13
+try
+    set x to 1 / 0
+catch error e
+    say e
+end
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: catch_binding_test::expect_ok
+   3: catch_binding_test::catch_error_name_binds_the_message
+   4: catch_binding_test::catch_error_name_binds_the_message::{closure#0}
+   5: <catch_binding_test::catch_error_name_binds_the_message::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    catch_error_name_binds_the_message
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test catch_binding_test`
+[0m
+[0m$ [0mgrep -n "fn current\|fn peek\|fn advance\|fn previous\|self.pos\b" src/parser.rs | head -20
+405:    fn current(&self) -> Option<&Token> {
+406:        self.tokens.get(self.pos)
+419:    fn advance(&mut self) -> Option<Token> {
+420:        if self.pos < self.tokens.len() {
+421:            self.pos += 1;
+422:            Some(self.tokens[self.pos - 1].clone())
+985:        let mut ahead = self.pos + 1;
+1093:        for token in self.tokens[self.pos..].iter() {
+1338:            .get(self.pos.saturating_sub(1))
+1890:            self.tokens.get(self.pos + offset),
+1911:                self.tokens.get(self.pos + 2),
+1983:    fn current_at(&self, offset: usize) -> Option<&TokenKind> {
+1984:        self.tokens.get(self.pos + offset).map(|token| &token.kind)
+[0m
+[0m→ [0mRead src/parser.rs[90m [limit=20, offset=1885][0m
+Now the fix in `src/parser.rs`:
+[0m
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -1618,8 +1618,21 @@
+     ..
+ }) = self.current()
+ {
+     self.advance();
++    // SPEC.md § Error Handling writes the handler as `catch error`, and
++    // `error` is a word to the lexer like any other — so the word after
++    // `catch` is read as the name it binds, and `catch error` binds a
++    // name spelled `error`. The spelled-out `catch error <name>` is the
++    // same handler with the binder written after the word: it is a second
++    // identifier on the *same line*, which is the only place two
++    // identifiers sit next to each other here. Reading it this way keeps
++    // `catch error` binding `error` — a `catch` followed by its body on
++    // the next line, where the body starts with a name, is not
++    // `catch error e`.
++    if self.catch_keyword_ahead() {
++        self.advance(); // consume 'error'
++    }
+     if let Some(Token {
+         kind: TokenKind::Identifier(name),
+         ..
+     }) = self.current()
+
+[0m
+Now the helper, next to `is_word_ahead`:
+[0m← [0mEdit src/parser.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/parser.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/parser.rs
++++ /home/runner/work/rbops/rbops/redblue/src/parser.rs
+@@ -1907,8 +1907,34 @@
+         }) if found == word
+     )
+ }
+ 
++/// Whether the current position is the `error` word of a spelled-out
++/// `catch error <name>` rather than a name in its own right.
++///
++/// It is the word `error` followed by a second identifier *on the same
++/// line*. `catch error` alone — SPEC.md's own handler, and the spelling
++/// every example in the language uses — is the word with nothing after it,
++/// so it goes on binding a name spelled `error`. So does a `catch error`
++/// whose body starts on the next line with a name: the body's first word is
++/// on another line, so there is no second identifier here to be a binder.
++fn catch_keyword_ahead(&self) -> bool {
++    if !self.is_word_ahead(0, "error") {
++        return false;
++    }
++    let Some(first) = self.current() else {
++        return false;
++    };
++    matches!(
++        self.tokens.get(self.pos + 1),
++        Some(Token {
++            kind: TokenKind::Identifier(_),
++            line,
++            ..
++        }) if *line == first.line
++    )
++}
++
+ /// Whether the whole `or equal to` tail of a compound word comparison sits
+ /// at the current position. It is matched as one phrase rather than as an
+ /// `or` for `parse_or` to bind later, so `x is greater than or equal to y`
+ /// is one comparison and not `(x is greater than y) or equal to y`.
+
+[0m
+[0m$ [0mcargo test --test catch_binding_test 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 2.47s
+[1m[92m     Running[0m tests/catch_binding_test.rs (target/debug/deps/catch_binding_test-743d2e7ef2ed55dc)
+
+running 1 test
+error
+test catch_error_name_binds_the_message ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo build --bin rb 2>&1 | tail -5 && ./target/debug/rb run target/tmp/p048/catch_error_name.rb; echo "RUN_EXIT=$?"; ./target/debug/rb compile target/tmp/p048/catch_error_name.rb -o target/tmp/p048/cen.rbc 2>&1 | tail -3; ./target/debug/rb vm target/tmp/p048/cen.rbc; echo "VM_EXIT=$?"
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.07s
+error
+RUN_EXIT=0
+Compiled target/tmp/p048/catch_error_name.rb -> target/tmp/p048/cen.rbc
+error
+VM_EXIT=0
+[0m
+[0m$ [0mgrep -n "Statement::Try" -A 40 src/formatter.rs | head -60
+493:            Statement::Try {
+494-                body,
+495-                catch_var,
+496-                catch_body,
+497-                finally_body,
+498-            } => {
+499-                self.write("try");
+500-                self.open_line(stmt.span.line);
+501-                // Which keyword closed the block just written — `catch` if the
+502-                // source has a catch clause, `end` if it has none. Reassigned
+503-                // when a catch clause is written, because then the catch body's
+504-                // own closing keyword is the one the `finally` is judged against.
+505-                let mut closed_by = self.format_block(body);
+506-
+507-                // A bare `catch` — one with no name binding — is legal: the parser
+508-                // leaves catch_var as None and still collects catch_body. Gating
+509-                // the whole block on `Some(var)` DELETED the body: the formatter
+510-                // silently discarded code the user wrote, which is the worst
+511-                // thing a formatter can do.
+512-                match catch_var {
+513-                    Some(var) => {
+514-                        // `catch` takes the error's name, so it cannot go through
+515-                        // `write_keyword_line`: that helper ends the line with the
+516-                        // trailing comment, and a name written after a comment
+517-                        // lands in it — `catch err // note` came out as
+518-                        // `catch // noteerr`, which does not read back at all. The
+519-                        // name is written first, then the one trailing comment.
+520-                        self.write_indent();
+521-                        self.write("catch ");
+522-                        self.write(var);
+523-                        self.write_trailing_comment(self.last_line);
+524-                        self.newline();
+525-                        closed_by = self.format_block(catch_body);
+526-                    }
+527-                    // The name is optional to the parser, so a nameless `catch` is
+528-                    // a catch clause like any other and the body after it has to
+529-                    // be written back out. The tree cannot tell a nameless `catch`
+530-                    // from no `catch` at all — both are `None` with an empty body
+531-                    // — so the keyword the source wrote is what decides, with the
+532-                    // body as a second witness. A nameless `catch` may carry a
+533-                    // trailing comment like any other line.
+[0m
+[0m$ [0mcp target/tmp/p048/catch_error_name.rb target/tmp/p048/fmt.rb && ./target/debug/rb format target/tmp/p048/fmt.rb && cat target/tmp/p048/fmt.rb && ./target/debug/rb lint target/tmp/p048/fmt.rb; echo "LINT=$?"
+try
+    set x to 1 / 0
+catch e
+    say e
+end
+try
+    set x to 1 / 0
+catch error e
+    say e
+end
+Warning: line 2: Unused variable: 'x'
+LINT=0
+[0m
+[0m$ [0mgrep -rn "catch" bootstrap/*.rb tooling/ --include=* -l 2>/dev/null | head; echo "---"; grep -rn "catch" docs/GRAMMAR.md | head
+bootstrap/compiler.rb
+tooling/vscode/syntaxes/redblue.tmLanguage.json
+tooling/vscode/snippets/redblue.json
+tooling/vscode/README.md
+---
+50:         | 'try' | 'catch' | 'finally' | 'error'
+262:the loop — a `catch`, `finally`, `test`, `object` or `module` body, or an `unless`
+265:`try ... catch error` catches; a function body is not inside the loop that called
+304:                    { 'catch' [ identifier ] [ 'of' identifier ]
+311:The `catch` is optional, and a `try` without one is not a handler: the `finally`
+313:reported on — and the failure is then the enclosing program's to catch, or its
+322:  `catch` written around the `try` does not run. See `SPEC.md`, "Finally".
+571:catch error
+[0m
+[0m$ [0msed -n '290,330p' docs/GRAMMAR.md; echo "=== bootstrap ==="; grep -n "catch" bootstrap/compiler.rb | head -20
+method_decl      = 'to' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+                    { statement }
+                    'end'
+
+method_decl      = 'to' 'can' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+                    { statement }
+                    'end'
+```
+
+### 4.7 Try Statement (Error Handling)
+
+```
+try_statement    = 'try'
+                    { statement }
+                    { 'catch' [ identifier ] [ 'of' identifier ]
+                      { statement } }
+                    [ 'finally'
+                      { statement } ]
+                    'end'
+```
+
+The `catch` is optional, and a `try` without one is not a handler: the `finally`
+is still owed however its region is left — a failure runs it before the failure is
+reported on — and the failure is then the enclosing program's to catch, or its
+own to stop with. See `SPEC.md`, "Finally".
+
+Two things in that `finally` are not the failure being reported:
+
+- a `finally` that **fails** replaces it — the failure that reaches the enclosing
+  `try` is the cleanup's own;
+- a `finally` that leaves its region **abruptly** — a `break` or a `skip` — drops
+  it, because the region was left by the jump rather than by the failure, so a
+  `catch` written around the `try` does not run. See `SPEC.md`, "Finally".
+
+### 4.8 Async Statements
+
+```
+async_function   = 'async' function_decl
+async_call       = 'async' set_statement
+
+parallel_block   = 'parallel'
+=== bootstrap ===
+93:    catch failure
+561:    catch failure
+672:    set keyword_of_words to ["set", "constant", "to", "is", "are", "if", "then", "else", "end", "when", "unless", "for", "each", "in", "from", "times", "while", "repeat", "until", "break", "skip", "return", "give", "back", "might", "fail", "say", "print", "ask", "try", "catch", "finally", "and", "or", "not", "mod", "yes", "no", "nothing", "module", "import", "export", "as", "test", "expect", "object", "has", "can", "this", "that", "new", "extends", "async", "wait", "parallel"]
+673:    set keyword_of_kinds to ["set", "constant", "to", "is", "are", "if", "then", "else", "end", "when", "unless", "for", "each", "in", "from", "times", "while", "repeat", "until", "break", "skip", "return", "giveback", "giveback", "mightfail", "mightfail", "say", "print", "ask", "try", "catch", "finally", "and", "or", "not", "mod", "yes", "no", "nothing", "module", "import", "export", "as", "test", "expect", "object", "has", "can", "this", "that", "new", "extends", "async", "wait", "parallel"]
+1525:// `try ... catch ... finally ... end`
+1527:    set parse_try_body to parse_block_body(tokens, pos + 1, check_depth(line, depth + 1, "blocks"), ["catch", "finally", "end"])
+1528:    give back parse_try_catch(tokens, parse_try_body[1], depth, line, parse_try_body[0])
+1531:to parse_try_catch(tokens, pos, depth, line, body)
+1532:    set parse_try_catch_out to nothing
+1533:    if token_kind(tokens, pos) is "catch" then
+1534:        set parse_try_catch_out to parse_try_catch_body(tokens, pos + 1, depth, line, body, [])
+1536:    if type_of(parse_try_catch_out) is "nothing" then
+1537:        set parse_try_catch_out to parse_try_finally(tokens, pos, depth, line, body, [], [])
+1539:    give back parse_try_catch_out
+1542:to parse_try_catch_body(tokens, pos, depth, line, body, catch_name)
+1543:    set parse_try_catch_body_out to nothing
+1545:        set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos + 1, depth, line, body, tokens[pos].b)
+1547:    if type_of(parse_try_catch_body_out) is "nothing" then
+1548:        set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos, depth, line, body, catch_name)
+1550:    give back parse_try_catch_body_out
+[0m
+[0m$ [0msed -n '1542,1600p' bootstrap/compiler.rb
+to parse_try_catch_body(tokens, pos, depth, line, body, catch_name)
+    set parse_try_catch_body_out to nothing
+    if token_kind(tokens, pos) is "id" then
+        set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos + 1, depth, line, body, tokens[pos].b)
+    end
+    if type_of(parse_try_catch_body_out) is "nothing" then
+        set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos, depth, line, body, catch_name)
+    end
+    give back parse_try_catch_body_out
+end
+
+to parse_try_catch_body_tail(tokens, pos, depth, line, body, catch_name)
+    set parse_try_catch_body_tail_inner to parse_block_body(tokens, pos, depth, ["finally", "end"])
+    set parse_try_catch_body_tail_out to nothing
+    set parse_try_catch_body_tail_out to parse_try_finally(tokens, parse_try_catch_body_tail_inner[1], depth, line, body, catch_name, parse_try_catch_body_tail_inner[0])
+    give back parse_try_catch_body_tail_out
+end
+
+to parse_try_finally(tokens, pos, depth, line, body, catch_name, catch_body)
+    set parse_try_finally_out to nothing
+    if token_kind(tokens, pos) is "finally" then
+        set parse_try_finally_inner to parse_block_body(tokens, pos + 1, depth, ["end"])
+        set parse_try_finally_q to expect_kind(tokens, parse_try_finally_inner[1], "end")
+        set parse_try_finally_out to [{s: "try", l: line, t: body, cn: catch_name, c: catch_body, f: parse_try_finally_inner[0]}, parse_try_finally_q]
+    end
+    if type_of(parse_try_finally_out) is "nothing" then
+        set parse_try_finally_q to expect_kind(tokens, pos, "end")
+        set parse_try_finally_out to [{s: "try", l: line, t: body, cn: catch_name, c: catch_body, f: []}, parse_try_finally_q]
+    end
+    give back parse_try_finally_out
+end
+
+// `module NAME ... end`
+to parse_module(tokens, pos, depth, line)
+    if token_kind(tokens, pos + 1) is not "id" then
+        refuse(line, "expected a module name")
+    end
+    set parse_module_body to parse_block_body(tokens, pos + 2, check_depth(line, depth + 1, "blocks"), ["end"])
+    set parse_module_q to expect_kind(tokens, parse_module_body[1], "end")
+    set parse_module_out to [{s: "module", l: line, n: tokens[pos + 1].b, t: parse_module_body[0]}, parse_module_q]
+    give back parse_module_out
+end
+
+// `export name, ...` or `export all`.
+to parse_export(tokens, pos, line)
+    set parse_export_out to nothing
+    if word_at(tokens, pos) is "all" then
+        set parse_export_out to parse_export_more(tokens, pos + 1, line, [], yes)
+    end
+    if type_of(parse_export_out) is "nothing" then
+        if token_kind(tokens, pos) is "id" then
+            set parse_export_out to parse_export_more(tokens, pos + 1, line, [tokens[pos].b], no)
+        end
+    end
+    if type_of(parse_export_out) is "nothing" then
+        refuse(token_line(tokens, pos), "expected a name to export after 'export'")
+    end
+    give back parse_export_out
+end
+[0m
+[0m$ [0mgrep -n "to token_line\|to word_at\|to token_kind" -A 8 bootstrap/compiler.rb | head -40
+741:to token_kind(tokens, pos)
+742-    set token_kind_kind to 0
+743-    set token_kind_kind to "eof"
+744-    if pos >= 0 then
+745-        if pos < length(tokens) then
+746-            set token_kind_kind to tokens[pos].k
+747-        end
+748-    end
+749-    give back token_kind_kind
+--
+752:to token_line(tokens, pos)
+753-    set token_line_line to 0
+754-    set token_line_line to 0
+755-    if pos >= 0 then
+756-        if pos < length(tokens) then
+757-            set token_line_line to tokens[pos].l
+758-        end
+759-    end
+760-    give back token_line_line
+--
+766:to word_at(tokens, pos)
+767-    set word_at_word to 0
+768-    set word_at_word to ""
+769-    if token_kind(tokens, pos) is "id" then
+770-        set word_at_word to bytes.text(tokens[pos].b)
+771-    end
+772-    give back word_at_word
+773-end
+774-
+--
+990:    set is_statement_keyword_k to token_kind(tokens, pos)
+991-    set is_statement_keyword_yes to no
+992-    if is_statement_keyword_k is "say" then
+993-        set is_statement_keyword_yes to yes
+994-    end
+995-    if is_statement_keyword_k is "print" then
+996-        set is_statement_keyword_yes to yes
+997-    end
+998-    if is_statement_keyword_k is "set" then
+--
+[0m
+[0m$ [0mgrep -n "{k:\|ln:\|line:" bootstrap/compiler.rb | head -20
+443:    append("G_TOKENS", {k: "eof", l: lex_line})
+463:            set lex_one_result to [{k: "nl", l: line}, lex_one_p, 1]
+567:    give back [{k: "num", l: line, v: lex_number_value}, lex_number_p, 0]
+636:    give back [{k: "text", l: line, b: lex_text_out}, lex_text_p, lex_text_lines]
+662:    give back [{k: keyword_of(bytes.text(lex_word_raw)), l: line, b: lex_word_raw}, lex_word_p, 0]
+730:    give back [{k: lex_operator_kind, l: line}, lex_operator_p, 0]
+967:        set parse_statement_stmt to {s: "expr", l: line, e: {k: "expect", a: parse_statement_r[0][0], b: parse_statement_r[0][1]}}
+1718:    set bin_node_out to {k: "bin", op: kind, l: left, r: right}
+1890:        set parse_unary_out to [{k: "un", op: "not", e: parse_unary_inner[0]}, parse_unary_inner[1]]
+1895:            set parse_unary_out to [{k: "un", op: "neg", e: parse_unary_inner[0]}, parse_unary_inner[1]]
+1918:        set parse_postfix_more_next to {k: "prop", o: node, p: tokens[pos + 1].b}
+1931:            set parse_postfix_more_next to {k: "index", o: node, i: parse_postfix_more_index[0]}
+1973:        set make_call_call to {k: "call", n: node.n, args: args}
+1976:        set make_call_call to {k: "mcall", o: node.o, m: node.p, args: args}
+1987:        set parse_primary_out to [{k: "num", v: tokens[pos].v}, pos + 1]
+1993:                set parse_primary_out to {k: "text", b: tokens[pos].b}
+2000:            set parse_primary_out to [{k: "yes"}, pos + 1]
+2005:            set parse_primary_out to [{k: "no"}, pos + 1]
+2010:            set parse_primary_out to [{k: "nothing"}, pos + 1]
+2016:            set parse_primary_out to [{k: "var", n: tokens[pos].b}, pos + 1]
+[0m
+[0m$ [0mcd target/tmp/p048 && cat > probe.rb <<'EOF'
+set e to "outer"
+try
+    set bad to 1 / 0
+catch error e
+    say e
+end
+say e
+EOF
+../../debug/rb run probe.rb; echo "EXIT=$?"
+printf 'try\n  say "fine"\ncatch error e\n  say e\nend\nsay e\n' > probe2.rb; ../../debug/rb run probe2.rb; echo "EXIT2=$?"
+printf 'try\n  set bad to 1/0\ncatch error\nend\nsay "survived"\n' > probe3.rb; ../../debug/rb run probe3.rb; echo "EXIT3=$?"
+printf 'set e to "outer"\ntry\n  set bad to 1/0\ncatch error\n  say e\nend\nsay e\n' > probe4.rb; ../../debug/rb run probe4.rb; echo "EXIT4=$?"
+error
+outer
+EXIT=0
+Error: AnalyzerError: Unknown variable 'e'
+  --> probe2.rb:6:1
+6 | say e
+  | ^
+EXIT2=1
+survived
+EXIT3=0
+outer
+outer
+EXIT4=0
+[0m
+[0m$ [0mcd target/tmp/p048
+printf 'try\n  set bad to 1/0\nend\nsay "after"\n' > p5.rb; ../../debug/rb run p5.rb; echo "EXIT5=$?"
+printf 'try\n  set bad to 1/0\ncatch error\n  say 1/0\nend\nsay "after"\n' > p6.rb; ../../debug/rb run p6.rb; echo "EXIT6=$?"
+printf 'set total to 0\ntry\n  set bad to 1/0\ncatch error\n  total is 41\n  say total\nend\n' > p7.rb; ../../debug/rb run p7.rb; echo "EXIT7=$?"
+printf 'say e\ntry\n  set bad to 1/0\ncatch error e\n  say e\nend\nsay e\n' > p8.rb; ../../debug/rb run p8.rb; echo "EXIT8=$?"
+Error: RuntimeError: Division by zero
+  --> p5.rb:2:3
+2 |   set bad to 1/0
+  |   ^
+EXIT5=1
+Error: RuntimeError: Division by zero
+  --> p6.rb:4:3
+4 |   say 1/0
+  |   ^
+EXIT6=1
+0
+EXIT7=0
+EXIT8=1
+Error: AnalyzerError: Unknown variable 'e'
+Unknown variable 'e'
+  --> p8.rb:1:1
+1 | say e
+  | ^
+[0m
+[0m$ [0mcd target/tmp/p048
+printf 'try\n  set bad to 1/0\ncatch error\n  n is 5\n  say n\nend\n' > p9.rb; ../../debug/rb run p9.rb; echo "EXIT9=$?"
+printf 'try\n  set bad to 1/0\ncatch error e\nend\n' > p10.rb; ../../debug/rb run p10.rb; echo "EXIT10=$?"
+printf 'try\n  set bad to 1/0\ncatch error\n  say "\xe2\x9c\x93 \xf0\x9f\x8e\x89 "\nend\n' > p11.rb; ../../debug/rb run p11.rb; echo "EXIT11=$?"
+printf 'try\n  set bad to 1/0\ncatch error of FileError\n  say 1\nend\n' > p12.rb; ../../debug/rb run p12.rb; echo "EXIT12=$?"
+Error: AnalyzerError: Unknown variable 'n'
+Unknown variable 'n'
+  --> p9.rb:4:3
+4 |   n is 5
+  |   ^
+EXIT9=1
+EXIT10=0
+✓ 🎉 
+EXIT11=0
+Error: AnalyzerError: Unknown variable 'FileError'
+  --> p12.rb:3:16
+3 | catch error of FileError
+  |                ^
+EXIT12=1
+[0m
+[0m$ [0msed -n '70,175p' tests/might_fail_test.rs
+///
+/// The published limits are far above what a test may spend, so a program that
+/// has to *reach* one is not a test. These build the VM with the limits set
+/// directly rather than reading the environment, which is shared with every other
+/// test running in parallel — the same reason `tests/bytecode_vm_test.rs` does it.
+fn tree_walk_bounded(source: &str, max_iterations: usize, max_steps: usize) -> Outcome {
+    let failed = |error: Error| Outcome {
+        output: Vec::new(),
+        result: Err(error),
+    };
+    let tokens = match redblue::lexer::Lexer::tokenize(source) {
+        Ok(tokens) => tokens,
+        Err(error) => return failed(error),
+    };
+    let ast = match redblue::parser::parse(tokens) {
+        Ok(ast) => ast,
+        Err(error) => return failed(error),
+    };
+    if let Err(error) = redblue::analyzer::analyze(&ast) {
+        return failed(error);
+    }
+    let mut vm = redblue::Vm::with_limits(max_iterations, max_steps);
+    let result = vm.run(&ast);
+    Outcome {
+        output: vm.take_output(),
+        result,
+    }
+}
+
+/// [`bytecode`] with both resource limits brought down.
+fn bytecode_bounded(source: &str, max_iterations: usize, max_steps: usize) -> Outcome {
+    let chunk = match compile_source(source) {
+        Ok(chunk) => chunk,
+        Err(error) => {
+            return Outcome {
+                output: Vec::new(),
+                result: Err(error),
+            }
+        }
+    };
+    let mut vm = BytecodeVm::with_limits(max_iterations, max_steps);
+    vm.set_echo(false);
+    let result = vm.run(&chunk);
+    Outcome {
+        output: vm.take_output(),
+        result,
+    }
+}
+
+/// One program, run on both engines, with the engines' agreement asserted.
+///
+/// A helper that ran one engine would let a divergence pass as a pass, so this is
+/// the only way a case in this file reaches an engine at all. The comparison is
+/// over the printed lines and the label, message and line of any failure: the
+/// column is compared only where both engines can carry one, because a compiled
+/// instruction has a line and no column.
+#[track_caller]
+fn both(source: &str) -> (Outcome, Outcome) {
+    let tree = tree_walk(source);
+    let byte = bytecode(source);
+    assert!(
+        agrees(&tree, &byte),
+        "the two engines disagree about:\n{}\n  tree-walking: {:?}\n  bytecode:     {:?}",
+        source,
+        tree,
+        byte
+    );
+    (tree, byte)
+}
+
+fn agrees(a: &Outcome, b: &Outcome) -> bool {
+    if a.output != b.output {
+        return false;
+    }
+    match (&a.result, &b.result) {
+        (Ok(x), Ok(y)) => x == y,
+        (Err(x), Err(y)) => {
+            x.label() == y.label()
+                && x.message() == y.message()
+                && x.span().map(|s| s.line) == y.span().map(|s| s.line)
+        }
+        _ => false,
+    }
+}
+
+/// What both engines printed, asserted line for line.
+#[track_caller]
+fn both_print(source: &str, expected: &[&str]) {
+    let (tree, byte) = both(source);
+    assert_eq!(
+        tree.output, expected,
+        "tree-walking output for:\n{}",
+        source
+    );
+    assert_eq!(byte.output, expected, "bytecode output for:\n{}", source);
+}
+
+/// The value both engines ended with, asserted.
+#[track_caller]
+fn both_value(source: &str, expected: Value) {
+    let (tree, byte) = both(source);
+    assert_eq!(
+        tree.result.as_ref().ok(),
+        Some(&expected),
+        "tree-walking value for:\n{}",
+        source
+[0m
+[0m← [0mWrite tests/catch_binding_test.rs
+Wrote file successfully.
+[0m
+[0m$ [0mcargo test --test catch_binding_test 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0369][0m[1m: binary operation `==` cannot be applied to type `Result<String, &redblue::Error>`[0m
+   [1m[94m--> [0mtests/catch_binding_test.rs:100:5
+    [1m[94m|[0m
+[1m[94m100[0m [1m[94m|[0m [1m[91m/[0m     assert_eq!(
+[1m[94m101[0m [1m[94m|[0m [1m[91m|[0m         outcome.result.as_ref().map(|v| format!("{v:?}")),
+[1m[94m102[0m [1m[94m|[0m [1m[91m|[0m         Ok("Nothing".to_string()),
+[1m[94m103[0m [1m[94m|[0m [1m[91m|[0m         "the program should succeed for:\n{source}"
+[1m[94m104[0m [1m[94m|[0m [1m[91m|[0m     );
+    [1m[94m|[0m [1m[91m|[0m     [1m[91m^[0m
+    [1m[94m|[0m [1m[91m|[0m     [1m[91m|[0m
+    [1m[94m|[0m [1m[91m|_____Result<String, &redblue::Error>[0m
+    [1m[94m|[0m       [1m[91mResult<String, &redblue::Error>[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: `redblue::Error` does not implement `PartialEq`
+   [1m[94m--> [0msrc/error.rs:78:1
+    [1m[94m|[0m
+[1m[94m 78[0m [1m[94m|[0m pub enum Error {
+    [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^[0m [1m[92m`redblue::Error` is defined in another crate[0m
+
+[1mFor more information about this error, try `rustc --explain E0369`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "catch_binding_test") due to 1 previous error
+[0m
+[0m← [0mEdit tests/catch_binding_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+@@ -98,9 +98,9 @@
+ fn both_print(source: &str, expected: &[&str]) {
+     let outcome = both(source);
+     assert_eq!(
+         outcome.result.as_ref().map(|v| format!("{v:?}")),
+-        Ok("Nothing".to_string()),
++        Some("Nothing".to_string()),
+         "the program should succeed for:\n{source}"
+     );
+     assert_eq!(outcome.output, expected, "output for:\n{source}");
+ }
+
+[0m
+[0m$ [0mcargo test --test catch_binding_test 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0369][0m[1m: binary operation `==` cannot be applied to type `Result<String, &redblue::Error>`[0m
+   [1m[94m--> [0mtests/catch_binding_test.rs:100:5
+    [1m[94m|[0m
+[1m[94m100[0m [1m[94m|[0m [1m[91m/[0m     assert_eq!(
+[1m[94m101[0m [1m[94m|[0m [1m[91m|[0m         outcome.result.as_ref().map(|v| format!("{v:?}")),
+[1m[94m102[0m [1m[94m|[0m [1m[91m|[0m         Some("Nothing".to_string()),
+[1m[94m103[0m [1m[94m|[0m [1m[91m|[0m         "the program should succeed for:\n{source}"
+[1m[94m104[0m [1m[94m|[0m [1m[91m|[0m     );
+    [1m[94m|[0m [1m[91m|[0m     [1m[91m^[0m
+    [1m[94m|[0m [1m[91m|[0m     [1m[91m|[0m
+    [1m[94m|[0m [1m[91m|_____Result<String, &redblue::Error>[0m
+    [1m[94m|[0m       [1m[91mOption<String>[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: `Result<String, &redblue::Error>` does not implement `PartialEq<Option<String>>`
+   [1m[94m--> [0m/rustc/b940084d7eb6a299eb4bfeb8e34901bc051e7ac4/library/core/src/result.rs:558:0
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `Result<String, &redblue::Error>` is defined in another crate
+
+[1mFor more information about this error, try `rustc --explain E0369`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "catch_binding_test") due to 1 previous error
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m← [0mEdit tests/catch_binding_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+@@ -97,9 +97,9 @@
+ #[track_caller]
+ fn both_print(source: &str, expected: &[&str]) {
+     let outcome = both(source);
+     assert_eq!(
+-        outcome.result.as_ref().map(|v| format!("{v:?}")),
++        outcome.result.as_ref().ok().map(|v| format!("{v:?}")),
+         Some("Nothing".to_string()),
+         "the program should succeed for:\n{source}"
+     );
+     assert_eq!(outcome.output, expected, "output for:\n{source}");
+
+[0m
+[0m$ [0mcargo test --test catch_binding_test 2>&1 | tail -45
+test edge_an_empty_catch_body_still_handles_the_failure ... ok
+test edge_the_bound_name_is_ordinary_unicode_text ... ok
+test edge_a_try_that_never_fails_never_binds_the_name ... FAILED
+c
+error
+error
+outer
+test the_binder_is_scoped_to_the_catch_body_alone ... ok
+test edge_the_keyword_and_the_binder_may_be_the_same_word ... ok
+test the_binder_shadows_a_program_variable_of_the_same_name ... ok
+error
+error
+error
+test every_catch_spelling_handles_the_same_failure ... ok
+
+failures:
+
+---- edge_a_try_that_never_fails_never_binds_the_name stdout ----
+
+thread 'edge_a_try_that_never_fails_never_binds_the_name' (6585) panicked at tests/catch_binding_test.rs:209:17:
+the program should have failed, it printed instead:
+set e to ""
+try
+    say "fine"
+catch error e
+    say e
+end
+say e
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: catch_binding_test::both_fail
+   3: catch_binding_test::edge_a_try_that_never_fails_never_binds_the_name
+   4: catch_binding_test::edge_a_try_that_never_fails_never_binds_the_name::{closure#0}
+   5: <catch_binding_test::edge_a_try_that_never_fails_never_binds_the_name::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_try_that_never_fails_never_binds_the_name
+
+test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[91merror[0m: test failed, to rerun pass `--test catch_binding_test`
+[0m
+[0m← [0mEdit tests/catch_binding_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+@@ -205,9 +205,9 @@
+ /// assigned and reading it anywhere is an analyzer error, not a silent
+ /// `nothing`.
+ #[test]
+ fn edge_a_try_that_never_fails_never_binds_the_name() {
+-    let error = both_fail("set e to \"\"\ntry\n    say \"fine\"\ncatch error e\n    say e\nend\nsay e\n");
++    let error = both_fail("try\n    say \"fine\"\ncatch error e\n    say e\nend\nsay e\n");
+     assert_eq!(
+         error.label(),
+         "AnalyzerError",
+         "the failure must be caught at analysis time, got {error:?}"
+
+[0m
+[0m$ [0mcargo test --test catch_binding_test 2>&1 | grep -E "^test |test result" | tail -25
+test edge_a_try_that_never_fails_never_binds_the_name ... ok
+test catch_error_name_binds_the_message ... ok
+test edge_a_keyword_and_a_binder_on_one_line_bind_and_run ... ok
+test edge_a_failure_inside_the_catch_body_is_not_swallowed ... ok
+test edge_a_try_with_no_catch_reports_its_own_failure ... ok
+test edge_the_body_first_word_on_the_next_line_is_not_the_binder ... ok
+test edge_catch_error_of_a_type_is_refused_naming_the_orphan ... ok
+test edge_the_bound_name_is_ordinary_unicode_text ... ok
+test edge_an_empty_catch_body_still_handles_the_failure ... ok
+test edge_the_keyword_and_the_binder_may_be_the_same_word ... ok
+test the_binder_is_scoped_to_the_catch_body_alone ... ok
+test the_binder_shadows_a_program_variable_of_the_same_name ... ok
+test every_catch_spelling_handles_the_same_failure ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m← [0mEdit tests/catch_binding_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs
+@@ -153,19 +153,21 @@
+         ),
+     ];
+ 
+     for (label, source, binder) in cases {
++        // A bare `catch` binds nothing, so it cannot read what it caught; every
++        // named `catch` binds the same text, whatever it is called.
+         let expected: &[&str] = match binder {
+-            // A bare `catch` binds nothing, so it cannot read what it caught.
+             None => &["c"],
+-            // Every named `catch` binds the same text, whatever it is called.
+             Some(_) => &["error"],
+         };
+-        both_print(source, expected);
+-        assert!(
+-            label.starts_with("catch") || label.starts_with("bare"),
+-            "unreachable: a malformed case label {label:?}"
++        let outcome = both(source);
++        assert_eq!(
++            outcome.result.as_ref().ok().map(|v| format!("{v:?}")),
++            Some("Nothing".to_string()),
++            "{label} should succeed"
+         );
++        assert_eq!(outcome.output, expected, "{label} should handle the failure");
+     }
+ }
+ 
+ // --- scoping -----------------------------------------------------------------
+
+[0m
+Now the bootstrap compiler parity fix:
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -1540,12 +1540,24 @@
+ end
+ 
+ to parse_try_catch_body(tokens, pos, depth, line, body, catch_name)
+     set parse_try_catch_body_out to nothing
+-    if token_kind(tokens, pos) is "id" then
+-        set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos + 1, depth, line, body, tokens[pos].b)
++    // `catch error <name>` — the word `error` with a second identifier after it
++    // on the same line — binds the name after it. Same rule as the Rust parser:
++    // `catch error` on its own still binds a name spelled `error`.
++    if word_at(tokens, pos) is "error" then
++        if token_kind(tokens, pos + 1) is "id" then
++            if token_line(tokens, pos + 1) is token_line(tokens, pos) then
++                set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos + 2, depth, line, body, tokens[pos + 1].b)
++            end
++        end
+     end
+     if type_of(parse_try_catch_body_out) is "nothing" then
++        if token_kind(tokens, pos) is "id" then
++            set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos + 1, depth, line, body, tokens[pos].b)
++        end
++    end
++    if type_of(parse_try_catch_body_out) is "nothing" then
+         set parse_try_catch_body_out to parse_try_catch_body_tail(tokens, pos, depth, line, body, catch_name)
+     end
+     give back parse_try_catch_body_out
+ end
+
+[0m
+[0m$ [0mgrep -n "\"fail\"\|\"raise\"\|raise\b" src/stdlib.rs | head -10; echo "=== 947-965 SPEC ==="; grep -n "" SPEC.md | sed -n '948,962p'
+=== 947-965 SPEC ===
+948:set stopped to might fail files.read("config.rb")   // -> nothing
+949:```
+950:
+951:### Raising Errors
+952:
+953:```redblue
+954:to might fail divide(a, b)
+955:    if b is equal to 0
+956:        give back error "Cannot divide by zero"
+957:    end
+958:    give back a / b
+959:end
+960:```
+961:
+962:---
+[0m
+[0m→ [0mRead SPEC.md[90m [offset=790, limit=32][0m
+[0m
+[0m← [0mEdit SPEC.md
+Index: /home/runner/work/rbops/rbops/redblue/SPEC.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/SPEC.md
++++ /home/runner/work/rbops/rbops/redblue/SPEC.md
+@@ -793,29 +793,66 @@
+ ### Try-Catch
+ 
+ ```redblue
+ try
+-    set data to might fail files.read("config.rb")
++    set data to files.read("config.rb")
+     process data
+ catch error
+-    say "Error: {error message}"
++    say "Error: {error}"
+ end
+ ```
+ 
+-### Multiple Catch Blocks
++A `catch` may name what it caught, and that name is bound for the body of the
++`catch` alone — not before the `try` and not after its `end`:
+ 
+ ```redblue
+ try
+-    set result to might fail risky_operation()
+-catch error of FileError
+-    handle_file_error(error)
+-catch error of NetworkError
+-    handle_network_error(error)
+-catch error
+-    handle_generic_error(error)
++    set data to files.read("config.rb")
++catch error problem
++    say "Error: {problem}"
+ end
+ ```
+ 
++The two spellings are one word apart and both are the same handler: `catch error`
++binds a name spelled `error`, and `catch error problem` binds a name spelled
++`problem`. `error` is a word to the lexer, not a keyword, so which of the two a
++line is writing is decided by whether a second name follows it **on the same
++line**. A `catch error` whose body starts on the next line is the first spelling,
++whatever the body's first word is.
++
++The name is bound to the text `error` — the word that says a failure was handled.
++Redblue errors are messages, not tagged values: there is no error object with a
++type to dispatch on, so `say error` is the whole of what a handler can say about
++what it caught.
++
++### Handling Failures by Hand
++
++A `try` has **one** `catch`. There is no `catch error of <Type>`, no second
++`catch`, and no type a failure could be matched against — `of` is not a word in
++the language, so `catch error of FileError` reads as a binder named `of` and
++leaves `FileError` as a statement of its own. A handler written that way fails
++the analyzer, naming the orphan.
++
++Asking what kind of failure it was is work for the program, not for the handler:
++the failing operation is inside the `try`, and its own result is what says which
++kind it was.
++
++```redblue
++try
++    set record to files.read("records/cleo.rb")
++catch error problem
++    say "could not read the record: {problem}"
++    give back
++end
++```
++
++```redblue
++set result to might fail network.get("https://example.com")
++if result is nothing
++    say "the network call failed"
++end
++```
++
+ ### Finally
+ 
+ ```redblue
+ try
+
+[0m
+Now the `give back error` section:
+[0m← [0mEdit SPEC.md
+Index: /home/runner/work/rbops/rbops/redblue/SPEC.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/SPEC.md
++++ /home/runner/work/rbops/rbops/redblue/SPEC.md
+@@ -986,15 +986,26 @@
+ ```
+ 
+ ### Raising Errors
+ 
++There is no `raise`, and no `give back error "..."`. Redblue has no statement
++that fails on the writer's account: `give back` hands a value back to the caller,
++and a value is not a failure. What `error` would be here is a name like any other
++— `give back error "Cannot divide by zero"` reads `error` as a variable, and a
++function that has never been given one fails the analyzer naming it.
++
++A function signals a failure by performing an operation that fails, which is the
++only thing that can fail:
++
+ ```redblue
+-to might fail divide(a, b)
+-    if b is equal to 0
+-        give back error "Cannot divide by zero"
++to divide(a, b)
++    if b is equal to 0 then
++        give back 1 / 0          // the RuntimeError this function owes its caller
+     end
+     give back a / b
+ end
++
++set result to might fail divide(1, 0)   // -> nothing
+ ```
+ 
+ ---
+ 
+
+[0m
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -300,15 +300,24 @@
+ 
+ ```
+ try_statement    = 'try'
+                     { statement }
+-                    { 'catch' [ identifier ] [ 'of' identifier ]
++                    { 'catch' [ 'error' ] [ identifier ] [ 'error' ] 
+                       { statement } }
+                     [ 'finally'
+                       { statement } ]
+                     'end'
+ ```
+ 
++A `catch` names what it caught by naming it, and there is one form of that name:
++the word after `catch`. `catch error` is a name spelled `error` — `error` is not
++a keyword — and `catch error <name>` is the same handler with the name written
++after the word, which is read when a second identifier follows `error` on the
++same line. The grammar writes the `error` twice because either of the two
++optional words may be the one that is actually there; it is not two separate
++keywords. There is no `catch error of <Type>`: `of` is not a word in the
++language.
++
+ The `catch` is optional, and a `try` without one is not a handler: the `finally`
+ is still owed however its region is left — a failure runs it before the failure is
+ reported on — and the failure is then the enclosing program's to catch, or its
+ own to stop with. See `SPEC.md`, "Finally".
+
+[0m
+Now GRAMMAR.md:
+Now the four gates.
+[0m$ [0mcargo fmt --all -- --check 2>&1 | head -30; echo "FMT_EXIT=${PIPESTATUS[0]}"
+Diff in /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs:166:
+             Some("Nothing".to_string()),
+             "{label} should succeed"
+         );
+-        assert_eq!(outcome.output, expected, "{label} should handle the failure");
++        assert_eq!(
++            outcome.output, expected,
++            "{label} should handle the failure"
++        );
+     }
+ }
+ 
+Diff in /home/runner/work/rbops/rbops/redblue/tests/catch_binding_test.rs:322:
+         error.message()
+     );
+ }
++
+FMT_EXIT=1
+[0m
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check && echo "FMT OK"
+FMT OK
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -30
+[1m[92m    Checking[0m httpdate v1.0.3
+[1m[92m    Checking[0m tokio-native-tls v0.3.1
+[1m[92m    Checking[0m idna v1.1.0
+[1m[92m    Checking[0m aho-corasick v1.1.5
+[1m[92m    Checking[0m scopeguard v1.2.0
+[1m[92m    Checking[0m base64 v0.21.7
+[1m[92m    Checking[0m simdutf8 v0.1.5
+[1m[92m    Checking[0m regex-syntax v0.8.11
+[1m[92m    Checking[0m serde v1.0.229
+[1m[92m    Checking[0m ryu v1.0.23
+[1m[92m    Checking[0m core_detect v1.0.0
+[1m[92m    Checking[0m encoding_rs v0.8.42
+[1m[92m    Checking[0m serde_urlencoded v0.7.1
+[1m[92m    Checking[0m rustls-pemfile v1.0.4
+[1m[92m    Checking[0m url v2.5.8
+[1m[92m    Checking[0m hyper v0.14.32
+[1m[92m    Checking[0m num-traits v0.2.19
+[1m[92m    Checking[0m sync_wrapper v0.1.2
+[1m[92m    Checking[0m regex-automata v0.4.18
+[1m[92m    Checking[0m ipnet v2.12.2
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Checking[0m mime v0.3.17
+[1m[92m    Checking[0m iana-time-zone v0.1.65
+[1m[92m    Checking[0m chrono v0.4.45
+[1m[92m    Checking[0m zmij v1.0.23
+[1m[92m    Checking[0m serde_json v1.0.151
+[1m[92m    Checking[0m hyper-tls v0.5.0
+[1m[92m    Checking[0m reqwest v0.11.27
+[1m[92m    Checking[0m regex v1.13.1
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 13.63s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^(test result|error|failures:|---- )|panicked|FAILED" | head -60
+test result: ok. 135 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 309.45s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 391.25s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.36s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+error
+error ✓ 🎉 café
+error
+error
+error
+error
+error
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.08s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.10s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "test result: FAILED|failures:|error\[|^error:" | head -20; echo "GREP_DONE"
+GREP_DONE
+[0m
+[0m$ [0m./rbops/verify.sh phase-048 2>&1 | tail -60
+/bin/bash: line 1: ./rbops/verify.sh: No such file or directory
+[0m
+[0m$ [0mls rbops 2>&1; ls phases | tail -5; ls phases/phase-048 2>&1
+ls: cannot access 'rbops': No such file or directory
+phase-043
+phase-044
+phase-045
+phase-046
+phase-047
+ls: cannot access 'phases/phase-048': No such file or directory
+[0m
+[0m$ [0mgrep -n "fn compile_with_bootstrap\|compiler.rb\|fn run_bootstrap\|Command::new" tests/bootstrap_selfhost_test.rs | head -20
+1://! `bootstrap/compiler.rb` — the compiler written in Redblue (ladder stage S2).
+5://! `bootstrap/compiler.rb`: the same four stages, written in Redblue and run by
+25:    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+90:/// Compiles `source` by running `bootstrap/compiler.rb` under the Rust `rb`.
+97:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+641:        let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+780:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+912:/// `stage1.rbc` is `bootstrap/compiler.rb` compiled by stage 1. Running that
+937:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+952:/// `bootstrap/compiler.rb` compiled by stage 1 — the self-hosted compiler, built
+959:        let bytes = stage1("bootstrap/compiler.rb", &compiler_contents());
+966:/// The source of `bootstrap/compiler.rb`.
+968:    fs::read_to_string(compiler()).expect("bootstrap/compiler.rb is UTF-8")
+1047:/// `for each` of `bootstrap/compiler.rb` wrongly wrote bytes here too, which is
+1287:        let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+1313:            // that does not exist — and `bootstrap/compiler.rb` implements no
+1431:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+1455:    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+1524:/// `bootstrap/compiler.rb`, compiled by itself, run as bytecode. Stage 1 is the
+1537:    Command::new(env!("CARGO_BIN_EXE_rb"))
+[0m
+[0m$ [0mls phases/phase-047; echo "---"; head -40 phases/phase-047/REPORT.md 2>/dev/null
+FINDINGS.md
+REPORT.md
+---
+# Phase 047 — Substitute `{expr}` in string literals so `Expr::InterpolatedText` is reachable
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| `src/parser.rs` | +357 −1 | `parse_primary`'s text arm now calls `parse_text`, which builds `Expr::InterpolatedText`; `interpolated_parts` splits a literal into text runs and substitutions; `read_interpolated` reads the source between `{` and `}` as one expression through a fresh `Parser`; a shared `Rc<Cell<usize>>` `interp_depth` bounds that recursion; `unmatched_opens` marks the opens no `}` closes in one backward pass, so the walk through a literal is linear in its length |
+| `bootstrap/compiler.rb` | +119 −1 | the same rule in Redblue, so stage 2 emits the `BUILD_TEXT` stage 1 emits and the S3 fixed point still holds |
+| `tests/test_text.rb` | +187 −8 | `text: braces are ordinary characters in a text literal` rewritten to assert real substitution; `text: braces survive at the edges of a text literal` rewritten likewise; `edge_text_an_unknown_name_inside_braces_is_never_printed` rewritten to put the name inside braces, with `edge_text_the_same_body_without_braces_is_not_a_failure` as its control; 17 new Redblue tests |
+| `tests/interpolation_test.rs` | +506 | new: 33 `#[test]`s — every one that asserts what a program *prints* runs on both engines — plus three unit tests in `src/parser.rs` for the budget, the nesting and the backward pass |
+| `tests/bytecode_test.rs` | +12 −0 | the documented instruction sequence for `say "n is {1 + 2}"` now names the `PUSH_CONST ×3, ADD, BUILD_TEXT` it really compiles to |
+| `tests/wasm_test.rs` | +4 −1 | `HELLO` records the substituted third line |
+| `tests/common/generator.rs` | +2 −2 | a stale comment that called interpolation "documented and unimplemented" |
+| `corpus/functions-0004.expected` | +1 −1 | `hi {name}` → `hi world` |
+| `corpus/text-ops-0017.expected` | +1 −1 | `Hello, {name}!` → `Hello, World!` |
+
+The construction site, `src/parser.rs:2437-2442`:
+
+```rust
+    fn parse_text(&mut self, text: String, span: Span) -> Result<Expr> {
+        match self.interpolated_parts(&text, span)? {
+            Some(parts) => Ok(Expr::InterpolatedText(parts)),
+            None => Ok(Expr::Text(text)),
+        }
+    }
+```
+
+`grep -n 'InterpolatedText' src/parser.rs` now prints three lines — the declaration at `:58`, the doc comment at `:2432`, and this construction at `:2440` — against the one it printed before.
+
+## The rule
+
+A `{` starts a substitution only when it has a matching `}` and the source between them reads as **one whole expression**. Everything else — an unmatched `{`, a lone `}`, an empty `{}`, a pair holding a JSON document, a pair holding a prefix of a larger expression like `{1 + }` — stays the characters it was written as. A literal with no substitution is still one `Expr::Text`, so a program that writes no brace pair gets exactly the node it got yesterday.
+
+## Definition of done
+
+**`rb run` and `rb vm` both substitute.**
+
+```
+$ rb run target/tmp/dod.rb          # set name to "World" / say "Hello, {name}!"
+Hello, World!
+[0m
+[0m$ [0msed -n '85,130p' tests/bootstrap_selfhost_test.rs
+path.display()
+        ),
+    }
+}
+
+/// Compiles `source` by running `bootstrap/compiler.rb` under the Rust `rb`.
+fn stage2(name: &str, source: &str) -> Stage2 {
+    let input = scratch(&format!("{name}.rb"));
+    let output = scratch(&format!("{name}.rbc"));
+    fs::write(&input, source).expect("write the program to compile");
+    clear_output(&output);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("run")
+        .arg(compiler())
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .expect("the rb binary runs");
+
+    Stage2 {
+        bytes: read_output(&output),
+        stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
+        succeeded: run.status.success(),
+    }
+}
+
+/// The bytes stage 1 writes for `source`.
+fn stage1(name: &str, source: &str) -> Vec<u8> {
+    match redblue::compile_source(source) {
+        Ok(chunk) => chunk.encode(),
+        Err(error) => {
+            panic!("stage 1 refuses {name}, so there are no bytes to compare:\n{error:?}\n{source}")
+        }
+    }
+}
+
+/// The one comparison this file makes: stage 2 wrote exactly what stage 1 did.
+fn assert_identical(name: &str, source: &str) {
+    let expected = stage1(name, source);
+    let actual = stage2(name, source);
+
+    assert!(
+        actual.succeeded,
+        "stage 2 failed on {name}:\n{}\nsource:\n{source}",
+        actual.stderr
+[0m
+I can verify the bootstrap parity directly:
+[0m$ [0mcd target/tmp/p048 && printf 'try\n  set bad to 1 / 0\ncatch error e\n  say e\nend\n' > bs1.rb && printf 'try\n  set bad to 1 / 0\ncatch error\n  say error\nend\n' > bs2.rb && printf 'try\n  set bad to 1 / 0\ncatch problem\n  say problem\nend\n' > bs3.rb && printf 'try\n  set bad to 1 / 0\ncatch\n  say "c"\nend\n' > bs4.rb && printf 'try\n  set bad to 1 / 0\ncatch error\n  n is 5\n  say n\nend\n' > bs5.rb
+for f in bs1 bs2 bs3 bs4 bs5; do
+  ../../../target/debug/rb run ../../../bootstrap/compiler.rb $f.rb s_$f.rbc >/dev/null 2>s_$f.err
+  ../../../target/debug/rb compile $f.rb -o c_$f.rbc >/dev/null 2>&1
+  if cmp -s s_$f.rbc c_$f.rbc; then echo "$f IDENTICAL"; else echo "$f DIFFERS"; head -3 s_$f.err; fi
+done
+bs1 IDENTICAL
+bs2 IDENTICAL
+bs3 IDENTICAL
+bs4 IDENTICAL
+bs5 DIFFERS
+[0m
+[0m$ [0mcd target/tmp/p048 && ls -la c_bs5.rbc s_bs5.rbc 2>&1; ../../../target/debug/rb compile bs5.rb -o c_bs5.rbc; echo "EXIT=$?"
+ls: cannot access 'c_bs5.rbc': No such file or directory
+-rw-r--r-- 1 runner runner 310 Oct 11 13:33 s_bs5.rbc
+AnalyzerError: Unknown variable 'n'
+Unknown variable 'n'
+  --> bs5.rb:4:3
+4 |   n is 5
+  |   ^
+EXIT=1
+[0m
+[0m$ [0msed -n '195,225p' tests/bootstrap_selfhost_test.rs
+"for each x in [1, 2, 3]\n    if x is 2 then\n        skip\n    end\n    if x is 3 then\n        break\n    end\n    say x\nend\n",
+        ),
+        (
+            "function",
+            "to add(a, b)\n    give back a + b\nend\nsay add(1, 2)\n",
+        ),
+        (
+            "give_back_nothing",
+            "to nothing_at_all()\n    give back\nend\nsay nothing_at_all()\n",
+        ),
+        (
+            "try_catch",
+            "try\n    say 1 / 0\ncatch error\n    say \"caught\"\nend\n",
+        ),
+        (
+            "try_finally",
+            "try\n    say \"body\"\nfinally\n    say \"finally\"\nend\n",
+        ),
+        (
+            "list_and_index",
+            "set xs to [10, 20, 30]\nsay xs[1]\nsay length(xs)\n",
+        ),
+        (
+            "record",
+            "set r to {name: \"Ada\", age: 36}\nsay r.name\nsay r.age\n",
+        ),
+        (
+            "nested_lists",
+            "set grid to [[1, 2], [3, 4]]\nsay grid[0][1]\n",
+        ),
+        (
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -206,8 +206,15 @@
+     "try_catch",
+     "try\n    say 1 / 0\ncatch error\n    say \"caught\"\nend\n",
+ ),
+ (
++    // The spelled-out binder: stage 2 has to read the word `error` as the
++    // handler keyword when a second name follows it on the same line, or
++    // it would emit a different program than stage 1 does.
++    "try_catch_error_name",
++    "try\n    say 1 / 0\ncatch error problem\n    say problem\nend\n",
++),
++(
+     "try_finally",
+     "try\n    say \"body\"\nfinally\n    say \"finally\"\nend\n",
+ ),
+ (
+
+[0m
+[0m$ [0mcargo test --test bootstrap_selfhost_test 2>&1 | grep -E "^test |test result|panicked" | tail -30
+test edge_a_broken_branch_is_refused_and_writes_nothing ... ok
+test edge_for_range_pushes_only_the_bounds_it_was_given ... ok
+test edge_malformed_source_is_reported_rather_than_compiled ... ok
+test edge_each_branch_compiles_the_statements_it_was_given ... ok
+test edge_stage3_is_byte_identical_on_a_sample_of_every_family ... ok
+test edge_stage3_is_byte_identical_on_the_awkward_shapes ... ok
+test edge_stage3_refuses_every_malformed_corpus_program ... ok
+test edge_stage3_reports_a_failure_rather_than_writing_a_file ... ok
+test edge_the_bytecode_vm_hands_arguments_to_the_program_it_runs ... ok
+test edge_the_bytecode_vm_reports_a_bad_invocation_as_a_failure ... ok
+test edge_the_self_compilation_still_obeys_the_step_budget ... ok
+test edge_a_while_loop_nested_in_another_patches_its_own_jump ... ok
+test edge_source_shapes_are_byte_identical ... ok
+test edge_the_two_engines_run_a_branching_program_the_same ... ok
+test stage2_is_byte_identical_for_each_statement_kind ... ok
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically has been running for over 60 seconds
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families ... ok
+test edge_three_consecutive_self_compilations_are_byte_identical ... ok
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically ... ok
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 312.99s
+[0m
+[0m$ [0mcargo fmt --all -- --check && echo "FMT OK"; cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "^(warning|error)" | head -10; echo "CLIPPY_DONE"
+FMT OK
+CLIPPY_DONE
+[0m
+[0m$ [0mcargo build --bin rb 2>&1 | tail -2; fail=0; for f in examples/*.rb modules/*.rb; do ./target/debug/rb run "$f" >/dev/null 2>&1 || { echo "FAIL: $f"; fail=1; }; done; echo "EXAMPLES_FAIL=$fail"; ls examples/*.rb modules/*.rb | wc -l
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.10s
+EXAMPLES_FAIL=0
+9
+[0m
+[0m$ [0mgit status --short; echo "--- diffstat ---"; git diff --stat
+M SPEC.md
+ M bootstrap/compiler.rb
+ M docs/GRAMMAR.md
+ M src/parser.rs
+ M tests/bootstrap_selfhost_test.rs
+?? tests/catch_binding_test.rs
+--- diffstat ---
+ SPEC.md                          | 74 +++++++++++++++++++++++++++++++++-------
+ bootstrap/compiler.rb            | 16 +++++++--
+ docs/GRAMMAR.md                  | 11 +++++-
+ src/parser.rs                    | 39 +++++++++++++++++++++
+ tests/bootstrap_selfhost_test.rs |  7 ++++
+ 5 files changed, 131 insertions(+), 16 deletions(-)
+[0m
+[0m$ [0mgit diff --stat --numstat src/parser.rs; wc -l tests/catch_binding_test.rs
+39	0	src/parser.rs
+ src/parser.rs | 39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+327 tests/catch_binding_test.rs
+[0m
+[0m$ [0mmkdir -p phases/phase-048 && ls phases/phase-048
+(no output)
+[0m
+[0m← [0mWrite phases/phase-048/REPORT.md
+Wrote file successfully.
+[0m
+[0m← [0mWrite phases/phase-048/FINDINGS.md
+Wrote file successfully.
+[0m
+[0m$ [0mrm -rf target/tmp/p048; git status --short
+M SPEC.md
+ M bootstrap/compiler.rb
+ M docs/GRAMMAR.md
+ M src/parser.rs
+ M tests/bootstrap_selfhost_test.rs
+?? phases/phase-048/
+?? tests/catch_binding_test.rs
+[0m
+DONE
+
+**Reproduced** — `catch error e` → `Error: AnalyzerError: Unknown variable 'e'`, exit 1. `give back error "..."` and `catch error of FileError` also reproduced as described.
+
+**Fix** (`src/parser.rs`, +39): `parse_try` now reads `error` as the handler keyword when a second identifier follows it *on the same line*; that identifier becomes the binder. `catch error`, `catch <name>` and bare `catch` are untouched. Same rule added to `bootstrap/compiler.rb` so stage 2 stays byte-identical to stage 1.
+
+**Tests** — `tests/catch_binding_test.rs` (13 `#[test]`s, every case run on both engines and required to agree), plus one stage-1/stage-2 byte-identity case in `tests/bootstrap_selfhost_test.rs`. Five tests assert failures are produced; eight are `edge_*`.
+
+**Decisions** — `catch error of <Type>` and `give back error "..."` corrected in SPEC.md/GRAMMAR.md (neither can be implemented without a tagged error type / a raise statement, which is a language-design change); both named in `phases/phase-048/REPORT.md` and `FINDINGS.md`.
+
+**Gates** — `cargo fmt --check` pass, `cargo clippy -- -D warnings` pass, `cargo test --all-targets` 0 failed, `examples/`+`modules/` (9 files) exit 0. Gate 4 `./rbops/verify.sh phase-048` **could not be run** — `rbops/` is not in this checkout; nothing is claimed about it.
+
+DONE
