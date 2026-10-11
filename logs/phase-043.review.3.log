@@ -1,0 +1,42 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round 3 audit — reading the phase-043 diff for hidden faults.
+[0m→ [0mRead build.rs
+[0m→ [0mRead src/interpreter.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/vfs.rs
+[0m→ [0mRead src/wasm.rs
+Initial scan shows the output boundary and stack budget — now digging into the remaining modules.
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead tests/wasm_test.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead src/runtime.rs[90m [offset=1208][0m
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|unimplemented!|\[.*\]"[90m in src · 100 matches[0m
+[0m✱ [0mGrep "unwrap|expect\(|panic!|unreachable!|todo!|unimplemented!"[90m in src · 8 matches[0m
+[0m✱ [0mGrep "unwrap|expect\(|panic!|unreachable!|todo!|unimplemented!"[90m in src · 1 match[0m
+[0m✱ [0mGrep "\.unwrap\(\)|\.expect\(|panic!|unreachable!|todo!|unimplemented!"[90m in src · 0 matches[0m
+[0m✱ [0mGrep "\.unwrap\(\)|\.expect\(|panic!|unreachable!|todo!|unimplemented!"[90m in src · 16 matches[0m
+No obvious panic paths in the new boundary code — now checking indexing and edge-case coverage.
+[0m✱ [0mGrep "as_ptr|from_raw_parts|copy_nonoverlapping|add\("[90m in src · 19 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1143][0m
+[0m✱ [0mGrep "module_path|module_source|std::fs|vfs|Path::new"[90m in src/bytecode · 4 matches[0m
+[0m→ [0mRead wasm/redblue.js
+[0m→ [0mRead tests/wasm_test.rs[90m [offset=1181][0m
+[0m→ [0mRead wasm/check-examples.js
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=120, offset=3365][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=60, offset=3650][0m
+Found a filesystem routing gap that breaks playground imports — verifying the remaining details.
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead src/wasm.rs[90m [limit=80, offset=747][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=30, offset=1319][0m
+[0m✱ [0mGrep "type Fields|struct Fields|HashMap|BTreeMap|IndexMap|indexmap"[90m in src · 6 matches[0m
+[0m→ [0mRead src/wasm.rs[90m [limit=30, offset=253][0m
+FINDINGS:
+1. [MAJOR] src/interpreter.rs:416 — `module_path` checks `Path::new(path).exists()` and `module_source` uses `std::fs`, bypassing `vfs` — the memory filesystem `files.write` writes to on wasm is invisible here, so write-then-import succeeds natively and fails as `Cannot find module` in the playground, contradicting `src/vfs.rs:28` (`Every path into the filesystem goes through here`); same bypass at `src/bytecode/vm.rs:3379` and `src/bytecode/vm.rs:3667` — route both lookups and reads through `crate::vfs::exists` / `crate::vfs::read_to_string`.
+2. [MAJOR] src/wasm.rs:758 — `rb_run_into` refuses null-buffer-with-nonzero-cap but silently accepts non-null-buffer-with-null-cell, skipping the copy and returning success with the output discarded — a host lending a buffer with no length gets `0` and no bytes — add the mirror refusal (`!output.is_null() && output_len.is_null()` → `-1`, same for error).
+3. [MAJOR] src/wasm.rs:431 — `copy_out` uses `copy_nonoverlapping` for a host-supplied `dest` that may alias the channel (e.g. a prior `rb_output_ptr` passed back as `dest`), which is UB on overlap — use `std::ptr::copy` (memmove) for the host copy.
+4. [MINOR] wasm/redblue.js:234 — `readChannel` calls `rb_release(scratch)` before creating the `Uint8Array` view and decoding it, reading a buffer after releasing it; works only because release merely marks free without clearing on a single thread — decode/copy out of `scratch` first, then release.
+5. [MINOR] src/lib.rs:545 — `print_version` hardcodes `Redblue v0.1.0` while `Cargo.toml:3` is `0.2.0` and the new `src/wasm.rs:270` `version()` reports `CARGO_PKG_VERSION`, so native `rb version` and playground `version()` disagree — print `env!("CARGO_PKG_VERSION")`.
+REVIEW VERDICT: FINDINGS 5

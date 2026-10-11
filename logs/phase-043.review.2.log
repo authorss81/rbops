@@ -1,0 +1,38 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Round-2 adversarial review — hunting what the green gate missed.
+[0m→ [0mRead .
+[0m→ [0mRead src/wasm.rs
+[0m→ [0mRead src/vfs.rs
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/interpreter.rs
+Seen the core boundary files — now digging into the remaining diff surface.
+[0m→ [0mRead build.rs
+[0m→ [0mRead tests/wasm_test.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead src/runtime.rs[90m [offset=1208][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1158, limit=600][0m
+[0m→ [0mRead wasm/redblue.js
+[0m→ [0mRead phases/phase-043/REVIEW-RESPONSE.md
+[0m→ [0mRead src/interpreter.rs[90m [offset=1758][0m
+Core logic mapped — now checking the playground glue and verification claims.
+[0m→ [0mRead wasm/check-examples.js
+[0m→ [0mRead wasm/index.html
+[0m→ [0mRead phases/phase-043/REPORT.md[90m [offset=200][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=197, limit=15][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=946, limit=18][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1130, limit=14][0m
+FINDINGS:
+1. [BLOCKER] src/interpreter.rs:207 — `Vm.output: Vec<String>` is unbounded and `Statement::Say` (src/interpreter.rs:1134) buffers every line until `Vm::run` flushes at src/interpreter.rs:956, so `MAX_OUTPUT_BYTES` enforced only in `wasm::emit` never bounds `say` output — a `repeat` up to `MAX_ITERATIONS` with long lines OOMs before the cap is reached; same shape in `BytecodeVm.output` (src/bytecode/vm.rs:607) — why it matters: user-reachable process-killer, the claimed 4MiB bound is ineffective for `say` — fix: cap/charge `Vm.output` bytes as they are pushed and refuse with `Error::Limit` like `emit` does.
+2. [MAJOR] src/wasm.rs:425 — `HostInput::reserve` does `vec![0u8; len]` for any `len >= 0` up to `i32::MAX` with no cap and the arena is never shrunk — why it matters: one host call can demand ~2GiB and abort/OOM the module; unbounded resource use — fix: refuse lengths over a stated bound (e.g. source-size limit) with null/`-1` before allocating.
+3. [MAJOR] src/wasm.rs:441 — `HostInput::release` never clears/updates `last`, so a second `rb_release` re-releases the same index and fails via `free.contains`, and a non-last allocation can never be freed — why it matters: `tests/wasm_test.rs:479` releases twice ignoring the return, so the leak passes vacuously and the "pointer stays valid until released" contract is false for the first buffer — fix: clear `last` on release and release by pointer, or document LIFO-only and assert returns in the test.
+4. [MAJOR] src/wasm.rs:532 — `if !host_output().set(&outcome.printed)` returning `-1` is unreachable: `emit` caps the capture at `MAX_OUTPUT_BYTES` (src/wasm.rs:82) and the host buffer capacity is the same constant, so `printed` always fits and the overflow path already returned from `run_outcome` (src/wasm.rs:161) with a different message — why it matters: dead status branch with a second divergent overflow wording, untestable code presented as a guard — fix: delete the branch or make the capacities differ and test it.
+5. [MAJOR] src/wasm.rs:551 — `rb_output_ptr`/`rb_output_len`/`rb_error_ptr`/`rb_error_len` read `HostBuffer` with no `RUN_LOCK`, which is held only across `rb_run` (src/wasm.rs:504) / `run_program` (src/wasm.rs:219) — why it matters: parallel native tests and any host that reads after `rb_run` races the next run's `set`, clobbering bytes the pointer points at; the "serialized by RUN_LOCK" comment is false for the read half — fix: hold the lock across alloc→run→read or copy bytes out under the lock.
+6. [MAJOR] src/interpreter.rs:178 — `run_isolated` fallback runs the program inline on the current (small) thread when `spawn` fails — why it matters: exactly when resources are scarce the `MAX_CALL_DEPTH` counter is no longer backed by `limit * STACK_BYTES_PER_CALL` of stack, turning a catchable `Limit` back into a Rust stack overflow abort — fix: refuse cleanly when the sized thread cannot be spawned instead of running unprotected.
+7. [MAJOR] src/vfs.rs:139 — memory `exists` is `contains_key` (false for directories) while native `exists` (src/vfs.rs:38) is `Path::exists` (true for directories) — why it matters: `files.exists("modules")` answers differently in the two builds, breaking the byte-identical promise the corpus claims — fix: make memory `exists` model directories or document/refuse them identically in both backends.
+8. [MINOR] src/vfs.rs:102 — memory `read_to_string` on non-UTF8 bytes reports `stream did not contain valid UTF-8: {path}` while `std::fs` reports it without the path suffix, then `runtime.rs` prefixes the path again — why it matters: error text diverges between builds despite the comment claiming the same sentence — fix: emit exactly `std`'s message.
+REVIEW VERDICT: FINDINGS 8

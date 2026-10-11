@@ -1,0 +1,43 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the phase-043 diff for what's still broken.
+[0m→ [0mRead src/wasm.rs
+[0m→ [0mRead src/vfs.rs
+[0m→ [0mRead src/runtime.rs
+[0m→ [0mRead src/interpreter.rs[90m [limit=120, offset=1940][0m
+I've mapped the new WASM boundary and filesystem shim — now digging into the execution-path changes.
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead tests/wasm_test.rs
+[0m→ [0mRead src/runtime.rs[90m [offset=1221][0m
+[0m✱ [0mGrep "emit|run_isolated|STACK_BYTES|run_source_value|thread::spawn|say|print"[90m in src · 100 matches[0m
+[0m✱ [0mGrep "wasm::emit|run_isolated|STACK_BYTES|thread::spawn|println!|print!|stdout"[90m in src · 6 matches[0m
+[0m✱ [0mGrep "wasm::emit|println!|print!|stdout"[90m in src/bytecode · 2 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=120, offset=110][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=220, offset=930][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=40, offset=835][0m
+I spotted several boundary lifetime issues and a possible test contradiction — now verifying the call-depth mechanics.
+[0m✱ [0mGrep "call_depth|max_call_depth|execute_statements|Return|return_value|abrupt"[90m in src · 23 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=240, offset=1310][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=80, offset=400][0m
+[0m✱ [0mGrep "fn run_block|return_value|Return|abrupt_exit|loop_control"[90m in src · 26 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=130, offset=530][0m
+[0m✱ [0mGrep "call_user_function|Call\(|Return"[90m in src · 7 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=160, offset=1695][0m
+[0m✱ [0mGrep "Statement::If|Statement::Repeat|Statement::For|While|Loop"[90m in src · 23 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=110, offset=1160][0m
+FINDINGS:
+1. [BLOCKER] src/wasm.rs:269 — `rb_output_ptr` returns `output_buffer().as_ptr()` where `output_buffer()` is a temporary `MutexGuard` dropped at return, so the pointer dangles immediately and any host read is use-after-free — fix by leaking a stable buffer, copying into `INPUT`-style owned storage, or returning pointer+len from a `static` owned by the run.
+2. [BLOCKER] src/wasm.rs:282 — `rb_error_ptr` does `ERROR_TEXT.lock()...as_ptr()` on a temporary guard, same dangling-pointer UB as above; the host reads freed mutex-guard contents — fix identically to (1), never hand out a pointer borrowed from a dropped guard.
+3. [MAJOR] src/runtime.rs:1203 — `bytes_write` calls `std::fs::write` directly, bypassing `crate::vfs`, so on wasm it hits "operation not supported" while `files.write` hits the in-memory fs; the two write paths diverge — fix by routing binary writes through `vfs` (add a byte-oriented `vfs` entry) or document/refuse cleanly on wasm.
+4. [MAJOR] src/runtime.rs:722 — builtin `say` (and `console_log` at src/runtime.rs:1032, `print!` prompt at src/runtime.rs:744) uses `println!/print!` directly, bypassing `wasm::emit`, while `Statement::Say` goes through the capture buffer — `say("hi")` as a call vs `say "hi"` as a statement produce different sinks, breaking the byte-identical claim — fix by routing every builtin print through `wasm::emit`.
+5. [MAJOR] src/runtime.rs:741 — `input`/`ask` does blocking `stdin().read_line` with no `#[cfg(wasm32)]`, unlike `network`/`sleep` which refuse cleanly; on `wasm32-unknown-unknown` this blocks/panics and aborts the module instead of a catchable error — fix by adding the same `network_refused`-style wasm refusal arm.
+6. [MAJOR] src/runtime.rs:34 — `module_program` uses `std::fs::read_to_string`, bypassing `vfs`, so `import` on wasm can never read the in-memory filesystem that `files.write` wrote to — fix by reading modules through `crate::vfs::read_to_string`.
+7. [MAJOR] src/wasm.rs:173 — `rb_alloc` returns `input.as_mut_ptr()` into a `Mutex<Vec<u8>>` then drops the guard; the next `rb_alloc`/`rb_release` reallocates and invalidates the outstanding pointer, and `RUN_LOCK` is not held across alloc→run, so parallel native tests race — fix by holding `RUN_LOCK` across the whole alloc/write/run sequence or by copying on `rb_run` from a per-call token.
+8. [MAJOR] src/wasm.rs:113 — `run_captured` discards `printed` on `Err` and `rb_run` at src/wasm.rs:246 leaves the capture buffer empty, contradicting the comment "whatever the program printed before it failed is still worth showing, so it is kept"; partial output is lost and there is no `catch_unwind`, so any interpreter panic leaves `CAPTURING=true` stuck for the next run — fix by preserving partial bytes on error and resetting capture in a guard.
+9. [MAJOR] tests/wasm_test.rs:329 — `edge_recursion_beyond_the_call_depth_is_a_clean_error_not_an_abort` uses `f(100000)` but per phases/phase-043/FINDINGS.md `f(3)` already hits the limit, so the test passes for any recursion depth and cannot pin `MAX_CALL_DEPTH` or the stack-size fix — fix by asserting a shallow recursion succeeds and only deep recursion is caught.
+10. [MAJOR] tests/wasm_test.rs:78 — corpus pin uses `contains("time.now()")` string match and all wasm-cfg backends (`vfs` memory map, `network_refused`, wasm `sleep_for`, wasm `now`/host clock) are never executed by `cargo test` on the host; the tests exercise the native `std::fs`/blocking backends only — fix by unit-testing the memory-fs logic behind a testable seam or running the wasm target in CI.
+11. [MAJOR] src/interpreter.rs:174 — `run_isolated` fallback claims inline run is "the same computation on a smaller stack", but native spawns `limit*256KiB`=256MiB (src/interpreter.rs:124) while wasm links 16MiB, and the file's own comment sizes one call at ~58KiB (1000 calls ≈58MiB >16MiB), so the two builds do not accept/refuse the same programs — fix by sizing the wasm stack from the same formula or stating the real limit.
+12. [MINOR] src/wasm.rs:276 — `rb_output_len` (and `rb_error_len` at src/wasm.rs:291) does `len as i32`, a narrowing cast that wraps negative past 2GiB, with no output cap anywhere in the pipeline — fix by saturating/clamping and adding an output-byte bound.
+REVIEW VERDICT: FINDINGS 12
