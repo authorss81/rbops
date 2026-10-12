@@ -51,6 +51,34 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
 
+# =============================================================================
+# RBOPS_PREFLIGHT=1 — the cheap half of the gate.
+#
+# Everything here is a question about a DIFF or a DOCUMENT. Nothing here needs a
+# build, a test run, or an example to execute. So it can be asked BEFORE the
+# agent is dispatched, against whatever the phase inherits (its recovery branch,
+# its WIP checkpoint, or nothing yet).
+#
+# Why this exists, in numbers: phases 037 and 048 each burned three ~5-hour runs
+# and 24 agent-hours total, and both were correct work refused by a DETECTOR —
+# first `eval_err`, then `label()`, neither of which the failure-assert regex
+# recognised. The agent cannot fix that; only the gate can. Asking the same
+# questions seconds earlier, before the model call, turns a 5-hour failure into
+# a 5-second one.
+#
+# This mode deliberately does NOT reimplement any check. It runs the same
+# functions below, so preflight and the real gate cannot drift into disagreeing
+# about what a diff means. It only skips the expensive sections (3 and 4), and
+# says so in its own verdict line, so a skipped section is never a silent pass.
+# =============================================================================
+PREFLIGHT="${RBOPS_PREFLIGHT:-0}"
+preflight_skip() {
+  [ "$PREFLIGHT" = "1" ] || return 1
+  printf '\n\033[1m== %s\033[0m\n' "$*"
+  printf '  \033[33mSKIP\033[0m %s — needs a build; preflight does not build\n' "$*"
+  return 0
+}
+
 # --- 0. integrity: is the phase even declared? ------------------------------
 step "manifest"
 if command -v "$JQ" >/dev/null 2>&1; then
@@ -95,7 +123,17 @@ if [ -f "$REPORT" ]; then
     bad "report claims cargo test passed but records no passing count"
   fi
 else
-  bad "$REPORT missing — a phase without a report cannot pass"
+  # Under preflight a missing report is EXPECTED, not a defect: preflight runs
+  # BEFORE the agent, so it is judging a tree nobody has written a report into
+  # yet. Failing it there would refuse every retry of every phase, which is the
+  # opposite of what an early warning is for. The report is still required by the
+  # full gate, which runs after the agent. A report that EXISTS is checked in
+  # full even under preflight — only its absence is tolerated.
+  if [ "$PREFLIGHT" = "1" ]; then
+    warn "no REPORT.md yet — expected under preflight (the agent has not run); the full gate requires one"
+  else
+    bad "$REPORT missing — a phase without a report cannot pass"
+  fi
 fi
 
 # --- 2. diff hygiene ---------------------------------------------------------
@@ -117,6 +155,17 @@ git add -N . >/dev/null 2>&1 || true
 
 CHANGED="$(git diff --name-only "$BASE_REF" 2>/dev/null)"
 if [ -z "$CHANGED" ]; then
+  # An empty diff means two different things. Under the full gate it means the
+  # phase changed nothing, which is a failure — and correctly so. Under
+  # PREFLIGHT it usually means the phase is on its FIRST attempt and has not
+  # written anything yet: there is nothing to judge, not something to reject.
+  # Failing it there would defer every new phase before the agent ever ran.
+  if [ "$PREFLIGHT" = "1" ]; then
+    printf '\n\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT NOTHING TO JUDGE — %s ║\033[0m\n' "$PHASE"
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 4
+  fi
   bad "no changed files detected against $BASE_REF"
 fi
 
@@ -152,9 +201,19 @@ fi
 # 2b2. scratch and probe files must not land in the diff. phase-020 left
 # tests/zz_probe.rs — a debugging scratch file — in the tree, and the gate only
 # caught it incidentally via formatting. A formatted scratch file would have
-# shipped. Patterns are deliberately narrow (prefixes and junk extensions, not
-# substrings) so a legitimately-named file cannot trip this.
-_scratch="$(printf '%s\n' "$CHANGED" | grep -iE '(^|/)(zz_[^/]*|[^/]*probe[^/]*|[^/]*scratch[^/]*)$|\.(tmp|bak|orig|swp)$|~$' || true)"
+# shipped.
+#
+# The comment here used to claim the patterns were "prefixes and junk
+# extensions, not substrings", and the code said otherwise: `[^/]*probe[^/]*`
+# was a substring match, so ANY filename containing "probe" was refused.
+# Preflight caught it on its first real use — a legitimate
+# `tests/preflight_probe.rs` was rejected as scratch, which is exactly the
+# failure this rule exists to prevent, inverted. It is now anchored to the
+# conventions that mean "scratch" and nothing else: the `zz_` prefix phase-020
+# actually used, a `_scratch` suffix, and junk extensions. `probe_stub.rs`,
+# `resumed_probe.rs` and `preflight_probe.rs` are real test files and pass;
+# `zz_probe.rs`, `foo_scratch.rs` and `x.tmp` do not.
+_scratch="$(printf '%s\n' "$CHANGED" | grep -iE '(^|/)zz_[^/]*$|(^|/)[^/]*_scratch\.[^/]*$|\.(tmp|bak|orig|swp)$|~$' || true)"
 if [ -n "$_scratch" ]; then
   bad "scratch/probe files in the diff — remove them, they are not phase work: $(printf '%s' "$_scratch" | tr '\n' ' ' | head -c 300)"
 else
@@ -209,6 +268,9 @@ else
 fi
 
 # --- 3. the four gates -------------------------------------------------------
+if preflight_skip "cargo fmt"; then
+  :
+else
 step "cargo fmt"
 if cargo fmt --all -- --check >/tmp/fmt.log 2>&1; then ok "cargo fmt --check"
 else bad "cargo fmt --check"; tail -20 /tmp/fmt.log; fi
@@ -232,9 +294,12 @@ fi
 
 step "doc tests"
 cargo test --doc >/tmp/doctest.log 2>&1 || { bad "cargo test --doc"; tail -15 /tmp/doctest.log; }
+fi
 
 # --- 4. examples still run (the language's spec-by-example) ------------------
-step "examples"
+if preflight_skip "examples"; then
+  :
+else
 # Do not hide why the build failed: an unbuilt binary used to surface as the
 # useless "rb binary not built".
 if ! cargo build >/tmp/build.log 2>&1; then
@@ -267,6 +332,7 @@ if [ -x "$RB" ]; then
   ok "example sweep done"
 else
   bad "rb binary missing at $RB after a successful build — check [[bin]] name in Cargo.toml"
+fi
 fi
 
 # --- 5. test policy: edge cases and failure assertions are mandatory ---------
@@ -385,6 +451,25 @@ fi
 
 # --- verdict -----------------------------------------------------------------
 printf '\n'
+if [ "$PREFLIGHT" = "1" ]; then
+  # A preflight PASS is NOT a gate pass, and the exit code says so: 0 means "no
+  # defect found in the cheap half", never "this phase may be marked .done". The
+  # caller (dispatch.sh cmd_run) still runs the full gate after the agent. A
+  # distinct exit code makes it impossible for a preflight to be mistaken for
+  # the real thing by a caller that does not read this banner.
+  if [ "$FAIL" -eq 0 ]; then
+    printf '\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT CLEAN — %-19s ║\033[0m\n' "$PHASE"
+    printf '\033[33m║ diff-based checks only; no build run ║\033[0m\n'
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 0
+  fi
+  printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[31m║ PREFLIGHT FAIL   — %-19s ║\033[0m\n' "$PHASE"
+  printf '\033[31m║ %d diff-based check(s) failed         ║\033[0m\n' "$FAIL"
+  printf '\033[31m╚══════════════════════════════════════╝\033[0m\n'
+  exit 3
+fi
 if [ "$FAIL" -eq 0 ]; then
   printf '\033[32m╔══════════════════════════════════════╗\033[0m\n'
   printf '\033[32m║ VERIFY PASS — %-24s ║\033[0m\n' "$PHASE"

@@ -484,6 +484,52 @@ cmd_run() {
       log "WIP checkpoint would not apply cleanly — continuing from main"
     fi
   fi
+
+  # =============================================================================
+  # PREFLIGHT — the cheap half of the gate, asked BEFORE the model call.
+  #
+  # Phases 037 and 048 each burned three ~5-hour runs, 24 agent-hours total, and
+  # both were CORRECT work refused by a detector: `eval_err` then `label()`,
+  # neither recognised by the failure-assert regex. The agent cannot fix that
+  # (hard rule 1: it may not touch rbops/). So the question is asked here instead
+  # of five hours later, against the tree the agent is about to inherit.
+  #
+  # It runs ONLY when there is inherited work to judge. A first attempt has no
+  # diff yet and nothing to refuse — preflighting that defers every new phase
+  # before the agent ever runs, which smoke §3 and §8 both caught.
+  #
+  # Two outcomes, deliberately different:
+  #
+  #   * Nothing to judge yet (clean tree, no preserved work) — silent. Every
+  #     phase's first attempt looks like this and a warning would be noise.
+  #   * A defect the AGENT CANNOT fix (a gate detector, or a manifest that
+  #     contradicts its own goal) — hard stop, attempt NOT consumed, .deferred.
+  #     The reason is logged so a human sees it in seconds instead of 5 hours.
+  #     The full gate still runs after the agent; preflight is an early warning,
+  #     never a substitute.
+  #
+  # Inherited-work blindness is the specific thing this catches: a recovery
+  # branch holding a perfect diff, refused only because the gate cannot read it.
+  # =============================================================================
+  local pf_out pf_rc=0
+  if [ "$resumed" -eq 1 ]; then
+    pf_out="$(RBOPS_PREFLIGHT=1 RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" \
+                    RBOPS_BASE_REF="$base" "$VERIFY" "$phase" 2>&1)" || pf_rc=$?
+    if [ "$pf_rc" -eq 3 ]; then
+      log "$phase PREFLIGHT FAILED — the diff it inherits is refused by the gate already"
+      printf '%s\n' "$pf_out" | grep -E 'FAIL' | sed 's/^/          /' | sed -n '1,8p'
+      # Refuse to spend an attempt on a tree the gate has already rejected. The
+      # marker is .deferred (retryable, no attempt burned), not .blocked: the fix
+      # may be a gate fix or a manifest fix, and either lands as a new commit that
+      # should re-open this phase rather than exhaust it.
+      touch "$(marker "$phase" .deferred)"
+      rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .blocked)"
+      log "$phase DEFERRED without consuming an attempt — fix the gate or the manifest, then it retries for free"
+      return 42
+    fi
+    [ "$pf_rc" -eq 0 ] || log "$phase preflight inconclusive (rc=$pf_rc) — continuing to the agent"
+  fi
+
   {
     # The brief comes FIRST and is deliberately blunt. A weak model given a
     # 25KB context with no explicit scope spends its entire budget orienting:

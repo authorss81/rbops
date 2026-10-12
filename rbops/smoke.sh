@@ -189,6 +189,42 @@ D() { ( cd "$PIPE" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" \
 marker() { [ -f "$PIPE/phases/$1/$2" ]; }
 strip() { sed 's/\x1b\[[0-9;]*m//g'; }
 
+# Forge a recovery branch holding a diff that PREFLIGHT ACCEPTS, so a subtest
+# about what the agent inherits actually gets as far as building a context.
+# Preflight (dispatch.sh, before the model call) runs the gate's diff-based
+# checks on whatever a retry would inherit. A src/-only fixture diff is refused
+# there, the run defers, and no .ctx is ever written — which silently broke
+# every "the agent was told what it inherited" assertion for a reason that had
+# nothing to do with inheritance. A real recovery branch holds a compliant diff
+# (its tests ran, or the gate would not have parked it), so this one does too:
+# a src/ change big enough to clear the size floor, an edge_* test, and a
+# failure assertion in the is_err dialect.
+forge_compliant_recovery() {
+  { printf '// recovered work from attempt 1\n';
+    printf 'pub fn recovered_fn() -> u8 { 7 }\n';
+    printf 'pub fn recovered_fn2() -> u8 { 8 }\n';
+    printf 'pub fn recovered_fn3() -> u8 { 9 }\n';
+    printf 'pub fn recovered_fn4() -> u8 { 10 }\n';
+    printf 'pub fn recovered_fn5() -> u8 { 11 }\n'; } >> "$PROJ/src/vm.rs"
+  cat > "$PROJ/tests/resumed_probe.rs" <<'EOR'
+#[test]
+fn edge_a_recovered_failure_is_refused() {
+    let r: Result<(), ()> = Err(());
+    assert!(r.is_err());
+}
+
+#[test]
+fn edge_b() { assert!(true); }
+
+#[test]
+fn edge_c() { assert!(true); }
+EOR
+  ( cd "$PROJ" \
+    && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
+    && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+    && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+}
+
 # Build the fixture once up front. Forgetting this is exactly how the first
 # version of this script reported eighteen failures that were all "no such
 # directory".
@@ -481,11 +517,10 @@ use_stubs
 head_ "13. a retry resumes the preserved work instead of starting from zero"
 build_fixture >/dev/null; use_stubs
 # Forge a previous attempt: a commit on the recovery ref with distinctive content.
-( cd "$PROJ" \
-  && printf '// recovered work from attempt 1\n' >> src/vm.rs \
-  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
-  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
-  && git reset -q --hard HEAD~1 )
+# forge_compliant_recovery writes the distinctive marker AND a diff preflight
+# accepts — see its comment for why the second half matters to every assertion
+# below.
+forge_compliant_recovery
 # Sanity: the fixture project is back to clean, the ref points at the work.
 ( cd "$PROJ" && git rev-parse --verify -q "origin/rbops-recovery/phase-001" >/dev/null ) \
   || { no "fixture ref not created"; }
@@ -614,13 +649,18 @@ fi
 # without ever calling the model. The quoted previous report is now capped like
 # every other unbounded inclusion.
 build_fixture >/dev/null; use_stubs
-( cd "$PROJ" \
-  && printf '// recovered work from attempt 1\n' >> src/vm.rs \
-  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
-  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
-  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+forge_compliant_recovery
 mkdir -p "$PIPE/phases/phase-001"
-{ printf '# Phase 001 — recovered report\n\n## Gates\n\n| Gate | Result |\n|---|---|---|\n';
+# Every required section is present: preflight checks a report that EXISTS (only
+# its ABSENCE is tolerated under preflight), and a report with none of these
+# sections is a stub, so it would be refused before any context is built and
+# every assertion below would measure that instead of the capping it is about.
+{ printf '# Phase 001 — recovered report\n\n## What changed\n\n| File | Lines | What |\n|---|---|---|\n';
+  printf '| src/vm.rs | +1 −0 | recovered work from attempt 1 |\n\n';
+  printf '## Tests added\n\n| Test | Edge class covered |\n|---|---|\n';
+  printf '| edge_a_recovered_failure_is_refused | failure |\n\n';
+  printf '## Gates\n\n| Gate | Result |\n|---|---|\n| cargo test | 12 passed, 0 failed |\n\n';
+  printf '## Known gaps / follow-ups\n\n- none\n\n';
   awk 'BEGIN{for(i=0;i<3000;i++) print "| filler evidence row " i " | pass |"}'; } > "$PIPE/phases/phase-001/REPORT.md"
 out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
 [ "$rc" = "42" ] && ok "oversize-report run still defers via the dead model (exit 42)" \
@@ -2047,6 +2087,34 @@ case "$out" in
   *"VERIFY PASS"*) ok "same tree passes once the scratch file is gone" ;;
   *) no "tree still fails without the scratch file"; printf '%s\n' "$out" | grep -E 'FAIL' | head -4 | sed 's/^/      /' ;;
 esac
+# The scratch rule must reject SCRATCH and nothing else. It used to match the
+# substring "probe", so a legitimate `tests/preflight_probe.rs` was refused as a
+# debugging scratch file — the failure inverted, on the first real use. Both
+# directions are pinned here: the names a scratch file gets, and the names
+# real test files get.
+# A `.bk` file is gitignored (AGENTS.md: **/*.rs.bk), so it never enters the
+# diff at all — the gate cannot reject what git will not show it. The junk
+# extension matters for files git DOES carry.
+for name in zz_probe.rs foo_scratch.rs x.tmp y.rs~; do
+  printf '#[test]\nfn edge_x() { assert!(true); }\n' > "$PROJ/tests/$name"
+  out="$( ( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+          JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+  rm -f "$PROJ/tests/$name"
+  case "$out" in
+    *"scratch/probe files in the diff"*) ok "scratch name rejected: $name" ;;
+    *) no "a scratch file slipped through: $name" ;;
+  esac
+done
+for name in preflight_probe.rs resumed_probe.rs probe_stub.rs probe.rs tmp_data.rs; do
+  printf '#[test]\nfn edge_x() { assert!(true); }\n' > "$PROJ/tests/$name"
+  out="$( ( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+          JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+  rm -f "$PROJ/tests/$name"
+  case "$out" in
+    *"scratch/probe files in the diff"*) no "a real test file called scratch: $name" ;;
+    *) ok "real test file accepted: $name" ;;
+  esac
+done
 
 # =========================================================== 29. truncation never changes a verdict
 head_ "29. truncating output must not change what the gate decides"
@@ -2172,6 +2240,104 @@ printf '4' > "$PIPE/phases/phase-001/.deferred_attempts"
 out="$( RBOPS_MIN_OUTPUT=500 D review phase-001 | strip )"; rc=$?
 [ "$rc" = "3" ] && ok "fix defer at cap exits 3 (blocked)" || no "fix defer at cap exit changed: got $rc"
 marker phase-001 .blocked && ok ".blocked written on fix-defer cap" || no ".blocked missing on fix-defer cap"
+
+# =========================================================== 31. preflight
+head_ "31. preflight turns a 5-hour detector failure into a 5-second one"
+# Phases 037 and 048 each burned three ~5-hour runs on CORRECT work the gate
+# refused because its failure-assert regex did not recognise `eval_err` and then
+# `label()`. 24 agent-hours to learn something a diff-only gate asks in seconds.
+# The agent cannot fix a detector (hard rule 1 forbids touching rbops/), so the
+# question is asked BEFORE the model call instead of after it.
+#
+# (a) preflight mode skips the build sections and says so — never a silent skip.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+out="$( ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" RBOPS_PREFLIGHT=1 bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+case "$out" in
+  *"preflight does not build"*) ok "preflight skips the cargo sections and says which" ;;
+  *) no "preflight ran a build or hid the skip"; printf '%s\n' "$out" | grep -E 'cargo|PREFLIGHT' | head -4 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"PREFLIGHT CLEAN"*|*"PREFLIGHT FAIL"*) ok "preflight has its own verdict, distinct from VERIFY" ;;
+  *) no "preflight verdict is indistinguishable from the gate's" ;;
+esac
+# (b) A clean tree is NOTHING TO JUDGE, not a failure: every phase's first
+# attempt looks like this, and failing it would defer every new phase before
+# the agent ever ran. Two things are cleared here on purpose, both of which
+# make the tree dirty without any phase work existing: subtest (a)'s stub agent
+# leaves a REPORT.md under $PROJ/phases, and `use_stubs` installs a stub binary
+# at $PROJ/target/debug/rb. Neither is a phase change, and this subtest was
+# failing because it was measuring its own leftovers rather than a clean tree.
+build_fixture >/dev/null; use_stubs
+rm -rf "$PROJ/phases" "$PROJ/target"
+out="$( ( cd "$PROJ" && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" RBOPS_PREFLIGHT=1 bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip ) )"
+case "$out" in
+  *"PREFLIGHT NOTHING TO JUDGE"*) ok "a tree with nothing to judge is neither pass nor fail" ;;
+  *) no "preflight demands work that does not exist yet"; printf '%s\n' "$out" | grep -E 'PREFLIGHT|no changed|FAIL' | head -4 | sed 's/^/      /' ;;
+esac
+# (c) The whole point: an inherited diff the gate would reject is caught BEFORE
+# the agent runs, without consuming an attempt.
+build_fixture >/dev/null; use_stubs
+cat > "$PROJ/tests/preflight_probe.rs" <<'EOR'
+#[test]
+fn edge_a_thing() { assert!(true); }
+#[test]
+fn b() { assert!(true); }
+#[test]
+fn c() { assert!(true); }
+EOR
+( cd "$PROJ" \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+a_before="$(cat "$PIPE/phases/phase-001/.attempts" 2>/dev/null || echo none)"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+[ "$rc" = "42" ] && ok "a refused inherited diff defers (exit 42) instead of dispatching" \
+  || no "preflight did not stop the run: got $rc"
+case "$out" in
+  *"PREFLIGHT FAILED"*) ok "the refusal names preflight as the reason" ;;
+  *) no "no preflight line in the output"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /' ;;
+esac
+marker phase-001 .deferred && ok ".deferred written (retryable)" || no ".deferred missing"
+marker phase-001 .blocked && no "blocked — a detector bug is not the agent's fault" \
+  || ok "not blocked — a fix must not exhaust the phase's attempts"
+a_after="$(cat "$PIPE/phases/phase-001/.attempts" 2>/dev/null || echo none)"
+[ "$a_before" = "$a_after" ] && ok "no attempt consumed ($a_before → $a_after)" \
+  || no "an attempt was burned on a preflight failure: $a_before → $a_after"
+# (d) A good inherited diff must NOT be stopped: preflight that refuses
+# everything is as useless as one that refuses nothing. This one has to clear
+# EVERY diff-based check — quota, edge_*, a failure assertion, the size floor —
+# or it is testing the wrong thing and the refusal is the gate being right.
+build_fixture >/dev/null; use_stubs
+cat > "$PROJ/tests/preflight_probe.rs" <<'EOR'
+#[test]
+fn edge_a_failure_is_refused() {
+    let r: Result<(), ()> = Err(());
+    assert!(r.is_err());
+}
+
+#[test]
+fn edge_b() { assert!(true); }
+
+#[test]
+fn edge_c() { assert!(true); }
+EOR
+{ printf 'pub fn added_by_attempt_one() -> u8 { 1 }\n';
+  printf 'pub fn also_added_by_attempt_one() -> u8 { 2 }\n';
+  printf 'pub fn and_a_three() -> u8 { 3 }\n';
+  printf 'pub fn four() -> u8 { 4 }\n';
+  printf 'pub fn five() -> u8 { 5 }\n'; } >> "$PROJ/src/vm.rs"
+( cd "$PROJ" \
+  && git add -A && git -c user.email=t@t -c user.name=t commit -qm "attempt 1" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+case "$out" in
+  *"PREFLIGHT"*) no "preflight refused a good diff — it would block every retry" ;;
+  *)  ok "a good inherited diff passes preflight and the agent runs (rc=$rc)" ;;
+esac
 
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
