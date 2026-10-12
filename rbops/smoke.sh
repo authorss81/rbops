@@ -863,6 +863,50 @@ case "$out" in
   *"no test asserts a failure"*) ok "assert-only tests still fail the failure rule" ;;
   *) no "failure rule stopped biting on Rust"; printf '%s\n' "$out" | grep -E 'failure|FAIL' | head -4 | sed 's/^/      /' ;;
 esac
+# Third dialect, found by phase-048: Redblue's Error carries a label, so a
+# test proves a failure through a helper rather than a Result --
+# assert_eq!(label(&e), "RuntimeError"). Phase-048 blocked with ~10 such
+# assertions and zero recognized strings.
+cat > "$PROJ/tests/eval_probe.rs" <<'EOR'
+fn label(e: &String) -> String { e.clone() }
+
+#[test]
+fn edge_a_try_with_no_catch_reports_its_own_failure() {
+    let e = "RuntimeError: something".to_string();
+    assert_eq!(label(&e), "RuntimeError", "a bare try must still fail, got {e}");
+}
+
+#[test]
+fn two_plus_two() { assert!(true); }
+
+#[test]
+fn another_plain_case() { assert!(true); }
+EOR
+out="$( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip )"
+case "$out" in
+  *"failure-asserting test present"*) ok "label-assertion dialect satisfies the failure rule" ;;
+  *) no "label-assertion dialect still rejected"; printf '%s\n' "$out" | grep -E 'failure|FAIL' | head -4 | sed 's/^/      /' ;;
+esac
+# Control: the label named in PROSE, with no assertion beside it, must not buy
+# a pass -- that is the gaming the anchored patterns exist to prevent.
+cat > "$PROJ/tests/eval_probe.rs" <<'EOR'
+// The RuntimeError should be reported here.
+#[test]
+fn edge_success_only() { assert!(true); }
+
+#[test]
+fn two_plus_two() { assert!(true); }
+
+#[test]
+fn another_plain_case() { assert!(true); }
+EOR
+out="$( cd "$PROJ" && git add -A && RBOPS_ROOT="$PIPE" RBOPS_PROJECT_DIR="$PROJ" PATH="$STUB:$PATH" \
+        JQ="$JQ" bash "$PIPE/rbops/verify.sh" phase-001 2>&1 | strip )"
+case "$out" in
+  *"no test asserts a failure"*) ok "a label named in prose buys no pass" ;;
+  *) no "the failure rule is buyable from a comment" ;;
+esac
 # And the anchored catch must not be buyable from a string literal or prose.
 printf 'test "edge_catch_error is mentioned in the docs"\n    set note to "catch error"\n    expect note to be "catch error"\n' \
   > "$PROJ/tests/sample.rb"

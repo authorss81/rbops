@@ -329,8 +329,16 @@ if [ "$FAILASSERT_MODE" = "not_applicable" ]; then
   # from the rule being satisfied.
   warn "failure-assertion rule NOT APPLICABLE to this phase (failure_assert: not_applicable) — the reviewer still judges whether the tests can fail"
 else
+  # Redblue's Error carries a label rather than a Result, so a test that proves
+  # a failure was produced reads `assert_eq!(label(&e), "RuntimeError")` through
+  # a local helper rather than calling is_err() on a Result. Phase-048 blocked on
+  # this with ~10 such assertions (every one documented as "failure asserted" in
+  # its REPORT) and zero recognized strings. Detecting the assertion is what
+  # matters, not which method spells it, so the pattern also accepts a helper
+  # call beside a spelled-out error label: a test cannot buy this by naming a
+  # label in prose, because the label must be quoted inside the matched line.
   FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
-    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|expect .* to fail|assert_throws)|^\+[[:space:]]*catch[[:space:]]+error')"
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
   if [ "$FAILASSERT" -ge 1 ]; then
     ok "failure-asserting test present: $FAILASSERT"
   else

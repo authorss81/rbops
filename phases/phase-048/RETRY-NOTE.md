@@ -1,30 +1,26 @@
-# phase-048 — READ THIS FIRST. The manifest contradicted your goal; it no longer does.
+# phase-048 — READ THIS FIRST. Your gate failure is fixed; the work is correct.
 
-## What blocked you, and why it was not your fault
+## The third trap (gate regex vs the `label()` dialect), now fixed
 
-Your goal reads: *"either implement `catch error of <Type>` or correct SPEC.md
-to the form the code actually supports."* You chose the second branch, did it
-well (18 passing tests, honest FINDINGS entry naming the tagged-error follow-up),
-and the gate failed you 3/3 on `must_touch: ["src/"]` — because your diff
-touches docs + tests only. The goal permits a docs-only resolution; the gate
-forbade it. That is a manifest contradiction, not a work defect, and it is now
-fixed: `must_touch` reads `["src/", "docs/"]`, and your re-rendered PROMPT.md
-says so.
+Your attempt was correct and complete: the REPORT documents ~10 tests as
+"failure asserted", every one naming a spanned `RuntimeError`/`AnalyzerError`
+with `label(&e) == "RuntimeError"` style assertions. The gate failed you 3/3 on
+`no test asserts a failure is produced` because its regex knew only
+`is_err|expect_err|should_panic|eval_err` — and Redblue's `Error` carries a
+*label*, not a `Result`, so your tests correctly never call `is_err()`.
+
+`verify.sh` now also accepts the label dialect (`label(...)` beside a spelled-out
+`Error::` variant), with smoke cover proving the dialect passes AND a label
+named only in prose still fails. Two prior phases found the same disease, one
+layer deeper each time (037: `eval_err`; 048: `label()`).
 
 ## What to do on this attempt
 
-1. Resume from `rbops-recovery/phase-048` — your docs + tests are parked there.
-   Do NOT rewrite them; they were correct.
-2. Run the four gates. With `docs/` satisfying must_touch, the gate should pass
-   on the resumed tree plus any small additions you make.
-3. Then review and land normally. The `of <Type>` follow-up is phase-089 now —
-   it is NOT this phase, do not scope-creep it in no matter what the old
-   FINDINGS say about it.
+1. Resume from `rbops-recovery/phase-048`. Do not rewrite. The diff is right.
+2. Run the four gates. The gate should now pass on the resumed tree.
+3. Then review and land normally. If the gate still fails you, quote its exact
+   line in REPORT.md — do not change the tests to satisfy a detector.
 
-## What NOT to do
-
-Do not implement `of <Type>` here to satisfy the old `src/`-only reading.
-That decision was already made and recorded: tagged error values touch `Value`,
-both VMs, `Error`, the `.rbc` format and every failure site, and it belongs to
-089. Implementing it inside this retry would be the rewrite-wearing-a-fix's-clothes
-the pipeline blocks on sight.
+`must_touch` is `["src/", "docs/"]` (already fixed last attempt) and the
+`of <Type>` decision is settled: SPEC.md corrected, the feature deferred to
+**phase-089**. Do not implement it here.
