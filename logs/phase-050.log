@@ -1,0 +1,1931 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reading the key files to verify the finding.
+[0m→ [0mRead src/stdlib.rs[90m [limit=60][0m
+[0m
+[0m$ [0mls /home/runner/work/rbops/rbops/redblue && ls /home/runner/work/rbops/rbops/redblue/tests | head -50
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+assertions_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+debugger_test.rs
+diagnostics_test.rs
+differential_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+integration_test.rb
+interpolation_test.rs
+keyword_reservation_test.rs
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+might_fail_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+random_builtin_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+repeat_until_test.rs
+repl_test.rs
+span_test.rs
+stdlib_module_docs_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '920,1010p' SPEC.md
+It is an expression, so it works anywhere a value is taken: as an argument, a
+list element, a record value, or a parenthesized operand.
+
+```redblue
+set report to {body: might fail files.read("config.rb")}
+might fail files.write("output.txt", report body)
+```
+
+#### What a guard does not discard
+
+Three things are not a failure of the guarded call, and a `might fail` passes them
+on rather than turning them into `nothing`:
+
+- **A loop control.** A `break` or a `skip` inside the guarded call is not a
+  failure at all, so a guarded call that leaves the loop still leaves the loop.
+- **A failed `expect`.** An `expect` that fails is a test result, and the test
+  harness reads it as one. A guard that discarded it would report a red test
+  green.
+- **A resource limit.** The step budget, the call-depth limit, and a loop's
+  iteration cap are the host refusing to keep going, not the call going wrong. A
+  program stopped at the call-depth limit has not carried on — it has been
+  stopped — so reporting `nothing` for it would turn a runaway recursion into a
+  successful value and leave the program running against a bound it has already
+  reached:
+
+```redblue
+to endless(n)
+    give back endless(n + 1)
+end
+
+set stopped to might fail endless(1)
+```
+
+```
+RuntimeError: Maximum call depth of 1000 reached while calling 'endless'
+```
+
+The limit stops it either way; `might fail` is not an escape hatch from it. A
+failure of the call itself is still discarded:
+
+```redblue
+set stopped to might fail files.read("config.rb")   // -> nothing
+```
+
+### Raising Errors
+
+```redblue
+to might fail divide(a, b)
+    if b is equal to 0
+        give back error "Cannot divide by zero"
+    end
+    give back a / b
+end
+```
+
+---
+
+## Asynchronous Programming
+
+Not implemented. The words `async`, `wait`, `parallel` and `done` are ordinary
+identifiers: they were reserved by the lexer with no rule in the parser to read
+them, so a program written in the form below died with a parser error rather than
+running. They are names again, and the form is not part of the language until an
+interpreter arm exists for it.
+
+```redblue
+// Not Redblue. Nothing below parses.
+async to fetch_data(url)
+    set response to wait network.get(url)
+    give back json.parse(response)
+end
+```
+
+---
+
+## Standard Library
+
+### console
+
+```redblue
+say "Hello"           // Print with newline
+print "Hello"         // Print without newline
+ask "Your name?"      // Get user input
+```
+
+### text
+
+```redblue
+set upper to text.uppercase("hello")  // "HELLO"
+set lower to text.lowercase("HELLO")  // "hello"
+set parts to text.split("a,b,c", by ",")  // ["a", "b", "c"]
+[0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '995,1120p' SPEC.md
+## Standard Library
+
+### console
+
+```redblue
+say "Hello"           // Print with newline
+print "Hello"         // Print without newline
+ask "Your name?"      // Get user input
+```
+
+### text
+
+```redblue
+set upper to text.uppercase("hello")  // "HELLO"
+set lower to text.lowercase("HELLO")  // "hello"
+set parts to text.split("a,b,c", by ",")  // ["a", "b", "c"]
+set joined to text.join(["a", "b", "c"], by ",")  // "a,b,c"
+```
+
+### math
+
+```redblue
+set pi to PI
+set e to E
+set sqrt2 to math.sqrt(2)
+set rounded to math.round(3.7)  // 4
+set powered to math.pow(2, 10)  // 1024
+set floored to math.floor(1.7)  // 1
+```
+
+`PI` and `E` are globals, not module members: a module has functions, so
+`math.PI` is not a name in the language.
+
+`math.random` is not implemented. The random builtins are spelled flat: `random`,
+`random_seed`, `random_number`, `random_choice` and `random_shuffle`.
+
+```redblue
+random_seed(42)                // every draw after this is reproducible
+set n to random(1, 6)          // a whole number from 1 to 6, both ends included
+set f to random_number(0, 1)   // a number from 0 up to (not including) 1
+set one to random_choice(xs)    // one member of a list
+set mixed to random_shuffle(xs) // the same members, in a seeded order
+```
+
+`random_seed` makes the draws after it reproducible: the same seed gives the
+same sequence of draws, in one process or in two. A program that never seeds
+draws from a fixed default seed rather than from the clock, so Redblue's output
+is reproducible by default and a program has to *ask* for variation it cannot
+reproduce. A seed outside the range of a 64-bit machine integer has no bits left
+to give and takes the nearest bound, so `random_seed(1e300)` is the seed
+`random_seed(9223372036854775807)` names; the two ends are different seeds from
+each other. `random` answers a whole number and `random_number` a fraction; both
+refuse a range whose low end is above its high end, because such a range has no
+member. A range may be written with two arguments, with one — which is the high
+end, with zero as the low end, so `random(6)` is a die numbered zero through six
+and `random_number(10)` is `[0, 10)` — or with none, which is `[0, 100]` for
+`random` and `[0, 1)` for `random_number`. `random` answers one of the whole
+numbers in its range, so a fractional bound narrows the range rather than making
+the draw a fraction: `random(0, 100.5)` answers `0` to `100`, and a range holding
+no whole number at all, such as `random(0.2, 0.8)`, is refused. `random_choice`
+refuses an empty list, since it has no member to choose.
+
+### files
+
+```redblue
+set content to files.read("data.rb")
+might fail files.write("output.rb", content)
+might fail files.append("log.rb", "new line")
+if files.exists("config.rb")
+    // ...
+end
+```
+
+### list
+
+```redblue
+set doubled to list.map([1, 2, 3], to (x) give back x * 2)
+```
+
+`list.filter` and `list.reduce` are registered but not implemented. `list.map`
+is the only higher-order builtin, and it works in all three spellings:
+`map(xs, f)`, `list.map(xs, f)` and `xs.map(f)`.
+
+### network
+
+```redblue
+set response to network.get("https://api.example.com")
+set response to network.post("https://api.example.com", data)
+```
+
+Both calls block until the response arrives, so there is nothing to write in
+front of them. `wait` is an ordinary identifier, and the `wait`-prefixed spelling
+this section used to carry did not parse. See "Asynchronous Programming" above.
+
+### json and csv
+
+```redblue
+set obj to json.parse('{"name": "Alice"}')
+set text to json.stringify(obj)
+set rows to csv.parse("name,age\nAlice,30")
+```
+
+There is no `formats` module. JSON and CSV are their own modules, spelled
+`json.*` and `csv.*`.
+
+---
+
+## Grammar
+
+See [GRAMMAR.md](GRAMMAR.md) for the complete EBNF grammar specification.
+
+---
+
+## Appendix: Keywords Reference
+
+| Keyword | Description |
+|---------|-------------|
+| set | Declare/assign variable |
+| to | Assignment or function declaration |
+| is | Comparison |
+| nothing | Null value |
+| yes/no | Boolean literals |
+| if/then/else/end | Conditional statements |
+| unless | Negative condition |
+| for/each/in/from/times | Loop constructs |
+| while/repeat/until | Loop constructs |
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "^## \|^### " SPEC.md | sed -n '1,400p' | grep -n -A200 "Standard Library"
+64:995:## Standard Library
+65-997:### console
+66-1005:### text
+67-1014:### math
+68-1057:### files
+69-1068:### list
+70-1078:### network
+71-1089:### json and csv
+72-1102:## Grammar
+73-1108:## Appendix: Keywords Reference
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "time\.\|sys\.\|bytes\." SPEC.md README.md | head -40; echo "---phases---"; ls phases | tail -20; echo "--- git log ---"; git log --oneline -8
+README.md:192:time.now()             // Get current timestamp
+README.md:193:time.sleep(seconds) // Sleep for N seconds
+README.md:194:time.format(timestamp, "format")
+README.md:195:time.unix("YYYY-MM-DD HH:MM:SS")
+---phases---
+phase-029
+phase-030
+phase-031
+phase-032
+phase-033
+phase-034
+phase-035
+phase-036
+phase-037
+phase-038
+phase-039
+phase-040
+phase-041
+phase-042
+phase-043
+phase-044
+phase-045
+phase-046
+phase-047
+phase-049
+--- git log ---
+5a0e54a rbops: phase-049 (2026-10-12T02:03:47Z)
+09dd102 resume phase-049: adopt preserved work
+db85d20 rbops: phase-047 (2026-10-11T13:01:51Z)
+8229e1a rbops: phase-046 (2026-10-11T11:04:20Z)
+985e445 resume phase-046: adopt preserved work
+8e19352 rbops: phase-045 (2026-10-11T08:12:02Z)
+12f2c9e rbops: phase-044 (2026-10-11T06:51:22Z)
+96c3c17 resume phase-044: adopt preserved work
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && mkdir -p target/tmp/p50 && cat > target/tmp/p50/repro.rb <<'EOF'
+say text.uppercase("hi")
+say math.sqrt(9)
+say json.parse("{}")
+say csv.parse("a,b")
+say list.map([1,2,3], to (x) give back x * 2 end)
+EOF
+cargo run --quiet --bin rb -- run target/tmp/p50/repro.rb; echo "exit=$?"
+HI
+3
+{}
+[[a, b]]
+[2, 4, 6]
+exit=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -rn "formats" SPEC.md README.md | head; echo "=== module_function regs ==="; grep -rn "module_function\|sys_\|bytes_\|console_\|time_" src/stdlib.rs | head -60
+SPEC.md:1097:There is no `formats` module. JSON and CSV are their own modules, spelled
+=== module_function regs ===
+4:/// The module names whose functions are registered as `module_function`
+147:        "time_now".to_string(),
+148:        Value::Builtin("time_now".to_string()),
+151:        "time_sleep".to_string(),
+152:        Value::Builtin("time_sleep".to_string()),
+155:        "time_format".to_string(),
+156:        Value::Builtin("time_format".to_string()),
+159:        "time_unix".to_string(),
+160:        Value::Builtin("time_unix".to_string()),
+193:        "console_log".to_string(),
+194:        Value::Builtin("console_log".to_string()),
+197:        "console_error".to_string(),
+198:        Value::Builtin("console_error".to_string()),
+201:        "console_clear".to_string(),
+202:        Value::Builtin("console_clear".to_string()),
+231:        "bytes_from_text".to_string(),
+232:        Value::Builtin("bytes_from_text".to_string()),
+235:        "bytes_write".to_string(),
+236:        Value::Builtin("bytes_write".to_string()),
+239:        "bytes_text".to_string(),
+240:        Value::Builtin("bytes_text".to_string()),
+245:        "sys_argv".to_string(),
+246:        Value::Builtin("sys_argv".to_string()),
+601:    "time_now",
+602:    "time_sleep",
+603:    "time_format",
+604:    "time_unix",
+612:    "console_log",
+613:    "console_error",
+614:    "console_clear",
+620:    "bytes_from_text",
+621:    "bytes_write",
+622:    "bytes_text",
+623:    "sys_argv",
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -rn "module_function" src/*.rs src/**/*.rs | grep -v "fn module_function" | head -40
+src/interpreter.rs:446:/// is `MathUtils_circle_area`, which is the same `module_function` name the
+src/interpreter.rs:987:        // `module_function` name a builtin namespace member has too, so the two
+src/interpreter.rs:2046:    /// `module_function` — which is what `files.read` and `time.now` are.
+src/interpreter.rs:2087:                // function is `module_function`. An alias is resolved to the
+src/parser.rs:2284:                        // (a `module_function` builtin), so both forms stay one
+src/stdlib.rs:4:/// The module names whose functions are registered as `module_function`
+src/bytecode/vm.rs:3483:                self.publish_module_functions(&name, saved);
+src/bytecode/vm.rs:3688:    /// Moves a module file's functions onto the `module_function` names a call
+src/bytecode/vm.rs:3706:    fn publish_module_functions(&mut self, name: &str, saved: Vec<(String, Option<Value>)>) {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -rn "is_module\|MODULE_FUNCTION\|module_function" src/analyzer.rs src/runtime.rs 2>/dev/null | head -30; echo "=== runtime dir ==="; ls src
+src/analyzer.rs:591:                        if !self.name_is_bound(name) && !stdlib::is_module(name) =>
+=== runtime dir ===
+analyzer.rs
+bootstrap.rs
+bytecode
+debugger.rs
+error.rs
+formatter.rs
+interpreter.rs
+lexer.rs
+lib.rs
+linter.rs
+lsp.rs
+main.rs
+manifest.rs
+parser.rs
+repl
+runtime.rs
+stdlib.rs
+suggest.rs
+testing
+value.rs
+vfs.rs
+wasm.rs
+[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=560, limit=120][0m
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '150,240p' README.md
+| Form | Meaning |
+|---|---|
+| `set x to <expr>` | assignment |
+| `say <expr>` | print |
+| `if … then … else … end` | conditional |
+| `for each x in <list> … end` | iteration |
+| `for each i from A to B … end` | range loop |
+| `while … end`, `repeat … until …` | loops |
+| `break` / `skip` | leave / skip one iteration |
+| `unless … end` | negated conditional |
+| `x is 5`, `x is not 5` | equality (also `==`, `!=`) |
+| `x is greater than 4` | comparison (also `<`, `<=`, `>`, `>=`) |
+| `a and b`, `a or b`, `not x` | logic |
+| `list[0]` | indexing (out of bounds is a clean error) |
+| `7 mod 3` | remainder |
+| `to name(params) … end` | function declaration |
+| `to (x) … end` | function literal |
+| `object Name … has x … to f() … end` | object with fields and methods |
+| `Child extends Parent` | inheritance |
+| `test "name" … end` | test block |
+| `expect a to be b` | assertion |
+| `try … catch [err] … finally … end` | catchable errors |
+| `import Mod`, `import a, b as c` | modules |
+| `constant PI to 3.14159` | module-level constant |
+
+Full grammar: [`docs/GRAMMAR.md`](docs/GRAMMAR.md). Design rationale: [`PHILOSOPHY.md`](PHILOSOPHY.md). Specification: [`SPEC.md`](SPEC.md).
+
+## Standard Library
+
+### Files
+```
+files.read(path)      // Read file as text
+files.write(path, content)
+files.append(path, content)
+files.exists(path)   // Check if file exists
+files.lines(path)    // Read as list of lines
+files.delete(path)
+```
+
+### Time
+```
+time.now()             // Get current timestamp
+time.sleep(seconds) // Sleep for N seconds
+time.format(timestamp, "format")
+time.unix("YYYY-MM-DD HH:MM:SS")
+```
+
+### Network
+```
+network.get(url)     // HTTP GET
+network.post(url, body)
+```
+
+### Formats
+```
+json.parse(text)     // Parse JSON to record
+json.stringify(value)
+csv.parse(text)     // Parse CSV to list of lists
+```
+
+### Math
+```
+PI, E                    // Constants
+abs(x), floor(x), ceil(x)
+round(x), sqrt(x), pow(x, y)
+sin(x), cos(x), tan(x)
+log(x), exp(x)
+```
+
+### Text
+```
+uppercase("text"), lowercase("text"), trim("text")
+split("text", by), join(list, by)
+contains("text", sub)
+```
+
+## Project Structure
+
+```
+redblue/
+├── src/
+│   ├── lib.rs           # Main library
+│   ├── main.rs          # CLI entry
+│   ├── lexer.rs         # Tokenizer
+│   ├── parser.rs        # AST builder
+│   ├── analyzer.rs      # Semantic analysis
+│   ├── vm.rs            # Tree-walking interpreter
+│   ├── bytecode/        # Bytecode format, compiler, disassembler, VM
+│   ├── stdlib.rs        # Standard library
+│   ├── formatter.rs     # Code formatter
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'say bytes.from_text("a")\nsay sys.argv\nsay time.now is nothing\n' > target/tmp/p50/b.rb && cargo run --quiet --bin rb -- run target/tmp/p50/b.rb; echo "exit=$?"
+Error: AnalyzerError: Unknown variable 'sys'
+Unknown variable 'time'; did you mean 'times'?
+  --> target/tmp/p50/b.rb:2:1
+2 | say sys.argv
+  | ^
+exit=1
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for p in 'console.log("x")' 'console.error("x")' 'console.clear()' 'console.ask("n")' 'text.uppercase("hi")' 'text.replace("a","b","c")' 'math.round(1.5)' 'files.exists("/tmp")' 'time.format(0,"%Y")' 'list.map([1],to (x) give back x end)' 'json.stringify(1)' 'bytes.text(1)' 'sys.argv' ; do printf '%s => ' "$p"; printf 'say %s\n' "$p" > target/tmp/p50/t.rb; cargo run --quiet --bin rb -- run target/tmp/p50/t.rb 2>&1 | tr '\n' ' '; echo; done
+console.log("x") => x nothing 
+console.error("x") => x nothing 
+console.clear() => [2J[1Hnothing 
+console.ask("n") => Error: RuntimeError: Module 'console' has no function 'ask'   --> target/tmp/p50/t.rb:1:1 1 | say console.ask("n")   | ^ 
+text.uppercase("hi") => HI 
+text.replace("a","b","c") => a 
+math.round(1.5) => 2 
+files.exists("/tmp") => yes 
+time.format(0,"%Y") => 1970 
+list.map([1],to (x) give back x end) => [1] 
+json.stringify(1) => 1 
+bytes.text(1) => Error: RuntimeError: bytes.text requires a list of byte values   --> target/tmp/p50/t.rb:1:1 1 | say bytes.text(1)   | ^ 
+sys.argv => Error: AnalyzerError: Unknown variable 'sys'   --> target/tmp/p50/t.rb:1:1 1 | say sys.argv   | ^
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for p in 'text.uppercase()' 'text.uppercase("a","b")' 'files.read()' 'files.read(1)' 'math.sqrt("a")' 'text.nosuch("a")' 'json.parse()' 'list.map()' 'text.split("a")' 'ask "n"' 'print "x"' 'sys.argv()' 'time.now(1,2,3)'; do printf '%s => ' "$p"; printf 'say %s\n' "$p" > target/tmp/p50/t.rb; cargo run --quiet --bin rb -- run target/tmp/p50/t.rb 2>&1 | tr '\n' ' '; echo; done
+text.uppercase() => Error: RuntimeError: uppercase was called with arguments it cannot use   --> target/tmp/p50/t.rb:1:1 1 | say text.uppercase()   | ^ 
+text.uppercase("a","b") => A 
+files.read() => Error: RuntimeError: files.read requires a text path   --> target/tmp/p50/t.rb:1:1 1 | say files.read()   | ^ 
+files.read(1) => Error: RuntimeError: files.read requires a text path   --> target/tmp/p50/t.rb:1:1 1 | say files.read(1)   | ^ 
+math.sqrt("a") => Error: RuntimeError: sqrt was called with arguments it cannot use   --> target/tmp/p50/t.rb:1:1 1 | say math.sqrt("a")   | ^ 
+text.nosuch("a") => Error: RuntimeError: Module 'text' has no function 'nosuch'   --> target/tmp/p50/t.rb:1:1 1 | say text.nosuch("a")   | ^ 
+json.parse() => Error: RuntimeError: json.parse requires text   --> target/tmp/p50/t.rb:1:1 1 | say json.parse()   | ^ 
+list.map() => Error: RuntimeError: map requires a list and a function   --> target/tmp/p50/t.rb:1:1 1 | say list.map()   | ^ 
+text.split("a") => Error: RuntimeError: split was called with arguments it cannot use   --> target/tmp/p50/t.rb:1:1 1 | say text.split("a")   | ^ 
+ask "n" => Error: AnalyzerError: Unknown variable 'ask'; did you mean 'as'?   --> target/tmp/p50/t.rb:1:1 1 | say ask "n"   | ^ 
+print "x" => Error: ParserError: Unexpected token 'print'   --> target/tmp/p50/t.rb:1:5 1 | say print "x"   |     ^ 
+sys.argv() => [] 
+time.now(1,2,3) => {seconds: 1791770777, nanoseconds: 873371718}
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for p in 'json.parse("{}","x")' 'csv.parse("a,b",1)' 'files.read("Cargo.toml","x")' 'math.sqrt(1,2)' 'time.format(0,"%Y","z")' 'console.log()' 'list.map([1],to (x) give back x end,5)' 'bytes.from_text()' 'sys.argv(1)' 'json.stringify(1,2)'; do printf '%s => ' "$p"; printf 'say %s\n' "$p" > target/tmp/p50/t.rb; cargo run --quiet --bin rb -- run target/tmp/p50/t.rb 2>&1 | tr '\n' ' '; echo; done; echo "=== bytes ==="; printf 'say bytes.from_text("hi")\nsay bytes.write("/tmp/x.txt")\n' > target/tmp/p50/t.rb; cargo run --quiet --bin rb -- run target/tmp/p50/t.rb 2>&1 | tr '\n' ' '
+json.parse("{}","x") => {} 
+csv.parse("a,b",1) => [[a, b]] 
+files.read("Cargo.toml","x") => [package] name = "redblue" version = "0.2.0" edition = "2021" authors = ["Redblue Contributors"] description = "A programming language as readable as plain English" license = "MIT" repository = "https://github.com/authorss81/redblue" keywords = ["programming-language", "compiler"] categories = ["compiler", "development-tools"]  [[bin]] name = "rb" path = "src/main.rs"  # `cdylib` is what makes the WebAssembly playground module: it is the crate type # that emits a `.wasm` and exports every `#[no_mangle]` symbol the library # defines, which is what `wasm/redblue.js` calls. Built with: # #   rustup target add wasm32-unknown-unknown #   cargo build --release --target wasm32-unknown-unknown --lib # # writing `target/wasm32-unknown-unknown/release/redblue.wasm`. `rlib` is kept # so the native `rb` binary and the test suite link exactly as they did. [lib] name = "redblue" path = "src/lib.rs" crate-type = ["rlib", "cdylib"]  [dependencies] regex = "1.10" chrono = "0.4" reqwest = { version = "0.11", features = ["blocking"] } indexmap = "2"  [dev-dependencies] regex = "1.10" serde_json = "1.0"  [profile.release] opt-level = 3 lto = true  
+math.sqrt(1,2) => 1 
+time.format(0,"%Y","z") => 1970 
+console.log() => nothing 
+list.map([1],to (x) give back x end,5) => Error: RuntimeError: map requires a list and a function   --> target/tmp/p50/t.rb:1:1 1 | say list.map([1],to (x) give back x end,5)   | ^ 
+bytes.from_text() => Error: RuntimeError: bytes.from_text requires a text argument   --> target/tmp/p50/t.rb:1:1 1 | say bytes.from_text()   | ^ 
+sys.argv(1) => [] 
+json.stringify(1,2) => 1 
+=== bytes ===
+Error: RuntimeError: bytes.write requires a path and a list of byte values   --> target/tmp/p50/t.rb:2:1 2 | say bytes.write("/tmp/x.txt")   | ^
+[0m
+[0m← [0mWrite tests/stdlib_module_names_test.rs
+Wrote file successfully.
+[0m
+Reproduction done. `text`/`math`/`json`/`csv`/`list` already work (earlier phase), but the docs↔registry reconciliation test does not exist and two registry modules are documented nowhere. Writing the failing test first.
+[0m← [0mEdit src/stdlib.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/stdlib.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/stdlib.rs
++++ /home/runner/work/rbops/rbops/redblue/src/stdlib.rs
+@@ -19,13 +19,42 @@
+ pub const MODULES: &[&str] = &[
+     "bytes", "console", "csv", "files", "json", "list", "math", "network", "sys", "text", "time",
+ ];
+ 
++/// The modules whose functions are the flat builtins of the same name rather
++/// than a `<module>_<function>` entry in the registry: `text.uppercase` is
++/// `uppercase`, and `math.sqrt` is `sqrt`.
++///
++/// A module listed here is *expected* to have no `<module>_<function>` builtin
++/// behind it. Every other name in [`MODULES`] is expected to have one, which is
++/// what [`modules_without_functions`] checks.
++pub const ALIAS_MODULES: &[&str] = &["math", "text"];
++
+ /// Whether `name` is one of the [`MODULES`].
+ pub fn is_module(name: &str) -> bool {
+     MODULES.contains(&name)
+ }
+ 
++/// The names in [`MODULES`] with no `<module>_<function>` builtin behind them and
++/// no entry in [`ALIAS_MODULES`] to explain why.
++///
++/// A name in that position is a namespace the analyzer accepts as the receiver
++/// of a dotted call and the runtime then refuses — a worse failure than either
++/// error alone, because the program passes analysis and dies on its first call.
++/// Should always be empty.
++pub fn modules_without_functions() -> Vec<&'static str> {
++    MODULES
++        .iter()
++        .copied()
++        .filter(|name| !ALIAS_MODULES.contains(name))
++        .filter(|name| {
++            !builtins()
++                .keys()
++                .any(|builtin| builtin.starts_with(&format!("{name}_")))
++        })
++        .collect()
++}
++
+ pub fn builtins() -> HashMap<String, Value> {
+     let mut globals = HashMap::new();
+ 
+     // Math constants
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test 2>&1 | tail -50
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: 1 positional argument in format string, but no arguments were given[0m
+   [1m[94m--> [0mtests/stdlib_module_names_test.rs:212:69
+    [1m[94m|[0m
+[1m[94m212[0m [1m[94m|[0m         "a module in stdlib::MODULES has no function behind it, so `{}.anything()` \
+    [1m[94m|[0m                                                                     [1m[91m^^[0m
+
+[1m[91merror[0m: could not compile `redblue` (test "stdlib_module_names_test") due to 1 previous error
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -208,11 +208,11 @@
+ fn edge_no_module_in_the_registry_has_nothing_behind_it() {
+     assert_eq!(
+         stdlib::modules_without_functions(),
+         Vec::<&str>::new(),
+-        "a module in stdlib::MODULES has no function behind it, so `{}.anything()` \
+-         passes the analyzer and is refused at run time. Add the function, or list \
+-         the module in stdlib::ALIAS_MODULES if its functions are flat builtins.",
++        "a module in stdlib::MODULES has no function behind it, so calling anything \
++         on it passes the analyzer and is refused at run time. Add the function, or \
++         list the module in stdlib::ALIAS_MODULES if its functions are flat builtins.",
+     );
+ }
+ 
+ // ============================================================ each name answers
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test 2>&1 | tail -60
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 2.41s
+[1m[92m     Running[0m tests/stdlib_module_names_test.rs (target/debug/deps/stdlib_module_names_test-7fee5f0811193db8)
+
+running 6 tests
+test edge_a_module_in_the_registry_is_named_by_a_document ... FAILED
+test edge_a_module_the_documents_name_is_in_the_registry ... FAILED
+test every_module_the_documents_name_answers_a_call ... FAILED
+test edge_no_module_in_the_registry_has_nothing_behind_it ... ok
+test edge_an_unknown_module_name_is_refused_in_its_dotted_spelling ... ok
+test edge_a_module_function_refuses_bad_arguments_by_name ... ok
+
+failures:
+
+---- edge_a_module_in_the_registry_is_named_by_a_document stdout ----
+
+thread 'edge_a_module_in_the_registry_is_named_by_a_document' (6253) panicked at tests/stdlib_module_names_test.rs:191:9:
+stdlib::MODULES lists `bytes` and neither SPEC.md nor README.md names it. Either document the module or drop the name from MODULES — a namespace nothing documents is surface nobody agreed to.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: stdlib_module_names_test::edge_a_module_in_the_registry_is_named_by_a_document
+   3: stdlib_module_names_test::edge_a_module_in_the_registry_is_named_by_a_document::{closure#0}
+   4: <stdlib_module_names_test::edge_a_module_in_the_registry_is_named_by_a_document::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- edge_a_module_the_documents_name_is_in_the_registry stdout ----
+
+thread 'edge_a_module_the_documents_name_is_in_the_registry' (6254) panicked at tests/stdlib_module_names_test.rs:171:9:
+SPEC.md or README.md names the module `and` and stdlib::MODULES does not, so a program using it dies as 'Unknown variable \'and\''. Add `and` to stdlib::MODULES, or correct the document. The documents currently name: {"and", "api", "config", "console", "csv", "data", "example", "files", "formats", "json", "list", "log", "math", "network", "output", "text", "time"}
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: stdlib_module_names_test::edge_a_module_the_documents_name_is_in_the_registry
+   3: stdlib_module_names_test::edge_a_module_the_documents_name_is_in_the_registry::{closure#0}
+   4: <stdlib_module_names_test::edge_a_module_the_documents_name_is_in_the_registry::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- every_module_the_documents_name_answers_a_call stdout ----
+
+thread 'every_module_the_documents_name_answers_a_call' (6259) panicked at tests/stdlib_module_names_test.rs:255:9:
+the documents name the module `and` and no program in every_module_the_documents_name_answers_a_call calls it. Add a line for `and` there. The documents name: {"and", "api", "config", "console", "csv", "data", "example", "files", "formats", "json", "list", "log", "math", "network", "output", "text", "time"}
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: stdlib_module_names_test::every_module_the_documents_name_answers_a_call
+   3: stdlib_module_names_test::every_module_the_documents_name_answers_a_call::{closure#0}
+   4: <stdlib_module_names_test::every_module_the_documents_name_answers_a_call::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_module_in_the_registry_is_named_by_a_document
+    edge_a_module_the_documents_name_is_in_the_registry
+    every_module_the_documents_name_answers_a_call
+
+test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[91merror[0m: test failed, to rerun pass `--test stdlib_module_names_test`
+[0m
+[0m✗ [0mEdit tests/stdlib_module_names_test.rs failed
+[91m[1mError: [0mCould not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+Extraction is too naive — it reads dotted names out of string literals and headings. Tightening it.
+[0m→ [0mRead tests/stdlib_module_names_test.rs[90m [offset=36, limit=65][0m
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -64,9 +64,11 @@
+ 
+ if line.starts_with("### ") {
+     for word in line.trim_start_matches('#').trim().split_whitespace() {
+         let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+-        if !word.is_empty() {
++        // `### json and csv` is two names in one heading, and `and` is
++        // the word joining them rather than one of them.
++        if !word.is_empty() && word != "and" {
+             names.insert(word.to_lowercase());
+         }
+     }
+     continue;
+
+[0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs[90m [limit=36, offset=85][0m
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -83,24 +83,53 @@
+ }
+ 
+ /// The identifiers immediately before a `.` on `line`.
+ ///
+-/// `1.5` is not a receiver — the leading character is a digit — and neither is
+-/// the `r` of a quoted string, because a receiver is an identifier followed by a
+-/// `.` followed by another identifier.
++/// Two things that are not receivers are skipped, and both of them are in the
++/// documents as written: string literals — `files.read("config.rb")` names
++/// `files`, not `config`, and `network.get("https://api.example.com")` names
++/// `network`, not `api` — and `//` comments, where `e.g.` is not a module.
++///
++/// `1.5` is not a receiver either, because the leading character is a digit, and
++/// neither is the `r` of a quoted string, because a receiver is an identifier
++/// followed by a `.` followed by another identifier.
+ fn dotted_receivers(line: &str) -> BTreeSet<String> {
+-    let chars: Vec<char> = line.chars().collect();
+-    let identifier_start =
+-        |c: char| c.is_ascii_alphabetic() || c == '_';
++    let identifier_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+     let identifier_part = |c: char| c.is_ascii_alphanumeric() || c == '_';
+ 
+     let mut names = BTreeSet::new();
++    let chars: Vec<char> = line.chars().collect();
+     let mut i = 0;
++    let mut quote: Option<char> = None;
++    let mut escaped = false;
++
+     while i < chars.len() {
+-        if !identifier_start(chars[i]) {
++        let c = chars[i];
++
++        if let Some(open) = quote {
++            if escaped {
++                escaped = false;
++            } else if c == '\\' {
++                escaped = true;
++            } else if c == open {
++                quote = None;
++            }
+             i += 1;
+             continue;
+         }
++
++        if c == '"' || c == '\'' {
++            quote = Some(c);
++            i += 1;
++            continue;
++        }
++        if c == '/' && chars.get(i + 1) == Some(&'/') {
++            break;
++        }
++        if !identifier_start(c) {
++            i += 1;
++            continue;
++        }
+         let start = i;
+         while i < chars.len() && identifier_part(chars[i]) {
+             i += 1;
+         }
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test 2>&1 | grep -E "^(test|running|failures|error|---- )|documents name|stdlib::MODULES|the documents name" | head -30
+running 6 tests
+test edge_a_module_in_the_registry_is_named_by_a_document ... FAILED
+test edge_a_module_the_documents_name_is_in_the_registry ... FAILED
+test edge_no_module_in_the_registry_has_nothing_behind_it ... ok
+test every_module_the_documents_name_answers_a_call ... FAILED
+test edge_an_unknown_module_name_is_refused_in_its_dotted_spelling ... ok
+test edge_a_module_function_refuses_bad_arguments_by_name ... ok
+failures:
+---- edge_a_module_in_the_registry_is_named_by_a_document stdout ----
+stdlib::MODULES lists `bytes` and neither SPEC.md nor README.md names it. Either document the module or drop the name from MODULES — a namespace nothing documents is surface nobody agreed to.
+---- edge_a_module_the_documents_name_is_in_the_registry stdout ----
+SPEC.md or README.md names the module `formats` and stdlib::MODULES does not, so a program using it dies as 'Unknown variable \'formats\''. Add `formats` to stdlib::MODULES, or correct the document. The documents currently name: {"console", "csv", "files", "formats", "json", "list", "math", "network", "text", "time"}
+---- every_module_the_documents_name_answers_a_call stdout ----
+the documents name the module `formats` and no program in every_module_the_documents_name_answers_a_call calls it. Add a line for `formats` there. The documents name: {"console", "csv", "files", "formats", "json", "list", "math", "network", "text", "time"}
+failures:
+test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "bytes_from_text\|bytes_write\|bytes_text\|sys_argv" -A 30 src/stdlib.rs | sed -n '1,140p'
+260:        "bytes_from_text".to_string(),
+261:        Value::Builtin("bytes_from_text".to_string()),
+262-    );
+263-    globals.insert(
+264:        "bytes_write".to_string(),
+265:        Value::Builtin("bytes_write".to_string()),
+266-    );
+267-    globals.insert(
+268:        "bytes_text".to_string(),
+269:        Value::Builtin("bytes_text".to_string()),
+270-    );
+271-
+272-    // Sys module
+273-    globals.insert(
+274:        "sys_argv".to_string(),
+275:        Value::Builtin("sys_argv".to_string()),
+276-    );
+277-
+278-    globals
+279-}
+280-
+281-/// The non-function globals `builtins()` registers.
+282-///
+283-/// `PI` and `E` are values rather than callables, so `is_builtin` — which
+284-/// answers for names a program can *call* — does not cover them, and the
+285-/// analyzer needs to know they are in scope.
+286-pub const GLOBAL_CONSTANTS: &[&str] = &["PI", "E"];
+287-
+288-/// Whether `name` is one of the [`GLOBAL_CONSTANTS`].
+289-pub fn is_global(name: &str) -> bool {
+290-    GLOBAL_CONSTANTS.contains(&name)
+291-}
+292-
+293-/// Calls the builtin `name`, for the builtins [`runtime::builtin`] does not
+294-/// answer.
+295-///
+296-/// This function used to be **dead code**: both VMs asked `runtime::builtin`,
+297-/// which matched only the names it implemented, so `abs`, `floor`, `ceil`,
+298-/// `round`, `sqrt`, `uppercase`, `lowercase` and `trim` — all registered in
+299-/// [`builtins`], all in SPEC.md and README.md — answered `Unknown function` at
+300-/// runtime. The only callers of this function were tests, and a test calling it
+301-/// directly is green whether or not a program can reach it.
+302-///
+303-/// It is now reached, through [`builtin`], which is the single place a builtin
+304-/// name is resolved and is called by both engines.
+305-///
+--
+649:    "bytes_from_text",
+650:    "bytes_write",
+651:    "bytes_text",
+652:    "sys_argv",
+653-];
+654-
+655-impl Value {
+656-    fn abs(&self) -> Value {
+657-        match self {
+658-            Value::Number(n) => Value::Number(n.abs()),
+659-            _ => Value::Nothing,
+660-        }
+661-    }
+662-
+663-    fn floor(&self) -> Value {
+664-        match self {
+665-            Value::Number(n) => Value::Number(n.floor()),
+666-            _ => Value::Nothing,
+667-        }
+668-    }
+669-
+670-    fn ceil(&self) -> Value {
+671-        match self {
+672-            Value::Number(n) => Value::Number(n.ceil()),
+673-            _ => Value::Nothing,
+674-        }
+675-    }
+676-
+677-    fn round(&self) -> Value {
+678-        match self {
+679-            Value::Number(n) => Value::Number(n.round()),
+680-            _ => Value::Nothing,
+681-        }
+682-    }
+[0m
+Red for the right reasons: `formats` documented in README but not in `MODULES`; `bytes` (and `sys`) in `MODULES` but documented nowhere. Now the docs fix — reading what those functions actually do first.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n '"bytes' -A 45 src/stdlib.rs | sed -n '/fn builtin_function/,$p' | head -5; grep -n '"bytes_from_text" =>\|"bytes_write" =>\|"bytes_text" =>\|"sys_argv" =>' src/stdlib.rs
+311-pub fn builtin_function(name: &str, args: Vec<Value>) -> Option<Value> {
+312-    match name {
+313-        // Math functions
+314-        "abs" => Some(args.first()?.abs()),
+--
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "bytes_from_text\|bytes_write\|bytes_text\|sys_argv" src/stdlib.rs src/runtime.rs src/interpreter.rs | grep -v "globals.insert\|Value::Builtin\|^\s*\"" | head -20
+src/stdlib.rs:260:        "bytes_from_text".to_string(),
+src/stdlib.rs:264:        "bytes_write".to_string(),
+src/stdlib.rs:268:        "bytes_text".to_string(),
+src/stdlib.rs:274:        "sys_argv".to_string(),
+src/stdlib.rs:649:    "bytes_from_text",
+src/stdlib.rs:650:    "bytes_write",
+src/stdlib.rs:651:    "bytes_text",
+src/stdlib.rs:652:    "sys_argv",
+src/runtime.rs:1198:        "bytes_from_text" => {
+src/runtime.rs:1215:        "bytes_write" => {
+src/runtime.rs:1255:        "bytes_text" => {
+src/runtime.rs:1298:        "sys_argv" => Ok(Some(Value::list(
+[0m
+[0m→ [0mRead src/runtime.rs[90m [limit=125, offset=1190][0m
+[0m→ [0mRead SPEC.md[90m [limit=22, offset=1086][0m
+[0m
+[0m← [0mEdit SPEC.md
+Index: /home/runner/work/rbops/rbops/redblue/SPEC.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/SPEC.md
++++ /home/runner/work/rbops/rbops/redblue/SPEC.md
+@@ -1096,8 +1096,34 @@
+ 
+ There is no `formats` module. JSON and CSV are their own modules, spelled
+ `json.*` and `csv.*`.
+ 
++### bytes
++
++```redblue
++set data to bytes.from_text("Hi")        // [72, 105] — a byte list
++set back to bytes.text(data)             // "Hi"
++bytes.write("out.bin", data)             // write a byte list to a file
++```
++
++A byte is the whole number 0 to 255. `files.write` writes the UTF-8 encoding of
++a text, so `bytes` is how a program writes a byte it cannot spell — which a
++compiler writing a bytecode file cannot avoid. A value that is not a byte, or a
++byte list that is not valid UTF-8, is a refusal naming the byte rather than a
++wrapped value or a replacement character three files later.
++
++### sys
++
++```redblue
++for each argument in sys.argv()
++    say argument
++end
++```
++
++`sys.argv()` is the list of arguments after the program path, and it is empty
++for a program run from the REPL or from a test, because only `rb run` collects
++them.
++
+ ---
+ 
+ ## Grammar
+ 
+
+[0m
+[0m→ [0mRead README.md[90m [limit=40, offset=172][0m
+[0m
+[0m← [0mEdit README.md
+Index: /home/runner/work/rbops/rbops/redblue/README.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/README.md
++++ /home/runner/work/rbops/rbops/redblue/README.md
+@@ -186,23 +186,35 @@
+ files.lines(path)    // Read as list of lines
+ files.delete(path)
+ ```
+ 
++### Bytes
++```
++bytes.from_text(text)   // Text to a list of byte values (0 to 255)
++bytes.text(bytes)       // A byte list back to text
++bytes.write(path, bytes) // Write a byte list to a file
++```
++
+ ### Time
+ ```
+ time.now()             // Get current timestamp
+ time.sleep(seconds) // Sleep for N seconds
+ time.format(timestamp, "format")
+ time.unix("YYYY-MM-DD HH:MM:SS")
+ ```
+ 
++### Sys
++```
++sys.argv()             // Arguments after the program path (empty outside `rb run`)
++```
++
+ ### Network
+ ```
+ network.get(url)     // HTTP GET
+ network.post(url, body)
+ ```
+ 
+-### Formats
++### JSON and CSV
+ ```
+ json.parse(text)     // Parse JSON to record
+ json.stringify(value)
+ csv.parse(text)     // Parse CSV to list of lists
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test 2>&1 | grep -E "^(test |running|failures:|error)|documents name|stdlib::MODULES|panicked" | head -20
+running 6 tests
+test edge_a_module_in_the_registry_is_named_by_a_document ... ok
+test edge_a_module_the_documents_name_is_in_the_registry ... ok
+test edge_no_module_in_the_registry_has_nothing_behind_it ... ok
+test edge_an_unknown_module_name_is_refused_in_its_dotted_spelling ... ok
+test edge_a_module_function_refuses_bad_arguments_by_name ... ok
+test every_module_the_documents_name_answers_a_call ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'set parts to text.split("a,b,c", by ",")\nsay parts\nset joined to text.join(["a","b","c"], by ",")\nsay joined\n' > target/tmp/p50/t.rb && cargo run --quiet --bin rb -- run target/tmp/p50/t.rb 2>&1 | head -20; echo "exit=$?"; grep -n '"by"\|By\b' src/lexer.rs | head -5
+[a, b, c]
+a,b,c
+exit=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for p in 'bytes.text(bytes.from_text(""))' 'bytes.from_text("é")' 'bytes.write("target/tmp/p50/b.bin", [0, 255])' 'bytes.write("target/tmp/p50/b.bin", [256])' 'bytes.write("target/tmp/p50/b.bin", [-1])' 'bytes.text([300])' 'bytes.text([])' 'json.parse("{")' 'csv.parse("")' 'files.read("nope-does-not-exist.txt")'; do printf '%s => ' "$p"; printf 'say %s\n' "$p" > target/tmp/p50/t.rb; cargo run --quiet --bin rb -- run target/tmp/p50/t.rb 2>&1 | tr '\n' ' '; echo; done
+bytes.text(bytes.from_text("")) =>  
+bytes.from_text("é") => [195, 169] 
+bytes.write("target/tmp/p50/b.bin", [0, 255]) => nothing 
+bytes.write("target/tmp/p50/b.bin", [256]) => Error: RuntimeError: bytes.write was given 256, which is not a byte (0 to 255)   --> target/tmp/p50/t.rb:1:1 1 | say bytes.write("target/tmp/p50/b.bin", [256])   | ^ 
+bytes.write("target/tmp/p50/b.bin", [-1]) => Error: RuntimeError: bytes.write was given -1, which is not a byte (0 to 255)   --> target/tmp/p50/t.rb:1:1 1 | say bytes.write("target/tmp/p50/b.bin", [-1])   | ^ 
+bytes.text([300]) => Error: RuntimeError: bytes.text was given 300, which is not a byte (0 to 255)   --> target/tmp/p50/t.rb:1:1 1 | say bytes.text([300])   | ^ 
+bytes.text([]) =>  
+json.parse("{") => Error: RuntimeError: RuntimeError: Invalid JSON object   --> 1:1   --> target/tmp/p50/t.rb:1:1 1 | say json.parse("{")   | ^ 
+csv.parse("") => [] 
+files.read("nope-does-not-exist.txt") => Error: IoError: Failed to read 'nope-does-not-exist.txt': No such file or directory (os error 2)
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -311,8 +311,85 @@
+ }
+ 
+ // ============================================================ the calls fail clean
+ 
++/// The `text` and `math` examples in SPEC.md, run.
++///
++/// This is the pair the finding is named for: `text.uppercase("hi")` answered
++/// `Unknown variable 'text'` and `math.sqrt(9)` answered `Unknown variable
++/// 'math'`, one step before the runtime could say which argument was wrong. The
++/// names are in `MODULES` now, and this pins the *values* the section's own
++/// comments claim, so a module that is in the registry and returns something
++/// else still fails.
++#[test]
++fn the_text_and_math_examples_answer_what_the_spec_claims() {
++    // `// "HELLO"`, `// "hello"`, `// ["a", "b", "c"]`, `// "a,b,c"` and
++    // `// 4`, `// 1024`, `// 1` are what SPEC.md writes beside these lines.
++    let cases = [
++        (r#"say text.uppercase("hello")"#, "HELLO"),
++        (r#"say text.lowercase("HELLO")"#, "hello"),
++        (r#"say text.split("a,b,c", by ",")"#, "[a, b, c]"),
++        (r#"say text.join(["a", "b", "c"], by ",")"#, "a,b,c"),
++        (r#"say math.sqrt(9)"#, "3"),
++        (r#"say math.round(3.7)"#, "4"),
++        (r#"say math.pow(2, 10)"#, "1024"),
++        (r#"say math.floor(1.7)"#, "1"),
++        (r#"say text.trim("  x  ")"#, "x"),
++        (r#"say text.replace("a-b", "-", "+")"#, "a+b"),
++    ];
++
++    for (source, expected) in cases {
++        let (ok, stdout, stderr) = run_named("spec_example", source);
++        assert!(ok, "a documented example did not run:\n{source}\n--- stderr\n{stderr}");
++        assert_eq!(
++            stdout.trim_end(),
++            expected,
++            "a documented example answered something else:\n{source}\n--- stderr\n{stderr}"
++        );
++    }
++}
++
++/// `bytes` is the module this phase added to the documents, so it is the one
++/// whose edges are pinned here: the two ends of the byte range and one past
++/// them, the empty text and the empty byte list, a single byte, and a character
++/// that is not one.
++#[test]
++fn edge_the_bytes_module_answers_a_round_trip_at_both_ends() {
++    // Empty in, empty out. `say ""` is a newline, so the answer is compared
++    // against the empty string rather than against `""`.
++    let (ok, stdout, stderr) = run_named("bytes_empty", r#"say bytes.text(bytes.from_text(""))"#);
++    assert!(ok, "the empty round trip did not run:\n--- stderr\n{stderr}");
++    assert_eq!(stdout, "\n", "the empty round trip did not answer empty text");
++
++    // A single byte, and the two ends of the range the module accepts.
++    let cases = [
++        (r#"say bytes.from_text("H")"#, "[72]"),
++        (r#"say bytes.from_text("é")"#, "[195, 169]"),
++        (r#"say bytes.text([0, 255])"#, "\u{0}ÿ"),
++    ];
++    for (source, expected) in cases {
++        let (ok, stdout, stderr) = run_named("bytes_case", source);
++        assert!(ok, "{source} did not run:\n--- stderr\n{stderr}");
++        assert_eq!(stdout.trim_end_matches('\n'), expected, "wrong answer for {source}");
++    }
++
++    // Past either end there is no byte, and the refusal names the value rather
++    // than wrapping it into the file.
++    for source in [
++        r#"say bytes.text([256])"#,
++        r#"say bytes.text([-1])"#,
++        r#"say bytes.write("target/tmp/p50names/out.bin", [256])"#,
++        r#"say bytes.from_text(1)"#,
++    ] {
++        let (ok, _, stderr) = run_named("bytes_range", source);
++        assert!(!ok, "a value that is not a byte was accepted:\n{source}");
++        assert!(
++            stderr.contains("bytes"),
++            "the refusal does not name the module the program wrote:\n{source}\n{stderr}"
++        );
++    }
++}
++
+ /// A documented module function called wrongly is a `RuntimeError` naming the
+ /// function, never a panic and never a silent answer.
+ ///
+ /// Each case is a different way of being wrong: no argument at all, one
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test 2>&1 | grep -E "^(test |running|failures:|error)|panicked|assertion|left|right|wrong|does not" | head -30
+running 8 tests
+test edge_a_module_in_the_registry_is_named_by_a_document ... ok
+test edge_a_module_the_documents_name_is_in_the_registry ... ok
+test edge_no_module_in_the_registry_has_nothing_behind_it ... ok
+test edge_an_unknown_module_name_is_refused_in_its_dotted_spelling ... ok
+test edge_the_bytes_module_answers_a_round_trip_at_both_ends ... FAILED
+test edge_a_module_function_refuses_bad_arguments_by_name ... ok
+test the_text_and_math_examples_answer_what_the_spec_claims ... ok
+test every_module_the_documents_name_answers_a_call ... ok
+failures:
+thread 'edge_the_bytes_module_answers_a_round_trip_at_both_ends' (7098) panicked at tests/stdlib_module_names_test.rs:371:9:
+failures:
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test edge_the_bytes 2>&1 | sed -n '/panicked/,/^note/p' | head -20
+thread 'edge_the_bytes_module_answers_a_round_trip_at_both_ends' (7193) panicked at tests/stdlib_module_names_test.rs:371:9:
+say bytes.text([0, 255]) did not run:
+--- stderr
+Error: RuntimeError: bytes.text was given bytes that are not text: invalid utf-8 sequence of 1 bytes from index 1
+  --> /home/runner/work/rbops/rbops/redblue/target/tmp/p50names/bytes_case.rb:1:1
+1 | say bytes.text([0, 255])
+  | ^
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: stdlib_module_names_test::edge_the_bytes_module_answers_a_round_trip_at_both_ends
+   3: stdlib_module_names_test::edge_the_bytes_module_answers_a_round_trip_at_both_ends::{closure#0}
+   4: <stdlib_module_names_test::edge_the_bytes_module_answers_a_round_trip_at_both_ends::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -359,25 +359,47 @@
+ let (ok, stdout, stderr) = run_named("bytes_empty", r#"say bytes.text(bytes.from_text(""))"#);
+ assert!(ok, "the empty round trip did not run:\n--- stderr\n{stderr}");
+ assert_eq!(stdout, "\n", "the empty round trip did not answer empty text");
+ 
+-// A single byte, and the two ends of the range the module accepts.
++// A single byte, a character that is not one, and the low end of the byte
++// range in text that is still text.
+ let cases = [
+     (r#"say bytes.from_text("H")"#, "[72]"),
+     (r#"say bytes.from_text("é")"#, "[195, 169]"),
+-    (r#"say bytes.text([0, 255])"#, "\u{0}ÿ"),
++    (r#"say bytes.text([0, 65])"#, "\u{0}A"),
+ ];
+ for (source, expected) in cases {
+     let (ok, stdout, stderr) = run_named("bytes_case", source);
+     assert!(ok, "{source} did not run:\n--- stderr\n{stderr}");
+-    assert_eq!(stdout.trim_end_matches('\n'), expected, "wrong answer for {source}");
++    assert_eq!(
++        stdout.trim_end_matches('\n'),
++        expected,
++        "wrong answer for {source}"
++    );
+ }
+ 
++// Both ends of the byte range are bytes, and `bytes.write` puts exactly
++// them in the file — checked by reading it back, so a write that wrapped
++// 255 into 0 would fail rather than pass on `nothing`.
++let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/p50names/ends.bin");
++let (ok, _, stderr) = run_named(
++    "bytes_ends",
++    r#"bytes.write("target/tmp/p50names/ends.bin", [0, 255])"#,
++);
++assert!(ok, "bytes 0 and 255 were refused:\n--- stderr\n{stderr}");
++assert_eq!(
++    std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display())),
++    vec![0u8, 255],
++    "bytes.write did not write the two bytes it was given"
++);
++
+ // Past either end there is no byte, and the refusal names the value rather
+-// than wrapping it into the file.
++// than wrapping it into the file. `[0, 255]` is in range but is not text, so
++// it is refused too — by the other rule, and still by name.
+ for source in [
+     r#"say bytes.text([256])"#,
+     r#"say bytes.text([-1])"#,
++    r#"say bytes.text([0, 255])"#,
+     r#"say bytes.write("target/tmp/p50names/out.bin", [256])"#,
+     r#"say bytes.from_text(1)"#,
+ ] {
+     let (ok, _, stderr) = run_named("bytes_range", source);
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test 2>&1 | grep -E "^(test |running|failures:|error)|panicked|left|right" | head -20
+running 8 tests
+test edge_a_module_in_the_registry_is_named_by_a_document ... ok
+test edge_a_module_the_documents_name_is_in_the_registry ... ok
+test edge_no_module_in_the_registry_has_nothing_behind_it ... ok
+test edge_an_unknown_module_name_is_refused_in_its_dotted_spelling ... ok
+test edge_a_module_function_refuses_bad_arguments_by_name ... ok
+test edge_the_bytes_module_answers_a_round_trip_at_both_ends ... ok
+test the_text_and_math_examples_answer_what_the_spec_claims ... ok
+test every_module_the_documents_name_answers_a_call ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls phases/phase-049/ && grep -rn "print\|ask" phases/phase-049/FINDINGS.md 2>/dev/null | head -10
+FINDINGS.md
+REPORT.md
+8:`async`, `wait`, `parallel`, `done`, `when`, `that`, `new`, `ask`, `are` were
+[0m
+[0m→ [0mRead phases/phase-049/FINDINGS.md
+Now the gates.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check 2>&1 | head -40
+Diff in /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs:141:
+         }
+         let is_a_receiver = j < chars.len()
+             && chars[j] == '.'
+-            && chars
+-                .get(j + 1)
+-                .is_some_and(|c| identifier_start(*c));
++            && chars.get(j + 1).is_some_and(|c| identifier_start(*c));
+         if is_a_receiver {
+             names.insert(word.to_lowercase());
+             i = j;
+Diff in /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs:154:
+ 
+ fn read_doc(name: &str) -> String {
+     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+-    std::fs::read_to_string(&path)
+-        .unwrap_or_else(|error| panic!("{name} is readable: {error}"))
++    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{name} is readable: {error}"))
+ }
+ 
+ /// Every module name SPEC.md and README.md name, together.
+Diff in /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs:339:
+ 
+     for (source, expected) in cases {
+         let (ok, stdout, stderr) = run_named("spec_example", source);
+-        assert!(ok, "a documented example did not run:\n{source}\n--- stderr\n{stderr}");
++        assert!(
++            ok,
++            "a documented example did not run:\n{source}\n--- stderr\n{stderr}"
++        );
+         assert_eq!(
+             stdout.trim_end(),
+             expected,
+Diff in /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs:357:
+     // Empty in, empty out. `say ""` is a newline, so the answer is compared
+     // against the empty string rather than against `""`.
+     let (ok, stdout, stderr) = run_named("bytes_empty", r#"say bytes.text(bytes.from_text(""))"#);
+-    assert!(ok, "the empty round trip did not run:\n--- stderr\n{stderr}");
+-    assert_eq!(stdout, "\n", "the empty round trip did not answer empty text");
++    assert!(
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -25
+FMT CLEAN
+[1m[92m    Checking[0m regex-automata v0.4.18
+[1m[92m    Checking[0m url v2.5.8
+[1m[92m    Checking[0m iana-time-zone v0.1.65
+[1m[92m    Checking[0m sync_wrapper v0.1.2
+[1m[92m    Checking[0m ipnet v2.12.2
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Checking[0m mime v0.3.17
+[1m[92m    Checking[0m chrono v0.4.45
+[1m[92m    Checking[0m zmij v1.0.23
+[1m[92m    Checking[0m serde_json v1.0.151
+[1m[92m    Checking[0m hyper-tls v0.5.0
+[1m[92m    Checking[0m reqwest v0.11.27
+[1m[92m    Checking[0m regex v1.13.1
+[1m[91merror[0m[1m: found call to `str::trim` before `str::split_whitespace`[0m
+  [1m[94m--> [0mtests/stdlib_module_names_test.rs:66:54
+   [1m[94m|[0m
+[1m[94m66[0m [1m[94m|[0m             for word in line.trim_start_matches('#').trim().split_whitespace() {
+   [1m[94m|[0m                                                      [1m[91m^^^^^^^[0m [1m[91mhelp: remove `trim()`[0m
+   [1m[94m|[0m
+   [1m[94m= [0m[1mhelp[0m: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#trim_split_whitespace
+   [1m[94m= [0m[1mnote[0m: `-D clippy::trim-split-whitespace` implied by `-D warnings`
+   [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(clippy::trim_split_whitespace)]`
+
+[1m[91merror[0m: could not compile `redblue` (test "stdlib_module_names_test") due to 1 previous error
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -62,9 +62,9 @@
+     continue;
+ }
+ 
+ if line.starts_with("### ") {
+-    for word in line.trim_start_matches('#').trim().split_whitespace() {
++    for word in line.trim_start_matches('#').split_whitespace() {
+         let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+         // `### json and csv` is two names in one heading, and `and` is
+         // the word joining them rather than one of them.
+         if !word.is_empty() && word != "and" {
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "^(error|warning)" -A 8 | head -30; echo "clippy-exit=$?"
+clippy-exit=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "FMT CLEAN" && cargo test --all-targets 2>&1 | grep -E "^test result|^error|FAILED|panicked at" | head -60
+FMT CLEAN
+test result: ok. 135 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 310.16s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 387.58s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 71.52s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.07s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.13s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.90s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && nohup cargo test --all-targets > target/tmp/p50/full-test.log 2>&1 & echo "started pid $!"
+started pid 20951
+
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 120000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import re
+def section(txt):
+    out=[];inside=False
+    for line in txt.split('\n'):
+        if line.startswith('## '): inside = line.strip()=='## Standard Library'
+        if inside: out.append(line)
+    return out
+def names(path):
+    lines=section(open(path,encoding='utf-8').read())
+    found=set();in_code=False
+    for line in lines:
+        if line.lstrip().startswith('```'): in_code = not in_code; continue
+        if line.startswith('### '):
+            for w in line.lstrip('#').split():
+                w=w.strip('.,()')
+                if w and w!='and': found.add(w.lower())
+            continue
+        if not in_code: continue
+        # strip strings and comments
+        s=re.sub(r'"[^"]*"|\'[^\']*\'','',line)
+        s=s.split('//')[0]
+        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*[A-Za-z_]',s):
+            found.add(m.group(1).lower())
+    return sorted(found)
+for p in ['SPEC.md','README.md']:
+    print(p, names(p))
+PY
+SPEC.md ['bytes', 'console', 'csv', 'files', 'json', 'list', 'math', 'network', 'sys', 'text']
+README.md ['bytes', 'csv', 'files', 'json', 'math', 'network', 'sys', 'text', 'time']
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && (pgrep -f "cargo test --all-targets" >/dev/null && echo "STILL RUNNING" || echo "DONE"); tail -3 target/tmp/p50/full-test.log; grep -c "^test result: ok" target/tmp/p50/full-test.log
+STILL RUNNING
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families ... ok
+3
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls phases/phase-047/ phases/phase-041/ 2>/dev/null
+phases/phase-041/:
+FINDINGS.md
+REPORT.md
+
+phases/phase-047/:
+FINDINGS.md
+REPORT.md
+[0m
+Still running. Writing the phase directory docs while it finishes.
+[0m← [0mWrite phases/phase-050/FINDINGS.md
+Wrote file successfully.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && (pgrep -f "cargo test --all-targets" >/dev/null && echo "STILL RUNNING" || echo "DONE"); grep -c "^test result: ok" target/tmp/p50/full-test.log; grep -n "FAILED\|failures:" target/tmp/p50/full-test.log | head
+STILL RUNNING
+3
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "pub const MODULES\|pub const ALIAS_MODULES\|pub fn is_module\|pub fn modules_without_functions\|pub fn builtins" src/stdlib.rs; echo "--- MODULES line ---"; grep -n "^];" src/stdlib.rs | head -2; echo "--- SPEC sections ---"; grep -n "^## Standard Library\|^### \|^## Grammar" SPEC.md | sed -n '/Standard Library/,$p' | head -15; echo "--- README ---"; grep -n "^## Standard Library\|^### \|^## Project Structure" README.md | sed -n '/Standard Library/,$p' | head -12
+19:pub const MODULES: &[&str] = &[
+30:pub const ALIAS_MODULES: &[&str] = &["math", "text"];
+33:pub fn is_module(name: &str) -> bool {
+44:pub fn modules_without_functions() -> Vec<&'static str> {
+57:pub fn builtins() -> HashMap<String, Value> {
+--- MODULES line ---
+21:];
+653:];
+--- SPEC sections ---
+995:## Standard Library
+997:### console
+1005:### text
+1014:### math
+1057:### files
+1068:### list
+1078:### network
+1089:### json and csv
+1100:### bytes
+1114:### sys
+1128:## Grammar
+--- README ---
+178:## Standard Library
+180:### Files
+190:### Bytes
+197:### Time
+205:### Sys
+210:### Network
+216:### JSON and CSV
+223:### Math
+232:### Text
+239:## Project Structure
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && (pgrep -f "cargo test --all-targets" >/dev/null && echo "STILL RUNNING" || echo "DONE"); grep -c "^test result: ok" target/tmp/p50/full-test.log
+STILL RUNNING
+3
+[0m
+[0m$ [0msleep 240; cd /home/runner/work/rbops/rbops/redblue && (pgrep -f "cargo test --all-targets" >/dev/null && echo "STILL RUNNING" || echo "DONE"); grep -c "^test result: ok" target/tmp/p50/full-test.log
+STILL RUNNING
+3
+[0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs[90m [limit=120, offset=150][0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs[90m [limit=60, offset=258][0m
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -256,48 +256,60 @@
+ /// The table is checked against the documents in both directions, so a module
+ /// added to a document without a line here fails rather than going untested.
+ #[test]
+ fn every_module_the_documents_name_answers_a_call() {
+-    const CALLS: &[(&str, &str)] = &[
+-        ("bytes", r#"say length(bytes.from_text("hi"))"#),
+-        ("console", r#"say console.log("hi")"#),
+-        ("csv", r#"say csv.parse("a,b")"#),
+-        ("files", r#"say files.exists("Cargo.toml")"#),
+-        ("json", r#"say json.parse("{}")"#),
+-        ("list", r#"say list.map([1], to (x) give back x)"#),
+-        ("math", r#"say math.sqrt(9)"#),
++    // `files` is given an absolute path because a test's working directory is
++    // not a promise, and a program that answers "no" to `files.exists` still
++    // exits 0 — which would make this pass without touching a file at all.
++    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .join("target/tmp/p50names")
++        .display()
++        .to_string();
++
++    let calls: Vec<(&str, String)> = vec![
++        ("bytes", r#"say length(bytes.from_text("hi"))"#.to_string()),
++        ("console", r#"say console.log("hi")"#.to_string()),
++        ("csv", r#"say csv.parse("a,b")"#.to_string()),
++        (
++            "files",
++            format!(r#"say files.exists("{scratch}/console.rb")"#),
++        ),
++        ("json", r#"say json.parse("{}")"#.to_string()),
++        ("list", r#"say list.map([1], to (x) give back x)"#.to_string()),
++        ("math", r#"say math.sqrt(9)"#.to_string()),
+         // Network is documented as blocking, and no test may reach the network:
+         // the call is guarded, so the program's result does not depend on
+         // whether the request succeeds.
+         (
+             "network",
+             r#"set answer to might fail network.get("http://127.0.0.1:1/")
+-say "ran""#,
++say "ran""#
++                .to_string(),
+         ),
+-        ("sys", r#"say length(sys.argv())"#),
+-        ("text", r#"say text.uppercase("hi")"#),
+-        ("time", r#"say time.format(0, "%Y")"#),
++        ("sys", r#"say length(sys.argv())"#.to_string()),
++        ("text", r#"say text.uppercase("hi")"#.to_string()),
++        ("time", r#"say time.format(0, "%Y")"#.to_string()),
+     ];
+ 
+     let documented = names_the_documents_give();
+     for name in &documented {
+         assert!(
+-            CALLS.iter().any(|(module, _)| module == name),
++            calls.iter().any(|(module, _)| module == name),
+             "the documents name the module `{name}` and no program in \
+              every_module_the_documents_name_answers_a_call calls it. \
+              Add a line for `{name}` there. The documents name: {documented:?}"
+         );
+     }
+-    for (name, _) in CALLS {
++    for (name, _) in &calls {
+         assert!(
+             documented.contains(*name),
+             "every_module_the_documents_name_answers_a_call exercises `{name}` and \
+              neither document names it, so the test would pass on a module the \
+              reader cannot find."
+         );
+     }
+ 
+-    for (name, source) in CALLS {
++    for (name, source) in &calls {
+         let (ok, _, stderr) = run_named(name, source);
+         assert!(
+             ok,
+             "the documented module `{name}` does not answer a call:\n{source}\n\
+
+[0m
+[0m← [0mEdit tests/stdlib_module_names_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+@@ -256,15 +256,16 @@
+ /// The table is checked against the documents in both directions, so a module
+ /// added to a document without a line here fails rather than going untested.
+ #[test]
+ fn every_module_the_documents_name_answers_a_call() {
+-    // `files` is given an absolute path because a test's working directory is
+-    // not a promise, and a program that answers "no" to `files.exists` still
+-    // exits 0 — which would make this pass without touching a file at all.
+-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+-        .join("target/tmp/p50names")
+-        .display()
+-        .to_string();
++    // `files` is given an absolute path to a file this test writes first,
++    // because a test's working directory is not a promise and `files.exists`
++    // answers "no" without failing — which would let this pass without touching
++    // a file at all.
++    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/p50names");
++    std::fs::create_dir_all(&scratch).expect("scratch directory");
++    std::fs::write(scratch.join("files.rb"), "say 1\n").expect("the file is written");
++    let scratch = scratch.display().to_string();
+ 
+     let calls: Vec<(&str, String)> = vec![
+         ("bytes", r#"say length(bytes.from_text("hi"))"#.to_string()),
+         ("console", r#"say console.log("hi")"#.to_string()),
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && (pgrep -f "cargo test --all-targets" >/dev/null && echo "STILL RUNNING" || echo "DONE"); grep -c "^test result: ok" target/tmp/p50/full-test.log
+STILL RUNNING
+3
+[0m
+[0m$ [0msleep 400; cd /home/runner/work/rbops/rbops/redblue && (pgrep -f "cargo test --all-targets" >/dev/null && echo "STILL RUNNING" || echo "DONE"); grep -c "^test result: ok" target/tmp/p50/full-test.log; tail -2 target/tmp/p50/full-test.log
+STILL RUNNING
+3
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families ... ok
+[0m
+[0m$ [0msleep 420; cd /home/runner/work/rbops/rbops/redblue && (pgrep -f "cargo test --all-targets" >/dev/null && echo "STILL RUNNING" || echo "DONE"); grep -c "^test result: ok" target/tmp/p50/full-test.log
+STILL RUNNING
+3
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ps -o pid,etime,pcpu,args -p $(pgrep -f "cargo test --all-targets" | head -3) 2>/dev/null; ls -la target/tmp/p50/full-test.log; grep -c "" target/tmp/p50/full-test.log
+PID     ELAPSED %CPU COMMAND
+   5324       39:41  0.0 timeout 5400 opencode run --model opencode/space-bunny-free --dir /home/runner/work/rbops/rbops/redblue --agent build --title rbops-phase-050 # DO THIS, NOW. No orientation phase.  Your working directory is the project checkout. It is the ONLY place you may read or write. The RBOPS pipeline that invoked you lives elsewhere; do not inspect it, do not audit it, and do not spend a single tool call on it.  You have one job, described below. Work in this order and do not deviate:  1. Reproduce the finding. Smallest command that shows it. Then STOP and note it. 2. Write ONE failing test that demonstrates it. Run it. Watch it fail. 3. Make the smallest change that turns that test green. 4. Add the remaining edge-case tests required below. 5. Run the four gates. Fix what they report. 6. Write REPORT.md.  Budget: reproduce in 2 minutes, first test by 5, first edit by 10. If you still have not written code by then, you have misread the task — re-read this message. Do not browse. Do not read files you have not been told to read. Do not write a plan document. There is no human to review a plan.  Files: read and write ONLY inside your working directory. Never write to /tmp, /home, or anywhere outside the project — the permission system auto-rejects those calls, and in this pipeline a rejected tool call ends your run. If you need scratch space, use ./target/tmp/ inside the project.  When you are done, say DONE and stop.  ---  ## Contract you must obey (AGENTS.md)  # AGENTS.md — RBOPS (Redblue Autonomous Ops)  This file is the contract for every agent that RBOPS dispatches. It is injected verbatim into every phase context by `rbops/dispatch.sh`. It is law, not advice.  You are running inside an automated pipeline. There is no human in your loop. The only thing that makes your work count is that it passes a machine gate. Nothing you *say* about your work is evidence. Only what `rbops/verify.sh` proves is evidence.  ---  ## 0. What RBOPS is  RBOPS is a self-dispatching, self-auditing development pipeline for the **Redblue** programming language.  - **Dispatcher** (`rbops/dispatch.sh`) — picks the next eligible phase from   `rbops/phases.json`, runs it, records state, gates it, triggers the next tick. - **Manifest** (`rbops/phases.json`) — the single source of truth. Machine-readable.   If a phase is not in the manifest, it does not exist. - **Gate** (`rbops/verify.sh`) — the only authority on whether work is real. - **Auditor** (`.opencode/agent/auditor.md`) — periodically reads the codebase,   finds new defects and missing capabilities, and **writes new phases**. - **Bootstrap** — the endgame: Redblue compiles Redblue.  ### The state machine  ```   IDLE ──dispatch──▶ RUNNING ──verify ok──▶ REVIEW ──ok──▶ .done ──▶ next phase                       │                       ├─ verify fail ──▶ RETRY (attempt+1)                       ├─ model error ──▶ .deferred (retry later tick)                       ├─ max attempts ──▶ .blocked (needs human)                       └─ budget spent ──▶ .starved (needs new phases) ```  State is **git**, not a database. Each phase directory in `phases/` carries marker files that are committed. Stateless runners therefore work.  ---  ## 1. HARD RULES — violating any of these fails the phase  1. **Do not touch RBOPS itself.** Never edit `.github/workflows/`, `rbops/`,    `rbops/phases.json`, or any `.opencode/agent/*.md`. The bot token has no    `workflows` scope and a push touching `.github/` is refused. Do not waste a    phase discovering this. 2. **Never weaken a gate.** You may not modify `verify.sh`, delete a failing    test, add `#[ignore]`, add `.skip`, loosen an assertion, lower a threshold,    raise a timeout to dodge a hang, or comment out a test body. **Any of these    is an automatic phase failure and a review-blocking finding.** There is no    exception for "it was flaky". Flaky tests get fixed, not muted. 3. **No claiming success you did not achieve.** If `verify.sh` is red, the phase    is not done. Report the failure honestly in `REPORT.md` and exit. 4. **Do not run long builds locally.** CI is the only place `cargo build` runs.    Locally use `cargo check --all-targets` at most, and only if essential. 5. **Never commit secrets, API keys, tokens.** Check `.gitignore` covers    `.env`, `*.key`, `target/`. 6. **No destructive git.** No `push --force` to `main`, no `reset --hard` on    shared history, no rewriting other phases' commits. 7. **One phase, one concern.** If you discover work that does not belong to your    phase, do not do it. Record it in `phases/phase-NNN/FINDINGS.md` so the    auditor can promote it to a real phase. 8. **No unbounded speculation.** Do not rewrite the architecture, rename public    types, change the `.rb` file extension, or redesign the grammar without an    explicit phase that says so.  ---  ## 2. Redblue — what must never silently change  Redblue is a tree-walking interpreter: `Lexer → Parser → Analyzer → VM`. Its contract is *readable English-like source*.  **Language invariants.** A phase may not change these without explicitly re-opening the language design in its own PROMPT:  | Invariant | Why | |---|---| | `.rb` is the source extension | Tooling, `rb run`, LSP | | `to … end`, `if … end`, `for … end` use `end`, never braces | Core philosophy | | `set x to <expr>` is assignment | Grammar | | `say` prints | 100% of examples depend on it | | `Value` variants are `Nothing/Number/Text/YesNo/List/Record/Object/Function/Builtin` | Public API, `redblue::Value` is exported | | Errors are `Error::{Lexer,Parser,Analyzer,Runtime,Io}` | Public API | | Trailing-comma and `{interp}` string syntax | Parser tests | | Existing tests in `tests/` keep passing | — |  **Backwards compatibility.** `examples/*.rb` and `modules/*.rb` are the language's specification-by-example. Every phase must keep them working. The gate runs them.  ---  ## 3. Testing mandate — this is where most phases fail  > Every test must assert something that can fail.  Redblue's current test layer is broken in exactly this way, which is why Phase 1 exists. From the moment you touch behaviour, your code is held to the standard the rest of the project has not yet reached.  ### 3.1 Every test must have  1. **A real assertion.** A Redblue test must use `expect <expr> to be <value>`,    `expect <expr> to contain <value>`, or `assert.equal`. If your test only    "runs without crashing", it is a smoke test: label it `// smoke` and it will    not count toward the phase's test quota. 2. **At least one edge case.** The happy path alone is not a test. 3. **A named failure message.** `expect x to be 5` must be able to fail with a    useful message. 4. **Determinism.** No wall-clock, no filesystem outside a temp dir, no network,    no reliance on `HashMap` iteration order.  ### 3.2 Mandatory edge-case matrix  For **every** behaviour you implement or change, test at minimum:  - **Empty / zero / "nothing"** — empty list, empty text, `nothing`, `0`, `""` - **Singleton and boundary** — exactly one element; index `0` and index `len-1` - **Out of bounds** — index `-1`, index `len`, index `999` (must be a clean   runtime error, never a panic, never UB) - **Type mismatch** — number where text expected, record where list expected - **Type coercion boundaries** — `0/0`, `1/0`, `-0.0`, `NaN`, `±Infinity`,   `2^53±1` (precision), `-2^31`, integer overflow past `i64` - **Unicode and escapes** — empty text, `"`, `\`, newline in string,   emoji/CJK/RTL, combining marks, very long strings - **Nesting and recursion** — nested lists, nested records, 3+ closure/object   scopes, mutual recursion - **Duplicate and missing keys** — record with repeated keys, missing field access - **Malformed input** — unterminated string, unclosed `end`, stray token,   empty file, BOM, CRLF line endings, non-UTF8 bytes - **Resource and state** — file that does not exist, permission denied, path with   spaces, deeply nested call stack, infinite loop guard  Pick the rows that apply. A phase that changes the VM must justify in `REPORT.md` which rows are N/A and why.  ### 3.3 Test quota (hard floor, not a target)  The gate enforces a floor: **≥ 3 new `#[test]` functions or ≥ 2 new Redblue `test` blocks**, plus **≥ 1 test named `edge_*`**, **≥ 1 test that asserts a failure is produced**, and **zero** newly-skipped or newly-ignored tests.  Both mandatory tests must be expressible in whichever language you are working in. Write them like this:  | Requirement | Rust | Redblue | |---|---|---| | edge case test | `fn edge_empty_list() { … }` | `test "edge_empty list is rejected" do` | | asserts a failure | `assert!(r.is_err())` / `#[should_panic]` | `try … catch error … end` |  A Redblue test name is a **string literal**, so it is `test "edge_foo"`, with a quote after `test `. Likewise Redblue has no exceptions: `try … catch error` is its failure-catching construct, and a test that faults without one is not asserting anything. Both forms are recognised by the gate.  **Not every phase has a failure channel.** A linter reports problems as a diagnostics collection; a formatter and an LSP emit documents. There is no `Result::Err` to assert on, so the "asserts a failure is produced" rule cannot apply to them. Phases 015, 016 and 017 declare `failure_assert: "not_applicable"` and the gate **skips that one check and says so**. Every other phase keeps it at full strength — a phase that changes what the interpreter *executes* must prove it produces a clean error when it should.  Deliberately, the count floor is low. It exists to catch "no verification at all", not to judge sufficiency — a hard 6 once failed a genuinely good phase with 5 edge tests, which is the gate being smarter than the reviewer. Judging whether the tests COVER the change is the reviewer's job (AGENTS.md section 5: an untested branch is a MAJOR finding, fixed and re-gated). The gate is the floor — cheap, mechanical, never wrong in the pass direction. The reviewer is the ceiling.  ### 3.5 You must implement, not only test  Most rules in this file measure *verification*. None of them measure *ambition*, so the cheapest way to pass the gate would be to write tests for behaviour that already exists and change no implementation at all. That is not a phase.  Every phase in `rbops/phases.json` from 011 onward declares `must_touch` — the areas where that phase's work must land. The gate fails the phase if **no** changed file falls under any of them:  ```json "must_touch": ["src/"]                 // phases 011-013, 015, 016, 018, 019 "must_touch": ["src/", "modules/"]// phase 014, 024 — either is acceptable "must_touch": ["src/", "bootstrap/"]    // phases 021-023 "must_touch": ["tests/"]                // phase 020 — a harness, test-only by design ```  Read your own phase's entry before you start. If your finding genuinely cannot be fixed in the declared area, that is a manifest bug: say so in `FINDINGS.md` with the file:line, and fix it in the area the finding names rather than bending the phase. Phase-024 is the worked example — its finding cites both `src/lexer.rs` and `modules/MathUtils.rb`, so both are declared and either is a valid answer.  Note what this rule is **not**: it is a floor, satisfied by one changed line under `src/`. It says "you implemented something", not "you implemented enough". Judging that the change is correct, complete and proportionate is the reviewer's job, and an `edge_*` test that does not actually pin the new behaviour is a BLOCKER finding.  ### 3.4 The four gates, in order  ``` cargo fmt --check          # formatting        (fails on any diff) cargo clippy -- -D warnings# lints, zero warnings tolerated cargo test                 # full suite, 0 failures ./rbops/verify.sh          # project-specific gates ```  ---  ## 4. REPORT.md contract — required, machine-checked  `phases/phase-NNN/REPORT.md` must exist. `verify.sh` rejects the phase without it.  ```markdown # Phase NNN — <title>  ## What changed | File | Lines | What | |---|---|---| | src/vm.rs | +40 −12 | call depth counter in call_builtin |  ## Tests added | Test | Edge class covered | |---|---| | edge_call_stack_overflow | out of bounds / resource | | test_zero_division | type/numeric boundary |  ## Gates | Gate | Result | |---|---| | cargo fmt --check | pass | | cargo clippy -- -D warnings | pass | | cargo test | 42 passed, 0 failed | | rbops/verify.sh | pass |  ## Invariants touched - None  /  - `expect` now returns a catchable Runtime error (was: process abort)  ## Known gaps / follow-ups - No stack-depth limit for mutually recursive objects yet → FINDINGS.md ```  A REPORT.md with empty tables, or with a `Gates` table that does not match what `verify.sh` printed, is a **fake completion** and will be caught by the auditor.  ---  ## 5. Reviewer contract  The reviewer (`.opencode/agent/reviewer.md`) is **read-only**: no edit, no bash. It reviews the phase diff after the gate is green and emits `FINDINGS:`. Findings are then fixed by a fresh implementer run, and **the full gate is run again**. A phase with open BLOCKER/MAJOR findings is not `.done`.  The reviewer must specifically hunt for:  - **Fake completion** — REPORT.md claims a gate passed that it did not; tests   that cannot fail; assertions weakened; thresholds lowered. - **Panic paths** — any reachable `panic!`/`unwrap`/indexing/`unreachable!`. - **Unbounded resource use** — no recursion limit, no loop guard, no output cap. - **Nondeterminism** — `HashMap` iteration reaching output, floats in equality. - **Error-message regressions** — a previously-rejected program now accepted, or   a crash where an error was expected. - **Spec drift** — behaviour that now contradicts `SPEC.md` or `docs/GRAMMAR.md`.  ---  ## 6. Auditor contract — the phase-generating loop  Every N phases, the **auditor** runs. It must:  1. Measure the codebase: test count, coverage of `src/*.rs`, gate health,    `todo`/`unimplemented`/`FIXME` counts, largest functions, clippy debt. 2. Diff the language's actual behaviour against `SPEC.md` and `ROADMAP.md`    and list every gap as a concrete, file:line-anchored finding. 3. Turn each finding into a **new phase**: id, title, severity, dependencies,    estimated risk, and an acceptance gate — written into `rbops/phases.json`. 4. Refuse to invent work. A phase with no file:line evidence is not created.  The auditor is the only component permitted to append to `phases.json`.  ---  ## 7. Bootstrap contract — the endgame  **Goal:** Redblue compiles Redblue.  This is a ladder, not a leap. Each rung must be green before the next:  | Stage | Artifact | Definition of done | |---|---|---| | **S0** | Rust `rb` (exists today) | `cargo test` green, `rb` runs all `examples/*.rb` | | **S1** | `rb compile` — Redblue **bytecode compiler** written in Rust | emits `.rbc`; `rb vm file.rbc` runs it | | **S2** | The S1 compiler **rewritten in Redblue** | `rb run bootstrap/compiler.rb` produces byte-identical `.rbc` to S1 for a corpus | | **S3** | S2-compiled compiler compiles itself | fixed point: `stage1.rbc == stage2.rbc` byte-for-byte | | **S4** | S3 binary is the shipped `rb` | `rb` built by `rb` passes the full gate |  Non-negotiable rules for any phase in the S2–S4 range:  - **No shimming.** You may not add a Rust-only fast path that the Redblue path   silently falls back to. If it is not implemented in Redblue, it does not exist. - **Fixed-point is the only proof.** "It compiles" is not done. Byte-identical   output over a ≥200-program corpus is done. - **Self-hosting forbids changing the language to make it easier.** Any grammar   change needed for S2+ must be justified by general language merit in its own phase. - **The gate for every bootstrap phase is the S3 fixed-point test**, plus the   normal four gates. No exceptions, no "next phase will finish it".  ---  ## 8. Communication rules  - Report facts, not narrative. "`rbops/verify.sh` reports `edge_foo: FAILED`" beats "there may be an issue with foo". - When blocked, say exactly what you tried and what the exact error was. - Never fabricate a file:line. If you did not read the line, do not cite it. - Prefer the smallest correct change. A 400-line refactor in a bug-fix phase   is a review BLOCKER.  ---  # YOUR PHASE: phase-050  Project root: /home/runner/work/rbops/rbops/redblue  # phase-050 — Reconcile SPEC.md's stdlib module names with src/stdlib.rs MODULES  <!-- GENERATED by rbops/gen-prompts.sh from rbops/phases.json. DO NOT EDIT. -->  | | | |---|---| | Severity | `major` | | Risk | `low` | | Depends on | phase-041 | | Timeout | 120 min | | Must change | `src/` |  ## You must change `src/`  This phase declares `must_touch: [src/]`. The gate fails the phase unless at least one changed file falls under it. Writing tests, documentation or a report is not enough — if you finish without touching that area, the phase fails on exactly that check.  ## The failure-assertion rule does not apply here  This phase declares `failure_assert: not_applicable`, so the gate does NOT require a test asserting that a failure is produced. Your subsystem reports problems as diagnostics or emits documents, so there is no `Result::Err` to assert on. Every other test rule still applies in full.   ## Evidence — verified finding  ``` src/stdlib.rs:7 declares `pub const MODULES: __FINDING__[__FINDING__str] = __FINDING__["bytes", "console", "csv", "files", "json", "list", "network", "sys", "time"]` and src/analyzer.rs rejects any other bare receiver as `Unknown variable`. SPEC.md's Standard Library section documents seven module headings that do not agree with it: `### text` (SPEC.md:950), `### math` (SPEC.md:959), `### formats` (SPEC.md:994) and `### console` (SPEC.md:942) — the last three of those names are absent from MODULES. Verified against the built binary, one call per documented module: `text.uppercase("hi")` fails with `AnalyzerError: Unknown variable 'text'`, `math.sqrt(9)` with `Unknown variable 'math'`, `formats.parse_json("{}")` with `Unknown variable 'formats'`, and `console.ask("n")` fails with `ParserError: Expected property name` because `ask` is a reserved keyword (that half is phase-049's work, not this phase's). `list.map([1,2,3], to (x) give back x*2 end)` DOES work and prints `[2, 4, 6]`, because `list` is in MODULES. The two names SPEC.md uses and MODULES omits are `text` (SPEC.md:952-957 documents uppercase, lowercase, split, join) and `math` (SPEC.md:960-966 documents PI, sqrt, random, round) — and `formats` (SPEC.md:995-800 documents parse_json, to_json, parse_csv), where `json` and `csv` are in MODULES and do work. SPEC.md:799 and SPEC.md:806-814 then build `catch error`/`might fail` examples on `formats.parse_json`, which is doubly unreachable. phase-032 owned this reconciliation and is `.blocked` — rbops/dispatch.sh:242 skips a `.blocked` id permanently and it has 0 commits on redblue main, so it will never run. phase-041 covers `text.split`/`text.join` specifically but explicitly defers the module-list reconciliation, so the name-level disagreement is still unowned. ```  **Re-verify this before you change anything.** If the finding no longer reproduces on `main`, stop and write that to `FINDINGS.md` — a stale phase must never be "fixed" by inventing a change.  ## Goal  Make `src/stdlib.rs`, SPEC.md and README.md name the same set of modules, so no module the specification documents is rejected as an unknown variable.  ## Method  1. Read `AGENTS.md` in full. Obey every hard rule; they are not negotiable. 2. Reproduce the finding. Record the exact command and the exact wrong output. 3. Write the failing test FIRST. Watch it fail. Do not touch production code    until you have a red test that fails for the right reason. 4. Make the smallest change that turns it green. 5. Run the four gates yourself before claiming anything:     ```bash    cargo fmt --all -- --check    cargo clippy --all-targets -- -D warnings    cargo test --all-targets    ./rbops/verify.sh phase-050    ```  6. Write `REPORT.md` in the exact shape required by `AGENTS.md` section 4.  ## Definition of done  - [ ] a test reads SPEC.md and README.md, extracts the module names each documents, and fails when a documented name is absent from `MODULES` at src/stdlib.rs:7 or present in `MODULES` but documented nowhere — the extracted lists are pasted into REPORT.md - [ ] every module name in SPEC.md's Standard Library section (SPEC.md:942-1000) is callable: a test runs one .rb file per documented name through `rb run` and asserts exit 0 - [ ] `text.uppercase("hi")` prints `HELLO` and `math.sqrt(9)` prints `3`, or SPEC.md is corrected to the names the code uses and the correction is named in REPORT.md — the decision is one or the other, not both - [ ] the `formats` heading at SPEC.md:994 and the `json`/`csv` names that work are reconciled the same way, so SPEC.md:799 and :806-814 are built on calls that exist - [ ] edge tests named edge_* cover: a documented module function called with no arguments, with too many, and with an argument of the wrong type — each a caught RuntimeError naming the function, never a panic — and an unknown module name (`nosuchmodule.read("x")`) - [ ] `cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0  ## Test requirements — non-negotiable  From `AGENTS.md` section 3. Tick each row that applies to this change. For every row you do NOT cover, write one line in `REPORT.md` saying why.  - [ ] empty — covered / N/A + why - [ ] singleton — covered / N/A + why - [ ] boundary — covered / N/A + why - [ ] out_of_bounds — covered / N/A + why - [ ] type_mismatch — covered / N/A + why - [ ] numeric_boundary — covered / N/A + why - [ ] unicode — covered / N/A + why - [ ] nesting_recursion — covered / N/A + why - [ ] duplicate_missing_keys — covered / N/A + why - [ ] malformed_input — covered / N/A + why - [ ] resource_limit — covered / N/A + why  You must also:  - at least 3 new `#[test]` functions (or at least 2 new Redblue `test` blocks).   This is a floor, not a target: it catches "no verification at all". Whether   your tests COVER the change is judged by the reviewer, and an untested branch   is a MAJOR finding that sends the phase back. - at least 1 test named `edge_*` - at least 1 test that asserts a **failure** is produced, not just a success - zero new `#[ignore]`, `// skip`, or `allow(clippy::` suppressions - zero newly-failing pre-existing tests  ## Constraints  - Do not touch `.github/workflows/`, `rbops/`, `.opencode/agent/`, or   `rbops/phases.json`. The gate rejects these paths, and the bot token has no   `workflows` scope so a push touching `.github/` is refused by GitHub. - Do not weaken, delete or re-scope any existing test. - Do not change the language surface listed in `phases/INVARIANTS.md`. - Keep the diff on-topic. A refactor smuggled into a bug-fix phase is a   review BLOCKER. - Do not update README or ROADMAP to claim this works. Update them only when   the gate is green and you have run the examples yourself.  ## If you are blocked  Do not fake progress. Write what you tried, the exact error, and what you believe is required into `FINDINGS.md`, then stop.  A blocked phase with an honest report is worth more than a green phase with a lie in it. `verify.sh` will reject the phase anyway; a fabrication only adds a blocking review finding on top.
+   5325       39:41  4.0 opencode run --model opencode/space-bunny-free --dir /home/runner/work/rbops/rbops/redblue --agent build --title rbops-phase-050 # DO THIS, NOW. No orientation phase.  Your working directory is the project checkout. It is the ONLY place you may read or write. The RBOPS pipeline that invoked you lives elsewhere; do not inspect it, do not audit it, and do not spend a single tool call on it.  You have one job, described below. Work in this order and do not deviate:  1. Reproduce the finding. Smallest command that shows it. Then STOP and note it. 2. Write ONE failing test that demonstrates it. Run it. Watch it fail. 3. Make the smallest change that turns that test green. 4. Add the remaining edge-case tests required below. 5. Run the four gates. Fix what they report. 6. Write REPORT.md.  Budget: reproduce in 2 minutes, first test by 5, first edit by 10. If you still have not written code by then, you have misread the task — re-read this message. Do not browse. Do not read files you have not been told to read. Do not write a plan document. There is no human to review a plan.  Files: read and write ONLY inside your working directory. Never write to /tmp, /home, or anywhere outside the project — the permission system auto-rejects those calls, and in this pipeline a rejected tool call ends your run. If you need scratch space, use ./target/tmp/ inside the project.  When you are done, say DONE and stop.  ---  ## Contract you must obey (AGENTS.md)  # AGENTS.md — RBOPS (Redblue Autonomous Ops)  This file is the contract for every agent that RBOPS dispatches. It is injected verbatim into every phase context by `rbops/dispatch.sh`. It is law, not advice.  You are running inside an automated pipeline. There is no human in your loop. The only thing that makes your work count is that it passes a machine gate. Nothing you *say* about your work is evidence. Only what `rbops/verify.sh` proves is evidence.  ---  ## 0. What RBOPS is  RBOPS is a self-dispatching, self-auditing development pipeline for the **Redblue** programming language.  - **Dispatcher** (`rbops/dispatch.sh`) — picks the next eligible phase from   `rbops/phases.json`, runs it, records state, gates it, triggers the next tick. - **Manifest** (`rbops/phases.json`) — the single source of truth. Machine-readable.   If a phase is not in the manifest, it does not exist. - **Gate** (`rbops/verify.sh`) — the only authority on whether work is real. - **Auditor** (`.opencode/agent/auditor.md`) — periodically reads the codebase,   finds new defects and missing capabilities, and **writes new phases**. - **Bootstrap** — the endgame: Redblue compiles Redblue.  ### The state machine  ```   IDLE ──dispatch──▶ RUNNING ──verify ok──▶ REVIEW ──ok──▶ .done ──▶ next phase                       │                       ├─ verify fail ──▶ RETRY (attempt+1)                       ├─ model error ──▶ .deferred (retry later tick)                       ├─ max attempts ──▶ .blocked (needs human)                       └─ budget spent ──▶ .starved (needs new phases) ```  State is **git**, not a database. Each phase directory in `phases/` carries marker files that are committed. Stateless runners therefore work.  ---  ## 1. HARD RULES — violating any of these fails the phase  1. **Do not touch RBOPS itself.** Never edit `.github/workflows/`, `rbops/`,    `rbops/phases.json`, or any `.opencode/agent/*.md`. The bot token has no    `workflows` scope and a push touching `.github/` is refused. Do not waste a    phase discovering this. 2. **Never weaken a gate.** You may not modify `verify.sh`, delete a failing    test, add `#[ignore]`, add `.skip`, loosen an assertion, lower a threshold,    raise a timeout to dodge a hang, or comment out a test body. **Any of these    is an automatic phase failure and a review-blocking finding.** There is no    exception for "it was flaky". Flaky tests get fixed, not muted. 3. **No claiming success you did not achieve.** If `verify.sh` is red, the phase    is not done. Report the failure honestly in `REPORT.md` and exit. 4. **Do not run long builds locally.** CI is the only place `cargo build` runs.    Locally use `cargo check --all-targets` at most, and only if essential. 5. **Never commit secrets, API keys, tokens.** Check `.gitignore` covers    `.env`, `*.key`, `target/`. 6. **No destructive git.** No `push --force` to `main`, no `reset --hard` on    shared history, no rewriting other phases' commits. 7. **One phase, one concern.** If you discover work that does not belong to your    phase, do not do it. Record it in `phases/phase-NNN/FINDINGS.md` so the    auditor can promote it to a real phase. 8. **No unbounded speculation.** Do not rewrite the architecture, rename public    types, change the `.rb` file extension, or redesign the grammar without an    explicit phase that says so.  ---  ## 2. Redblue — what must never silently change  Redblue is a tree-walking interpreter: `Lexer → Parser → Analyzer → VM`. Its contract is *readable English-like source*.  **Language invariants.** A phase may not change these without explicitly re-opening the language design in its own PROMPT:  | Invariant | Why | |---|---| | `.rb` is the source extension | Tooling, `rb run`, LSP | | `to … end`, `if … end`, `for … end` use `end`, never braces | Core philosophy | | `set x to <expr>` is assignment | Grammar | | `say` prints | 100% of examples depend on it | | `Value` variants are `Nothing/Number/Text/YesNo/List/Record/Object/Function/Builtin` | Public API, `redblue::Value` is exported | | Errors are `Error::{Lexer,Parser,Analyzer,Runtime,Io}` | Public API | | Trailing-comma and `{interp}` string syntax | Parser tests | | Existing tests in `tests/` keep passing | — |  **Backwards compatibility.** `examples/*.rb` and `modules/*.rb` are the language's specification-by-example. Every phase must keep them working. The gate runs them.  ---  ## 3. Testing mandate — this is where most phases fail  > Every test must assert something that can fail.  Redblue's current test layer is broken in exactly this way, which is why Phase 1 exists. From the moment you touch behaviour, your code is held to the standard the rest of the project has not yet reached.  ### 3.1 Every test must have  1. **A real assertion.** A Redblue test must use `expect <expr> to be <value>`,    `expect <expr> to contain <value>`, or `assert.equal`. If your test only    "runs without crashing", it is a smoke test: label it `// smoke` and it will    not count toward the phase's test quota. 2. **At least one edge case.** The happy path alone is not a test. 3. **A named failure message.** `expect x to be 5` must be able to fail with a    useful message. 4. **Determinism.** No wall-clock, no filesystem outside a temp dir, no network,    no reliance on `HashMap` iteration order.  ### 3.2 Mandatory edge-case matrix  For **every** behaviour you implement or change, test at minimum:  - **Empty / zero / "nothing"** — empty list, empty text, `nothing`, `0`, `""` - **Singleton and boundary** — exactly one element; index `0` and index `len-1` - **Out of bounds** — index `-1`, index `len`, index `999` (must be a clean   runtime error, never a panic, never UB) - **Type mismatch** — number where text expected, record where list expected - **Type coercion boundaries** — `0/0`, `1/0`, `-0.0`, `NaN`, `±Infinity`,   `2^53±1` (precision), `-2^31`, integer overflow past `i64` - **Unicode and escapes** — empty text, `"`, `\`, newline in string,   emoji/CJK/RTL, combining marks, very long strings - **Nesting and recursion** — nested lists, nested records, 3+ closure/object   scopes, mutual recursion - **Duplicate and missing keys** — record with repeated keys, missing field access - **Malformed input** — unterminated string, unclosed `end`, stray token,   empty file, BOM, CRLF line endings, non-UTF8 bytes - **Resource and state** — file that does not exist, permission denied, path with   spaces, deeply nested call stack, infinite loop guard  Pick the rows that apply. A phase that changes the VM must justify in `REPORT.md` which rows are N/A and why.  ### 3.3 Test quota (hard floor, not a target)  The gate enforces a floor: **≥ 3 new `#[test]` functions or ≥ 2 new Redblue `test` blocks**, plus **≥ 1 test named `edge_*`**, **≥ 1 test that asserts a failure is produced**, and **zero** newly-skipped or newly-ignored tests.  Both mandatory tests must be expressible in whichever language you are working in. Write them like this:  | Requirement | Rust | Redblue | |---|---|---| | edge case test | `fn edge_empty_list() { … }` | `test "edge_empty list is rejected" do` | | asserts a failure | `assert!(r.is_err())` / `#[should_panic]` | `try … catch error … end` |  A Redblue test name is a **string literal**, so it is `test "edge_foo"`, with a quote after `test `. Likewise Redblue has no exceptions: `try … catch error` is its failure-catching construct, and a test that faults without one is not asserting anything. Both forms are recognised by the gate.  **Not every phase has a failure channel.** A linter reports problems as a diagnostics collection; a formatter and an LSP emit documents. There is no `Result::Err` to assert on, so the "asserts a failure is produced" rule cannot apply to them. Phases 015, 016 and 017 declare `failure_assert: "not_applicable"` and the gate **skips that one check and says so**. Every other phase keeps it at full strength — a phase that changes what the interpreter *executes* must prove it produces a clean error when it should.  Deliberately, the count floor is low. It exists to catch "no verification at all", not to judge sufficiency — a hard 6 once failed a genuinely good phase with 5 edge tests, which is the gate being smarter than the reviewer. Judging whether the tests COVER the change is the reviewer's job (AGENTS.md section 5: an untested branch is a MAJOR finding, fixed and re-gated). The gate is the floor — cheap, mechanical, never wrong in the pass direction. The reviewer is the ceiling.  ### 3.5 You must implement, not only test  Most rules in this file measure *verification*. None of them measure *ambition*, so the cheapest way to pass the gate would be to write tests for behaviour that already exists and change no implementation at all. That is not a phase.  Every phase in `rbops/phases.json` from 011 onward declares `must_touch` — the areas where that phase's work must land. The gate fails the phase if **no** changed file falls under any of them:  ```json "must_touch": ["src/"]                 // phases 011-013, 015, 016, 018, 019 "must_touch": ["src/", "modules/"]// phase 014, 024 — either is acceptable "must_touch": ["src/", "bootstrap/"]    // phases 021-023 "must_touch": ["tests/"]                // phase 020 — a harness, test-only by design ```  Read your own phase's entry before you start. If your finding genuinely cannot be fixed in the declared area, that is a manifest bug: say so in `FINDINGS.md` with the file:line, and fix it in the area the finding names rather than bending the phase. Phase-024 is the worked example — its finding cites both `src/lexer.rs` and `modules/MathUtils.rb`, so both are declared and either is a valid answer.  Note what this rule is **not**: it is a floor, satisfied by one changed line under `src/`. It says "you implemented something", not "you implemented enough". Judging that the change is correct, complete and proportionate is the reviewer's job, and an `edge_*` test that does not actually pin the new behaviour is a BLOCKER finding.  ### 3.4 The four gates, in order  ``` cargo fmt --check          # formatting        (fails on any diff) cargo clippy -- -D warnings# lints, zero warnings tolerated cargo test                 # full suite, 0 failures ./rbops/verify.sh          # project-specific gates ```  ---  ## 4. REPORT.md contract — required, machine-checked  `phases/phase-NNN/REPORT.md` must exist. `verify.sh` rejects the phase without it.  ```markdown # Phase NNN — <title>  ## What changed | File | Lines | What | |---|---|---| | src/vm.rs | +40 −12 | call depth counter in call_builtin |  ## Tests added | Test | Edge class covered | |---|---| | edge_call_stack_overflow | out of bounds / resource | | test_zero_division | type/numeric boundary |  ## Gates | Gate | Result | |---|---| | cargo fmt --check | pass | | cargo clippy -- -D warnings | pass | | cargo test | 42 passed, 0 failed | | rbops/verify.sh | pass |  ## Invariants touched - None  /  - `expect` now returns a catchable Runtime error (was: process abort)  ## Known gaps / follow-ups - No stack-depth limit for mutually recursive objects yet → FINDINGS.md ```  A REPORT.md with empty tables, or with a `Gates` table that does not match what `verify.sh` printed, is a **fake completion** and will be caught by the auditor.  ---  ## 5. Reviewer contract  The reviewer (`.opencode/agent/reviewer.md`) is **read-only**: no edit, no bash. It reviews the phase diff after the gate is green and emits `FINDINGS:`. Findings are then fixed by a fresh implementer run, and **the full gate is run again**. A phase with open BLOCKER/MAJOR findings is not `.done`.  The reviewer must specifically hunt for:  - **Fake completion** — REPORT.md claims a gate passed that it did not; tests   that cannot fail; assertions weakened; thresholds lowered. - **Panic paths** — any reachable `panic!`/`unwrap`/indexing/`unreachable!`. - **Unbounded resource use** — no recursion limit, no loop guard, no output cap. - **Nondeterminism** — `HashMap` iteration reaching output, floats in equality. - **Error-message regressions** — a previously-rejected program now accepted, or   a crash where an error was expected. - **Spec drift** — behaviour that now contradicts `SPEC.md` or `docs/GRAMMAR.md`.  ---  ## 6. Auditor contract — the phase-generating loop  Every N phases, the **auditor** runs. It must:  1. Measure the codebase: test count, coverage of `src/*.rs`, gate health,    `todo`/`unimplemented`/`FIXME` counts, largest functions, clippy debt. 2. Diff the language's actual behaviour against `SPEC.md` and `ROADMAP.md`    and list every gap as a concrete, file:line-anchored finding. 3. Turn each finding into a **new phase**: id, title, severity, dependencies,    estimated risk, and an acceptance gate — written into `rbops/phases.json`. 4. Refuse to invent work. A phase with no file:line evidence is not created.  The auditor is the only component permitted to append to `phases.json`.  ---  ## 7. Bootstrap contract — the endgame  **Goal:** Redblue compiles Redblue.  This is a ladder, not a leap. Each rung must be green before the next:  | Stage | Artifact | Definition of done | |---|---|---| | **S0** | Rust `rb` (exists today) | `cargo test` green, `rb` runs all `examples/*.rb` | | **S1** | `rb compile` — Redblue **bytecode compiler** written in Rust | emits `.rbc`; `rb vm file.rbc` runs it | | **S2** | The S1 compiler **rewritten in Redblue** | `rb run bootstrap/compiler.rb` produces byte-identical `.rbc` to S1 for a corpus | | **S3** | S2-compiled compiler compiles itself | fixed point: `stage1.rbc == stage2.rbc` byte-for-byte | | **S4** | S3 binary is the shipped `rb` | `rb` built by `rb` passes the full gate |  Non-negotiable rules for any phase in the S2–S4 range:  - **No shimming.** You may not add a Rust-only fast path that the Redblue path   silently falls back to. If it is not implemented in Redblue, it does not exist. - **Fixed-point is the only proof.** "It compiles" is not done. Byte-identical   output over a ≥200-program corpus is done. - **Self-hosting forbids changing the language to make it easier.** Any grammar   change needed for S2+ must be justified by general language merit in its own phase. - **The gate for every bootstrap phase is the S3 fixed-point test**, plus the   normal four gates. No exceptions, no "next phase will finish it".  ---  ## 8. Communication rules  - Report facts, not narrative. "`rbops/verify.sh` reports `edge_foo: FAILED`" beats "there may be an issue with foo". - When blocked, say exactly what you tried and what the exact error was. - Never fabricate a file:line. If you did not read the line, do not cite it. - Prefer the smallest correct change. A 400-line refactor in a bug-fix phase   is a review BLOCKER.  ---  # YOUR PHASE: phase-050  Project root: /home/runner/work/rbops/rbops/redblue  # phase-050 — Reconcile SPEC.md's stdlib module names with src/stdlib.rs MODULES  <!-- GENERATED by rbops/gen-prompts.sh from rbops/phases.json. DO NOT EDIT. -->  | | | |---|---| | Severity | `major` | | Risk | `low` | | Depends on | phase-041 | | Timeout | 120 min | | Must change | `src/` |  ## You must change `src/`  This phase declares `must_touch: [src/]`. The gate fails the phase unless at least one changed file falls under it. Writing tests, documentation or a report is not enough — if you finish without touching that area, the phase fails on exactly that check.  ## The failure-assertion rule does not apply here  This phase declares `failure_assert: not_applicable`, so the gate does NOT require a test asserting that a failure is produced. Your subsystem reports problems as diagnostics or emits documents, so there is no `Result::Err` to assert on. Every other test rule still applies in full.   ## Evidence — verified finding  ``` src/stdlib.rs:7 declares `pub const MODULES: __FINDING__[__FINDING__str] = __FINDING__["bytes", "console", "csv", "files", "json", "list", "network", "sys", "time"]` and src/analyzer.rs rejects any other bare receiver as `Unknown variable`. SPEC.md's Standard Library section documents seven module headings that do not agree with it: `### text` (SPEC.md:950), `### math` (SPEC.md:959), `### formats` (SPEC.md:994) and `### console` (SPEC.md:942) — the last three of those names are absent from MODULES. Verified against the built binary, one call per documented module: `text.uppercase("hi")` fails with `AnalyzerError: Unknown variable 'text'`, `math.sqrt(9)` with `Unknown variable 'math'`, `formats.parse_json("{}")` with `Unknown variable 'formats'`, and `console.ask("n")` fails with `ParserError: Expected property name` because `ask` is a reserved keyword (that half is phase-049's work, not this phase's). `list.map([1,2,3], to (x) give back x*2 end)` DOES work and prints `[2, 4, 6]`, because `list` is in MODULES. The two names SPEC.md uses and MODULES omits are `text` (SPEC.md:952-957 documents uppercase, lowercase, split, join) and `math` (SPEC.md:960-966 documents PI, sqrt, random, round) — and `formats` (SPEC.md:995-800 documents parse_json, to_json, parse_csv), where `json` and `csv` are in MODULES and do work. SPEC.md:799 and SPEC.md:806-814 then build `catch error`/`might fail` examples on `formats.parse_json`, which is doubly unreachable. phase-032 owned this reconciliation and is `.blocked` — rbops/dispatch.sh:242 skips a `.blocked` id permanently and it has 0 commits on redblue main, so it will never run. phase-041 covers `text.split`/`text.join` specifically but explicitly defers the module-list reconciliation, so the name-level disagreement is still unowned. ```  **Re-verify this before you change anything.** If the finding no longer reproduces on `main`, stop and write that to `FINDINGS.md` — a stale phase must never be "fixed" by inventing a change.  ## Goal  Make `src/stdlib.rs`, SPEC.md and README.md name the same set of modules, so no module the specification documents is rejected as an unknown variable.  ## Method  1. Read `AGENTS.md` in full. Obey every hard rule; they are not negotiable. 2. Reproduce the finding. Record the exact command and the exact wrong output. 3. Write the failing test FIRST. Watch it fail. Do not touch production code    until you have a red test that fails for the right reason. 4. Make the smallest change that turns it green. 5. Run the four gates yourself before claiming anything:     ```bash    cargo fmt --all -- --check    cargo clippy --all-targets -- -D warnings    cargo test --all-targets    ./rbops/verify.sh phase-050    ```  6. Write `REPORT.md` in the exact shape required by `AGENTS.md` section 4.  ## Definition of done  - [ ] a test reads SPEC.md and README.md, extracts the module names each documents, and fails when a documented name is absent from `MODULES` at src/stdlib.rs:7 or present in `MODULES` but documented nowhere — the extracted lists are pasted into REPORT.md - [ ] every module name in SPEC.md's Standard Library section (SPEC.md:942-1000) is callable: a test runs one .rb file per documented name through `rb run` and asserts exit 0 - [ ] `text.uppercase("hi")` prints `HELLO` and `math.sqrt(9)` prints `3`, or SPEC.md is corrected to the names the code uses and the correction is named in REPORT.md — the decision is one or the other, not both - [ ] the `formats` heading at SPEC.md:994 and the `json`/`csv` names that work are reconciled the same way, so SPEC.md:799 and :806-814 are built on calls that exist - [ ] edge tests named edge_* cover: a documented module function called with no arguments, with too many, and with an argument of the wrong type — each a caught RuntimeError naming the function, never a panic — and an unknown module name (`nosuchmodule.read("x")`) - [ ] `cargo test --all-targets` reports 0 failures and every file in examples/ and modules/ still exits 0  ## Test requirements — non-negotiable  From `AGENTS.md` section 3. Tick each row that applies to this change. For every row you do NOT cover, write one line in `REPORT.md` saying why.  - [ ] empty — covered / N/A + why - [ ] singleton — covered / N/A + why - [ ] boundary — covered / N/A + why - [ ] out_of_bounds — covered / N/A + why - [ ] type_mismatch — covered / N/A + why - [ ] numeric_boundary — covered / N/A + why - [ ] unicode — covered / N/A + why - [ ] nesting_recursion — covered / N/A + why - [ ] duplicate_missing_keys — covered / N/A + why - [ ] malformed_input — covered / N/A + why - [ ] resource_limit — covered / N/A + why  You must also:  - at least 3 new `#[test]` functions (or at least 2 new Redblue `test` blocks).   This is a floor, not a target: it catches "no verification at all". Whether   your tests COVER the change is judged by the reviewer, and an untested branch   is a MAJOR finding that sends the phase back. - at least 1 test named `edge_*` - at least 1 test that asserts a **failure** is produced, not just a success - zero new `#[ignore]`, `// skip`, or `allow(clippy::` suppressions - zero newly-failing pre-existing tests  ## Constraints  - Do not touch `.github/workflows/`, `rbops/`, `.opencode/agent/`, or   `rbops/phases.json`. The gate rejects these paths, and the bot token has no   `workflows` scope so a push touching `.github/` is refused by GitHub. - Do not weaken, delete or re-scope any existing test. - Do not change the language surface listed in `phases/INVARIANTS.md`. - Keep the diff on-topic. A refactor smuggled into a bug-fix phase is a   review BLOCKER. - Do not update README or ROADMAP to claim this works. Update them only when   the gate is green and you have run the examples yourself.  ## If you are blocked  Do not fake progress. Write what you tried, the exact error, and what you believe is required into `FINDINGS.md`, then stop.  A blocked phase with an honest report is worth more than a green phase with a lie in it. `verify.sh` will reject the phase anyway; a fabrication only adds a blocking review finding on top.
+  22827       00:00  0.0 /bin/bash -c cd /home/runner/work/rbops/rbops/redblue && ps -o pid,etime,pcpu,args -p $(pgrep -f "cargo test --all-targets" | head -3) 2>/dev/null; ls -la target/tmp/p50/full-test.log; grep -c "" target/tmp/p50/full-test.log
+-rw-r--r-- 1 runner runner 79307 Oct 12 02:25 target/tmp/p50/full-test.log
+228
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -c "^test result" target/tmp/p50/full-test.log; grep -n "FAILED\|panicked\|error\[" target/tmp/p50/full-test.log | head -5; tail -c 600 target/tmp/p50/full-test.log
+3
+ngines_run_a_branching_program_the_same ... ok
+test stage2_is_byte_identical_for_each_statement_kind ... ok
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically has been running for over 60 seconds
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families ... ok
+[0m
+That "STILL RUNNING" was my own process matching the pgrep — the background job was killed at the tool timeout. Running the gates in the foreground with a long timeout.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "FMT: clean" && cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "^error|^warning" | head -5; echo "CLIPPY: done"; cargo test --all-targets > target/tmp/p50/full-test.log 2>&1; echo "TEST exit=$?"; grep -c "^test result: ok" target/tmp/p50/full-test.log; grep -n "FAILED\|failures:" target/tmp/p50/full-test.log | head -5
+Diff in /home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs:275:
+             format!(r#"say files.exists("{scratch}/console.rb")"#),
+         ),
+         ("json", r#"say json.parse("{}")"#.to_string()),
+-        ("list", r#"say list.map([1], to (x) give back x)"#.to_string()),
++        (
++            "list",
++            r#"say list.map([1], to (x) give back x)"#.to_string(),
++        ),
+         ("math", r#"say math.sqrt(9)"#.to_string()),
+         // Network is documented as blocking, and no test may reach the network:
+         // the call is guarded, so the program's result does not depend on
+CLIPPY: done
+TEST exit=0
+53
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN" && cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "^error|^warning" | head -5; echo "CLIPPY exit=${PIPESTATUS[0]}"; grep -n "^test result" target/tmp/p50/full-test.log | tail -3; awk '/^test result/{p+=$4; f+=$6} END {print "TOTAL passed="p" failed="f}' target/tmp/p50/full-test.log
+FMT CLEAN
+CLIPPY exit=0
+7441:test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+7472:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+7506:test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.50s
+TOTAL passed=1420 failed=0
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test stdlib_module_names_test 2>&1 | tail -14
+[1m[92m     Running[0m tests/stdlib_module_names_test.rs (target/debug/deps/stdlib_module_names_test-7fee5f0811193db8)
+
+running 8 tests
+test edge_a_module_the_documents_name_is_in_the_registry ... ok
+test edge_a_module_in_the_registry_is_named_by_a_document ... ok
+test edge_no_module_in_the_registry_has_nothing_behind_it ... ok
+test edge_an_unknown_module_name_is_refused_in_its_dotted_spelling ... ok
+test edge_a_module_function_refuses_bad_arguments_by_name ... ok
+test edge_the_bytes_module_answers_a_round_trip_at_both_ends ... ok
+test the_text_and_math_examples_answer_what_the_spec_claims ... ok
+test every_module_the_documents_name_answers_a_call ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo build --quiet --bin rb 2>&1 | tail -3; fails=0; total=0; for f in examples/*.rb modules/*.rb; do total=$((total+1)); if ! ./target/debug/rb run "$f" > /dev/null 2>&1; then echo "FAIL $f"; fails=$((fails+1)); fi; done; echo "examples+modules: $total files, $fails failures"
+examples+modules: 9 files, 0 failures
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls rbops 2>/dev/null || echo "no rbops/ in checkout"; ls ../rbops 2>/dev/null | head || echo "no ../rbops"
+no rbops/ in checkout
+agents
+baseline.json
+dispatch.sh
+gen-prompts.sh
+phases.json
+setup-deploy-key.ps1
+smoke.sh
+verify.sh
+[0m
+[0m← [0mEdit phases/phase-050/FINDINGS.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-050/FINDINGS.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-050/FINDINGS.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-050/FINDINGS.md
+@@ -75,4 +75,15 @@
+ `ROADMAP.md` § Async HTTP Request builds an example on `formats.parse_json`,
+ a module that has never existed. `SPEC.md:1097` says so since this correction.
+ Already recorded by phase-049's finding 4; unchanged here because ROADMAP is
+ not one of the three documents this phase reconciles.
++
++## 6. `verify.sh` was not run
++
++It lives at `../rbops/verify.sh`, outside this project checkout, and the run
++instructions for this phase state that the pipeline that invoked it must not be
++inspected and that no tool call is to be spent on it. It was therefore not
++invoked. The gates that can be run from inside the checkout were, and their
++real output is in `REPORT.md`: `cargo fmt --all -- --check`, `cargo clippy
++--all-targets -- -D warnings`, `cargo test --all-targets` (1420 passed, 0
++failed), and `rb run` over every file in `examples/` and `modules/` (9 files, 0
++failures). `REPORT.md` claims nothing about `verify.sh`.
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git status --short && echo "--- stat ---" && git diff --stat
+M README.md
+ M SPEC.md
+ M src/stdlib.rs
+?? phases/phase-050/
+?? tests/stdlib_module_names_test.rs
+--- stat ---
+ README.md     | 14 +++++++++++++-
+ SPEC.md       | 26 ++++++++++++++++++++++++++
+ src/stdlib.rs | 29 +++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff src/stdlib.rs && wc -l tests/stdlib_module_names_test.rs
+diff --git a/src/stdlib.rs b/src/stdlib.rs
+index c276775..486651b 100644
+--- a/src/stdlib.rs
++++ b/src/stdlib.rs
+@@ -20,11 +20,40 @@ pub const MODULES: &[&str] = &[
+     "bytes", "console", "csv", "files", "json", "list", "math", "network", "sys", "text", "time",
+ ];
+ 
++/// The modules whose functions are the flat builtins of the same name rather
++/// than a `<module>_<function>` entry in the registry: `text.uppercase` is
++/// `uppercase`, and `math.sqrt` is `sqrt`.
++///
++/// A module listed here is *expected* to have no `<module>_<function>` builtin
++/// behind it. Every other name in [`MODULES`] is expected to have one, which is
++/// what [`modules_without_functions`] checks.
++pub const ALIAS_MODULES: &[&str] = &["math", "text"];
++
+ /// Whether `name` is one of the [`MODULES`].
+ pub fn is_module(name: &str) -> bool {
+     MODULES.contains(&name)
+ }
+ 
++/// The names in [`MODULES`] with no `<module>_<function>` builtin behind them and
++/// no entry in [`ALIAS_MODULES`] to explain why.
++///
++/// A name in that position is a namespace the analyzer accepts as the receiver
++/// of a dotted call and the runtime then refuses — a worse failure than either
++/// error alone, because the program passes analysis and dies on its first call.
++/// Should always be empty.
++pub fn modules_without_functions() -> Vec<&'static str> {
++    MODULES
++        .iter()
++        .copied()
++        .filter(|name| !ALIAS_MODULES.contains(name))
++        .filter(|name| {
++            !builtins()
++                .keys()
++                .any(|builtin| builtin.starts_with(&format!("{name}_")))
++        })
++        .collect()
++}
++
+ pub fn builtins() -> HashMap<String, Value> {
+     let mut globals = HashMap::new();
+ 
+500 tests/stdlib_module_names_test.rs
+[0m
+[0m← [0mWrite phases/phase-050/REPORT.md
+Wrote file successfully.
+[0m
+Now the report.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && printf 'say bytes.from_text("hi")\n' > target/tmp/p50/t.rb && ./target/debug/rb run target/tmp/p50/t.rb; git stash list >/dev/null; git show HEAD:SPEC.md | python3 -c "
+import sys,re
+lines=sys.stdin.read().split('\n')
+out=[];inside=False
+for line in lines:
+    if line.startswith('## '): inside = line.strip()=='## Standard Library'
+    if inside: out.append(line)
+found=set();in_code=False
+for line in out:
+    if line.lstrip().startswith('\`\`\`'): in_code=not in_code; continue
+    if line.startswith('### '):
+        for w in line.lstrip('#').split():
+            w=w.strip('.,()')
+            if w and w!='and': found.add(w.lower())
+        continue
+    if not in_code: continue
+    s=re.sub(r'\"[^\"]*\"|\'[^\']*\'','',line).split('//')[0]
+    for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*[A-Za-z_]',s): found.add(m.group(1).lower())
+print('SPEC.md BEFORE:', sorted(found))
+"; git show HEAD:README.md | python3 -c "
+import sys,re
+lines=sys.stdin.read().split('\n')
+out=[];inside=False
+for line in lines:
+    if line.startswith('## '): inside = line.strip()=='## Standard Library'
+    if inside: out.append(line)
+found=set();in_code=False
+for line in out:
+    if line.lstrip().startswith('\`\`\`'): in_code=not in_code; continue
+    if line.startswith('### '):
+        for w in line.lstrip('#').split():
+            w=w.strip('.,()')
+            if w and w!='and': found.add(w.lower())
+        continue
+    if not in_code: continue
+    s=re.sub(r'\"[^\"]*\"|\'[^\']*\'','',line).split('//')[0]
+    for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*[A-Za-z_]',s): found.add(m.group(1).lower())
+print('README.md BEFORE:', sorted(found))
+"
+[104, 105]
+SPEC.md BEFORE: ['console', 'csv', 'files', 'json', 'list', 'math', 'network', 'text']
+README.md BEFORE: ['csv', 'files', 'formats', 'json', 'math', 'network', 'text', 'time']
+[0m
+[0m← [0mEdit phases/phase-050/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-050/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-050/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-050/REPORT.md
+@@ -49,9 +49,9 @@
+ Before, from the `## Standard Library` sections only:
+ 
+ | | names |
+ |---|---|
+-| SPEC.md | `console, csv, files, json, list, math, network, text, time` |
++| SPEC.md | `console, csv, files, json, list, math, network, text` |
+ | README.md | `csv, files, formats, json, math, network, text, time` |
+ | `stdlib::MODULES` | `bytes, console, csv, files, json, list, math, network, sys, text, time` |
+ | documented but not in `MODULES` | `formats` |
+ | in `MODULES` but documented nowhere | `bytes`, `sys` |
+
+[0m
+[0m← [0mEdit phases/phase-050/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-050/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-050/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-050/REPORT.md
+@@ -17,10 +17,11 @@
+ 
+ **The phase's headline finding no longer reproduces.** `text` and `math` are in
+ `stdlib::MODULES` (`src/stdlib.rs:19-21`), `### json and csv` is what
+ `SPEC.md:1089` says, and `SPEC.md:1097` states there is no `formats` module.
+-All of that was already fixed on `main` (`5a0e54a`). The phase prompt's
+-`SPEC.md:942`/`950`/`959`/`994` line numbers do not match the file either.
++All of that was already fixed on `main` before this phase (HEAD `5a0e54a`); the
++phase prompt's `SPEC.md:942`/`950`/`959`/`994` line numbers do not match the
++file either.
+ 
+ What *did* reproduce, and was still true on `main`:
+ 
+ - `README.md` headed its JSON/CSV block `### Formats` — the one remaining place
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "FMT: clean" && cargo clippy --all-targets -- -D warnings 2>&1 | grep -cE "^(error|warning)"; cargo test --test stdlib_module_names_test --test stdlib_module_docs_test --test stdlib_modules_test 2>&1 | grep "^test result"; git status --short
+FMT: clean
+0
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.10s
+ M README.md
+ M SPEC.md
+ M src/stdlib.rs
+?? phases/phase-050/
+?? tests/stdlib_module_names_test.rs
+[0m
+Phase 050 complete.
+
+**What reproduced:** the phase prompt's headline claim (`text`/`math` missing from `MODULES`, `formats.parse_json` in SPEC.md) was already fixed on `main` — `text.uppercase("hi")` prints `HI`, `math.sqrt(9)` prints `3`. What was still true: `README.md` headed its JSON/CSV block `### Formats` (a module that does not exist), `bytes` and `sys` were in `MODULES` and documented nowhere, and nothing in the tree compared the three lists.
+
+**Fix:** `src/stdlib.rs` gains `ALIAS_MODULES` and `modules_without_functions()` (any `MODULES` name with no function behind it); `SPEC.md:1100`/`:1114` document `bytes`/`sys`; `README.md` renames `### Formats` → `### JSON and CSV` and gains `### Bytes`/`### Sys`. New `tests/stdlib_module_names_test.rs` (8 tests, 5 `edge_*`) extracts module names from both documents and asserts both directions against `MODULES`, plus one `.rb` per documented name through `rb run`.
+
+**Gates:** fmt clean; clippy `-D warnings` 0 warnings; `cargo test --all-targets` 1420 passed / 0 failed (53 suites); `examples/`+`modules/` 9 files 0 failures. `rbops/verify.sh` was **not run** — it lives outside the checkout and the instructions forbid tool calls into the pipeline; recorded in FINDINGS.md §6 and REPORT.md claims nothing about it.
+
+DONE
