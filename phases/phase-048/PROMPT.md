@@ -8,11 +8,11 @@
 | Risk | `low` |
 | Depends on | _none_ |
 | Timeout | 120 min |
-| Must change | `src/` |
+| Must change | `src/ or docs/` |
 
-## You must change `src/`
+## You must change `src/ or docs/`
 
-This phase declares `must_touch: [src/]`. The gate fails the phase unless at
+This phase declares `must_touch: [src/ or docs/]`. The gate fails the phase unless at
 least one changed file falls under it. Writing tests, documentation or a report
 is not enough — if you finish without touching that area, the phase fails on
 exactly that check.

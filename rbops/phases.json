@@ -1144,7 +1144,8 @@
       "finding": "src/parser.rs:1436-1443 binds the catch variable ONLY when the token after `catch` is a `TokenKind::Identifier`. `error` is NOT a keyword — `grep -n '\"error\"' src/lexer.rs` returns nothing — so `catch error e` reads the bare word `error` as the BINDER, consumes it, and leaves `e` as an orphan statement, which the analyzer then reports as `Unknown variable 'e'`. Verified against the built binary: `try` / `set x to 1/0` / `catch error e` / `say e` exits 1 with `Error: AnalyzerError: Unknown variable 'e'`. The shorthand `catch error` (no binder) works and `catch e` works and binds the message text — `try` / `set x to 1/0` / `catch e` / `say e` prints `error`. SPEC.md:800 (`catch error` then `say \"Error: {error message}\"`), SPEC.md:809-813 (`catch error of FileError` / `of NetworkError`) and README.md:64 all use the `catch error ...` spelling. Separately, the analyzer already declares a catch binder that no parse can reach: src/analyzer.rs:325-327 does `if let Some(var) = catch_var { self.push_scope(); self.declare(var); ... }`, so `catch_var` (src/parser.rs:223, :1427, :1481) is dead unless the identifier branch at :1436 is the only path — and the documented `catch error e` shape can never take it. `catch error of FileError` fails outright: `of` is not a word anywhere (`grep -c '\"of\"' src/lexer.rs` is 0), so it parses as a bare variable named `of` and the analyzer reports `Unknown variable 'of'`.",
       "goal": "Make `catch error <name>` parse and bind the caught message, and either implement `catch error of <Type>` or correct SPEC.md to the form the code actually supports.",
       "must_touch": [
-        "src/"
+        "src/",
+        "docs/"
       ],
       "accept": [
         "`try` / `set x to 1/0` / `catch error e` / `say e` prints the failure text and exits 0, verified BOTH with `rb run` and with `rb vm` on the output of `rb compile`",
@@ -2049,6 +2050,27 @@
         "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
       ],
       "timeout_min": 120
+    },
+    {
+      "id": "phase-089",
+      "title": "Give caught failures a type so `catch error of <Type>` can match",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "high",
+      "finding": "Phase-048 proved the negative: Redblue's runtime errors carry no type. `src/error.rs:78` defines `Error::{Lexer,Parser,Analyzer,Runtime,Io}` as compile-time kinds, and a caught failure binds the untyped text `error` (src/interpreter.rs:1772-1774, src/bytecode/vm.rs:3326) — so there is nothing for `of <Type>` to match against. 048 corrected SPEC.md/GRAMMAR.md to the untyped form and named this as the follow-up: inventing a tagged error value touches `Value`, both VMs, `Error`, the `.rbc` format and every runtime failure site. That is this phase, whole.",
+      "goal": "Introduce a typed error value (a new `Value` variant or a tagged record shape, whichever disturbs the format least) carrying kind + message + span, raise it at every runtime failure site on both engines, and implement `catch error of <Type>` matching with the untyped `catch error` form unchanged. The `.rbc` format version bumps if and only if the encoding changes; the differential suite must stay green throughout.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`catch error of Io` catches a failed `files.read` and ignores a `1 + \"x\"` type error in the same body (both directions pinned — a matcher that catches everything proves nothing)",
+        "the untyped `catch error` form behaves byte-identically to before (the existing `catch_binding_test.rs` suite passes unmodified — no silent migration)",
+        "both engines raise the same typed value for the same failure (one differential test per failure kind across tree-walker and bytecode VM, kinds diffed not eyeballed)",
+        "`rb dis` on a program containing a typed catch shows no new operand shape unless the format version bumped, in which case `docs/BYTECODE.md` documents it in the same commit",
+        "SPEC.md documents the type names a program can match (closed list, asserted by a test that matches each one and refuses an invented one by name)",
+        "edge_* tests cover matching a supertype/all-errors form if one exists, a `catch of` with no matching arm falling through to the untyped arm, error values escaping the `catch` body as first-class values (inspectable, printable), and a 200-deep error chain (no stack growth per frame)"
+      ],
+      "timeout_min": 180
     }
   ]
 }
