@@ -1917,6 +1917,138 @@
         "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added and no `#[ignore]`"
       ],
       "timeout_min": 120
+    },
+    {
+      "id": "phase-083",
+      "title": "Make unreviewed work on redblue main detectable, including the 13 commits that are there now",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "The check the audit contract prescribes is `git -C redblue log --oneline main | grep checkpoint`, and phase-078's finding cites eight commits on that basis: 7fdea15, 074c95e, 563a351, 286fccd (`rbops: phase-0NN checkpoint`) and the merges e97983a, d664d3c, 2179034, 255816e. Measured this audit, NONE of them reproduces: `git -C redblue log --oneline main | grep -c checkpoint` prints 0, and `git -C redblue merge-base --is-ancestor <c> main` returns false for all eight. A check written to that finding would scan an empty set and pass vacuously. The same defect is on main THIRTEEN times under a different subject - `git -C redblue log --oneline main | grep 'resume phase'` prints 09dd102, 985e445, 96c3c17, 8910456, 1ee5aba, b6d633b, dff04f6, 4c45731, 11b9fe2, 2804ab8, 861080d, 25e9b68 and 825193a, each titled `resume phase-NNN: adopt preserved work`, together 27,984 changed lines (`git show --stat` summed per commit; 09dd102 alone is 35 files / 1437 insertions). phase-051 and phase-079 are a different defect (work in the working tree, not ancestry) and do not cover this. This phase SUPERSEDES phase-078's finding, which is provably false as written.",
+      "goal": "Install an executable check that fails when a commit carrying unreviewed work is an ancestor of redblue main and is not on a written acknowledgement list, matching the commit subjects the pipeline actually writes.",
+      "must_touch": [
+        "tests/"
+      ],
+      "accept": [
+        "a test runs `git log --format=%H%x09%s` over HEAD and fails for ANY subject matching `checkpoint` OR `resume phase-` that is not named in an acknowledgement list inside the test file",
+        "the acknowledgement list names all thirteen `resume phase-NNN: adopt preserved work` commits measured at audit time - 09dd102, 985e445, 96c3c17, 8910456, 1ee5aba, b6d633b, dff04f6, 4c45731, 11b9fe2, 2804ab8, 861080d, 25e9b68, 825193a - each with a line recording that it carries unreviewed code and was deliberately not rewritten",
+        "a second test asserts phase-078's eight superseded commits (7fdea15, 074c95e, 563a351, 286fccd, e97983a, d664d3c, 2179034, 255816e) are NOT ancestors of HEAD, so the stale finding cannot be silently re-derived",
+        "the tests are deterministic and offline: no network, no path outside the repository, no wall-clock, no dependence on reflog or stash state",
+        "edge_* tests cover: a log with zero unreviewed commits, a log whose only unreviewed commits are acknowledged, a log with exactly one unacknowledged commit, a subject merely CONTAINING the word checkpoint inside a longer phrase, and a two-tab-delimited malformed subject line",
+        "REPORT.md states that phase-078's finding was measured false and why, so the supersession is on the record",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added and no `#[ignore]`"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-084",
+      "title": "Resolve the reviewer agent's permissions where opencode can actually see them",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "`~/.config/opencode/opencode.json` is 213 bytes and declares NO `agent` key - `jq -r 'has(\"agent\")'` on it prints false. It sets only `default_agent: \"build\"` and a permission block whose `edit` and `bash` are both `allow`. The redblue checkout has no opencode.json (`ls redblue/opencode.json` -> No such file or directory). rbops/dispatch.sh:786 invokes opencode as `--dir \"$PROJECT_DIR\" --agent reviewer`; opencode resolves configuration from the working directory upward and then the global file, so the name `reviewer` is not found there and opencode falls back to `default_agent: build` - a configuration that grants edit and bash. The reviewer is contractually read-only: rbops/agents/reviewer.md opens 'You are READ-ONLY: you cannot edit files or run commands', and the pipeline's own opencode.json sets `agent.reviewer.permission` to `edit: deny, bash: deny`. NEITHER is in the resolution path. dispatch.sh:727-732 already acknowledges the resolution failure in prose and inlines the CONTRACT, which is why every phase has had one - but the PERMISSIONS remain unenforced, so the single component whose job is to catch a compromised phase is the one component that is allowed to edit it, and nothing in the gate would notice if it did.",
+      "goal": "Ship the agent definitions inside the checkout opencode resolves, so `--agent reviewer` and `--agent verifier` carry their declared permissions instead of inheriting the global build agent's.",
+      "must_touch": [
+        "tests/"
+      ],
+      "accept": [
+        "the project ships an opencode.json whose `agent.reviewer.permission` denies BOTH edit and bash, and whose `agent.verifier.permission` allows both",
+        "a test reads that file and asserts all four permission values, so removing a single deny fails `cargo test`",
+        "a test asserts the file declares no `default_agent`, so the implementer agent cannot be quietly repointed",
+        "the file lives at the repository root and NOT under `.opencode/agent/`, which rbops/verify.sh:127 treats as a forbidden path",
+        "REPORT.md records the opencode configuration-resolution rule this relies on (working directory first, then the global file) with a citation, and says plainly that the test can only assert the file's contents, not opencode's resolution",
+        "edge_* tests cover: the file missing, the `agent` key missing, `reviewer` missing, `verifier` missing, and one permission flipped to allow - five distinct failing cases",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean with no `allow(` added"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-085",
+      "title": "Decode `\\uXXXX` in a string literal instead of silently dropping the backslash",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "docs/GRAMMAR.md:80 promises `escape = '\\' ( 'n' | 't' | 'r' | '\"' | '\\' | 'u' hex_digit hex_digit hex_digit hex_digit )`, but src/lexer.rs:317-326 matches only `n`, `t`, `r`, `\\` and `\"`. The catch-all `Some(c) => text.push(c)` arm at src/lexer.rs:325 pushes only the FIRST character after the backslash, and `self.advance()` at src/lexer.rs:318 has already consumed the `\\` itself. So `\"\\u00e9\"` lexes as the single character `u` and the remaining `00e9` becomes ordinary text. Verified against the built binary this audit: `say \"\\u00e9\"` prints `u00e9` and `say \"A\\u0042C\"` prints `Au0042C` (`od -c` gives `A u 0 0 4 2 C`), exit 0 both times. This is SILENT DATA CORRUPTION rather than an error: a program carrying a unicode escape runs to completion and prints text that is not the text that was written, and nothing in the 1,414-test suite notices because no test anywhere writes a `\\u` escape. A language whose stated selling point is readable English-like source cannot quietly rewrite its own string literals.",
+      "goal": "Make `\"\\uXXXX\"` decode to the character it names, or refuse the literal cleanly, so a string literal can never silently become different text.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`rb run` on `say \"\\u0041\"` prints `A`, and `rb compile` followed by `rb vm` on the same file prints `A`",
+        "`say \"\\u00e9\"` prints one character, `é`, asserted by code point rather than by byte sequence",
+        "an escape that is NOT `\\u` followed by four hex digits is a clean LexerError naming line and column - covering `\"\\uZZZZ\"`, `\"\\u00\"`, `\"\\u00e9` with the string unterminated, and a bare trailing `\\` - and never a silent rewrite",
+        "the escapes that already work keep their behaviour, each pinned by a test: `\\n`, `\\t`, `\\r`, `\\\"`, `\\\\`",
+        "docs/GRAMMAR.md:80 and the corresponding SPEC.md text agree with the implementation afterwards, whichever way the phase resolves it",
+        "edge_* tests cover: empty string, a bare `\\u`, `\\u` at end of input, four uppercase hex digits, four lowercase, a value above U+FFFF, `\\u0041` immediately before the closing quote, an unterminated string, and the same cases through the bytecode engine",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-086",
+      "title": "Make `xs.map(f)` work when the receiver is a variable",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "src/interpreter.rs:2052 matches `Expr::Variable(name) => name.clone()` FIRST inside `call_method`, so a variable receiver never reaches the list branch at src/interpreter.rs:2059-2071 whose own comment reads '`xs.map(f)` is the method spelling of the higher-order builtin' - the case that comment names is precisely the case it cannot see. The dotted name is resolved as a module-style builtin, `xs.map` becomes `xs_map`, and nothing registers it. Verified against the built binary this audit: after `to dbl(x) give back x * 2 end` and `set xs to [1,2,3]`, `say xs.map(dbl)` raises `RuntimeError: Unknown function 'xs_map'` at 5:1 - on the tree-walker AND through `rb compile` + `rb vm`, while the literal receiver `[1,2,3].map(dbl)` prints `[2, 4, 6]`. src/bytecode/vm.rs:2707 `call_method` has the same shape and fails identically, so a one-engine fix would be caught by tests/differential_test.rs. SPEC.md:574-579 presents `set doubled to numbers.map(double)` as the entire headline example of '### First-Class Functions': the one program the specification uses to introduce function values is the one program that does not run.",
+      "goal": "Make `xs.map(f)` answer on both engines for a variable receiver, so the specification's own first-class-functions example runs.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`rb run` on SPEC.md:574-579 verbatim prints the doubled list, and `rb compile` + `rb vm` on the same file prints the same list",
+        "the two engines agree across three tests - `xs.map(f)`, `list.map(xs, f)` and `[1,2,3].map(f)` - each asserting the same literal expected value",
+        "bad arguments stay clean RuntimeErrors, not panics: `xs.map(5)` names the argument it got and `xs.map()` with no argument is a RuntimeError",
+        "a module receiver is unaffected: `text.uppercase(\"hi\")` and `files.exists(p)` still answer, in tests that fail if the fix shadows them",
+        "an object receiver is unaffected: a method on an object declared with `object`/`has`/`to` still dispatches, and the existing object-model tests stay green",
+        "edge_* tests cover: an empty list receiver, a singleton receiver, a list held in a record field, a list returned from a function, a receiver whose name collides with a module name in src/stdlib.rs:19, and a receiver whose value is `nothing`",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-087",
+      "title": "Count characters in `length`, not UTF-8 bytes",
+      "severity": "critical",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "src/runtime.rs:777-781 answers `\"length\" | \"len\"` with `s.len()` - the UTF-8 BYTE count - before any other implementation is consulted. The correct character count sits at src/stdlib.rs:424-427 (`Value::Text(s) => Some(Value::Number(s.chars().count() as f64))`) and is unreachable DEAD CODE, because runtime::builtin matches the name first. This is the declared-but-unreached code path the audit contract names as this codebase's signature defect. Verified against the built binary this audit: `say text.length(\"日本\")` prints `6`, `say length(\"é\")` prints `2`, while `say text.length(\"abc\")` correctly prints `3`. README.md:69 states 'Text is fully Unicode' and AGENTS.md section 3.2 makes unicode and combining marks a mandatory edge class, so the one measurement a program can make about its own text is silently wrong for every non-ASCII string, with a plausible-looking number. SPEC.md:315's worked example is ASCII (`text.length(\"hello\")`), which is why 1,414 tests do not catch it.",
+      "goal": "Make `length` and `text.length` count characters, so a Unicode string's length is the number of characters a reader would count.",
+      "must_touch": [
+        "src/"
+      ],
+      "accept": [
+        "`say text.length(\"日本\")` and `say length(\"é\")` both print `2`, on the tree-walker and on the bytecode VM",
+        "the arm at src/stdlib.rs:424 is either deleted or is the arm that executes; a test asserts exactly one implementation of `length` over text remains, so the dead arm cannot come back",
+        "list length is unchanged: `length([1,2,3])` still prints `3` and a test asserts it",
+        "the combining case is pinned deliberately: `\"e\" + U+0301` is two code points and one grapheme, the test states which of the two it asserts and why, so the choice is recorded rather than accidental",
+        "no other builtin's result moves: a test walks the registry the way tests/stdlib_module_docs_test.rs does and asserts the other results are unchanged",
+        "edge_* tests cover: empty text, ASCII, 2-byte Latin-1, 3-byte CJK, 4-byte emoji, combining marks, RTL text, text containing NUL, and a list of zero elements",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-088",
+      "title": "Make the reachability-only tests assert the value they reach for",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "Three groups of tests prove a code path RUNS and cannot prove it runs correctly. tests/stdlib_module_docs_test.rs:232-237 walks six builtins (`abs`, `uppercase`, `trim`, `sqrt`, `text.uppercase`, `text.split`) through the bytecode VM with `Ok(_) => {}` and a `panic!` only on `Err` - so `sqrt` returning 1 instead of 1.4142135623730951, or `split` returning one element instead of two, both pass. tests/loop_bounds_test.rs:586-591 runs `repeat \"five\" times` with `say \"never\"` in the body and asserts only that the run succeeded; `vm.take_output()` is never called, so the test passes whether or not the loop body ran at all. tests/loop_bounds_test.rs:596-601 is the identical shape for `for each x in 5`. tests/redblue_test.rs is five tests that each call `run_source` and assert `result.is_ok()`, and src/lib.rs:105 discards the value with `result.map(|_| ())`, so no test in that file can detect a wrong answer. Twenty tests across tests/ have no reachable `assert!` or `assert_eq!` at all for the same reason. The suite reports 1,414 passing, which is exactly what makes the gap invisible.",
+      "goal": "Make every test that claims output was or was not produced actually read the output, so a builtin that answers the wrong value fails the suite.",
+      "must_touch": [
+        "tests/"
+      ],
+      "accept": [
+        "tests/stdlib_module_docs_test.rs:232 asserts the bytecode VM's VALUE for all six builtins rather than `Ok(_)`; every expected value is written literally in the test, not derived from the implementation",
+        "tests/loop_bounds_test.rs:586 and :596 call `take_output()` and assert it is empty - the literal `never` inside each loop body is what makes that assertion possible",
+        "each of the five tests in tests/redblue_test.rs asserts the exact output its program produces",
+        "the twenty tests with no reachable `assert!` or `assert_eq!` are each either given one or deleted, and REPORT.md lists every one with its reason - a deleted test is replaced by one that can fail, never silently dropped",
+        "the `cargo test` total is NOT lower than the 1,414 measured at audit time, which is the machine-checkable form of 'nothing was deleted to make the suite quieter'",
+        "edge_* tests cover: a builtin returning the wrong value on each engine, a loop body that must not run, a program whose correct output is the empty string, and a program whose output is non-empty",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 120
     }
   ]
 }
