@@ -530,6 +530,47 @@ cmd_run() {
     [ "$pf_rc" -eq 0 ] || log "$phase preflight inconclusive (rc=$pf_rc) — continuing to the agent"
   fi
 
+  # --- STALE FINDING -------------------------------------------------------
+  # A phase whose finding is ALREADY FALSE costs a model call to discover that,
+  # every single time, and the agent is right to change nothing — which the gate
+  # then refuses as an empty diff. Phase-051 spent 21 minutes proving its
+  # seven-file S3 finding was stale: the work had been committed weeks earlier by
+  # six separate `resume phase-NNN` commits, and `054e0d6 rbops: phase-022` was on
+  # main. It would have repeated forever.
+  #
+  # The signature is cheap to see and needs no model: a phase that has already
+  # been attempted (`.attempts` > 0) or resumed (`.recovered`), whose PROJECT tree
+  # is CLEAN, has no diff to make. That is not "the agent did nothing" — it is
+  # "there is nothing left for this phase to do". A first attempt with a clean
+  # tree is the ordinary start of a phase, so it is NOT flagged.
+  #
+  # This does not decide the finding is stale; it stops a loop. The gate still
+  # decides the work, and a human closes the phase — which is exactly what
+  # happened to 051, and it took ten minutes instead of twenty per retry.
+  #
+  # Routed through defer_phase, not a bare touch, so it shares that counter's
+  # MAX_DEFERRALS bound: a phase whose tree is legitimately clean mid-retry still
+  # gets its attempts, and only a genuinely stuck one reaches .blocked.
+  # A resumed attempt is EXCLUDED, and that exclusion is load-bearing. Resuming
+  # squashes the preserved work into a commit, so the tree is CLEAN afterwards by
+  # construction — a clean tree after a resume says "the work was adopted", which
+  # is the opposite of stale. Reading it the other way would defer every retry
+  # forever, which is why the first draft of this check was caught by smoke §32.
+  #
+  # So the signature is: prior attempts AND nothing resumed AND a clean tree.
+  # Phase-051 matched it because its recovery branch could not be applied
+  # ("recovery branch present but not usable — starting clean"), so it resumed
+  # nothing, started from main, had nothing to do, and the tree stayed clean.
+  local sa; sa="$(read_n "$phase" .attempts 2>/dev/null || echo 0)"
+  case "$sa" in ''|*[!0-9]*) sa=0;; esac
+  local proj_dirty
+  proj_dirty="$(in_project git status --porcelain 2>/dev/null | head -1)"
+  if [ "$sa" -gt 0 ] && [ "$resumed" -eq 0 ] && [ -z "$proj_dirty" ]; then
+    log "$phase looks STALE — ${sa} prior attempt(s), no work resumed, and the project tree is clean (nothing left to change)"
+    defer_phase "$phase" "finding appears already satisfied; close it by hand rather than re-deriving it"
+    return $?
+  fi
+
   {
     # The brief comes FIRST and is deliberately blunt. A weak model given a
     # 25KB context with no explicit scope spends its entire budget orienting:

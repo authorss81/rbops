@@ -2339,6 +2339,92 @@ case "$out" in
   *)  ok "a good inherited diff passes preflight and the agent runs (rc=$rc)" ;;
 esac
 
+# =========================================================== 32. stale findings
+head_ "32. a finding that no longer reproduces costs no model call"
+# Phase-051 spent 21 model-minutes proving its finding was stale: the S3 work it
+# was asked to commit had been committed weeks earlier by six `resume phase-NNN`
+# commits. The agent was RIGHT to change nothing, and the gate was right to
+# refuse the empty diff — so it would have repeated forever, once per attempt,
+# each time re-deriving a conclusion already in git history.
+build_fixture >/dev/null; use_stubs
+# The DEAD-model stub: the agent must fail, or this case would complete the
+# phase instead of deferring, and the stale line would never be printed.
+#
+# use_stubs installs a stub `rb` at $PROJ/target/debug/rb and its report-writer
+# would leave a REPORT.md in $PROJ/phases — both of which make the project tree
+# DIRTY, and a dirty tree is exactly what this check is not looking for. Both are
+# removed, so the fixture is the plain state 051 was in: clean tree, one prior
+# attempt, nothing left to do.
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+echo "Error: OpenCode 1.18.0 or newer is required to use the free tier"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+rm -rf "$PROJ/target" "$PROJ/phases"
+( cd "$PROJ" && git add -A >/dev/null 2>&1; git commit -qm "clean fixture" >/dev/null 2>&1 ) || true
+mkdir -p "$PIPE/phases/phase-001"
+printf '1' > "$PIPE/phases/phase-001/.attempts"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+[ "$rc" = "42" ] && ok "a stale finding defers instead of dispatching (exit 42)" \
+  || no "a stale finding still burns a model call: got $rc"
+case "$out" in
+  *"looks STALE"*) ok "the deferral says why it looks stale" ;;
+  *) no "no stale explanation in the output"; printf '%s\n' "$out" | tail -3 | sed 's/^/      /' ;;
+esac
+case "$out" in
+  *"close it by hand"*) ok "the reason names the fix: close it by hand" ;;
+  *) no "the stale deferral does not say what to do about it" ;;
+esac
+a_after="$(cat "$PIPE/phases/phase-001/.attempts" 2>/dev/null || echo none)"
+[ "$a_after" = "1" ] && ok "no attempt consumed ($a_after → $a_after)" \
+  || no "an attempt was burned proving a finding stale: 1 → $a_after"
+marker phase-001 .deferred && ok ".deferred written (retryable)" || no ".deferred missing"
+# A FIRST attempt with a clean tree is the ordinary start of a phase. Deferring
+# that would strand every new phase before its agent ever ran. The dead-model
+# stub also defers with 42, so this asserts on the REASON, never the code — a
+# test that reads the exit code would pass for the wrong reason, which is
+# exactly what the first draft of this section did.
+build_fixture >/dev/null; use_stubs
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+case "$out" in
+  *"looks STALE"*) no "a first attempt on a clean tree was deferred as stale" ;;
+  *)  ok "a first attempt with a clean tree is not called stale (rc=$rc)" ;;
+esac
+# A retry that resumes real work has a DIRTY tree, and must be left alone. The
+# dead-model stub again, so the run cannot complete and hide the check.
+build_fixture >/dev/null; use_stubs
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+echo "Error: OpenCode 1.18.0 or newer is required to use the free tier"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+forge_compliant_recovery
+printf '2' > "$PIPE/phases/phase-001/.attempts"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+case "$out" in
+  *"looks STALE"*) no "a retry with real inherited work was called stale" ;;
+  *)  ok "a retry with inherited work is not mistaken for stale (rc=$rc)" ;;
+esac
+# And the control that matters: the check is about a CLEAN tree, not about the
+# attempt count. Same fixture, same attempts, but the tree dirtied afterwards.
+build_fixture >/dev/null; use_stubs
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+echo "Error: OpenCode 1.18.0 or newer is required to use the free tier"
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+rm -rf "$PROJ/target" "$PROJ/phases"
+printf '3' > "$PIPE/phases/phase-001/.attempts"
+printf '\n// uncommitted work in progress\n' >> "$PROJ/src/vm.rs"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
+case "$out" in
+  *"looks STALE"*) no "a dirty tree with prior attempts was called stale" ;;
+  *)  ok "prior attempts alone do not make a phase stale (rc=$rc)" ;;
+esac
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then
