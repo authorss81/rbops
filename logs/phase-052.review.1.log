@@ -1,0 +1,17 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the phase-052 diff for hidden defects — reading the new line-editor wiring.
+[0m→ [0mRead src/repl/editor.rs
+[0m→ [0mRead src/repl/completer.rs
+[0m→ [0mRead src/repl/mod.rs
+[0m✱ [0mGrep "\.record\(|flush_history|history_len|complete_start|SessionNames|auto_add_history|max_history|set_max|history_path"[90m in src/repl · 44 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=1346][0m
+FINDINGS:
+1. [MAJOR] src/repl/editor.rs:241 — `EditSource::completion()` calls `self.completer.complete()` directly so all TAB tests bypass the `set_helper` wiring at src/repl/editor.rs:221 — REPORT admits TAB was dead until `set_helper` was added yet unit tests would still pass without it — pin TAB through the helper/`readline` path or assert helper presence.
+2. [MAJOR] src/repl/editor.rs:216 — `Config::builder().auto_add_history(true).build()` sets no `max_history_size`/truncation while `ReplHistory` is capped at `HISTORY_LIMIT=1000` (src/repl/mod.rs:26) — `FileHistory` grows unbounded in memory and `~/.redblue/history` grows unbounded across sessions — set `max_history_size(HISTORY_LIMIT)` and truncate on save.
+3. [MAJOR] src/repl/mod.rs:106 — `debug_stop` still reads via `io::stdin().read_line` while the main loop uses `LineSource` — Ctrl-C at `(rb-debug)` delivers SIGINT and kills the session instead of abandoning the line, contradicting the phase's sane-interrupt claim — route `debug_stop` through `LineSource`/`EditSource` with a debugger validator.
+4. [MINOR] src/repl/editor.rs:38 — `default_history_path` reads only `HOME` and returns `None` silently for unset/relative `HOME` (notably Windows) with no warning; `line_source` only warns on `EditSource::new` failure — silent in-memory history loss — warn on fallback or resolve platform home directory.
+5. [MINOR] src/repl/editor.rs:260 — `EditSource::record()` is never called in production (only tests); production relies on `auto_add_history`, so `history_survives_a_restart_of_the_session` (src/repl/editor.rs:490) pins `record()+save()` not the shipped `readline+flush_history()` path and trimmed-vs-raw divergence (`session_loop` pushes trimmed at src/repl/mod.rs:352, editor stores raw) is untested — call `record` from the loop or delete it and test `flush_history`.
+REVIEW VERDICT: FINDINGS 5
