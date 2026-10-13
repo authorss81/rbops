@@ -445,6 +445,12 @@ printf '3' > "$PIPE/phases/phase-001/.deferred_attempts"
 last_phase="$(cd "$RBOPS_ROOT" && "$JQ" -r '.phases | length' rbops/phases.json)"
 last_phase="${last_phase:-41}"
 for id in $(seq -f "phase-%03g" 2 "$last_phase"); do
+  # mkdir -p, not touch: a phase in the manifest with no directory yet (the
+  # auditor appends phases faster than anyone mkdirs) would leave `touch`
+  # failing silently, and that phase would stay runnable and be selected —
+  # silently turning this into a test of nothing. Same trap as the hardcoded
+  # `seq 2 41` above, one level down.
+  mkdir -p "$PIPE/phases/$id"
   touch "$PIPE/phases/$id/.blocked"
 done
 out="$(D select)"

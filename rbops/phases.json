@@ -1233,7 +1233,9 @@
       "id": "phase-052",
       "title": "Wire the REPL to a real line editor: TAB completion, persistent history, sane interrupts",
       "severity": "critical",
-      "depends_on": [],
+      "depends_on": [
+        "phase-107"
+      ],
       "risk": "high",
       "finding": "src/repl/mod.rs:166 reads every line with `io::stdin().read_line(&mut input)` — cooked-mode stdin, so no keystroke ever reaches the program: TAB arrives as a literal tab character, Up-arrow arrives as escape bytes, and Ctrl-C kills the process. `Repl::complete()` at src/repl/mod.rs:112 is a tested completion engine (src/repl/completer.rs, case-insensitive, keywords + builtins + session names) that nothing calls on a keypress — the same dead-code shape as the `builtin_function` defect phase-032 fixed. `src/repl/history.rs` keeps an in-memory `VecDeque` with `save_to_file`/`load_from_file` (history.rs:76) that only the explicit `:save`/`:restore` commands touch (mod.rs:594, mod.rs:623) — no `~/.redblue/history` is ever loaded at startup or written at exit, so every session starts amnesiac. `Cargo.toml` depends on regex, chrono, reqwest and indexmap only: no line-editing crate exists anywhere in the tree. Verified by running the binary: piped input works, interactive keys cannot.",
       "goal": "Replace the `read_line` loop with a line editor (rustyline) so TAB completes through the existing `ReplCompleter`, Up/Down walks a history file at `~/.redblue/history`, and Ctrl-C abandons the line instead of the session. No language change: the editor is I/O around the unchanged `execute_line` path.",
@@ -1697,7 +1699,7 @@
       "title": "Measure before optimizing: a benchmark harness with a checked-in baseline",
       "severity": "major",
       "depends_on": [
-        "phase-072"
+        "phase-107"
       ],
       "risk": "medium",
       "finding": "Redblue has no benchmark harness at all: no `benches/` or `benchmarks/` directory exists, `Cargo.toml` names no criterion/divan dependency, and no BASELINE file records how fast anything is. Ipp ships `benchmarks/run_benchmarks.py` plus a checked-in `BENCHMARKS.md` table (fibonacci, prime counting, mandelbrot, string concat across interpreter/VM/Python/Node) for exactly this reason — and phase-022's 29.0s-to-3.5s speedup claim had nowhere to live except a FINDINGS paragraph, so no later phase can tell whether it regressed. Performance work without a harness is unmeasurable by construction.",
@@ -1788,7 +1790,7 @@
       "title": "Finish the list surface: `sort`, `reverse`, `zip`, `enumerate`, `filter`, `reduce`",
       "severity": "major",
       "depends_on": [
-        "phase-076"
+        "phase-107"
       ],
       "risk": "medium",
       "finding": "The list surface stops halfway: `map` works (with `list_map`), `pop`/`shift` were wired in phase-032, and `filter`, `reduce`, `sort`, `reverse`, `zip` and `enumerate` are all missing — `filter`/`reduce`/`list_map` sit in `tests/stdlib_module_docs_test.rs::KNOWN_GAPS` explicitly deferred as higher-order work needing a walker's captured scopes. inscript ships map/filter/reduce/zip/enumerate/sort/reverse as core builtins because list transformation is everyday code, not a special occasion. The first-order four are pure functions on values; the higher-order two follow the `map_builtin` precedent in both VMs.",
@@ -2071,6 +2073,500 @@
         "edge_* tests cover matching a supertype/all-errors form if one exists, a `catch of` with no matching arm falling through to the untyped arm, error values escaping the `catch` body as first-class values (inspectable, printable), and a 200-deep error chain (no stack growth per frame)"
       ],
       "timeout_min": 180
+    },
+    {
+      "id": "phase-090",
+      "title": "Survey what a Python programmer cannot do in Redblue, and rank the gaps",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "The standard library is the language's actual ceiling, and nobody has measured the ceiling. src/stdlib.rs exposes math, text, list, types, files, time, json/csv, network, bytes, console, random, testing and sys, and src/stdlib.rs:612 states outright 'Redblue has no regex, so this is a literal separator' - the regex crate is a dependency (src/testing/assertions.rs:130, src/testing/runner.rs:252) but is never reachable from a Redblue program. time offers now/sleep/format/unix and nothing else, so there is no date arithmetic. There is no itertools, no functools, no collections, no pathlib, no argparse, no logging, no encodings. Meanwhile 1,472 #[test] functions and 722 corpus files make every phase expensive, so choosing the next library by taste is how the wrong twelve get built.",
+      "goal": "Produce SURVEY.md: an evidence-anchored inventory of what Redblue's stdlib cannot do that Python/Rust/JS can, each gap cited to the file and line that proves its absence, ranked by how many realistic programs each one blocks. Rank by blocked-program count, not by how interesting the library is. Name the top ten and say which are implementable in Redblue versus which must be bindings. Implement nothing: this phase ships a document, and a phase whose output is a document must not also change code, or the ranking is never checked against anything.",
+      "accept": [
+        "SURVEY.md exists in redblue and lists every stdlib gap with a file:line citation proving the absence, and no gap is listed without one",
+        "the regex gap cites src/stdlib.rs:612 by line and states that the crate is a dependency used only by src/testing/",
+        "each of the top ten gaps names at least one concrete program that cannot be written without it, written out as real Redblue source that is genuinely blocked",
+        "each of the top ten is labelled implementable-in-Redblue or binding-required, and every binding-required entry names the Rust crate that would satisfy it",
+        "the survey does not modify anything under src/ - `git diff --stat` shows docs only, and REPORT.md says so",
+        "no test is deleted and `cargo test` is not run to completion as part of this phase; the phase is a document and its acceptance is reviewed by reading it"
+      ],
+      "timeout_min": 90,
+      "must_touch": []
+    },
+    {
+      "id": "phase-091",
+      "title": "Document the memory model: shared values, copying, and the cycle leak",
+      "severity": "minor",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "The memory model is a real and deliberate design, and it is documented nowhere a user would look. src/value.rs:276 defines `pub type Shared<T> = std::sync::Arc<T>`, and Value::List, Value::Record and Value::Object (src/value.rs:253-255) are Arc-shared, so they are immutable once built. Reading a variable clones the value bound to it (src/value.rs:88-90), so assignment copies rather than aliases. Two consequences follow and neither is written down. First, Arc drops when the last reference goes and no Weak appears anywhere in src/, so a reference cycle is never collected and leaks - a real limitation that will surface eventually as an unexplained memory growth bug. Second, there is no tracing garbage collector and no ownership or borrowing rule a Redblue programmer must learn, which is a feature for a language whose goal is plain-English readability and a cost in that it is copying rather than zero-cost.",
+      "goal": "Write MEMORY.md stating the model exactly as implemented: values are immutable and Arc-shared, reading copies, there is no garbage collector, there is no cycle collection, and a cycle therefore leaks. Document the cycle leak as a known limitation with the shape of program that triggers it, not as a defect to be fixed later. Also document that deep recursion is bounded by MAX_CALL_DEPTH and raises a catchable Error::Limit rather than overflowing the native stack (src/bytecode/vm.rs:18-21 asserts 'There is no path from a .rbc to a native stack overflow'), and that REDBLUE_MAX_CALL_DEPTH overrides it. Link it from README.md. Implement nothing.",
+      "accept": [
+        "MEMORY.md states that values are immutable once constructed and shared, and cites src/value.rs:276 by line",
+        "MEMORY.md states that reading a variable copies rather than aliases, citing src/value.rs:88-90",
+        "MEMORY.md names the absence of cycle collection as a known limitation and gives a Redblue program that leaks because of it",
+        "MEMORY.md documents MAX_CALL_DEPTH as a catchable Error::Limit with the REDBLUE_MAX_CALL_DEPTH override, citing src/bytecode/vm.rs",
+        "README.md links MEMORY.md",
+        "a test asserts the documented cycle-leak example leaks, so the documented limitation cannot quietly become untrue",
+        "`git diff --stat` shows documentation and tests only; no runtime behaviour changed"
+      ],
+      "timeout_min": 90,
+      "must_touch": [
+        "docs/",
+        "README.md"
+      ]
+    },
+    {
+      "id": "phase-092",
+      "title": "Shard the test suite across parallel CI jobs",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "manual": true,
+      "finding": "One job runs everything. .github/workflows/ci.yml runs `cargo build`, then `cargo test`, then clippy, then the README block executor, then the corpus count pin - serially, in a single job. The suite is 1,472 #[test] functions across src/ and tests/ plus 722 corpus files, and it grows every phase. A single job is a hard ceiling on how large the suite can become before a phase cannot finish inside its time limit, so the ceiling is currently a constraint on what the language is allowed to test. Cargo has no native sharding, so this has to be written, but it is the single largest lever available and it is pure CI configuration. NOTE: this phase changes .github/workflows/, and the rbops bot token deliberately has NO `workflows` permission (.github/workflows/rbops.yml:10) so that an agent cannot edit its own gate. An agent CANNOT land this phase. It is declared manual and is applied by a human push.",
+      "goal": "Split `cargo test` across N parallel jobs using the matrix strategy, partitioning tests deterministically by a stable hash of each test name so every test runs in exactly one shard and the partition does not shift when unrelated tests are added. Add a final aggregation job that fails if any shard fails. Keep the fast jobs (build, clippy, fmt, README blocks, corpus pin) un-sharded so a formatting error is still caught in seconds rather than waiting on the slowest shard. Prove the partitioning is total and non-overlapping rather than assuming it. MANUAL: the agent that dispatches this must not attempt it; the change is pushed by a human with workflow scope.",
+      "accept": [
+        "this phase is applied by a human push, not by the bot - an agent attempting it will have its push refused, which is the intended lock",
+        "the suite runs across at least 4 parallel matrix jobs and the workflow shows the fan-out",
+        "the union of shards runs every test exactly once - a test that asserts this by counting total tests per shard against the unsharded count, and it fails if any test is in two shards or none",
+        "the shard assignment is stable: adding one new test changes only its own shard's membership, proven by a test over the partitioning function",
+        "an aggregation job fails the workflow when any shard fails",
+        "clippy, fmt and the README block executor still run in a fast job that does not wait for the shards",
+        "the corpus-count pin still runs and still fails when README.md and the corpus disagree",
+        "REPORT.md records the wall-clock before and after, measured from two CI runs on the same commit"
+      ],
+      "timeout_min": 90,
+      "must_touch": [
+        ".github/workflows/"
+      ]
+    },
+    {
+      "id": "phase-093",
+      "title": "Stop rebuilding from cold on every push, and run the fast tier first  [MANUAL — bot has no workflows scope]",
+      "severity": "minor",
+      "depends_on": [
+        "phase-092"
+      ],
+      "risk": "low",
+      "manual": true,
+      "finding": "Every push pays a cold build and every push runs the whole corpus. .github/workflows/ci.yml triggers on both push and pull_request to main, and its only job begins at `cargo build` with no cache step, so target/ is discarded between runs. The suite has a natural fast tier and a slow tier that are not separated: unit tests, the linter, the formatter and the LSP finish in seconds, while the 722-file corpus differential harness dominates the wall clock. Paying the full cost to learn that a line is misformatted is waste that repeats on every push. NOTE: this phase changes .github/workflows/, and the rbops bot token deliberately has NO `workflows` permission (.github/workflows/rbops.yml:10) so that an agent cannot edit its own gate. An agent CANNOT land this phase. It is declared manual and is applied by a human push.",
+      "goal": "Cache target/ between runs keyed on the lockfile hash. Split the workflow so a fast job runs fmt, clippy, the unit/linter/formatter/LSP tests and the README blocks, and the sharded full suite runs only where it is needed - on merge to main and on pull requests, not on every push to a branch that has no pull request. A push that only opens the fast tier should finish in minutes. Keep every check that can catch a bad commit in the fast tier, so nothing is lost by not running the slow tier on branch pushes. MANUAL: the agent that dispatches this must not attempt it; the change is pushed by a human with workflow scope.",
+      "accept": [
+        "this phase is applied by a human push, not by the bot - an agent attempting it will have its push refused, which is the intended lock",
+        "target/ is cached between runs and a second push does not recompile the workspace from scratch - proven by CI logs, not asserted",
+        "a push to a branch with no pull request runs the fast tier and does not run the corpus differential job",
+        "the fast tier still catches a formatting error, proven by a deliberate bad-format push in a test run recorded in REPORT.md",
+        "the full suite still runs on pull_request and on push to main",
+        "the fast tier's wall clock is recorded in REPORT.md and is a small fraction of the full suite's",
+        "no check present before this phase is now unreachable on any trigger - each is listed in REPORT.md with the trigger that runs it"
+      ],
+      "timeout_min": 90,
+      "must_touch": [
+        ".github/workflows/"
+      ]
+    },
+    {
+      "id": "phase-094",
+      "title": "Write down what Redblue libraries should be written in Redblue, bound, or not built",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "low",
+      "finding": "Every stdlib phase re-litigates the same question from scratch: should this be written in Redblue, wrapped around a Rust crate, or skipped? The answer is consistently the numpy pattern - wrap the crate - because Redblue already does exactly this, with network.get wrapping reqwest and files.read wrapping std::fs. But it is nowhere written down, so each phase argues it again. The question also has a firm answer that is easy to get wrong. A PyTorch written in Redblue is not a matter of effort, it is wrong: tensor and autograd work is fast because it is native, which is exactly why numpy and PyTorch are C/C++ rather than Python. An interpreted Redblue is slower than Python, so Redblue's path to that class of library is a binding, not an implementation.",
+      "goal": "Write LIBRARIES.md as the standing policy, derived from SURVEY.md's ranking. Three sections: libraries that should be written in Redblue because interpreted speed is irrelevant (parsers, servers, data structures, tools, test frameworks, compilers); libraries that must be bindings to Rust crates because the work is numeric or native (tensor, matrix, statistics, crypto), following the numpy pattern Redblue already uses; and libraries that should not be built at all, with the reason. Include the honest statement that Redblue cannot out-run a native library in interpreted code and that its advantage is readability, not speed, and that a native backend is the only thing that changes that. Link from README.md and from AGENTS.md so the policy reaches the agent that will implement the next phase.",
+      "accept": [
+        "LIBRARIES.md has the three sections and every entry in each is justified by its reason, not by taste",
+        "the binding section names a specific Rust crate for each entry, and each named crate is either already a dependency or exists on crates.io",
+        "LIBRARIES.md states plainly that a PyTorch-equivalent written in Redblue is not achievable and that a binding is the numpy-style answer",
+        "LIBRARIES.md states that interpreted Redblue is slower than Python, so speed is not a design goal the language should promise",
+        "LIBRARIES.md names the native backend as the only thing that would change the speed answer, without committing to building it",
+        "README.md and AGENTS.md both link LIBRARIES.md",
+        "SURVEY.md's top ten gaps each appear in exactly one of the three sections, so no ranked gap is left undecided"
+      ],
+      "timeout_min": 90,
+      "must_touch": [
+        "docs/",
+        "README.md",
+        "AGENTS.md"
+      ]
+    },
+    {
+      "id": "phase-095",
+      "title": "Expose the regex crate to Redblue programs",
+      "severity": "critical",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "high",
+      "finding": "The regex crate is already a dependency and already used, twice: src/testing/assertions.rs:130 compiles a pattern from an assertion and src/testing/runner.rs:252 exposes assert_matches_regex. Both are Rust-side, so the crate reaches Redblue's test harness and nothing else. src/stdlib.rs:612 says it plainly: 'Redblue has no regex, so this is a literal separator.' A Redblue program therefore cannot split on a pattern, validate a string, or extract a capture group, which is why text.split takes a literal separator and why so many realistic programs are blocked. This is the highest-value single phase in the stdlib backlog and the dependency work is already paid.",
+      "goal": "Add a `regex` module to MODULES exposing pattern compilation, match, search, replace (with capture-group references), split on a pattern, and capture extraction, wrapping the crate that is already a dependency. Follow the binding pattern in LIBRARIES.md rather than implementing matching in Redblue. Decide deliberately whether match objects compare by identity or by their captured groups, and pin that decision in a test. Both engines must behave identically, since a program that matches on the tree-walker and not on the bytecode VM is a real bug.",
+      "accept": [
+        "a Redblue program compiles a pattern, matches a string, and reads a capture group - asserted on the value, not on Ok(_)",
+        "split on a pattern splits where the pattern matches, and a pattern with no match leaves the string whole - both directions pinned",
+        "replace with a capture-group reference substitutes the captured text, and an invalid group reference raises a catchable Error::Runtime rather than panicking",
+        "a pattern that does not compile raises a catchable error carrying the message, not a Rust panic",
+        "the tree-walker and the bytecode VM return equal values for the same match, compared as data across both engines",
+        "text.split's literal-separator behaviour is unchanged - src/stdlib.rs:612's comment is corrected only if the behaviour actually changed, and the existing text tests pass unmodified",
+        "SPEC.md and README.md document the module, and a test asserts every documented function exists and every registered function is documented",
+        "edge_* tests cover an empty pattern, a pattern matching at position zero, overlapping matches, a non-ASCII pattern and subject, and a catastrophic-backtracking pattern that must not hang - bounded by the existing step budget"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-096",
+      "title": "Give Redblue date and time values that can be compared and subtracted",
+      "severity": "critical",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "high",
+      "finding": "The time module is four functions. src/stdlib.rs exposes time.now, time.sleep, time.format and time.unix, and that is all - there is no date value at all. A program cannot ask what day it is, cannot add a day to a date, cannot compare two moments, and cannot ask how long something took. This blocks the majority of real programs: logs, reports, schedules, caches, retries and anything that stamps output. It is the second-largest gap after regex and it is the reason the two are split across two phases - a date value with arithmetic and comparison is a language-level type change, and formatting it is separable work that should not block it.",
+      "goal": "Introduce a date/time value that can be compared, subtracted to yield a duration, and constructed from components, then build time arithmetic on it: add and subtract years, months, days, hours, minutes and seconds, and compare two values. Decide and document how timezone-naive values behave, since a datetime without a zone is a decision, not an omission - state it in SPEC.md rather than leaving it implied. Leave parsing and formatting to the next phase so this one stays a coherent unit of work.",
+      "accept": [
+        "a Redblue program constructs a date from components, compares two dates, and asserts which is earlier",
+        "subtracting two dates yields a duration whose components can be read, and the arithmetic is correct across a month boundary and across a leap day - asserted on literal values",
+        "adding a duration to a date lands on the correct calendar date, including 29 February plus one year and 31 January plus one month, with the overflow rule stated in SPEC.md",
+        "a date is a first-class value: it can be stored in a record and a list, passed to and returned from a function, and printed",
+        "comparing a date against a number is refused with a catchable type error rather than silently coercing",
+        "the tree-walker and the bytecode VM agree on every operation, compared as data across both engines",
+        "SPEC.md documents the value, the overflow rules, and the timezone stance explicitly",
+        "edge_* tests cover month-end overflow in both directions, a leap year and a non-leap year, a negative duration, zero duration, and the boundary at a DST-free fixed offset"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-097",
+      "title": "Parse and format dates from text, the way time.format cannot today",
+      "severity": "major",
+      "depends_on": [
+        "phase-096"
+      ],
+      "risk": "medium",
+      "finding": "phase-096 gives Redblue a date value but no way to get one from text or print one in a chosen shape. time.format takes a Unix timestamp and a format string, and time.unix parses one fixed 'YYYY-MM-DD HH:MM:SS' layout, so a program cannot read an ISO-8601 timestamp with a zone, cannot read the format another system emits, and cannot control the output shape. Every real program that reads data from somewhere else - a log line, a CSV column, an HTTP header - needs this, and the current single hardcoded layout is the reason it cannot.",
+      "goal": "Give the date value parsing and formatting: parse ISO-8601 including an offset and fractional seconds, format to a caller-chosen layout, and convert between the date value and a Unix timestamp. Extend the existing time.unix and time.format to route through the date value rather than remaining a separate implementation, so there is one date model in the runtime rather than two that can disagree. A malformed timestamp must raise a catchable error naming the offending characters, never a panic and never a silently wrong value.",
+      "accept": [
+        "an ISO-8601 timestamp with a zone offset parses to a date value equal to the same instant expressed in UTC - asserted on literal values, not on round-tripping through the same code",
+        "formatting a date to a chosen layout produces the exact expected text, including padding and a zero-padded month against a single-digit month",
+        "the existing time.unix and time.format still return what they returned for the inputs they already handled, with the existing tests passing unmodified",
+        "a malformed timestamp raises a catchable Error::Runtime naming the position that failed to parse, and no input makes the parser panic",
+        "a timestamp with fractional seconds preserves the fraction, and one without a zone is interpreted under the stance phase-096 documented",
+        "the tree-walker and the bytecode VM parse and format identically, compared as data across both engines",
+        "SPEC.md documents the accepted layouts, including what is NOT accepted, so the limits are explicit",
+        "edge_* tests cover Feb 29 in a leap year, a leap second refused rather than accepted silently, an empty string, a date-only string, a timezone-less string, and a string with trailing garbage"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-098",
+      "title": "Add lazy iteration helpers: chain, zip, enumerate, product, groupby, lru_cache",
+      "severity": "major",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "medium",
+      "finding": "Redblue lists are values, not iterators, so every helper that is lazy in other languages is materialised here, and the ones a program actually needs are simply missing. There is no chain to join two sequences, no zip to walk two together, no enumerate to pair with an index, no product to cross two sequences, no groupby to bucket, and no memoisation at all - so a recursive function that recomputes the same subproblem has no way to avoid it. phase-077 adds sort, reverse, zip, enumerate, filter and reduce to the list surface; this phase is the functions that are not list methods, and it is scoped to avoid overlapping phase-077.",
+      "goal": "Add the iteration helpers that are not list methods: chain, zip, enumerate, product, groupby, take, skip, and an lru_cache decorator usable on a function declaration. State plainly in SPEC.md which of these are lazy and which materialise, because on a list-valued language laziness has to be spelled out rather than assumed. Memoisation must be observable - a test counts calls, not just results, because a cache that never hits looks identical to one that works until the program gets slow.",
+      "accept": [
+        "chain, zip, enumerate, product, groupby, take and skip each return correct values on empty, single-element and multi-element inputs - all three shapes per function, asserted literally",
+        "zip stops at the shorter input rather than padding with a missing value, and that rule is written in SPEC.md",
+        "groupby returns groups in first-appearance order and groups keys by equality, asserted on a literal expected grouping",
+        "an lru_cache-decorated recursive function is asserted to make fewer calls than the uncached version - the test counts calls, so a cache that never hits fails",
+        "the cache evicts at its stated capacity and the test proves eviction by asserting the call count rises again after the bound is passed",
+        "SPEC.md says for each helper whether it is lazy or materialising, and a test asserts that statement is not stale",
+        "the tree-walker and the bytecode VM produce equal values for each helper, compared as data across both engines",
+        "this phase does not re-add sort, reverse, zip or enumerate to the list surface - if phase-077 already added one of them, this phase extends it rather than defining a second spelling, and REPORT.md says which case applied"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-099",
+      "title": "Add the collection types programs keep rebuilding: Counter, defaultdict, deque, namedtuple",
+      "severity": "major",
+      "depends_on": [
+        "phase-098"
+      ],
+      "risk": "medium",
+      "finding": "There is no counting-with-defaults structure, so the most common data-shaping idiom in the language is a hand-written loop every time. Counting occurrences means either a nested scan over the list for each element, which is quadratic, or a record built with repeated existence checks. Absent-key behaviour is the sharp edge: a record read of a missing key does not behave the way a defaultdict does, and there is no way to say 'give me a zero here'. And there is no double-ended queue, so a work queue written with list.shift is quadratic if shift removes from the front.",
+      "goal": "Add Counter for counting occurrences with a documented missing-key value, defaultdict with a documented factory, a deque for O(1) push and pop at both ends, and a way to build a record with named fields that reports a missing field by name. Decide what happens when a Counter or defaultdict entry is read that was never set, and pin it in a test rather than leaving it to the default. Check what list.shift actually costs today and say so in REPORT.md, because a deque is only worth adding if shift is genuinely quadratic.",
+      "accept": [
+        "Counter counts occurrences of mixed value types and returns the documented value for a key never seen - asserted literally, not as Ok(_)",
+        "Counter's most_common returns keys ordered by count and the ordering is stable for equal counts, asserted on a literal expected ordering",
+        "defaultdict creates an entry through its factory on first read and returns the same factory value thereafter",
+        "deque pushes and pops at both ends, and a test asserts the O(1) claim by timing a large push/pop against a list-based equivalent rather than asserting a comment",
+        "the named-record form reports a missing field by name in a catchable error",
+        "SPEC.md documents the missing-key behaviour of each new collection explicitly",
+        "the tree-walker and the bytecode VM behave identically, compared as data across both engines",
+        "REPORT.md records the measured cost of list.shift today, so the deque's value is evidenced rather than assumed",
+        "edge_* tests cover an empty collection, a single entry, mixed key types, and a Counter over an empty list"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-100",
+      "title": "Add path handling so programs stop concatenating separators by hand",
+      "severity": "major",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "medium",
+      "finding": "Every program that touches the filesystem builds paths by string concatenation, and Redblue offers nothing to help. src/stdlib.rs exposes files.read, files.write, files.append, files.exists, files.lines, files.delete, files.copy and files.rename - all of which take a string path, and none of which understands a directory. There is no join, no parent, no filename, no extension, no directory listing and no notion of a working directory. So `a + \"/\" + b` appears in every script, breaks on Windows where the separator is not `/`, and there is no way to walk a tree. Phase-050 already had to fix a Windows backslash path bug of exactly this shape in tests/stdlib_module_docs_test.rs.",
+      "goal": "Add a path value with join, parent, filename, stem, extension, is_absolute, resolve and a directory listing, and route the files module's existing functions through it so they accept a path value as well as a string without breaking a single existing call. Separators must come from the platform rather than being hardcoded, and the tests must prove it rather than assume it - a test that only runs on Linux cannot catch a Windows separator bug. Keep the string form working, because the corpus and every existing program use it.",
+      "accept": [
+        "join, parent, filename, stem, extension and is_absolute each return the correct value for relative and absolute inputs, asserted literally",
+        "the separator is taken from the platform and a test asserts the Windows and POSIX results differ in exactly the way the platform does - a test that cannot distinguish them fails",
+        "a path value is accepted by files.read, files.write and files.exists, and every existing corpus program and test still passes unmodified",
+        "a directory listing returns entries sorted, so the result is deterministic, and an empty directory returns an empty list rather than an error",
+        "joining an absolute path onto a relative one has a documented rule that SPEC.md states and a test pins",
+        "parent of a root path and filename of a trailing-slash path are documented edge cases with their answers asserted",
+        "the tree-walker and the bytecode VM agree, compared as data across both engines",
+        "edge_* tests cover a trailing separator, a double separator, a dot-segment, a path with spaces and a non-ASCII filename"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-101",
+      "title": "Add the text utilities that formatting and diffing need",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "low",
+      "finding": "Redblue has text.uppercase, lowercase, trim, split, join, contains, starts_with, ends_with and replace, and nothing else. There is no wrapping to a width, no unified diff, no indentation-aware dedent, no template substitution, no padding or alignment, and no word handling - so wrapping text to a column, showing what changed between two files, and generating a file from a template are all written by hand in every project that needs them. These are boring, self-contained, and have no dependency on anything else in the backlog.",
+      "goal": "Add wrapping to a width, unified diff between two texts, dedent, a small template substitution with literal-text delimiters chosen so they cannot collide with ordinary prose, and fixed-width padding and alignment. Choose one way to spell each operation and document it in SPEC.md. Diff output must be well-formed unified diff, because the point of producing it is that other tools can read it - a diff only Redblue understands is not useful.",
+      "accept": [
+        "wrap produces lines within the width and does not break a word unless the word alone exceeds the width - both cases asserted literally",
+        "diff on identical texts is empty and diff on texts differing in one line produces a unified diff containing that line as a change, asserted on the exact output",
+        "diff parses back through a standard unified-diff reader, so the output is genuinely standard rather than Redblue-shaped",
+        "dedent removes common leading whitespace and leaves a line with no common prefix alone",
+        "the template substitutes a placeholder, escapes a literal delimiter, and reports an unknown placeholder by name in a catchable error",
+        "pad and align produce exact column widths including with non-ASCII content, where character count and byte count differ",
+        "the tree-walker and the bytecode VM agree, compared as data across both engines",
+        "edge_* tests cover empty text, single-line text, text with no trailing newline, CRLF input, and a line longer than the wrap width"
+      ],
+      "timeout_min": 150,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-102",
+      "title": "Let a Redblue program parse its own command line",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "low",
+      "finding": "sys exposes argv, so a script can read its arguments as a raw list of strings, and that is the whole of it. Every command-line program therefore hand-rolls the same loop: find the flag, check the next element exists, convert it, complain if it does not, and print usage text that drifts from what the code actually accepts. A flag typed wrongly is either silently ignored or crashes with an unrelated message, which is the worst possible behaviour for a tool and the first thing a beginner writing a script will hit.",
+      "goal": "Add a way to declare flags with a name, a type, whether it takes a value, a default, and requiredness, then parse sys.argv against that declaration into a record. Generate the usage text from the same declaration so help cannot drift from behaviour. An unknown flag, a missing required flag, and a value of the wrong type must each raise a catchable error naming the flag and what was expected, and a --help request must print usage and exit successfully without running the program.",
+      "accept": [
+        "a declared string flag, a declared numeric flag and a boolean flag each parse to the right value in a record",
+        "a default is applied when the flag is absent, and a required flag that is absent raises a catchable error naming the flag",
+        "an unknown flag is refused rather than ignored, and the error names it",
+        "a flag given a value of the wrong type is refused with an error naming the flag and the expected type",
+        "--help prints usage and exits successfully without running the program body - asserted by a program whose body would fail loudly if it ran",
+        "the usage text is generated from the declaration: a test that adds a flag to the declaration sees it in the help output, so help cannot drift",
+        "phase-100's path handling is used if a flag is declared as a path, rather than re-implementing path joining here",
+        "edge_* tests cover a repeated flag, a flag after a positional argument, an empty string as a value, an equals-form --flag=value, and no arguments at all"
+      ],
+      "timeout_min": 150,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-103",
+      "title": "Add structured logging so programs stop printing to stdout",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "low",
+      "finding": "A program that wants to record what it did has say and console.log and nothing else. There is no level, no destination other than the console, no timestamp attached to a log line, and no way to turn logging off. So a library cannot log without polluting the output of the program using it, and a program that wants diagnostics has to print them where its real output goes - which means a user cannot silence them without editing the source. This is why every Redblue program that has ever needed diagnostics has used a conditional and hoped for the best.",
+      "goal": "Add a logging facility with levels, a settable threshold, a settable destination, and a timestamp on each record, so a library can log without speaking to stdout. Make the default level quiet enough that adding a log call cannot change a program's observable output, since a library that changes its caller's output is a defect. Decide whether timestamps make records non-deterministic, and if so keep them out of anything a test would compare - the corpus compares output literally, so a timestamp in the default path would break it.",
+      "accept": [
+        "a record at or above the threshold is emitted and one below it is not, asserted by capturing the destination, for every adjacent pair of levels",
+        "the default level emits nothing, so adding a log call to a library cannot change a program's observable output - asserted by a corpus-style golden comparison",
+        "the destination is settable to a file and a record written there is readable back with the level and message intact",
+        "a timestamp is present on each record and a test proves a deterministic mode exists that omits it, so corpus goldens stay stable",
+        "logging to a closed or unwritable destination raises a catchable error rather than aborting the program",
+        "the tree-walker and the bytecode VM emit equal records, compared as data across both engines",
+        "SPEC.md documents the levels, the default, and the determinism stance",
+        "edge_* tests cover the threshold at its extremes, a record with an empty message, a multi-line message, and concurrent-ish interleaved writes from nested calls"
+      ],
+      "timeout_min": 150,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-104",
+      "title": "Expose the encoding and hashing utilities programs assume exist",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "low",
+      "finding": "Redblue can read bytes and there is a bytes module, but there is no base64, no hex, no hashing and no uuid. So a program cannot encode a binary payload for transport, cannot render bytes for a log or a protocol, cannot hash content to detect a change or address a cache, and cannot generate an identifier. Every one of these is a few lines over a crate that is already a dependency of most Rust projects, and every one is currently hand-rolled or unavailable. Hashing in particular is not something to hand-roll, and the language inviting people to hand-roll it is a real hazard.",
+      "goal": "Add hex, base64 (encode and decode), a hash function set, and uuid generation, each wrapping the appropriate Rust crate rather than implementing the algorithm in Redblue. Make decoding strict: invalid base64 or invalid hex must raise a catchable error naming the offending position, because a decoder that silently skips bad input is how corrupt data reaches a program unnoticed. Keep the existing bytes module working unchanged.",
+      "accept": [
+        "hex and base64 round-trip binary data including all 256 byte values, asserted on bytes rather than on a string",
+        "base64 encodes with correct padding and decodes both padded and unpadded input, asserted on literal expected text",
+        "an invalid hex or base64 string raises a catchable error naming the position, and no input is silently skipped",
+        "a hash of the same content is equal and a hash of different content differs, asserted across a set of literal inputs with expected digests written out rather than computed by the implementation under test",
+        "uuid generates a value that parses back to itself and two successive values differ",
+        "the existing bytes module passes its tests unmodified",
+        "SPEC.md documents each function and whether it raises or returns a sentinel on bad input",
+        "edge_* tests cover empty input, a single byte, input with whitespace, a string of the wrong length for hex, and a UUID at the extremes of its formatting"
+      ],
+      "timeout_min": 150,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-105",
+      "title": "Round out data formats: a CSV writer, line-delimited JSON, TOML, and archives",
+      "severity": "major",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "medium",
+      "finding": "Formats has json.parse, json.stringify and csv.parse, so Redblue can read CSV but cannot write it, and can read JSON but not line-delimited JSON, TOML or any archive. A program that reads a CSV and writes a CSV - the single most common data task there is - cannot finish the job. A program cannot read a config file in TOML, cannot append records to a JSON-lines file, and cannot open a zip. The asymmetry is worse than a plain gap: the read side exists, so the gap looks smaller than it is until someone tries to produce output.",
+      "goal": "Add a CSV writer that quotes correctly - including embedded commas, quotes and newlines, which is where naive writers break - plus line-delimited JSON, a TOML reader, and archive reading and writing for zip and tar. Get the quoting rules right and pin them with tests that round-trip through the existing csv.parse, so a value written can be read back by the reader already in the tree. Configuration parsing is a separate concern from data serialisation and should not be conflated with it.",
+      "accept": [
+        "a CSV writer emits correct quoting for a field containing a comma, a quote, a newline, and leading and trailing spaces - each asserted on literal expected text",
+        "every value written by the new writer is read back identically by the existing csv.parse, so the two halves cannot disagree",
+        "line-delimited JSON round-trips a list of records, one per line, and a record containing a newline is escaped rather than breaking the format",
+        "the TOML reader parses the documented subset and raises a catchable error naming the line for a malformed file",
+        "a zip and a tar can be written and read back with the same file list and contents, asserted on the extracted bytes",
+        "an unsupported compression method is refused by name rather than failing obscurely",
+        "SPEC.md documents the TOML subset explicitly, including what is not supported",
+        "edge_* tests cover an empty file, a header-only file, a field that is only whitespace, a BOM, and a very long field"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-106",
+      "title": "Add matrix and tensor values bound to Rust crates, the numpy way",
+      "severity": "major",
+      "depends_on": [
+        "phase-095"
+      ],
+      "risk": "high",
+      "finding": "There is no numeric container at all, so numeric work means nested lists and nested loops in Redblue code, which is both unreadable and slow enough to be unusable. This is the phase that answers 'can Redblue have PyTorch' honestly: it cannot, written in Redblue, because tensor and autograd work is fast only when native - that is exactly why numpy and PyTorch are C/C++ and not Python. An interpreted Redblue is slower than Python, so the answer is a binding, the same answer Python reached. Redblue already binds crates this way: network.get wraps reqwest and files.read wraps std::fs.",
+      "goal": "Add a numeric array value backed by a Rust linear-algebra crate, with elementwise operations, matrix multiply, reductions, shape, and indexing, all as bindings rather than as Redblue implementations. Follow the binding policy in LIBRARIES.md. Document the type promotion rules explicitly, because a multiply that silently truncates an integer is the kind of defect that is invisible until it is expensive. Scope this phase to a dense array and its arithmetic; autograd, GPU and anything else is a separate decision that should not be smuggled in here.",
+      "accept": [
+        "a Redblue program builds an array, multiplies two matrices, and asserts the result against literal expected numbers written out by hand",
+        "elementwise operations and reductions assert literal values on a known input, not values recomputed by the same code path",
+        "shape mismatches are refused with a catchable error naming both shapes, and no operation silently broadcasts",
+        "integer and floating operations follow a documented promotion rule, and a test asserts the documented rule on a mixed-type case",
+        "an empty array and a zero-dimension operation are defined and asserted rather than undefined behaviour",
+        "the tree-walker and the bytecode VM produce equal results, compared as data across both engines",
+        "SPEC.md documents the promotion rules and the operations, and states plainly that this is a binding to a crate and not Redblue-native",
+        "REPORT.md records the measured cost of the bound operations against the equivalent nested-list Redblue code, so the binding's value is evidenced",
+        "edge_* tests cover a 0x0 matrix, a rank mismatch, a non-square multiply, a very large value that loses precision in f64, and integer overflow in a sum"
+      ],
+      "timeout_min": 240,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-107",
+      "title": "Add statistics and exact decimal arithmetic",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "medium",
+      "finding": "math has abs, floor, ceil, round, sqrt, pow, sin, cos, tan, log and exp, and no descriptive statistics at all - no mean, median, mode, standard deviation, percentile or correlation. So a program holding a list of numbers cannot summarise it without writing the arithmetic itself, which is exactly the code that gets subtly wrong and never gets tested. Separately, every number in Redblue is an f64 (src/value.rs:250, Number(f64)), with integers held exactly only to 2^53 (src/value.rs:109), so money cannot be added up safely - and floating-point money is a defect waiting for a user's invoice.",
+      "goal": "Add descriptive statistics over a list of numbers, and a decimal type for exact arithmetic. The decimal work is the more important half: f64 money is a correctness bug, not a missing feature, and the fix is a type that keeps money exact rather than a function that rounds. Specify how a decimal interacts with an f64 - the conversion is lossy and the language must say so rather than let it happen quietly. Document the 2^53 integer limit prominently while doing it, since that limit is currently easy to trip and hard to discover.",
+      "accept": [
+        "mean, median, mode, variance and standard deviation assert literal expected values on a known list, computed by hand in the test rather than by calling the implementation",
+        "median of an even-length list is the documented interpolation, and of an empty list is the documented error - both asserted",
+        "mode returns all tied modes in a documented order, asserted",
+        "a percentile asserts a literal expected value and the interpolation rule is written in SPEC.md",
+        "decimal arithmetic is exact: a sum that is not representable in f64 asserts the exact decimal result, which is the case that proves the type exists",
+        "mixing a decimal with an f64 follows a documented rule, and a test asserts that rule - including that the loss is visible rather than silent",
+        "the 2^53 integer limit is documented in SPEC.md and a test asserts the boundary: values below it are exact and the first value above it is not",
+        "the tree-walker and the bytecode VM agree, compared as data across both engines",
+        "edge_* tests cover an empty list, a single element, negative values, a very large magnitude, and division that does not terminate"
+      ],
+      "timeout_min": 180,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-108",
+      "title": "Separate the package version from the language version",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "low",
+      "finding": "src/manifest.rs already resolves semver ranges and pins a lockfile, so the package machinery works, but nothing states whether a package version is independent of the Redblue version that resolves it. Left unstated, every future package will encode the language version somewhere - in its version number, in a required-version field, or in a comment - and the first time Redblue makes a backwards-incompatible change, packages will not know which language they need. This is the cheapest possible fix and the most expensive possible time to fix it.",
+      "goal": "Decide and document the relationship: package versions are independent of language versions, and a package declares the range of language versions it supports rather than mirroring them. Make the manifest able to carry and enforce that range, so a package declaring incompatibility is refused at resolution time with a message naming both versions. Fix any existing fixture or test that encoded the opposite assumption. This is a specification and validation change, not a re-architecture.",
+      "accept": [
+        "SPEC.md states that package versions are independent of language versions and gives the reasoning",
+        "a package manifest can declare a supported language version range, and resolution refuses an out-of-range combination with a catchable error naming both versions",
+        "a package inside its declared range resolves, asserted on a fixture",
+        "a boundary case at each end of the declared range is asserted, so the comparison is not off by one",
+        "every existing manifest test still passes, or is updated with its reason recorded in REPORT.md - no test is deleted to make this fit",
+        "src/manifest.rs:526's dependency-depth rule still holds and its test is unmodified",
+        "REPORT.md lists anything that previously conflated the two versions, with what changed for it"
+      ],
+      "timeout_min": 120,
+      "must_touch": [
+        "src/"
+      ]
+    },
+    {
+      "id": "phase-109",
+      "title": "Research whether a native backend for Redblue is feasible, and report",
+      "severity": "minor",
+      "depends_on": [
+        "phase-090"
+      ],
+      "risk": "low",
+      "finding": "Every performance question about Redblue has the same unexamined premise: that Redblue programs are interpreted and will stay that way. A tree-walking interpreter is slower than Python, so Redblue cannot honestly compete on speed, and LIBRARIES.md says so. The premise has never been examined. Redblue already has the pieces that make it plausible - a bytecode VM, a chunk format with a version, an assembler-facing rb dis command, and a compiler that already emits bytecode - so it has an intermediate representation and does not start from nothing. It has also never been stated whether the next step is a real one.",
+      "goal": "Produce NATIVE.md: a feasibility study, not an implementation. Cover what a native backend would require given what already exists, what the largest obstacles actually are, what LLVM and Cranelift would each cost in dependencies and build time, how the existing .rbc version and dis output would be affected, and what the honest expected speedup would be. Give a recommendation - build it, defer it, or decline it - with the reasoning that produced it. Include a short list of what would have to be true for the recommendation to be wrong, so a future reader can check rather than re-derive. Implement nothing and add no dependency.",
+      "accept": [
+        "NATIVE.md exists and makes a clear recommendation - build, defer, or decline - rather than listing options without choosing",
+        "the study names the existing components a backend would build on, each cited to a file and line, and says which are reusable and which are not",
+        "the obstacles are specific and each is stated as a cost, not as a concern",
+        "adding no crate to Cargo.toml is asserted by the diff, and REPORT.md says so",
+        "the expected speedup is given as a range with the reasoning that bounds it, not a single optimistic number",
+        "the document lists what would have to be true for the recommendation to be wrong",
+        "the document states what a native backend would unlock and what it would still not fix, so it is not read as solving everything",
+        "REPORT.md notes that no OS or GPU work is authorised by this phase - the finding asks a question, and the answer is not a mandate"
+      ],
+      "timeout_min": 90,
+      "must_touch": [
+        "src/"
+      ]
     }
   ]
 }
