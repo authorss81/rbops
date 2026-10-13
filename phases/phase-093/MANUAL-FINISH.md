@@ -27,8 +27,11 @@ that keeps both would double the cost on every branch push.
 
 ## Standing gaps
 
-- `cargo fmt --check` is **absent from CI** — the tree is not fmt-clean, so adding
-  it turns every build permanently red. Worth its own phase.
+- `cargo fmt --check` is **now in CI.** It was briefly recorded here as absent
+  because the tree was believed to be unformatted. That was wrong: the check had
+  never run (no Rust on the local PATH, `cargo: command not found`, shell exit 0
+  misread as "clean"). Verified with a real toolchain — the tree was always
+  fmt-clean — and the check has been added.
 - The `result` gate has only ever run with every job green; the branch that
   actually fails the workflow has never executed.
 

@@ -62,15 +62,27 @@ This is worth being careful about on the retry:
    fmt-clean, that check will fail for a reason that has nothing to do with this
    phase — and the honest response is to say so in REPORT.md, not to make the
    reformat look like part of the change.
-3. **The tree is currently not fmt-clean** (verified while closing phase-092).
-   So this is a live trap, not a hypothetical one. See the open question at the
-   bottom of `phases/phase-093/REPORT.md` in redblue.
+3. **The tree is fmt-clean** — verified with `cargo 1.98.1`, `cargo fmt --all --
+   --check` exits 0. (An earlier version of this file said the opposite and
+   called it a live trap. That was wrong: the check had never run, because the
+   environment had no Rust on its PATH and the shell reported exit 0 on
+   `cargo: command not found`, which was misread as "clean".) So the reformat
+   attempt 1 produced was reformatting already-correct code — most likely a
+   stale or mis-scoped invocation rather than a real fix.
 
-## Open question this phase may need to answer
+## What attempt 1's reformat therefore means
 
-Redblue's `cargo fmt --check` gate fails today because the tree is not
-fmt-clean. Nobody owns fixing that. If attempt 1's reformat was the *only*
-thing standing between the tree and a clean `cargo fmt --check`, that is worth
-recording in REPORT.md — and possibly worth a FINDINGS entry for a dedicated
-formatting phase, rather than having the formatting land invisibly inside an
-unrelated colour-system change.
+If `cargo fmt --check` passes on the tree this phase branched from, then the
+diff attempt 1 produced against `src/repl/mod.rs` did not fix a formatting
+defect. Either:
+
+- the formatter was pointed at the wrong path, or
+- it ran against a working tree that already differed from the committed state,
+  or
+- the reflow came from a `rustfmt` version difference between the runner and
+  whatever produced those lines originally.
+
+**Do not land that reflow as part of this phase.** `cargo fmt --check` passes
+without it, so it is not required by the gate, and it is not this phase's work.
+If the retry genuinely needs it, that is a finding of its own with its own
+justification — not a drive-by reformat inside a colour-system diff.
