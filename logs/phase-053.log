@@ -1,0 +1,3696 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m$ [0mgrep -rn $'\x1b\[' src/ --include=*.rs | head -50
+(no output)
+[0m
+[0m$ [0mls src/repl/ && ls phases/ | tail -20
+commands.rs
+completer.rs
+editor.rs
+history.rs
+mod.rs
+phase-034
+phase-035
+phase-036
+phase-037
+phase-038
+phase-039
+phase-040
+phase-041
+phase-042
+phase-043
+phase-044
+phase-045
+phase-046
+phase-047
+phase-048
+phase-049
+phase-050
+phase-052
+phase-092
+phase-093
+[0m
+[0m$ [0mgrep -rn 'x1[bB]' src/ --include=*.rs; echo "---NO_COLOR---"; grep -rn 'NO_COLOR\|isatty\|IsTerminal\|COLORTERM\|TERM' src/ --include=*.rs
+src/runtime.rs:1115:            crate::wasm::emit("\x1B[2J\x1B[1H");
+src/testing/reporter.rs:42:                "red" => format!("\x1B[31m{}\x1B[0m", text),
+src/testing/reporter.rs:43:                "green" => format!("\x1B[32m{}\x1B[0m", text),
+src/testing/reporter.rs:44:                "yellow" => format!("\x1B[33m{}\x1B[0m", text),
+src/testing/reporter.rs:45:                "blue" => format!("\x1B[34m{}\x1B[0m", text),
+src/testing/reporter.rs:46:                "bold" => format!("\x1B[1m{}\x1B[0m", text),
+src/repl/mod.rs:379:                print!("\x1B[2J\x1B[H");
+---NO_COLOR---
+src/repl/editor.rs:17:use std::io::{self, IsTerminal, Write};
+[0m
+[0m$ [0mwc -l src/repl/*.rs && git log --oneline -5
+758 src/repl/commands.rs
+   506 src/repl/completer.rs
+   633 src/repl/editor.rs
+   433 src/repl/history.rs
+  2226 src/repl/mod.rs
+  4556 total
+4672f75 Record phase 092 and 093 by hand, with the measured result and the part left undone
+589d8ca ci: fix a workflow expression that made the whole build unparseable
+d1380a4 ci: shard the test suite so a phase is not gated on one target
+57aea5e rbops: phase-052 (2026-10-13T05:59:57Z)
+d410ea8 REPL module completion reads the language's own module table
+[0m
+[0m$ [0msed -n '1,120p' src/repl/mod.rs
+pub mod commands;
+pub mod completer;
+pub mod editor;
+pub mod history;
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::rc::Rc;
+
+pub use commands::ReplCommand;
+pub use completer::ReplCompleter;
+pub use editor::{Line, LineSource, SessionNames};
+pub use history::ReplHistory;
+
+use crate::analyzer;
+use crate::debugger::{lock, DebugAction, DebugSession, SharedDebugSession, StepMode};
+use crate::interpreter::Vm;
+use crate::lexer::Lexer;
+use crate::parser::{open_block_depth, Parser, Program};
+use crate::value::Value;
+
+/// How many lines a session keeps before the oldest is dropped. A terminal
+/// scrollback holds far more, so a session that outgrows this has already lost
+/// anything the user would go looking for.
+const HISTORY_LIMIT: usize = 1000;
+
+/// The most lines a block may hold before the session stops waiting for its
+/// `end`.
+///
+/// Nobody types five hundred lines into one block by accident, and a piped block
+/// that is never closed — `printf 'repeat 3 times\n' | rb`, or a generator that
+/// forgot its `end` — buffered without limit until the process ran out of memory.
+/// Past this the session says the block is incomplete and starts over, which is
+/// what the user would have to do by hand anyway.
+const MAX_BLOCK_LINES: usize = 500;
+
+/// The most bytes a block may hold, for the same reason and for the same inputs:
+/// a block of a few very long lines gets nowhere near [`MAX_BLOCK_LINES`] and can
+/// still be enormous.
+const MAX_BLOCK_BYTES: usize = 64 * 1024;
+
+/// How many lines of an unclosed block are echoed back when the session ends or
+/// gives up. The rest are counted and reported, so the report itself cannot be
+/// the thing that floods a terminal.
+const BLOCK_REPORT_LINES: usize = 20;
+
+/// The prompt a program stopped by the debugger waits at.
+///
+/// Distinct from `>>> ` and `..  ` because it is asked by a running program
+/// rather than typed at, and a session has to be able to tell the three apart.
+const DEBUG_PROMPT: &str = "(rb-debug) ";
+
+/// The answers a debugger prompt takes, and what each one asks the VM to do.
+///
+/// Read in [`debug_stop`]. Every word is also reachable with a sigil, because
+/// the same words are the REPL's `:continue`, `:step` and `:next` and a user who
+/// has learned one should not have to unlearn it in the other place.
+fn debug_answer(input: &str) -> Option<DebugAction> {
+    let word = input
+        .trim()
+        .trim_start_matches([':', '.'])
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match word.as_str() {
+        "c" | "continue" | "r" | "run" | "q" | "quit" | "detach" => Some(DebugAction::Run),
+        "s" | "step" | "into" => Some(DebugAction::Step(StepMode::Into)),
+        "n" | "next" | "over" => Some(DebugAction::Step(StepMode::Over)),
+        _ => None,
+    }
+}
+
+/// Whether `input` at a debugger prompt asked to be shown the frame again.
+fn debug_asks_for_frame(input: &str) -> bool {
+    let word = input
+        .trim()
+        .trim_start_matches([':', '.'])
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(word.as_str(), "f" | "frame" | "where" | "bt" | "backtrace")
+}
+
+/// The interactive half of a stop: print where the program is, then read what to
+/// do about it.
+///
+/// This is the one place a running Redblue program reads the terminal, and it is
+/// here rather than anywhere in the interpreter so that the VM never learns that
+/// a terminal exists. Two reads end the wait rather than spinning on it: end of
+/// input, which is what a piped session runs into, and a terminal that has gone
+/// away. A debugger that kept asking a closed pipe for answers would hang the
+/// very sessions it is meant to be able to watch.
+fn debug_stop(report: &[String]) -> DebugAction {
+    for line in report {
+        println!("{}", line);
+    }
+    loop {
+        print!("{}", DEBUG_PROMPT);
+        if io::stdout().flush().is_err() {
+            return DebugAction::Run;
+        }
+        let mut input = String::new();
+        match io::stdin().read_line(&mut input) {
+            Ok(0) | Err(_) => {
+                println!();
+                return DebugAction::Run;
+            }
+            Ok(_) => {}
+        }
+        if debug_asks_for_frame(&input) {
+            for line in report {
+                println!("{}", line);
+            }
+            continue;
+        }
+        if let Some(action) = debug_answer(&input) {
+            return action;
+[0m
+Finding reproduces. No color module, no `NO_COLOR`/`TERM` gating, no theme.
+[0m$ [0msed -n '120,260p' src/repl/mod.rs
+return action;
+        }
+        if input.trim().is_empty() {
+            continue;
+        }
+        println!(
+            "Expected c (continue), s (step into), n (step over) or f (frame). \
+             A line with none of those is not a debugger answer."
+        );
+    }
+}
+
+/// Reads the line number a `:break` or `:delete` was given, or says why it is
+/// not one.
+///
+/// Nothing is guessed. An argument that does not parse is reported rather than
+/// read as line `0`, and `0` is refused rather than clamped up to `1`: a
+/// breakpoint on a line the program never has is a debugger that appears to
+/// ignore the user, which is worse than one that says the line is wrong.
+fn line_number(argument: &str) -> Result<usize, String> {
+    let trimmed = argument.trim();
+    let line: usize = trimmed
+        .parse()
+        .map_err(|_| format!("'{trimmed}' is not a line number"))?;
+    if line == 0 {
+        return Err("lines are counted from 1, so there is no line 0".to_string());
+    }
+    Ok(line)
+}
+
+/// The snippets `:help` prints under "Quick Reference", each one a complete
+/// program the session has run.
+///
+/// Kept as source rather than as a hand-written sentence so the help cannot
+/// promise something the interpreter does not do: `if x > 5 then` was printed for
+/// years and is not Redblue, and `say "Hello, {{name}}!"` promised an
+/// interpolation `say` does not perform.
+const QUICK_REFERENCE: &[(&str, &str)] = &[
+    ("Variable", "set x to 10"),
+    ("Print", r#"say "Hello""#),
+    ("Condition", "if x is greater than 5 then say \"big\" end"),
+    ("Loop", "for each i from 1 to 3\n    say i\nend"),
+];
+
+/// The code `:example` shows: a caption, the program, and the text that program
+/// prints.
+///
+/// Every entry has run in this session before it is printed here — the test at
+/// the bottom of this module analyzes each source and asserts it is accepted —
+/// so an example cannot promise a feature the interpreter does not have. The old
+/// examples promised string interpolation: `say "Hello, {{name}}!"` printed
+/// `Hello, {{name}}!`.
+const EXAMPLES: &[(&str, &str)] = &[
+    ("// Variables", "set name to \"World\"\nsay name"),
+    (
+        "// Print",
+        "set name to \"World\"\nsay \"Hello, \" + name + \"!\"",
+    ),
+    ("// Math", "set x to (10 + 5) * 2\nsay x"),
+    (
+        "// Conditionals",
+        "set age to 30\nif age is greater than 18 then\n    say \"Adult\"\nelse\n    say \"Minor\"\nend",
+    ),
+    (
+        "// Loops",
+        "repeat 3 times\n    say \"Hello!\"\nend",
+    ),
+    (
+        "// Functions",
+        "to greet(who)\n    say \"Hello, \" + who + \"!\"\nend\ngreet(\"World\")",
+    ),
+];
+
+/// Why a session's read loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// `:quit`. The user asked for it.
+    Quit,
+    /// Ctrl-D on an empty line, or input that ran out.
+    Eof,
+    /// The line source could not read. Not a quit: the session did not stop
+    /// because it was told to.
+    InputError,
+}
+
+/// What a session says as it ends.
+///
+/// Every ending says the same thing, and has since the REPL existed — the
+/// differences are why a session ended, which the user just saw happen. Kept as
+/// a function of the ending so that is a thing a test can pin rather than a
+/// `println!` nothing can observe.
+fn farewell(end: SessionEnd) -> &'static str {
+    match end {
+        SessionEnd::Quit | SessionEnd::Eof | SessionEnd::InputError => "Goodbye!",
+    }
+}
+
+pub struct Repl {
+    vm: Vm,
+    variables: HashMap<String, Value>,
+    history: ReplHistory,
+    completer: ReplCompleter,
+    running: bool,
+    multiline_buffer: Vec<String>,
+    in_multiline: bool,
+    /// The debugging session: its breakpoints, its pending step, and the frame
+    /// the last program stopped in. Shared with the hook the VM calls, so a
+    /// `:frame` typed after the program has run reads the frame that stop left.
+    debug: SharedDebugSession,
+}
+
+impl Repl {
+    pub fn new() -> Self {
+        Self {
+            vm: Vm::new(),
+            variables: HashMap::new(),
+            history: ReplHistory::new(HISTORY_LIMIT),
+            completer: ReplCompleter::new(),
+            running: true,
+            multiline_buffer: Vec::new(),
+            in_multiline: false,
+            debug: DebugSession::shared(),
+        }
+    }
+
+    /// Completes `word` against the session: the language's own keywords and
+    /// builtins, the REPL's commands, and every name this session has bound.
+    pub fn complete(&self, word: &str) -> Vec<String> {
+        self.completer.complete_with(word, &self.session_names())
+    }
+
+    /// Every name a completion could offer from the live session: the REPL's own
+    /// variables, plus the VM's own bindings, which is where a `to` function and
+    /// an `import`ed module's own `set` and `constant` declarations live.
+    ///
+    /// The `module_member` names a module's functions are published under are not
+    /// here — see [`Vm::user_names`]. `MathUtils.circle_area` is what a program
+    /// writes, and `MathUtils_circle_area` is only how the VM reaches it.
+    fn session_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.variables.keys().cloned().collect();
+        names.extend(self.vm.user_names());
+[0m
+[0m$ [0msed -n '260,470p' src/repl/mod.rs
+names.extend(self.vm.user_names());
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Whether `code` is a program the user has not finished typing, and so wants
+    /// the session to read another line before running anything.
+    ///
+    /// The question is asked of the tokens rather than of the last word of the
+    /// line. Matching the last word got both directions wrong: `repeat 3 times`
+    /// ends in `times` and `for each i from 1 to 10` ends in `10`, so real blocks
+    /// were run half-written, while a stray `end` matched and captured every line
+    /// after it.
+    ///
+    /// A line the lexer cannot read is treated as finished. It is a line the user
+    /// is going to retype, and waiting for an `end` that will never balance it
+    /// would hang the session on it.
+    fn needs_continuation(code: &str) -> bool {
+        match Lexer::tokenize(code) {
+            Ok(tokens) => open_block_depth(&tokens) > 0,
+            Err(_) => false,
+        }
+    }
+
+    pub fn run(&mut self) {
+        println!("Welcome to Redblue v0.1.0 - Interactive REPL");
+        println!("Type 'help' for commands, 'quit' to exit\n");
+
+        let names: SessionNames = Rc::new(RefCell::new(Vec::new()));
+        let mut source = editor::line_source(Rc::clone(&names));
+        self.restore_history(&*source);
+        let end = self.session_loop(&mut *source, &names);
+        if let Err(error) = source.flush_history() {
+            eprintln!("Warning: could not save history: {}", error);
+        }
+
+        println!("{}", farewell(end));
+    }
+
+    /// Reads back what a previous session left behind, so `:history` answers
+    /// about the lines this one can actually walk back to.
+    ///
+    /// The lines come from the line source rather than from re-reading its file:
+    /// the editor's history file is *its* format, and reading it as one line per
+    /// entry would put its version header in front of the user as if they had
+    /// typed it.
+    fn restore_history(&mut self, source: &dyn LineSource) {
+        for line in source.history() {
+            self.history.push(line);
+        }
+    }
+
+    /// The read-evaluate-print loop, over whatever is reading the lines.
+    ///
+    /// Nothing here knows about terminals: the interrupt that abandons a line,
+    /// the end of input that ends the session and the failed read that ends it
+    /// early all arrive as a [`Line`], which is what lets a test drive all three
+    /// without one.
+    pub fn session_loop<S: LineSource + ?Sized>(
+        &mut self,
+        source: &mut S,
+        names: &SessionNames,
+    ) -> SessionEnd {
+        loop {
+            if !self.running {
+                return SessionEnd::Quit;
+            }
+
+            let prompt = if self.in_multiline { "..  " } else { ">>> " };
+
+            // The editor completes against the names the session has bound, and
+            // it cannot be lent them while they are being borrowed to read a
+            // line, so it is given a snapshot refreshed here.
+            *names.borrow_mut() = self.session_names();
+
+            let line = match source.read_line(prompt) {
+                Ok(Line::Text(text)) => text,
+                // Ctrl-C throws away the line being written, not the session.
+                Ok(Line::Interrupted) => continue,
+                Ok(Line::Eof) => {
+                    self.report_unclosed_block();
+                    return SessionEnd::Eof;
+                }
+                Err(_) => return SessionEnd::InputError,
+            };
+
+            let input = line.trim();
+            if input.is_empty() {
+                continue;
+            }
+
+            self.history.push(input.to_string());
+
+            if self.handle_command(input) {
+                continue;
+            }
+
+            self.execute_line(input);
+        }
+    }
+
+    /// Runs one command line, returning whether `input` was a command rather
+    /// than Redblue source.
+    ///
+    /// The command table lives in [`ReplCommand::parse`]; this only dispatches
+    /// what it produced. Two copies of the table meant an alias added to one was
+    /// invisible to the other.
+    fn handle_command(&mut self, input: &str) -> bool {
+        match ReplCommand::parse(input) {
+            ReplCommand::Quit => {
+                self.running = false;
+                true
+            }
+            ReplCommand::Help => {
+                self.print_help();
+                true
+            }
+            ReplCommand::Clear => {
+                print!("\x1B[2J\x1B[H");
+                let _ = io::stdout().flush();
+                true
+            }
+            ReplCommand::History => {
+                for i in 0..self.history.len() {
+                    if let Some(entry) = self.history.get(i) {
+                        println!("  {:4}  {}", i + 1, entry);
+                    }
+                }
+                true
+            }
+            ReplCommand::Vars => {
+                self.print_variables();
+                true
+            }
+            ReplCommand::Functions => {
+                self.print_functions();
+                true
+            }
+            ReplCommand::Load(path) => {
+                self.load_file(&path);
+                true
+            }
+            ReplCommand::Save(path) => {
+                self.save_session(&path);
+                true
+            }
+            ReplCommand::Restore(path) => {
+                self.restore_session(&path);
+                true
+            }
+            ReplCommand::Reset => {
+                self.reset_session();
+                true
+            }
+            ReplCommand::Run(path) => {
+                self.run_file(&path);
+                true
+            }
+            ReplCommand::Debug => {
+                self.debug_mode();
+                true
+            }
+            ReplCommand::Break(line) => {
+                self.toggle_breakpoint(&line);
+                true
+            }
+            ReplCommand::Breaks => {
+                self.print_breakpoints();
+                true
+            }
+            ReplCommand::Delete(line) => {
+                self.delete_breakpoint(&line);
+                true
+            }
+            ReplCommand::Step => {
+                self.arm_step(StepMode::Into);
+                true
+            }
+            ReplCommand::Next => {
+                self.arm_step(StepMode::Over);
+                true
+            }
+            ReplCommand::Continue => {
+                self.resume();
+                true
+            }
+            ReplCommand::Frame => {
+                self.print_frame();
+                true
+            }
+            ReplCommand::Inspect(name) => {
+                self.inspect_value(&name);
+                true
+            }
+            ReplCommand::Ast(expr) => {
+                self.print_ast(&expr);
+                true
+            }
+            ReplCommand::Tokens(expr) => {
+                self.print_tokens(&expr);
+                true
+            }
+            ReplCommand::Example => {
+                self.show_examples();
+                true
+            }
+            ReplCommand::NotACommand => false,
+            ReplCommand::MissingArgument { command, usage } => {
+                println!("Usage: :{} {}", command, usage);
+                true
+[0m
+[0m$ [0msed -n '470,700p' src/repl/mod.rs
+true
+            }
+            ReplCommand::Unknown(word) => {
+                println!(
+                    "Unknown command '{}'. Type :help for available commands.",
+                    word
+                );
+                true
+            }
+        }
+    }
+
+    /// Buffers `input` and runs the buffer once it holds a whole program.
+    ///
+    /// A block the user opened and has not closed yet leaves the session in
+    /// continuation mode; the buffer is run the moment it balances, and a line
+    /// that leaves a block open is the only thing that opens continuation mode at
+    /// all. That is what makes a block work whichever of its forms the user typed
+    /// it in, and what stops a stray `end` from swallowing the rest of the
+    /// session.
+    fn execute_line(&mut self, input: &str) {
+        self.multiline_buffer.push(input.to_string());
+        let buffered = self.multiline_buffer.join("\n");
+        if Self::exceeds_block_limits(&self.multiline_buffer, buffered.len()) {
+            self.report_buffered_block_too_large();
+            return;
+        }
+        if Self::needs_continuation(&buffered) {
+            self.in_multiline = true;
+            return;
+        }
+
+        let code = std::mem::take(&mut self.multiline_buffer).join("\n");
+        self.in_multiline = false;
+        self.execute_code(&code);
+    }
+
+    /// Forgets everything the session has done: its bindings, its last result,
+    /// and any block it is halfway through typing.
+    ///
+    /// The block is the half that is easy to leave out. `:reset` used to replace
+    /// the VM and clear `variables` and nothing else, so `repeat 3 times` then
+    /// `:reset` left the session in continuation mode with that line still
+    /// buffered: the next line was appended to a block nobody was typing any
+    /// more, so `say "hi"` waited for an `end` that was never coming and never
+    /// ran. A session that has been reset is a session at a prompt, so the buffer
+    /// goes with the bindings.
+    ///
+    /// The history is left alone: it is the record of what was typed, and a reset
+    /// is not a new session in the sense that the earlier lines were never typed.
+    fn reset_session(&mut self) {
+        self.vm = Vm::new();
+        self.variables.clear();
+        self.multiline_buffer.clear();
+        self.in_multiline = false;
+        println!("REPL state reset.");
+    }
+
+    /// Whether a buffer of `bytes` over `lines` is too much for a block the user
+    /// is still typing.
+    ///
+    /// Both limits, because either alone leaves a hole: a block of a thousand
+    /// blank lines is small in bytes, and one line of a megabyte is one line.
+    fn exceeds_block_limits(lines: &[String], bytes: usize) -> bool {
+        lines.len() > MAX_BLOCK_LINES || bytes > MAX_BLOCK_BYTES
+    }
+
+    /// Gives up on a block that has outgrown what a session will hold, saying so
+    /// rather than buffering on.
+    ///
+    /// The buffer is only unbounded while `needs_continuation` stays true, which
+    /// is forever for a piped block whose `end` was never written — or never
+    /// typed, because the user walked away. Reporting is better than dying: the
+    /// user finds out which block was dropped, and the session carries on reading
+    /// the next line instead of holding the rest of the input in memory.
+    fn report_buffered_block_too_large(&mut self) {
+        let lines = self.multiline_buffer.len();
+        let bytes: usize = self
+            .multiline_buffer
+            .iter()
+            .map(|line| line.len() + 1)
+            .sum();
+        self.multiline_buffer.clear();
+        self.in_multiline = false;
+        println!(
+            "Error: incomplete block: dropping a block of {} line(s) and {} byte(s) \
+             that never balanced; a session holds at most {} lines or {} bytes.",
+            lines, bytes, MAX_BLOCK_LINES, MAX_BLOCK_BYTES
+        );
+    }
+
+    /// Reports a block the user opened and never closed, instead of dropping the
+    /// lines of it on the floor at EOF.
+    ///
+    /// Discarding the buffer made an unfinished block and a finished one look the
+    /// same from the outside: the session printed `Goodbye!` either way, so a
+    /// block that never ran was indistinguishable from one that did.
+    ///
+    /// At most [`BLOCK_REPORT_LINES`] lines are echoed. The buffer is bounded now,
+    /// so this cannot flood, but the count of what was left out is printed rather
+    /// than the rest of it — a report is not the place to be the second problem.
+    fn report_unclosed_block(&mut self) {
+        if self.multiline_buffer.is_empty() {
+            return;
+        }
+
+        let code = std::mem::take(&mut self.multiline_buffer).join("\n");
+        self.in_multiline = false;
+        let lines: Vec<&str> = code.lines().collect();
+        println!(
+            "Error: incomplete block: {} line(s) were never closed with 'end'.",
+            lines.len()
+        );
+        for line in lines.iter().take(BLOCK_REPORT_LINES) {
+            println!("  {}", line);
+        }
+        if lines.len() > BLOCK_REPORT_LINES {
+            println!(
+                "  ... and {} more line(s)",
+                lines.len() - BLOCK_REPORT_LINES
+            );
+        }
+    }
+
+    fn execute_code(&mut self, code: &str) {
+        let result = self.run_code(code);
+
+        match result {
+            Ok(value) => {
+                if !matches!(value, Value::Nothing) {
+                    println!("= {}", value);
+                    self.variables.insert("_".to_string(), value);
+                }
+            }
+            Err(e) => {
+                println!("Error: {}", e);
+            }
+        }
+    }
+
+    /// Runs one line as a program of its own, analyzed against the names the
+    /// session has already bound.
+    ///
+    /// The analyzer is seeded from the session rather than started empty, which
+    /// is the whole difference between a REPL and a program runner: the VM is
+    /// reused across lines, so a `set`, a `to` or an `import` from an earlier line
+    /// is still bound here, and without the seed the next line could not read it.
+    /// `set x to 1` then `say x` was `AnalyzerError: Unknown variable 'x'` — the
+    /// value was right there in the VM and the analyzer had never heard of the
+    /// name.
+    fn run_code(&mut self, code: &str) -> Result<Value, crate::error::Error> {
+        let tokens = Lexer::tokenize(code)?;
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse()?;
+        let bound = self.session_names();
+        analyzer::analyze_with_bound_names(&program, &bound)?;
+        self.run_program(&program, code)
+    }
+
+    /// Installs the debugger on the session's VM for the program about to run,
+    /// or takes it away again.
+    ///
+    /// The hook is installed only when the session has something to stop for — a
+    /// breakpoint, or a step armed at the prompt — so a session that never asked
+    /// to debug pays a single `is_none` branch per statement and nothing else.
+    fn arm_debugger(&mut self, source: &str) {
+        if !lock(&self.debug).active() {
+            self.vm.set_debug_hook(None);
+            return;
+        }
+        lock(&self.debug).set_source(source);
+        let session = std::sync::Arc::clone(&self.debug);
+        self.vm.set_debug_hook(Some(Box::new(move |event| {
+            let mut session = lock(&session);
+            if !session.poll(&event) {
+                return DebugAction::Run;
+            }
+            let report = session.stop_report();
+            let action = debug_stop(&report);
+            session.record_action(action);
+            action
+        })));
+    }
+
+    /// Runs `program` in this session's VM and prints what it printed.
+    ///
+    /// [`Vm::run`] prints the VM's whole output buffer at the end of a program and
+    /// leaves the buffer alone, and that buffer belongs to the VM rather than to
+    /// one line. Draining it first is what stops `say "A"` on the second line from
+    /// coming back on every line after it, which made a session's output grow with
+    /// the square of its length.
+    ///
+    /// Printing what is left on the error path is the other half: a program that
+    /// fails half way through never reaches [`Vm::run`]'s print loop, so the `say`
+    /// it had already run would otherwise be reported several lines later, by
+    /// whichever program ran next.
+    /// `source` is the text `program` was parsed from, which is what a stop shows
+    /// the user so the line they are looking at is the line they wrote. It is
+    /// the whole block the session buffered, so its line numbers are the block's
+    /// own rather than the prompt's.
+    fn run_program(
+        &mut self,
+        program: &Program,
+        source: &str,
+    ) -> Result<Value, crate::error::Error> {
+        self.arm_debugger(source);
+        self.vm.take_output();
+        let result = self.vm.run(program);
+        if result.is_err() {
+            for line in self.vm.take_output() {
+                println!("{}", line);
+            }
+        }
+        result
+    }
+
+    fn print_help(&self) {
+        println!("Redblue REPL Commands:");
+        println!();
+        // Every line of this list comes from the one table the parser accepts
+        // commands in, aliases included. It was written out separately, so `:q`,
+        // `:h`, `:hist`, `:v`, `:f`, `:cls`, `:l`, `:s` and `:i` all worked and
+        // none of them was documented.
+        for line in ReplCommand::help_lines() {
+            println!("{}", line);
+        }
+        println!();
+        // The second sigil is parsed by [`ReplCommand::parse`] and completed by
+        // the completer, so a table that lists only `:` leaves half of what the
+        // REPL answers to unexplained. One sentence says it once rather than
+        // printing every command twice.
+[0m
+[0m$ [0msed -n '700,830p' src/repl/mod.rs
+// printing every command twice.
+        let alt = commands::ALT_SIGIL;
+        println!(
+            "  Every command also answers to '{alt}' in place of ':' \
+             — {alt}quit is :quit."
+        );
+        println!();
+        println!("Quick Reference:");
+        for (caption, source) in QUICK_REFERENCE {
+            println!("  // {}", caption);
+            for line in source.lines() {
+                println!("  {}", line);
+            }
+        }
+        println!();
+    }
+
+    /// Every name the session has bound, with the value it holds, in name order.
+    ///
+    /// The REPL's own `variables` map is nearly empty — it holds `_`, the last
+    /// result — because a `set`, a `to` and an `import` all bind in the VM, which
+    /// is why `:vars` used to be able to print one line for a session that had
+    /// bound a dozen names. The VM's bindings are read as well.
+    ///
+    /// Sorted because both maps are `HashMap`s and their iteration order is not a
+    /// result: printing it directly gave one session a different listing from the
+    /// next for the same bindings. Built here rather than printed inline so the
+    /// order is something a test can read back.
+    fn session_bindings(&self) -> Vec<(String, Value)> {
+        let mut bindings: HashMap<String, Value> = self.variables.clone();
+        for name in self.vm.user_names() {
+            if let Some(value) = self.vm.user_value(&name) {
+                // The REPL's own entry for a name wins: `_` is the last result,
+                // and the VM holds a `Nothing` for it rather than the value.
+                bindings.entry(name).or_insert_with(|| value.clone());
+            }
+        }
+
+        let mut bindings: Vec<(String, Value)> = bindings.into_iter().collect();
+        bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        bindings
+    }
+
+    /// The `:vars` listing, or `None` when the session holds nothing at all.
+    fn variable_lines(&self) -> Option<Vec<String>> {
+        let bindings = self.session_bindings();
+        if bindings.is_empty() {
+            return None;
+        }
+
+        Some(
+            bindings
+                .iter()
+                .map(|(name, value)| format!("  {} = {}", name, value))
+                .collect(),
+        )
+    }
+
+    fn print_variables(&self) {
+        let Some(lines) = self.variable_lines() else {
+            println!("No variables defined.");
+            return;
+        };
+
+        println!("Variables:");
+        for line in lines {
+            println!("{}", line);
+        }
+    }
+
+    /// The `:funcs` listing: every function the session declared, in name order,
+    /// or `None` when it has declared none.
+    ///
+    /// It used to print "User-defined functions are stored in the VM" and nothing
+    /// else, which named no function and told the user nothing they could not read
+    /// off the same line — and the test that ran `:funcs` asserted that sentence,
+    /// so the missing listing could not fail anything.
+    fn function_lines(&self) -> Option<Vec<String>> {
+        let functions = self.vm.user_functions();
+        if functions.is_empty() {
+            return None;
+        }
+
+        Some(functions.iter().map(|name| format!("  {}", name)).collect())
+    }
+
+    fn print_functions(&self) {
+        let Some(lines) = self.function_lines() else {
+            println!("No functions defined.");
+            return;
+        };
+
+        println!("Functions:");
+        for line in lines {
+            println!("{}", line);
+        }
+    }
+
+    /// Reads the file at `path` and runs its source in this session's VM.
+    ///
+    /// `:load` runs, which is what `:help` promises: "Load and run a file". It
+    /// used to read the file and print its size without running anything, so a
+    /// session that loaded a file and carried on held none of the bindings the
+    /// file declared.
+    ///
+    /// The source goes through [`Repl::execute_code`] rather than
+    /// [`Repl::run_file`], so the bindings it makes are the session's own and
+    /// stay available to the lines that follow — the difference from `:run`,
+    /// which runs the file in a VM of its own and throws them away.
+    fn load_file(&mut self, path: &str) {
+        let source = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) => {
+                println!("Could not load file: {}", e);
+                return;
+            }
+        };
+
+        println!("Loaded {} bytes from '{}'.", source.len(), path);
+        self.execute_code(&source);
+    }
+
+    /// Writes the session's history to `path`, one entry per line, in the
+    /// format [`ReplHistory::load_from_file`] reads back — and read back by
+    /// [`Repl::restore_session`], which is what made the round trip one.
+    fn save_session(&self, path: &str) {
+        match self.history.save_to_file(path) {
+            Ok(()) => println!(
+                "Session saved to '{}' ({} line(s)).",
+                path,
+                self.history.len()
+[0m
+[0m$ [0msed -n '1,200p' src/repl/commands.rs
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplCommand {
+    /// A line that is Redblue source rather than a command.
+    ///
+    /// This is not [`ReplCommand::Unknown`]: `say "hi"` is not a mistyped
+    /// command, it is a program. Conflating the two made the REPL answer
+    /// `2 + 3` with "Unknown command '2 + 3'" and refuse to evaluate it.
+    NotACommand,
+    Quit,
+    Help,
+    Clear,
+    History,
+    Vars,
+    Functions,
+    Load(String),
+    Save(String),
+    /// Reads a history file written by [`ReplCommand::Save`] back into the
+    /// session's history.
+    ///
+    /// The other half of `:save`, which had no half: a saved file could not be
+    /// loaded by any REPL path, so the round trip existed only in unit tests.
+    Restore(String),
+    Reset,
+    Run(String),
+    Debug,
+    /// Sets a breakpoint on a line, or clears one that is already set there.
+    Break(String),
+    /// Lists the lines the session has breakpoints on.
+    Breaks,
+    /// Removes the breakpoint on a line.
+    Delete(String),
+    /// Arms a step into the next call, for the next program the session runs.
+    Step,
+    /// Arms a step over the next call, for the next program the session runs.
+    Next,
+    /// Runs the program to its end, or to the next breakpoint.
+    Continue,
+    /// Prints the frame the program last stopped in.
+    Frame,
+    Inspect(String),
+    Ast(String),
+    Tokens(String),
+    Example,
+    /// A command that was recognised but not given what it needs.
+    ///
+    /// Not [`ReplCommand::Unknown`]: the command *is* known, its argument is
+    /// not, and reporting "Unknown command 'load requires a file path'" told
+    /// the user they had mistyped a command they had typed correctly.
+    MissingArgument {
+        command: &'static str,
+        usage: &'static str,
+    },
+    Unknown(String),
+}
+
+/// One command in the table: every word that reaches it, what it does, the usage
+/// shown when it was given no argument, and how it builds itself.
+///
+/// The table is the single authority on what a command is called, what it does
+/// and what it takes. It replaced a hand-written `match` plus a separate list in
+/// the completer plus a third written-out list in the help text, which is how
+/// `:q`, `:h`, `:hist`, `:v` and `:f` came to parse without being completable.
+struct CommandSpec {
+    /// Every name that reaches this command, canonical name first — the name
+    /// [`ReplCommand::MissingArgument`] reports.
+    names: &'static [&'static str],
+    /// What the command is for, printed beside its name by `:help`.
+    description: &'static str,
+    /// What the command does with its argument, and the placeholder `:help` and
+    /// the missing-argument report both show. `None` for a command that takes
+    /// none, which is also what tells the parser it must not be given one.
+    usage: Option<&'static str>,
+    build: fn(Option<String>) -> ReplCommand,
+}
+
+/// The sigil other than `:`.
+///
+/// `:quit` and `.quit` are the same command. Named rather than read out of
+/// [`SIGILS`] by index, because `:help` prints it and an index into a
+/// two-element array is a way to print `:` twice.
+pub const ALT_SIGIL: char = '.';
+
+/// Every sigil a command word may begin with.
+///
+/// A command word carries exactly one. `:quit` and `.quit` are the same command,
+/// and `::quit` is not a command at all: it is reported as the unknown word
+/// `":quit"`. Stripping every leading sigil made `::load x` and `...quit` reach
+/// the commands inside them, so a typo loaded a file or ended the session.
+pub const SIGILS: [char; 2] = [':', ALT_SIGIL];
+
+/// Every command, in the order `:help` lists them.
+static COMMAND_TABLE: &[CommandSpec] = &[
+    CommandSpec {
+        names: &["quit", "exit", "q"],
+        description: "Exit the REPL",
+        usage: None,
+        build: |_| ReplCommand::Quit,
+    },
+    CommandSpec {
+        names: &["help", "h", "?"],
+        description: "Show this help",
+        usage: None,
+        build: |_| ReplCommand::Help,
+    },
+    CommandSpec {
+        names: &["clear", "cls"],
+        description: "Clear the screen",
+        usage: None,
+        build: |_| ReplCommand::Clear,
+    },
+    CommandSpec {
+        names: &["history", "hist"],
+        description: "Show command history",
+        usage: None,
+        build: |_| ReplCommand::History,
+    },
+    CommandSpec {
+        names: &["vars", "variables", "v"],
+        description: "Show all variables",
+        usage: None,
+        build: |_| ReplCommand::Vars,
+    },
+    CommandSpec {
+        names: &["functions", "funcs", "f"],
+        description: "Show defined functions",
+        usage: None,
+        build: |_| ReplCommand::Functions,
+    },
+    CommandSpec {
+        names: &["load", "l"],
+        description: "Load and run a file",
+        usage: Some("<filename>"),
+        build: |argument| ReplCommand::Load(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["save", "s"],
+        description: "Save current session",
+        usage: Some("<filename>"),
+        build: |argument| ReplCommand::Save(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["restore", "r"],
+        description: "Restore a saved session",
+        usage: Some("<filename>"),
+        build: |argument| ReplCommand::Restore(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["reset"],
+        description: "Reset REPL state",
+        usage: None,
+        build: |_| ReplCommand::Reset,
+    },
+    CommandSpec {
+        names: &["run"],
+        description: "Run a Redblue file",
+        usage: Some("<filename>"),
+        build: |argument| ReplCommand::Run(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["debug"],
+        description: "Debug mode",
+        usage: None,
+        build: |_| ReplCommand::Debug,
+    },
+    CommandSpec {
+        names: &["break", "b"],
+        description: "Stop at a line, or clear the breakpoint there",
+        usage: Some("<line>"),
+        build: |argument| ReplCommand::Break(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["breaks", "bps"],
+        description: "List the lines breakpoints are set on",
+        usage: None,
+        build: |_| ReplCommand::Breaks,
+    },
+    CommandSpec {
+        names: &["delete", "d"],
+        description: "Remove the breakpoint on a line",
+        usage: Some("<line>"),
+        build: |argument| ReplCommand::Delete(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["step", "st"],
+        description: "Step into the next call",
+        usage: None,
+        build: |_| ReplCommand::Step,
+    },
+    CommandSpec {
+        names: &["next", "n"],
+        description: "Step over the next call",
+        usage: None,
+        build: |_| ReplCommand::Next,
+    },
+    CommandSpec {
+        names: &["continue", "c"],
+        description: "Run on to the next breakpoint",
+        usage: None,
+        build: |_| ReplCommand::Continue,
+    },
+[0m
+[0m$ [0msed -n '200,330p' src/repl/commands.rs
+},
+    CommandSpec {
+        names: &["frame", "fr"],
+        description: "Show the frame the program last stopped in",
+        usage: None,
+        build: |_| ReplCommand::Frame,
+    },
+    CommandSpec {
+        names: &["inspect", "i"],
+        description: "Inspect a variable",
+        usage: Some("<variable>"),
+        build: |argument| ReplCommand::Inspect(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["ast"],
+        description: "Print AST for expression",
+        usage: Some("<expression>"),
+        build: |argument| ReplCommand::Ast(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["tokens"],
+        description: "Print tokens for expression",
+        usage: Some("<expression>"),
+        build: |argument| ReplCommand::Tokens(argument.unwrap_or_default()),
+    },
+    CommandSpec {
+        names: &["example", "examples"],
+        description: "Show example code",
+        usage: None,
+        build: |_| ReplCommand::Example,
+    },
+];
+
+impl ReplCommand {
+    /// Every command word the table accepts, without a sigil, sorted.
+    ///
+    /// The word itself rather than a spelling of it: which sigil the user types
+    /// is theirs, and [`SIGILS`] are all accepted, so the completer matches what
+    /// they typed against this and puts their sigil back.
+    ///
+    /// Not deduplicated: a word the table holds twice is a word two commands
+    /// answer to, and [`bare_names`] reporting it twice is what lets a test say
+    /// so. The completer's own `dedup` hides it from a user either way.
+    pub fn bare_names() -> Vec<String> {
+        let mut names: Vec<String> = COMMAND_TABLE
+            .iter()
+            .flat_map(|spec| spec.names.iter())
+            .map(|name| (*name).to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Every command word the table accepts, canonical sigil and all, sorted.
+    ///
+    /// Completion offers exactly these. The completer used to carry its own
+    /// 16-entry list of canonical names while the table accepted thirty-odd
+    /// aliases, so `:q`, `:h`, `:hist`, `:v` and `:f` all worked and none of
+    /// them were completable — the same two-table divergence this table exists
+    /// to delete, one level down.
+    ///
+    /// The `:` spelling is the one offered and the one `:help` prints; the other
+    /// sigil in [`SIGILS`] is the same word and is completed by
+    /// [`ReplCompleter`](super::ReplCompleter) when the user types it.
+    pub fn names() -> Vec<String> {
+        let mut names: Vec<String> = ReplCommand::bare_names()
+            .into_iter()
+            .map(|name| format!(":{}", name))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// One line per command, aliases included, for `:help`.
+    ///
+    /// Built from [`COMMAND_TABLE`], aliases and all, so every word the parser
+    /// accepts is one the user can read about, and a command added to the table
+    /// cannot be missing from the help. Padded to a common column so the
+    /// descriptions line up however long the command and its argument are.
+    pub fn help_lines() -> Vec<String> {
+        let entries: Vec<(String, &'static str)> = COMMAND_TABLE
+            .iter()
+            .map(|spec| {
+                let aliases: Vec<String> =
+                    spec.names.iter().map(|name| format!(":{}", name)).collect();
+                let signature = match spec.usage {
+                    Some(usage) => format!("{} {}", aliases.join(", "), usage),
+                    None => aliases.join(", "),
+                };
+                (signature, spec.description)
+            })
+            .collect();
+
+        let width = entries
+            .iter()
+            .map(|(signature, _)| signature.len())
+            .max()
+            .unwrap_or(0)
+            + 2;
+
+        entries
+            .into_iter()
+            .map(|(signature, description)| {
+                format!("  {:width$}  {}", signature, description, width = width)
+            })
+            .collect()
+    }
+
+    /// The whole of a command's argument: every word after the command word, not
+    /// just the first.
+    ///
+    /// One word was not enough for any of the seven commands that take one.
+    /// `:ast 1 + 1` became `Ast("1")`, so the AST it printed was of `1`, and
+    /// `:load /tmp/a b.rb` became `Load("/tmp/a")` — a path silently truncated
+    /// to a directory that is not the file the user named.
+    ///
+    /// The remainder is sliced out of `input` rather than rebuilt from words
+    /// joined with a single space. Re-joining collapsed the whitespace inside
+    /// it: `:ast say "a   b"` became `say "a b"`, and a path with two spaces in
+    /// it named a file that does not exist. The whitespace around the argument
+    /// is the separator and is dropped; the whitespace inside it is the user's
+    /// and is kept.
+    fn argument(input: &str) -> Option<String> {
+        let (_, rest) = input.split_once(char::is_whitespace)?;
+        let argument = rest.trim_start();
+        if argument.is_empty() {
+            None
+        } else {
+            Some(argument.to_string())
+        }
+    }
+[0m
+[0m$ [0msed -n '330,470p' src/repl/commands.rs
+}
+
+    pub fn parse(input: &str) -> Self {
+        let input = input.trim();
+
+        if !input.starts_with(SIGILS) {
+            return ReplCommand::NotACommand;
+        }
+
+        let word = match input.split_once(char::is_whitespace) {
+            Some((word, _)) => word,
+            None => input,
+        };
+        // Exactly one sigil, so `::quit` and `...quit` name nothing rather than
+        // reaching the command one sigil in.
+        let command = word.strip_prefix(SIGILS).unwrap_or(word);
+
+        match COMMAND_TABLE
+            .iter()
+            .find(|spec| spec.names.contains(&command))
+        {
+            Some(spec) => match spec.usage {
+                None => (spec.build)(None),
+                Some(usage) => match Self::argument(input) {
+                    Some(value) => (spec.build)(Some(value)),
+                    None => ReplCommand::MissingArgument {
+                        command: spec.names[0],
+                        usage,
+                    },
+                },
+            },
+            None => ReplCommand::Unknown(command.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReplCommand;
+
+    /// Every alias the help text and the completer promise, what it must parse
+    /// to, and — for the commands that take one — the argument it must carry.
+    ///
+    /// This table is the point of the module: when the REPL carried a second
+    /// copy of it, an alias added here was invisible to the REPL. A row that
+    /// stops parsing is a regression, not a rename.
+    ///
+    /// The argument is part of the assertion because checking only the variant
+    /// could not fail: `:ast 1 + 1` parsed to `Ast("1")` and this table called
+    /// that a pass. Each row is `(input, variant, argument)`, with an empty
+    /// argument for a command that takes none.
+    #[test]
+    fn parse_reads_the_whole_alias_table() {
+        let cases: Vec<(&str, &str, &str)> = vec![
+            (":quit", "Quit", ""),
+            (":exit", "Quit", ""),
+            (":q", "Quit", ""),
+            (":help", "Help", ""),
+            (":h", "Help", ""),
+            (":?", "Help", ""),
+            (":clear", "Clear", ""),
+            (":cls", "Clear", ""),
+            (":history", "History", ""),
+            (":hist", "History", ""),
+            (":vars", "Vars", ""),
+            (":variables", "Vars", ""),
+            (":v", "Vars", ""),
+            (":functions", "Functions", ""),
+            (":funcs", "Functions", ""),
+            (":f", "Functions", ""),
+            (":load some.rb", "Load", "some.rb"),
+            (":l some.rb", "Load", "some.rb"),
+            (":save out.txt", "Save", "out.txt"),
+            (":s out.txt", "Save", "out.txt"),
+            (":restore out.txt", "Restore", "out.txt"),
+            (":r out.txt", "Restore", "out.txt"),
+            (":reset", "Reset", ""),
+            (":run prog.rb", "Run", "prog.rb"),
+            (":debug", "Debug", ""),
+            (":break 3", "Break", "3"),
+            (":b 3", "Break", "3"),
+            (":breaks", "Breaks", ""),
+            (":bps", "Breaks", ""),
+            (":delete 3", "Delete", "3"),
+            (":d 3", "Delete", "3"),
+            (":step", "Step", ""),
+            (":st", "Step", ""),
+            (":next", "Next", ""),
+            (":n", "Next", ""),
+            (":continue", "Continue", ""),
+            (":c", "Continue", ""),
+            (":frame", "Frame", ""),
+            (":fr", "Frame", ""),
+            (":inspect x", "Inspect", "x"),
+            (":i x", "Inspect", "x"),
+            (":ast 1 + 1", "Ast", "1 + 1"),
+            (":tokens 1 + 1", "Tokens", "1 + 1"),
+            (":example", "Example", ""),
+            (":examples", "Example", ""),
+        ];
+
+        for (input, expected, argument) in cases {
+            let parsed = ReplCommand::parse(input);
+            let rendered = format!("{:?}", parsed);
+            let variant = rendered.split(['(', ' ']).next().unwrap_or_default();
+            assert_eq!(
+                variant, expected,
+                "parsing {:?} should give {}",
+                input, expected
+            );
+
+            let carried = match &parsed {
+                ReplCommand::Load(value)
+                | ReplCommand::Save(value)
+                | ReplCommand::Restore(value)
+                | ReplCommand::Run(value)
+                | ReplCommand::Inspect(value)
+                | ReplCommand::Ast(value)
+                | ReplCommand::Tokens(value)
+                | ReplCommand::Break(value)
+                | ReplCommand::Delete(value) => value.as_str(),
+                _ => "",
+            };
+            assert_eq!(
+                carried, argument,
+                "parsing {:?} should carry the argument {:?}",
+                input, argument
+            );
+        }
+    }
+
+    /// A command's argument is every word after it, not the first one. Reading
+    /// one word truncated a path to a directory that is not the file the user
+    /// named and printed the AST of `1` for `:ast 1 + 1`.
+    #[test]
+    fn parse_reads_the_argument_a_command_was_given() {
+        assert_eq!(
+            ReplCommand::parse(":load /tmp/a b.rb"),
+            ReplCommand::Load("/tmp/a b.rb".to_string()),
+            "a path with a space in it is the whole remainder"
+        );
+[0m
+[0m$ [0mgrep -n '#\[test\]\|mod tests\|fn edge_\|Capture\|capture\|struct .*LineSource\|impl LineSource' src/repl/mod.rs | head -80
+272:    /// were run half-written, while a stray `end` matched and captured every line
+1111:mod tests {
+1181:    impl LineSource for ScriptedSource {
+1200:    #[test]
+1227:    #[test]
+1258:    #[test]
+1259:    fn edge_control_d_ends_the_session_with_the_farewell_it_always_printed() {
+1282:    #[test]
+1283:    fn edge_a_read_that_fails_ends_the_session_and_is_reported_as_a_failure() {
+1301:    #[test]
+1302:    fn edge_an_unclosed_block_is_still_reported_at_end_of_input() {
+1325:    #[test]
+1346:    #[test]
+1361:    #[test]
+1373:    #[test]
+1384:    #[test]
+1399:    #[test]
+1400:    fn edge_a_line_repeated_in_a_row_is_one_entry_of_history() {
+1410:    #[test]
+1411:    fn edge_empty_input_is_not_recorded_and_runs_nothing() {
+1421:    #[test]
+1439:    #[test]
+1449:    #[test]
+1450:    fn edge_completion_after_reset_forgets_the_sessions_names() {
+1468:    #[test]
+1469:    fn edge_reset_drops_a_block_the_session_had_not_finished_typing() {
+1499:    #[test]
+1517:    #[test]
+1547:    #[test]
+1548:    fn edge_vars_lists_every_name_in_a_fixed_order() {
+1573:    #[test]
+1574:    fn edge_every_block_form_asks_for_its_continuation_line() {
+1607:    #[test]
+1627:    #[test]
+1628:    fn edge_an_imported_modules_internal_names_are_not_session_names() {
+1669:    #[test]
+1670:    fn edge_a_block_typed_on_one_line_does_not_wait_for_an_end() {
+1685:    #[test]
+1686:    fn edge_a_stray_end_does_not_capture_the_lines_after_it() {
+1706:    #[test]
+1707:    fn edge_a_block_keyword_inside_a_string_is_not_a_block() {
+1721:    #[test]
+1722:    fn edge_a_line_that_cannot_be_lexed_does_not_wait_for_an_end() {
+1737:    #[test]
+1738:    fn edge_a_range_bound_or_an_alias_is_not_a_function_declaration() {
+1766:    #[test]
+1767:    fn edge_eof_with_an_unclosed_block_reports_it_and_lets_the_buffer_go() {
+1790:    #[test]
+1791:    fn edge_eof_with_nothing_buffered_is_not_an_incomplete_block() {
+1806:    #[test]
+1835:    #[test]
+1864:    #[test]
+1891:    #[test]
+1892:    fn edge_vars_lists_the_names_the_session_has_bound() {
+1909:    #[test]
+1910:    fn edge_inspect_finds_a_name_the_session_bound() {
+1938:    #[test]
+1939:    fn edge_inspect_reports_the_redblue_type_of_the_value() {
+1987:    #[test]
+2028:    #[test]
+2029:    fn edge_a_restored_block_runs_as_the_block_it_was() {
+2058:    #[test]
+2059:    fn edge_a_restored_command_is_listed_and_not_run_again() {
+2088:    #[test]
+2089:    fn edge_restore_of_a_missing_file_leaves_the_history_alone() {
+2113:    #[test]
+2114:    fn edge_a_block_that_outgrows_the_buffer_is_dropped_not_kept() {
+2139:    #[test]
+2140:    fn edge_a_block_of_few_very_long_lines_is_dropped_too() {
+2158:    #[test]
+2159:    fn edge_the_report_of_an_unclosed_block_echoes_only_some_of_it() {
+2187:    #[test]
+2188:    fn edge_every_quick_reference_snippet_is_a_program_the_session_runs() {
+2207:    #[test]
+2208:    fn edge_every_example_is_a_program_the_session_runs() {
+[0m
+[0m$ [0msed -n '1111,1260p' src/repl/mod.rs
+mod tests {
+    use std::cell::RefCell;
+    use std::io;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{farewell, Repl, SessionEnd};
+    use crate::repl::editor::{Line, LineSource};
+    use crate::value::Value;
+
+    /// Where the `.rb` file under test is written, inside the project checkout
+    /// rather than in a user's temp directory.
+    fn scratch_file(name: &str, source: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp/repl-load");
+        std::fs::create_dir_all(&dir).expect("scratch directory should be creatable");
+        let path = dir.join(format!("{}-{}.rb", name, serial));
+        std::fs::write(&path, source).expect("the file should be writable");
+        path
+    }
+
+    /// Where a non-`.rb` file under test — a history file — is written.
+    fn scratch_path(name: &str, extension: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tmp/repl-session");
+        std::fs::create_dir_all(&dir).expect("scratch directory should be creatable");
+        let path = dir.join(format!("{}-{}.{}", name, serial, extension));
+        std::fs::write(&path, "").expect("the file should be creatable");
+        path
+    }
+
+    /// Feeds `lines` to the session one at a time, as the read loop does: each line
+    /// is recorded in the history before it is dispatched, because that is the
+    /// order the loop keeps them in.
+    fn feed(repl: &mut Repl, lines: &[&str]) {
+        for line in lines {
+            repl.history.push((*line).to_string());
+            if repl.handle_command(line) {
+                continue;
+            }
+            repl.execute_line(line);
+        }
+    }
+
+    /// Feeds `count` copies of `line` to a session, as a piped input would.
+    fn feed_repeatedly(repl: &mut Repl, line: &str, count: usize) {
+        for _ in 0..count {
+            repl.history.push(line.to_string());
+            repl.execute_line(line);
+        }
+    }
+
+    /// A line source that answers with what the test tells it to, so the read
+    /// loop can be driven through the parts a terminal owns — an interrupt, end
+    /// of input, a failed read — without one.
+    struct ScriptedSource {
+        lines: std::collections::VecDeque<io::Result<Line>>,
+    }
+
+    impl ScriptedSource {
+        fn new(lines: Vec<io::Result<Line>>) -> Self {
+            Self {
+                lines: lines.into_iter().collect(),
+            }
+        }
+    }
+
+    impl LineSource for ScriptedSource {
+        fn read_line(&mut self, _prompt: &str) -> io::Result<Line> {
+            self.lines.pop_front().unwrap_or(Ok(Line::Eof))
+        }
+    }
+
+    /// Runs the read loop over `source`, the way [`Repl::run`] runs it over a
+    /// terminal.
+    fn drive(repl: &mut Repl, source: &mut ScriptedSource) -> SessionEnd {
+        let names = Rc::new(RefCell::new(repl.session_names()));
+        repl.session_loop(source, &names)
+    }
+
+    /// An editor with no names and no history file of its own, over `path`.
+    fn editor_at(path: Option<PathBuf>) -> crate::repl::editor::EditSource {
+        crate::repl::editor::EditSource::new(Rc::new(RefCell::new(Vec::new())), path)
+            .expect("an editor that never reads a line should be creatable")
+    }
+
+    #[test]
+    fn a_session_restores_what_a_previous_one_typed_and_not_the_history_files_header() {
+        let path = scratch_path("restored", "history");
+        std::fs::remove_file(&path).expect("the empty scratch file should be removable");
+
+        let mut previous = editor_at(Some(path.clone()));
+        previous.record("set restored_probe to 1");
+        previous
+            .save(&path)
+            .expect("the history file should be writable");
+
+        let restored = editor_at(Some(path));
+        let mut repl = Repl::new();
+        repl.restore_history(&restored);
+
+        assert_eq!(
+            repl.history.search("set restored_probe to 1"),
+            Some("set restored_probe to 1".to_string()),
+            "the line the previous session typed is in this session's history"
+        );
+        assert_eq!(
+            repl.history.search("#"),
+            None,
+            "and the history file's own version header is not a line anyone typed"
+        );
+    }
+
+    #[test]
+    fn interrupt_abandons_the_line_and_keeps_the_session_alive() {
+        let mut repl = Repl::new();
+        let mut source = ScriptedSource::new(vec![
+            Ok(Line::Text("set half_written to ".to_string())),
+            Ok(Line::Interrupted),
+            Ok(Line::Text("set after_interrupt to 7".to_string())),
+            Ok(Line::Eof),
+        ]);
+
+        let end = drive(&mut repl, &mut source);
+
+        assert_eq!(
+            end,
+            SessionEnd::Eof,
+            "Ctrl-C does not end the session; the run after it still reached end of input"
+        );
+        assert!(
+            repl.complete("after_interrupt")
+                .contains(&"after_interrupt".to_string()),
+            "the line typed after the interrupt ran"
+        );
+        assert!(
+            !repl
+                .complete("half_written")
+                .contains(&"half_written".to_string()),
+            "the line the interrupt abandoned did not run"
+        );
+        assert_eq!(repl.history.search("half_written"), None);
+    }
+
+    #[test]
+    fn edge_control_d_ends_the_session_with_the_farewell_it_always_printed() {
+        let mut repl = Repl::new();
+[0m
+[0m$ [0mcat Cargo.toml; ls tests/ | head -40
+[package]
+name = "redblue"
+version = "0.2.0"
+edition = "2021"
+authors = ["Redblue Contributors"]
+description = "A programming language as readable as plain English"
+license = "MIT"
+repository = "https://github.com/authorss81/redblue"
+keywords = ["programming-language", "compiler"]
+categories = ["compiler", "development-tools"]
+
+[[bin]]
+name = "rb"
+path = "src/main.rs"
+
+# `cdylib` is what makes the WebAssembly playground module: it is the crate type
+# that emits a `.wasm` and exports every `#[no_mangle]` symbol the library
+# defines, which is what `wasm/redblue.js` calls. Built with:
+#
+#   rustup target add wasm32-unknown-unknown
+#   cargo build --release --target wasm32-unknown-unknown --lib
+#
+# writing `target/wasm32-unknown-unknown/release/redblue.wasm`. `rlib` is kept
+# so the native `rb` binary and the test suite link exactly as they did.
+[lib]
+name = "redblue"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+regex = "1.10"
+chrono = "0.4"
+reqwest = { version = "0.11", features = ["blocking"] }
+indexmap = "2"
+rustyline = "18"
+
+[dev-dependencies]
+regex = "1.10"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+assertions_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+catch_binding_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+debugger_test.rs
+diagnostics_test.rs
+differential_test.rs
+discovery_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+integration_test.rb
+interpolation_test.rs
+keyword_reservation_test.rs
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+might_fail_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+random_builtin_test.rs
+record_order_test.rs
+[0m
+[0m$ [0mgrep -n 'repl\|Repl\|stdin\|args' src/main.rs | head -40; echo ---; grep -n 'fn line_source' -A 30 src/repl/editor.rs
+---
+326:pub fn line_source(names: SessionNames) -> Box<dyn LineSource> {
+327-    if io::stdin().is_terminal() {
+328-        match EditSource::new(names, default_history_path()) {
+329-            Ok(editor) => return Box::new(editor),
+330-            Err(error) => eprintln!(
+331-                "Warning: no line editor ({}); reading lines without one",
+332-                error
+333-            ),
+334-        }
+335-    }
+336-    Box::new(PlainSource)
+337-}
+338-
+339-#[cfg(test)]
+340-mod tests {
+341-    use std::cell::RefCell;
+342-    use std::fs;
+343-    use std::path::PathBuf;
+344-    use std::rc::Rc;
+345-    use std::sync::atomic::{AtomicUsize, Ordering};
+346-
+347-    use rustyline::error::ReadlineError;
+348-
+349-    use super::{
+350-        default_history_path, line_from, EditSource, Line, LineSource, PlainSource, SessionNames,
+351-    };
+352-
+353-    /// A scratch name no other test in this binary has taken.
+354-    fn scratch_name(prefix: &str) -> String {
+355-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+356-        let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
+[0m
+[0m$ [0mwc -l src/main.rs; sed -n '1,60p' src/main.rs
+3 src/main.rs
+pub fn main() {
+    redblue::run_cli();
+}
+[0m
+[0m$ [0mgrep -rn 'fn run_cli' -A 60 src/lib.rs | head -90
+161:pub fn run_cli() {
+162-    let args: Vec<String> = env::args().collect();
+163-
+164-    match args.len() {
+165-        1 => run_repl(),
+166-        2 => {
+167-            let cmd = &args[1];
+168-            match cmd.as_str() {
+169-                "help" | "--help" | "-h" => print_help(),
+170-                "version" | "--version" | "-v" => print_version(),
+171-                "test" => {
+172-                    if let Err(e) = run_test(None) {
+173-                        eprintln!("Error: {}", e);
+174-                        process::exit(1);
+175-                    }
+176-                }
+177-                "grammar" => print!("{}", textmate_grammar()),
+178-                "keywords" => {
+179-                    for keyword in Lexer::keywords() {
+180-                        println!("{}", keyword);
+181-                    }
+182-                }
+183-                // `rb bootstrap` with no output directory. It has to be named
+184-                // here, in the arm that treats an unknown name as a file to
+185-                // run: without this arm it fell through to the file-runner,
+186-                // tried to read `bootstrap` — a directory in a checkout — and
+187-                // exited 1 with `Is a directory`, which is the exact failure the
+188-                // command exists to remove. The `3 if` arm below handles the
+189-                // one-positional form; this is the same command with the
+190-                // output directory defaulted to `target/bootstrap`.
+191-                "bootstrap" => {
+192-                    if let Err(message) = bootstrap_args(&[]) {
+193-                        eprintln!("Error: {}", message);
+194-                        process::exit(1);
+195-                    }
+196-                }
+197-                _ => {
+198-                    if let Err(rendered) = run_file_with_diagnostic(cmd) {
+199-                        report(&rendered);
+200-                    }
+201-                }
+202-            }
+203-        }
+204-        // `rb bootstrap <out-dir>` — before the `3` arm, which would read the
+205-        // directory as a file to run. Bare `rb bootstrap` is the `bootstrap`
+206-        // arm in the `2` match above.
+207-        3 if args[1] == "bootstrap" => {
+208-            if let Err(message) = bootstrap_args(&args[2..]) {
+209-                eprintln!("Error: {}", message);
+210-                process::exit(1);
+211-            }
+212-        }
+213-        3 => {
+214-            let cmd = &args[1];
+215-            let path = &args[2];
+216-            match cmd.as_str() {
+217-                "test" => {
+218-                    if let Err(e) = run_test(Some(path)) {
+219-                        eprintln!("Error: {}", e);
+220-                        process::exit(1);
+221-                    }
+[0m
+[0m$ [0mgrep -rn 'help_lines\|bare_names()\|names()' src/ --include=*.rs | grep -v '^src/repl/commands.rs' | head -20
+src/repl/completer.rs:11:fn module_names() -> Vec<String> {
+src/repl/completer.rs:84:            builtins: module_names()
+src/repl/completer.rs:124:            commands: commands::ReplCommand::bare_names(),
+src/repl/completer.rs:202:    fn session_names() -> Vec<String> {
+src/repl/completer.rs:212:        let matches = ReplCompleter::new().complete_with("count", &session_names());
+src/repl/completer.rs:219:        let matches = ReplCompleter::new().complete_with("circle", &session_names());
+src/repl/completer.rs:226:        let matches = ReplCompleter::new().complete_with("math", &session_names());
+src/repl/completer.rs:292:        for name in ReplCommand::names() {
+src/repl/completer.rs:307:        let matches = ReplCompleter::new().complete_with("hi", &session_names());
+src/repl/completer.rs:329:        for name in ReplCommand::names() {
+src/repl/completer.rs:340:            offered.len() == ReplCommand::names().len(),
+src/repl/completer.rs:351:        let matches = completer.complete_with("c", &session_names());
+src/repl/completer.rs:376:            completer.complete_with("zzzz", &session_names()).is_empty(),
+src/repl/completer.rs:501:                .complete_with("math", &session_names())
+src/repl/mod.rs:248:        self.completer.complete_with(word, &self.session_names())
+src/repl/mod.rs:260:        names.extend(self.vm.user_names());
+src/repl/mod.rs:334:            *names.borrow_mut() = self.session_names();
+src/repl/mod.rs:624:        let bound = self.session_names();
+src/repl/mod.rs:693:        for line in ReplCommand::help_lines() {
+src/repl/mod.rs:730:        for name in self.vm.user_names() {
+[0m
+[0m$ [0mgrep -rn 'fn run_repl' -A 20 src/lib.rs; echo ---FIXTURES---; ls tests/common tests/fixtures 2>&1 | head; echo ---; grep -rln 'fixtures' tests/ | head
+132:pub fn run_repl() {
+133-    let mut repl = repl::Repl::new();
+134-    repl.run();
+135-}
+136-
+137-pub fn run_test(path: Option<&str>) -> Result<(), Error> {
+138-    let mut harness = testing::TestHarness::new();
+139-
+140-    match path {
+141-        Some(p) => {
+142-            harness.run_file(p)?;
+143-            // Report the failures and exit non-zero. Without this a failing
+144-            // `expect` printed only a dot/F and still exited 0.
+145-            testing::PrettyReporter::new().report(&harness.results());
+146-        }
+147-        None => {
+148-            let results = testing::run_all_tests()?;
+149-            println!("Tests run: {}", results.total);
+150-            println!("Passed: {}", results.passed);
+151-            println!("Failed: {}", results.failed);
+152-            if results.failed > 0 {
+---FIXTURES---
+ls: cannot access 'tests/fixtures': No such file or directory
+tests/common:
+corpus.rs
+generator.rs
+mod.rs
+rng.rs
+shrink.rs
+vm.rs
+---
+tests/formatter_test.rs
+[0m
+[0m$ [0mls target/debug/rb 2>/dev/null && echo EXISTS || echo MISSING; ls target/debug 2>/dev/null | head -5
+target/debug/rb
+EXISTS
+build
+deps
+examples
+incremental
+libredblue.d
+[0m
+[0m$ [0mmkdir -p ./target/tmp/repl-color && printf 'set x to 2 + 3\nsay x\n:vars\nnope\n:colors on\n:quit\n' | ./target/debug/rb | tee ./target/tmp/repl-color/before.txt | cat -A | head -20
+Welcome to Redblue v0.1.0 - Interactive REPL$
+Type 'help' for commands, 'quit' to exit$
+$
+>>> >>> 5$
+>>> Variables:$
+  x = 5$
+>>> Error: AnalyzerError: Unknown variable 'nope'$
+  --> 1:1$
+>>> Unknown command 'colors'. Type :help for available commands.$
+>>> Goodbye!$
+[0m
+[0m$ [0mgrep -rn ':help\|help_lines\|Usage:' src/ tests/ --include=*.rs | grep -i 'test\|assert' | head -20
+src/repl/mod.rs:1354:        assert!(repl.handle_command(":help"));
+tests/debugger_test.rs:289:        out.contains("Usage: :break <line>"),
+tests/repl_test.rs:165:    let s = session(":help\n:vars\n:funcs\n:history\n:quit\n");
+tests/repl_test.rs:172:        .assert_stdout_contains("     1  :help")
+tests/repl_test.rs:392:        .assert_stdout_contains("Usage: :load")
+tests/repl_test.rs:393:        .assert_stdout_contains("Usage: :inspect")
+tests/repl_test.rs:522:/// A command, in the help, from the parser: `:help` lists every command under
+tests/repl_test.rs:524:/// accepted since the command table was introduced and `:help` could not mention
+tests/repl_test.rs:528:    let s = session(":help\n.quit\n:quit\n");
+tests/repl_test.rs:682:/// `:help` and `:example` are the only documentation a user has at the prompt, so
+tests/repl_test.rs:688:    let s = session(":help\n:example\n:quit\n");
+tests/repl_test.rs:696:/// Every alias the parser accepts is offered by completion and named by `:help`.
+tests/repl_test.rs:702:    let s = session(":help\n:quit\n");
+tests/repl_test.rs:721:            "{:?} is accepted by the parser, so :help has to name it:\n{}",
+tests/repl_test.rs:735:        .assert_stdout_contains("Usage: :restore")
+[0m
+[0m$ [0msed -n '1,60p' tests/repl_test.rs
+//! End-to-end tests for the REPL: `rb` with no arguments, driven over a pipe.
+//!
+//! The REPL is the one surface a user touches first and the one with no
+//! coverage at all — every claim about it was previously made by reading
+//! `src/repl/mod.rs` rather than by running it. These tests pipe a session into
+//! the real binary and assert on what it printed and on how it exited.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How long a session may take before it counts as hung.
+///
+/// This is a liveness bound, not a performance assertion: nothing here claims a
+/// session is *fast*, only that it *finishes*. The pre-fix REPL spins forever on
+/// EOF printing prompts, so without a bound a regression would be an unkillable
+/// test rather than a failing one.
+const SESSION_LIMIT: Duration = Duration::from_secs(20);
+
+/// What one piped REPL session produced.
+struct Session {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl Session {
+    /// Asserts the session exited cleanly, quoting both streams.
+    fn assert_exited_ok(&self) -> &Self {
+        assert_eq!(
+            self.code,
+            Some(0),
+            "the REPL should exit 0\nstdout:\n{}\nstderr:\n{}",
+            self.stdout,
+            self.stderr
+        );
+        self
+    }
+
+    fn assert_stdout_contains(&self, needle: &str) -> &Self {
+        assert!(
+            self.stdout.contains(needle),
+            "stdout should contain {:?}\n--- actual ---\n{}",
+            needle,
+            self.stdout
+        );
+        self
+    }
+
+    fn assert_stdout_lacks(&self, needle: &str) -> &Self {
+        assert!(
+            !self.stdout.contains(needle),
+            "stdout should not contain {:?}\n--- actual ---\n{}",
+            needle,
+            self.stdout
+        );
+        self
+[0m
+[0m$ [0msed -n '60,170p' tests/repl_test.rs
+self
+    }
+
+    /// How many times `needle` appears, for the assertions that are about *how
+    /// often* a session says something rather than whether it says it at all.
+    fn count_stdout(&self, needle: &str) -> usize {
+        self.stdout.matches(needle).count()
+    }
+}
+
+/// Pipes `input` into `rb` with no arguments and collects the session.
+///
+/// stdin is closed as soon as `input` is written, so the REPL sees EOF exactly
+/// as it would from Ctrl-D at a terminal. Reading stdout on its own thread means
+/// a child that fills the pipe buffer cannot deadlock the test while the parent
+/// waits for it to exit.
+fn session(input: &str) -> Session {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the rb binary should start");
+
+    let mut stdin = child.stdin.take().expect("stdin should be piped");
+    let payload = input.to_string();
+    let writer = thread::spawn(move || {
+        let _ = stdin.write_all(payload.as_bytes());
+        drop(stdin);
+    });
+
+    let mut stdout = child.stdout.take().expect("stdout should be piped");
+    let reader = thread::spawn(move || read_all(&mut stdout));
+    let mut stderr = child.stderr.take().expect("stderr should be piped");
+    let errors = thread::spawn(move || read_all(&mut stderr));
+
+    let deadline = Instant::now() + SESSION_LIMIT;
+    let status = loop {
+        match child.try_wait().expect("child status should be readable") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                writer.join().ok();
+                let _ = reader.join();
+                panic!(
+                    "the REPL did not exit within {:?} of its input closing: it \
+                     hangs instead of terminating on EOF.\ninput:\n{}",
+                    SESSION_LIMIT, input
+                );
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+
+    writer.join().expect("the writer thread should not panic");
+    let stdout = reader.join().expect("the reader thread should not panic");
+    let stderr = errors.join().expect("the stderr thread should not panic");
+
+    Session {
+        code: status.code(),
+        stdout,
+        stderr,
+    }
+}
+
+/// Drains a pipe on its own thread: a child writing more than the pipe buffer
+/// holds would otherwise block forever waiting for a reader.
+fn read_all(pipe: &mut impl Read) -> String {
+    let mut buf = Vec::new();
+    let _ = pipe.read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Where `.rb` files under test are written, inside the project checkout.
+fn scratch_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/repl");
+    std::fs::create_dir_all(&dir).expect("scratch directory should be creatable");
+    dir
+}
+
+fn scratch_file(name: &str, source: &str) -> PathBuf {
+    let path = scratch_path(name, "rb");
+    std::fs::write(&path, source).expect("the program should be writable");
+    path
+}
+
+/// A path for a file that is not a program — a saved session, mostly — created
+/// empty so it exists before a session is asked to save over it.
+fn scratch_path(name: &str, extension: &str) -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let path = scratch_dir().join(format!(
+        "{}-{}-{}.{}",
+        name,
+        std::process::id(),
+        serial,
+        extension
+    ));
+    std::fs::write(&path, "").expect("the file should be creatable");
+    path
+}
+
+#[test]
+fn repl_runs_commands_and_quits() {
+    let s = session(":help\n:vars\n:funcs\n:history\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("Redblue REPL Commands:")
+        .assert_stdout_contains(":history")
+        .assert_stdout_contains("No variables defined.")
+[0m
+Now writing the failing test first.
+[0m← [0mWrite tests/repl_color_test.rs
+Wrote file successfully.
+[0m
+[0m$ [0mmkdir -p tests/fixtures && printf 'set x to 2 + 3\nsay x\n:vars\nnope\nnosuchcommand\n:quit\n' | ./target/debug/rb > tests/fixtures/repl_piped_session.txt && cat -A tests/fixtures/repl_piped_session.txt
+Welcome to Redblue v0.1.0 - Interactive REPL$
+Type 'help' for commands, 'quit' to exit$
+$
+>>> >>> 5$
+>>> Variables:$
+  x = 5$
+>>> Error: AnalyzerError: Unknown variable 'nope'$
+  --> 1:1$
+>>> Error: AnalyzerError: Unknown variable 'nosuchcommand'$
+  --> 1:1$
+>>> Goodbye!$
+[0m
+[0m$ [0mprintf 'set x to 2 + 3\nsay x\n:vars\nnope\n:nosuchcommand\n:quit\n' | ./target/debug/rb > tests/fixtures/repl_piped_session.txt && cat -A tests/fixtures/repl_piped_session.txt && git add -f tests/fixtures/repl_piped_session.txt && git status --short
+Welcome to Redblue v0.1.0 - Interactive REPL$
+Type 'help' for commands, 'quit' to exit$
+$
+>>> >>> 5$
+>>> Variables:$
+  x = 5$
+>>> Error: AnalyzerError: Unknown variable 'nope'$
+  --> 1:1$
+>>> Unknown command 'nosuchcommand'. Type :help for available commands.$
+>>> Goodbye!$
+A  tests/fixtures/repl_piped_session.txt
+?? tests/repl_color_test.rs
+[0m
+[0m$ [0mgit reset -q; cat .gitignore; echo ---; git check-ignore -v tests/fixtures/repl_piped_session.txt
+# Build outputs
+/target/
+*.rbc
+a.out
+
+# Stray debug outputs - never commit these
+err.txt
+errors.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Agent/copilot files (local only, do not commit)
+AGENTS.md
+.skill/
+.cursor/
+.cursorrules
+.github/copilot-instructions.md
+
+# Secrets
+.env
+*.pem
+*.key
+credentials.json
+secrets.txt
+
+# Test outputs
+*.tmp
+*.log---
+[0m
+[0m$ [0mcargo test --test repl_color_test 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0599][0m[1m: no method named `env` found for struct `Child` in the current scope[0m
+  [1m[94m--> [0mtests/repl_color_test.rs:70:15
+   [1m[94m|[0m
+[1m[94m70[0m [1m[94m|[0m         child.env(key, value);
+   [1m[94m|[0m               [1m[91m^^^[0m [1m[91mmethod not found in `Child`[0m
+
+[1mFor more information about this error, try `rustc --explain E0599`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "repl_color_test") due to 1 previous error
+[0m
+[0m← [0mEdit tests/repl_color_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+@@ -55,21 +55,22 @@
+     session_with_env(input, &[])
+ }
+ 
+ fn session_with_env(input: &str, env: &[(&str, &str)]) -> Session {
+-    let mut child = Command::new(env!("CARGO_BIN_EXE_rb"))
++    let mut command = Command::new(env!("CARGO_BIN_EXE_rb"));
++    command
+         .stdin(Stdio::piped())
+         .stdout(Stdio::piped())
+         .stderr(Stdio::piped())
++        // The gating reads all three, and the environment this test runs under
++        // is not the one under test: each case says what the terminal says.
+         .env_remove("NO_COLOR")
+         .env_remove("TERM")
+-        .env_remove("COLORTERM")
+-        .spawn()
+-        .expect("the rb binary should start");
+-
++        .env_remove("COLORTERM");
+     for (key, value) in env {
+-        child.env(key, value);
++        command.env(key, value);
+     }
++    let mut child = command.spawn().expect("the rb binary should start");
+ 
+     let mut stdin = child.stdin.take().expect("stdin should be piped");
+     let payload = input.to_string();
+     let writer = thread::spawn(move || {
+
+[0m
+[0m$ [0mcargo test --test repl_color_test 2>&1 | tail -50
+// Variable
+  set x to 10
+  // Print
+  say "Hello"
+  // Condition
+  if x is greater than 5 then say "big" end
+  // Loop
+  for each i from 1 to 3
+      say i
+  end
+
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: repl_color_test::help_reports_the_color_mode_in_force
+   3: repl_color_test::help_reports_the_color_mode_in_force::{closure#0}
+   4: <repl_color_test::help_reports_the_color_mode_in_force::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- no_color_and_a_dumb_terminal_produce_the_plain_transcript stdout ----
+
+thread 'no_color_and_a_dumb_terminal_produce_the_plain_transcript' (6309) panicked at tests/repl_color_test.rs:133:9:
+assertion `left == right` failed: with [("NO_COLOR", "1")] the session must paint nothing
+  left: "Welcome to Redblue v0.1.0 - Interactive REPL\nType 'help' for commands, 'quit' to exit\n\n>>> >>> 5\n>>> Variables:\n  x = 5\n>>> Error: AnalyzerError: Unknown variable 'nope'\n  --> 1:1\n>>> Error: AnalyzerError: Unknown variable 'nosuchcommand'\n  --> 1:1\n>>> Goodbye!\n"
+ right: "Welcome to Redblue v0.1.0 - Interactive REPL\nType 'help' for commands, 'quit' to exit\n\n>>> >>> 5\n>>> Variables:\n  x = 5\n>>> Error: AnalyzerError: Unknown variable 'nope'\n  --> 1:1\n>>> Unknown command 'nosuchcommand'. Type :help for available commands.\n>>> Goodbye!\n"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<alloc::string::String, alloc::string::String>
+   4: repl_color_test::no_color_and_a_dumb_terminal_produce_the_plain_transcript
+   5: repl_color_test::no_color_and_a_dumb_terminal_produce_the_plain_transcript::{closure#0}
+   6: <repl_color_test::no_color_and_a_dumb_terminal_produce_the_plain_transcript::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    a_loaded_program_keeps_its_text_with_color_on
+    a_piped_session_prints_the_transcript_it_printed_before_colours_existed
+    colors_off_in_a_live_session_prints_the_plain_transcript
+    colors_on_wraps_the_result_and_the_error_without_changing_their_text
+    edge_colors_with_a_bogus_argument_is_refused_by_name
+    help_reports_the_color_mode_in_force
+    no_color_and_a_dumb_terminal_produce_the_plain_transcript
+
+test result: FAILED. 0 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+[1m[91merror[0m: test failed, to rerun pass `--test repl_color_test`
+[0m
+[0m← [0mEdit tests/repl_color_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+@@ -106,9 +106,10 @@
+ 
+ /// The session the transcript fixtures were captured from: a value, a program
+ /// that prints, a listing, an error, and an unknown command. Covers the four
+ /// places the palette is applied — result, program output, `:vars` and errors.
+-const TRANSCRIPT_INPUT: &str = "set x to 2 + 3\nsay x\n:vars\nnope\nnosuchcommand\n:quit\n";
++const TRANSCRIPT_INPUT: &str =
++    "set x to 2 + 3\nsay x\n:vars\nnope\n:nosuchcommand\n:quit\n";
+ 
+ /// With output piped, every byte is what it was before the colour system existed.
+ #[test]
+ fn a_piped_session_prints_the_transcript_it_printed_before_colours_existed() {
+
+[0m
+[0m$ [0mcargo test --test repl_color_test a_piped 2>&1 | grep -A6 'panicked\|test result'
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.01s
+[0m
+Red for the right reason (7 failing; the plain transcript already pins itself). Now the implementation.
+[0m← [0mWrite src/repl/color.rs
+Wrote file successfully.
+[0m
+[0m← [0mEdit src/repl/color.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+@@ -156,15 +156,14 @@
+             term: env::var("TERM").ok(),
+             colorterm: env::var("COLORTERM").ok(),
+             no_color: env::var("NO_COLOR").ok(),
+             windows: cfg!(windows),
+-            ansi_ready: if is_tty {
+-                enable_virtual_terminal_processing()
+-            } else {
+-                // Nothing to enable: a pipe renders nothing, and asking about
+-                // it would only report that back.
+-                false
+-            },
++            // Asked whether or not stdout is a terminal: a redirected pipe is
++            // still a stream this platform knows how to write escapes into, and
++            // `:colors on` is allowed to write them. Only a console that cannot
++            // be told to interpret them is a refusal, and that is answered
++            // whatever stdout is.
++            ansi_ready: enable_virtual_terminal_processing(),
+         }
+     }
+ }
+ 
+
+[0m
+[0m← [0mEdit src/repl/color.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+@@ -317,19 +317,22 @@
+ /// cannot work out why their terminal is plain has no other way to ask.
+ /// `Refusal::as_str` values are this module's own words, never anything read
+ /// out of the environment, so a `TERM` full of escapes cannot reach here.
+ pub fn report(self) -> String {
+-    match (self.mode, self.enabled) {
+-        (ColorMode::On, true) => "Colors: on.".to_string(),
+-        (ColorMode::Off, _) | (_, false) if self.mode == ColorMode::Off => {
+-            "Colors: off.".to_string()
+-        }
+-        (_, true) => "Colors: auto (this terminal is painted).".to_string(),
+-        (_, false) => match self.refusal {
+-            Some(refusal) => format!("Colors: auto ({}).", refusal.as_str()),
+-            None => "Colors: auto (no colour).".to_string(),
+-        },
++    if self.mode == ColorMode::Off {
++        return "Colors: off.".to_string();
+     }
++    if self.enabled {
++        return if self.mode == ColorMode::On {
++            "Colors: on.".to_string()
++        } else {
++            "Colors: auto (this terminal is painted).".to_string()
++        };
++    }
++    match self.refusal {
++        Some(refusal) => format!("Colors: auto ({}).", refusal.as_str()),
++        None => "Colors: auto (no colour).".to_string(),
++    }
+ }
+ 
+ /// `text` in the colour `paint` names — or `text` itself, byte for byte,
+ /// when this style does not paint.
+
+[0m
+[0m← [0mEdit src/repl/color.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+@@ -353,44 +353,49 @@
+ ///
+ /// The order is the whole design. A console that cannot render an escape
+ /// sequence is refused first, under every mode, because the alternative is the
+ /// characters of a sequence printed into the middle of a line the user is
+-/// reading. `Off` is refused next, and only then does `On` force past what the
+-/// terminal asks — so a forced colour never outranks the platform's ability to
+-/// show one.
++/// reading — so a forced colour never outranks the platform's ability to show
++/// one. Everything after that is a question only `Auto` asks, in the order a
++/// user would: is this a terminal, did they ask for no colour, and what does it
++/// call itself.
+ fn refuse(terminal: &TerminalInfo) -> Option<Refusal> {
+     if !terminal.ansi_ready {
+         return Some(Refusal::NoAnsiSupport);
+     }
++
++    if !terminal.is_tty {
++        return Some(Refusal::NotATerminal);
++    }
++
++    if terminal
++        .no_color
++        .as_deref()
++        .is_some_and(|value| !value.is_empty())
++    {
++        return Some(Refusal::NoColor);
++    }
++
+     match terminal_kind(terminal.term.as_deref()) {
+-        TerminalKind::Dumb => return Some(Refusal::DumbTerminal),
++        TerminalKind::Dumb => Some(Refusal::DumbTerminal),
+         TerminalKind::Unknown => {
+-            // An unknown `TERM` is only a refusal where nothing else has said
++            // An unknown `TERM` is a refusal only where nothing else has said
+             // this is a terminal that paints. Windows sets no `TERM` of its own
+             // and sets `COLORTERM` when it is a terminal that does; a Unix
+-            // session with no `TERM` is a session being run from something that
++            // session with no `TERM` is a session being run by something that
+             // never said.
+             let colorterm = terminal
+                 .colorterm
+                 .as_deref()
+                 .is_some_and(|value| !value.is_empty());
+-            if !(colorterm || terminal.windows) {
+-                return Some(Refusal::UnreadableTerminal);
++            if colorterm || terminal.windows {
++                None
++            } else {
++                Some(Refusal::UnreadableTerminal)
+             }
+         }
+-        TerminalKind::Ansi => {}
++        TerminalKind::Ansi => None,
+     }
+-
+-    match terminal.no_color.as_deref() {
+-        Some(value) if !value.is_empty() => return Some(Refusal::NoColor),
+-        _ => {}
+-    }
+-
+-    if !terminal.is_tty {
+-        return Some(Refusal::NotATerminal);
+-    }
+-
+-    None
+ }
+ 
+ /// Whether this console can render SGR sequences, enabling them if it can be
+ /// told to.
+
+[0m
+Now wire it into the REPL.
+[0m$ [0mgrep -n 'pub mod\|^use \|^pub use ' src/repl/mod.rs | head -20
+1:pub mod commands;
+2:pub mod completer;
+3:pub mod editor;
+4:pub mod history;
+6:use std::cell::RefCell;
+7:use std::collections::HashMap;
+8:use std::io::{self, Write};
+9:use std::rc::Rc;
+11:pub use commands::ReplCommand;
+12:pub use completer::ReplCompleter;
+13:pub use editor::{Line, LineSource, SessionNames};
+14:pub use history::ReplHistory;
+16:use crate::analyzer;
+17:use crate::debugger::{lock, DebugAction, DebugSession, SharedDebugSession, StepMode};
+18:use crate::interpreter::Vm;
+19:use crate::lexer::Lexer;
+20:use crate::parser::{open_block_depth, Parser, Program};
+21:use crate::value::Value;
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -1,4 +1,5 @@
++pub mod color;
+ pub mod commands;
+ pub mod completer;
+ pub mod editor;
+ pub mod history;
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -14,8 +14,9 @@
+ pub use editor::{Line, LineSource, SessionNames};
+ pub use history::ReplHistory;
+ 
+ use crate::analyzer;
++use crate::repl::color::{ColorMode, Paint, Style};
+ use crate::debugger::{lock, DebugAction, DebugSession, SharedDebugSession, StepMode};
+ use crate::interpreter::Vm;
+ use crate::lexer::Lexer;
+ use crate::parser::{open_block_depth, Parser, Program};
+
+[0m
+Now the `Repl` struct and its style accessors:
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -227,12 +227,27 @@
+     /// The debugging session: its breakpoints, its pending step, and the frame
+     /// the last program stopped in. Shared with the hook the VM calls, so a
+     /// `:frame` typed after the program has run reads the frame that stop left.
+     debug: SharedDebugSession,
++    /// Whether this session paints, and in what colour.
++    ///
++    /// Resolved once when the session is built, out of the environment and the
++    /// terminal — and again by `:colors`. It is a value rather than a question
++    /// asked per line, so painting a result costs a field read and a format.
++    style: Style,
+ }
+ 
+ impl Repl {
+     pub fn new() -> Self {
++        Self::with_color_mode(ColorMode::Auto)
++    }
++
++    /// A session that starts in `mode` rather than in `auto`.
++    ///
++    /// A mode can be asked for before a session exists, which is what a caller
++    /// that has already read `NO_COLOR` itself wants, and what keeps the two
++    /// ways in — the environment and `:colors` — from being two code paths.
++    pub fn with_color_mode(mode: ColorMode) -> Self {
+         Self {
+             vm: Vm::new(),
+             variables: HashMap::new(),
+             history: ReplHistory::new(HISTORY_LIMIT),
+@@ -240,11 +255,57 @@
+             running: true,
+             multiline_buffer: Vec::new(),
+             in_multiline: false,
+             debug: DebugSession::shared(),
++            style: Style::detect(mode),
+         }
+     }
+ 
++    /// The colour mode in force, and the resolved style with it.
++    pub fn color_mode(&self) -> ColorMode {
++        self.style.mode()
++    }
++
++    /// Whether this session is painting.
++    pub fn paints_color(&self) -> bool {
++        self.style.enabled()
++    }
++
++    /// Switches the session to `mode`, re-deciding against the terminal.
++    ///
++    /// The terminal is asked again rather than cached from startup, so
++    /// `:colors auto` after `:colors on` lands where the environment says it
++    /// lands now, which is not necessarily where it landed then.
++    pub fn set_color_mode(&mut self, mode: ColorMode) {
++        self.style = Style::detect(mode);
++    }
++
++    /// `:colors on`, `:colors off`, `:colors auto` — or the refusal.
++    ///
++    /// A word that names no mode is named back and changes nothing. Defaulting
++    /// it would leave the session painted in a colour the user did not choose,
++    /// which is the one outcome a refusal exists to prevent.
++    fn set_color_argument(&mut self, argument: &str) {
++        match ColorMode::parse(argument) {
++            Some(mode) => {
++                self.set_color_mode(mode);
++                println!("Colors {}.", mode);
++            }
++            None => println!(
++                "{}",
++                self.style.paint(
++                    Paint::Error,
++                    &format!("':colors' takes on, off or auto, not '{argument}'.")
++                )
++            ),
++        }
++    }
++
++    /// One line of the `:help` output about colour: the mode, and why.
++    pub fn color_report(&self) -> String {
++        self.style.report()
++    }
++
+     /// Completes `word` against the session: the language's own keywords and
+     /// builtins, the REPL's commands, and every name this session has bound.
+     pub fn complete(&self, word: &str) -> Vec<String> {
+         self.completer.complete_with(word, &self.session_names())
+
+[0m
+[0m$ [0msed -n '218,240p' src/repl/mod.rs
+pub struct Repl {
+    vm: Vm,
+    variables: HashMap<String, Value>,
+    history: ReplHistory,
+    completer: ReplCompleter,
+    running: bool,
+    multiline_buffer: Vec<String>,
+    in_multiline: bool,
+    /// The debugging session: its breakpoints, its pending step, and the frame
+    /// the last program stopped in. Shared with the hook the VM calls, so a
+    /// `:frame` typed after the program has run reads the frame that stop left.
+    debug: SharedDebugSession,
+    /// Whether this session paints, and in what colour.
+    ///
+    /// Resolved once when the session is built, out of the environment and the
+    /// terminal — and again by `:colors`. It is a value rather than a question
+    /// asked per line, so painting a result costs a field read and a format.
+    style: Style,
+}
+
+impl Repl {
+    pub fn new() -> Self {
+[0m
+Now apply the palette at the four places:
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -389,8 +389,9 @@
+     return SessionEnd::Quit;
+ }
+ 
+ let prompt = if self.in_multiline { "..  " } else { ">>> " };
++let prompt = self.style.paint(Paint::Prompt, prompt);
+ 
+ // The editor completes against the names the session has bound, and
+ // it cannot be lent them while they are being borrowed to read a
+ // line, so it is given a snapshot refreshed here.
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -660,14 +660,25 @@
+ 
+     match result {
+         Ok(value) => {
+             if !matches!(value, Value::Nothing) {
+-                println!("= {}", value);
++                println!(
++                    "{}",
++                    self.style
++                        .paint(Paint::Result, &format!("= {}", value))
++                );
+                 self.variables.insert("_".to_string(), value);
+             }
+         }
+         Err(e) => {
+-            println!("Error: {}", e);
++            // The colour goes round the message, never into it: every
++            // assertion about what the REPL says on an error holds whether
++            // or not this session is painting.
++            println!(
++                "{}",
++                self.style
++                    .paint(Paint::Error, &format!("Error: {}", e))
++            );
+         }
+     }
+ }
+ 
+
+[0m
+[0m$ [0mgrep -n 'fn print_help' -A 12 src/repl/mod.rs | head -20; echo ===; grep -n 'Unknown command\|fn print_variables\|fn print_functions' -A 12 src/repl/mod.rs | sed -n '1,60p'
+761:    fn print_help(&self) {
+762-        println!("Redblue REPL Commands:");
+763-        println!();
+764-        // Every line of this list comes from the one table the parser accepts
+765-        // commands in, aliases included. It was written out separately, so `:q`,
+766-        // `:h`, `:hist`, `:v`, `:f`, `:cls`, `:l`, `:s` and `:i` all worked and
+767-        // none of them was documented.
+768-        for line in ReplCommand::help_lines() {
+769-            println!("{}", line);
+770-        }
+771-        println!();
+772-        // The second sigil is parsed by [`ReplCommand::parse`] and completed by
+773-        // the completer, so a table that lists only `:` leaves half of what the
+===
+538:                    "Unknown command '{}'. Type :help for available commands.",
+539-                    word
+540-                );
+541-                true
+542-            }
+543-        }
+544-    }
+545-
+546-    /// Buffers `input` and runs the buffer once it holds a whole program.
+547-    ///
+548-    /// A block the user opened and has not closed yet leaves the session in
+549-    /// continuation mode; the buffer is run the moment it balances, and a line
+550-    /// that leaves a block open is the only thing that opens continuation mode at
+--
+833:    fn print_variables(&self) {
+834-        let Some(lines) = self.variable_lines() else {
+835-            println!("No variables defined.");
+836-            return;
+837-        };
+838-
+839-        println!("Variables:");
+840-        for line in lines {
+841-            println!("{}", line);
+842-        }
+843-    }
+844-
+845-    /// The `:funcs` listing: every function the session declared, in name order,
+--
+861:    fn print_functions(&self) {
+862-        let Some(lines) = self.function_lines() else {
+863-            println!("No functions defined.");
+864-            return;
+865-        };
+866-
+867-        println!("Functions:");
+868-        for line in lines {
+869-            println!("{}", line);
+870-        }
+871-    }
+872-
+873-    /// Reads the file at `path` and runs its source in this session's VM.
+[0m
+[0m$ [0msed -n '530,542p' src/repl/mod.rs
+}
+            ReplCommand::NotACommand => false,
+            ReplCommand::MissingArgument { command, usage } => {
+                println!("Usage: :{} {}", command, usage);
+                true
+            }
+            ReplCommand::Unknown(word) => {
+                println!(
+                    "Unknown command '{}'. Type :help for available commands.",
+                    word
+                );
+                true
+            }
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -529,15 +529,31 @@
+         true
+     }
+     ReplCommand::NotACommand => false,
+     ReplCommand::MissingArgument { command, usage } => {
+-        println!("Usage: :{} {}", command, usage);
++        println!(
++            "{}",
++            self.style.paint(
++                Paint::Error,
++                &format!("Usage: :{} {}", command, usage)
++            )
++        );
+         true
+     }
++    ReplCommand::Colors(argument) => {
++        self.set_color_argument(&argument);
++        true
++    }
+     ReplCommand::Unknown(word) => {
+         println!(
+-            "Unknown command '{}'. Type :help for available commands.",
+-            word
++            "{}",
++            self.style.paint(
++                Paint::Error,
++                &format!(
++                    "Unknown command '{}'. Type :help for available commands.",
++                    word
++                )
++            )
+         );
+         true
+     }
+ }
+
+[0m
+Now the headings and listings:
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -774,9 +774,12 @@
+     result
+ }
+ 
+ fn print_help(&self) {
+-    println!("Redblue REPL Commands:");
++    println!(
++        "{}",
++        self.style.paint(Paint::Heading, "Redblue REPL Commands:")
++    );
+     println!();
+     // Every line of this list comes from the one table the parser accepts
+     // commands in, aliases included. It was written out separately, so `:q`,
+     // `:h`, `:hist`, `:v`, `:f`, `:cls`, `:l`, `:s` and `:i` all worked and
+
+[0m
+[0m$ [0msed -n '784,812p' src/repl/mod.rs
+// commands in, aliases included. It was written out separately, so `:q`,
+        // `:h`, `:hist`, `:v`, `:f`, `:cls`, `:l`, `:s` and `:i` all worked and
+        // none of them was documented.
+        for line in ReplCommand::help_lines() {
+            println!("{}", line);
+        }
+        println!();
+        // The second sigil is parsed by [`ReplCommand::parse`] and completed by
+        // the completer, so a table that lists only `:` leaves half of what the
+        // REPL answers to unexplained. One sentence says it once rather than
+        // printing every command twice.
+        let alt = commands::ALT_SIGIL;
+        println!(
+            "  Every command also answers to '{alt}' in place of ':' \
+             — {alt}quit is :quit."
+        );
+        println!();
+        println!("Quick Reference:");
+        for (caption, source) in QUICK_REFERENCE {
+            println!("  // {}", caption);
+            for line in source.lines() {
+                println!("  {}", line);
+            }
+        }
+        println!();
+    }
+
+    /// Every name the session has bound, with the value it holds, in name order.
+    ///
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -797,16 +797,23 @@
+         "  Every command also answers to '{alt}' in place of ':' \
+          — {alt}quit is :quit."
+     );
+     println!();
+-    println!("Quick Reference:");
++    println!(
++        "{}",
++        self.style.paint(Paint::Heading, "Quick Reference:")
++    );
+     for (caption, source) in QUICK_REFERENCE {
+         println!("  // {}", caption);
+         for line in source.lines() {
+             println!("  {}", line);
+         }
+     }
+     println!();
++    // Where the session is on colour, and why. The mode is the first thing a
++    // user asks for when a session is not painting and the second when it
++    // is, and without this line neither has anywhere to look.
++    println!("{}", self.color_report());
+ }
+ 
+ /// Every name the session has bound, with the value it holds, in name order.
+ ///
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -861,11 +861,11 @@
+         println!("No variables defined.");
+         return;
+     };
+ 
+-    println!("Variables:");
++    println!("{}", self.style.paint(Paint::Heading, "Variables:"));
+     for line in lines {
+-        println!("{}", line);
++        println!("{}", self.style.paint(Paint::Value, &line));
+     }
+ }
+ 
+ /// The `:funcs` listing: every function the session declared, in name order,
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -889,11 +889,11 @@
+         println!("No functions defined.");
+         return;
+     };
+ 
+-    println!("Functions:");
++    println!("{}", self.style.paint(Paint::Heading, "Functions:"));
+     for line in lines {
+-        println!("{}", line);
++        println!("{}", self.style.paint(Paint::Name, &line));
+     }
+ }
+ 
+ /// Reads the file at `path` and runs its source in this session's VM.
+
+[0m
+Now the `:colors` command in the table:
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -40,8 +40,16 @@
+ Inspect(String),
+ Ast(String),
+ Tokens(String),
+ Example,
++/// Sets the session's colour mode to the one named: `on`, `off` or `auto`.
++///
++/// A word that is not one of those three reaches this command intact and is
++/// refused by name rather than guessed at, which is the point of taking the
++/// whole remainder: `Auto` is a [`ColorMode`](super::color::ColorMode) and
++/// guessing it from a typo would paint a session the user did not ask to be
++/// painted.
++Colors(String),
+ /// A command that was recognised but not given what it needs.
+ ///
+ /// Not [`ReplCommand::Unknown`]: the command *is* known, its argument is
+ /// not, and reporting "Unknown command 'load requires a file path'" told
+
+[0m
+[0m← [0mEdit src/repl/commands.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/commands.rs
+@@ -235,8 +235,14 @@
+         description: "Show example code",
+         usage: None,
+         build: |_| ReplCommand::Example,
+     },
++    CommandSpec {
++        names: &["colors", "color"],
++        description: "Colour the session: on, off or auto",
++        usage: Some("<on|off|auto>"),
++        build: |argument| ReplCommand::Colors(argument.unwrap_or_default()),
++    },
+ ];
+ 
+ impl ReplCommand {
+     /// Every command word the table accepts, without a sigil, sorted.
+
+[0m
+[0m$ [0mcargo check --all-targets 2>&1 | grep -E '^(error|warning)' -A 8 | head -60
+(no output)
+[0m
+[0m$ [0mcargo test --test repl_color_test 2>&1 | grep -E 'panicked|assertion|test result|left:|right:' | head -30
+(no output)
+[0m
+[0m$ [0mcargo test --test repl_color_test 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0msrc/repl/mod.rs:400:47
+    [1m[94m|[0m
+[1m[94m400[0m [1m[94m|[0m             let line = match source.read_line(prompt) {
+    [1m[94m|[0m                                     [1m[94m---------[0m [1m[91m^^^^^^[0m [1m[91mexpected `&str`, found `String`[0m
+    [1m[94m|[0m                                     [1m[94m|[0m
+    [1m[94m|[0m                                     [1m[94marguments to this method are incorrect[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: method defined here
+   [1m[94m--> [0msrc/repl/editor.rs:67:8
+    [1m[94m|[0m
+[1m[94m 67[0m [1m[94m|[0m     fn read_line(&mut self, prompt: &str) -> io::Result<Line>;
+    [1m[94m|[0m        [1m[92m^^^^^^^^^[0m            [1m[94m------[0m
+[1m[96mhelp[0m: consider borrowing here
+    [1m[94m|[0m
+[1m[94m400[0m [1m[94m| [0m            let line = match source.read_line([92m&[0mprompt) {
+    [1m[94m|[0m                                               [92m+[0m
+
+[1mFor more information about this error, try `rustc --explain E0308`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib) due to 1 previous error
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -396,9 +396,9 @@
+ // it cannot be lent them while they are being borrowed to read a
+ // line, so it is given a snapshot refreshed here.
+ *names.borrow_mut() = self.session_names();
+ 
+-let line = match source.read_line(prompt) {
++let line = match source.read_line(&prompt) {
+     Ok(Line::Text(text)) => text,
+     // Ctrl-C throws away the line being written, not the session.
+     Ok(Line::Interrupted) => continue,
+     Ok(Line::Eof) => {
+
+[0m
+[0m$ [0mcargo test --test repl_color_test 2>&1 | tail -40
+1: core::panicking::panic_fmt
+   2: repl_color_test::colors_on_wraps_the_result_and_the_error_without_changing_their_text
+   3: repl_color_test::colors_on_wraps_the_result_and_the_error_without_changing_their_text::{closure#0}
+   4: <repl_color_test::colors_on_wraps_the_result_and_the_error_without_changing_their_text::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- colors_off_in_a_live_session_prints_the_plain_transcript stdout ----
+
+thread 'colors_off_in_a_live_session_prints_the_plain_transcript' (7559) panicked at tests/repl_color_test.rs:149:5:
+a session turned off paints nothing:
+--- actual ---
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Colors off.
+>>> >>> 5
+>>> Variables:
+  x = 5
+>>> Error: AnalyzerError: Unknown variable 'nope'
+  --> 1:1
+>>> Unknown command 'nosuchcommand'. Type :help for available commands.
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: repl_color_test::colors_off_in_a_live_session_prints_the_plain_transcript
+   3: repl_color_test::colors_off_in_a_live_session_prints_the_plain_transcript::{closure#0}
+   4: <repl_color_test::colors_off_in_a_live_session_prints_the_plain_transcript::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    a_loaded_program_keeps_its_text_with_color_on
+    colors_off_in_a_live_session_prints_the_plain_transcript
+    colors_on_wraps_the_result_and_the_error_without_changing_their_text
+
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+[1m[91merror[0m: test failed, to rerun pass `--test repl_color_test`
+[0m
+[0m← [0mEdit src/repl/color.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+@@ -280,9 +280,9 @@
+ }
+ 
+ /// The style `mode` asks for on `terminal`.
+ pub fn resolve(mode: ColorMode, terminal: &TerminalInfo) -> Style {
+-    match refuse(terminal) {
++    match refuse(mode, terminal) {
+         Some(refusal) => Style {
+             mode,
+             enabled: false,
+             refusal: Some(refusal),
+
+[0m
+[0m← [0mEdit src/repl/color.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+@@ -348,21 +348,25 @@
+         format!("{}{}{}", paint.code(), text, RESET)
+     }
+ }
+ 
+-/// Why `terminal` will not paint, in the order that decides it.
++/// Why `mode` will not paint on `terminal`, in the order that decides it.
+ ///
+ /// The order is the whole design. A console that cannot render an escape
+ /// sequence is refused first, under every mode, because the alternative is the
+ /// characters of a sequence printed into the middle of a line the user is
+-/// reading — so a forced colour never outranks the platform's ability to show
+-/// one. Everything after that is a question only `Auto` asks, in the order a
+-/// user would: is this a terminal, did they ask for no colour, and what does it
+-/// call itself.
+-fn refuse(terminal: &TerminalInfo) -> Option<Refusal> {
++/// reading — so no forced colour outranks the platform's ability to show one.
++/// After that only `Auto` asks anything, and it asks in the order a user would:
++/// is this a terminal, did they ask for no colour, and what does it call itself.
++/// `On` asks the user: they have said yes, and the only thing left to overrule
++/// them is the platform.
++fn refuse(mode: ColorMode, terminal: &TerminalInfo) -> Option<Refusal> {
+     if !terminal.ansi_ready {
+         return Some(Refusal::NoAnsiSupport);
+     }
++    if mode != ColorMode::Auto {
++        return None;
++    }
+ 
+     if !terminal.is_tty {
+         return Some(Refusal::NotATerminal);
+     }
+
+[0m
+[0m$ [0mcargo test --test repl_color_test 2>&1 | grep -E 'test result|^test ' | head -20
+test a_piped_session_prints_the_transcript_it_printed_before_colours_existed ... ok
+test a_loaded_program_keeps_its_text_with_color_on ... FAILED
+test colors_on_wraps_the_result_and_the_error_without_changing_their_text ... ok
+test edge_colors_with_a_bogus_argument_is_refused_by_name ... ok
+test colors_off_in_a_live_session_prints_the_plain_transcript ... FAILED
+test help_reports_the_color_mode_in_force ... ok
+test no_color_and_a_dumb_terminal_produce_the_plain_transcript ... ok
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+[0m
+[0m$ [0mcargo test --test repl_color_test a_loaded_program 2>&1 | grep -B3 -A 25 'panicked'
+---- a_loaded_program_keeps_its_text_with_color_on stdout ----
+
+thread 'a_loaded_program_keeps_its_text_with_color_on' (7806) panicked at tests/repl_color_test.rs:237:5:
+and its last value is still reported as `= 7`:
+Welcome to Redblue v0.1.0 - Interactive REPL
+Type 'help' for commands, 'quit' to exit
+
+>>> Colors on.
+[36m>>> [0mLoaded 29 bytes from '/home/runner/work/rbops/rbops/redblue/target/tmp/repl-color/loaded-0.rb'.
+from a file
+[36m>>> [0mGoodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: repl_color_test::a_loaded_program_keeps_its_text_with_color_on
+   3: repl_color_test::a_loaded_program_keeps_its_text_with_color_on::{closure#0}
+   4: <repl_color_test::a_loaded_program_keeps_its_text_with_color_on::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    a_loaded_program_keeps_its_text_with_color_on
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.01s
+
+[1m[91merror[0m: test failed, to rerun pass `--test repl_color_test`
+[0m
+[0m← [0mEdit tests/repl_color_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+@@ -225,18 +225,18 @@
+ /// The loaded-program path is a second way results reach a session, and it goes
+ /// through the same result line.
+ #[test]
+ fn a_loaded_program_keeps_its_text_with_color_on() {
+-    let path = scratch_file("loaded", "say \"from a file\"\nset y to 7\n");
++    let path = scratch_file("loaded", "say \"from a file\"\n7 * 6\n");
+     let s = session_with_env(&format!(":colors on\n:load {}\n:quit\n", path.display()), &[]);
+ 
+     assert!(
+         s.stdout.contains("from a file"),
+         "a loaded program still prints what it says:\n{}",
+         s.stdout
+     );
+     assert!(
+-        s.stdout.contains("= 7"),
+-        "and its last value is still reported as `= 7`:\n{}",
++        s.stdout.contains("= 42"),
++        "and its last value is still reported as `= 42`:\n{}",
+         s.stdout
+     );
+ }
+\ No newline at end of file
+
+[0m
+[0m$ [0mcargo test --test repl_color_test colors_off 2>&1 | grep -A 22 'panicked' | cat -A | head -30
+thread 'colors_off_in_a_live_session_prints_the_plain_transcript' (7924) panicked at tests/repl_color_test.rs:149:5:$
+a session turned off paints nothing:$
+--- actual ---$
+Welcome to Redblue v0.1.0 - Interactive REPL$
+Type 'help' for commands, 'quit' to exit$
+$
+>>> Colors off.$
+>>> >>> 5$
+>>> Variables:$
+  x = 5$
+>>> Error: AnalyzerError: Unknown variable 'nope'$
+  --> 1:1$
+>>> Unknown command 'nosuchcommand'. Type :help for available commands.$
+>>> Goodbye!$
+$
+stack backtrace:$
+   0: __rustc::rust_begin_unwind$
+   1: core::panicking::panic_fmt$
+   2: repl_color_test::colors_off_in_a_live_session_prints_the_plain_transcript$
+   3: repl_color_test::colors_off_in_a_live_session_prints_the_plain_transcript::{closure#0}$
+   4: <repl_color_test::colors_off_in_a_live_session_prints_the_plain_transcript::{closure#0} as core::ops::function::FnOnce<()>>::call_once$
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.$
+$
+[0m
+[0m← [0mEdit tests/repl_color_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+@@ -145,11 +145,14 @@
+ fn colors_off_in_a_live_session_prints_the_plain_transcript() {
+     let plain = session_with_env(&format!(":colors off\n{}", TRANSCRIPT_INPUT), &[("TERM", "xterm-256color")]);
+     let reference = session(TRANSCRIPT_INPUT);
+ 
+-    assert!(
+-        plain.stdout.ends_with(&reference.stdout),
+-        "a session turned off paints nothing:\n--- actual ---\n{}",
++    let acknowledged = plain.stdout.replacen(">>> Colors off.\n", "", 1);
++    assert_eq!(
++        acknowledged,
++        reference.stdout,
++        "with colors off a session prints the pre-colour transcript, bar the one \
++         line that answers the command:\n--- actual ---\n{}",
+         plain.stdout
+     );
+     assert_eq!(
+         plain.stdout.matches('\u{1b}').count(),
+
+[0m
+[0m$ [0mcargo test --test repl_color_test 2>&1 | grep -E 'test result|^test |panicked' | head -20
+test a_piped_session_prints_the_transcript_it_printed_before_colours_existed ... ok
+test colors_on_wraps_the_result_and_the_error_without_changing_their_text ... ok
+test a_loaded_program_keeps_its_text_with_color_on ... ok
+test edge_colors_with_a_bogus_argument_is_refused_by_name ... ok
+test help_reports_the_color_mode_in_force ... ok
+test colors_off_in_a_live_session_prints_the_plain_transcript ... ok
+test no_color_and_a_dumb_terminal_produce_the_plain_transcript ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+[0m
+[0m← [0mEdit src/repl/color.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/color.rs
+@@ -317,22 +317,17 @@
+ /// cannot work out why their terminal is plain has no other way to ask.
+ /// `Refusal::as_str` values are this module's own words, never anything read
+ /// out of the environment, so a `TERM` full of escapes cannot reach here.
+ pub fn report(self) -> String {
+-    if self.mode == ColorMode::Off {
+-        return "Colors: off.".to_string();
++    match (self.mode, self.enabled) {
++        (ColorMode::Off, _) => "Colors: off.".to_string(),
++        (_, true) if self.mode == ColorMode::On => "Colors: on.".to_string(),
++        (_, true) => "Colors: auto (this terminal is painted).".to_string(),
++        (_, false) => match self.refusal {
++            Some(refusal) => format!("Colors: {} ({}).", self.mode, refusal.as_str()),
++            None => format!("Colors: {}.", self.mode),
++        },
+     }
+-    if self.enabled {
+-        return if self.mode == ColorMode::On {
+-            "Colors: on.".to_string()
+-        } else {
+-            "Colors: auto (this terminal is painted).".to_string()
+-        };
+-    }
+-    match self.refusal {
+-        Some(refusal) => format!("Colors: auto ({}).", refusal.as_str()),
+-        None => "Colors: auto (no colour).".to_string(),
+-    }
+ }
+ 
+ /// `text` in the colour `paint` names — or `text` itself, byte for byte,
+ /// when this style does not paint.
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -264,8 +264,13 @@
+ pub fn color_mode(&self) -> ColorMode {
+     self.style.mode()
+ }
+ 
++/// The resolved style: whether this session paints, and how.
++pub fn color_style(&self) -> Style {
++    self.style
++}
++
+ /// Whether this session is painting.
+ pub fn paints_color(&self) -> bool {
+     self.style.enabled()
+ }
+
+[0m
+Now the unit tests in `src/repl/mod.rs`:
+[0m$ [0msed -n '1354,1372p' src/repl/mod.rs; echo ...; tail -30 src/repl/mod.rs
+);
+        assert!(
+            !repl
+                .complete("half_written")
+                .contains(&"half_written".to_string()),
+            "the line the interrupt abandoned did not run"
+        );
+        assert_eq!(repl.history.search("half_written"), None);
+    }
+
+    #[test]
+    fn edge_control_d_ends_the_session_with_the_farewell_it_always_printed() {
+        let mut repl = Repl::new();
+        let mut source =
+            ScriptedSource::new(vec![Ok(Line::Text("2 + 3".to_string())), Ok(Line::Eof)]);
+
+        assert_eq!(
+            drive(&mut repl, &mut source),
+            SessionEnd::Eof,
+...
+                source,
+                outcome.err()
+            );
+        }
+    }
+
+    /// `:example` is the same list, and it used to promise an interpolation `say`
+    /// does not perform: `say "Hello, {{name}}!"` printed `Hello, {{name}}!`. Each
+    /// entry is run here, so an example cannot be shown unless the session can run
+    /// it.
+    #[test]
+    fn edge_every_example_is_a_program_the_session_runs() {
+        let mut repl = Repl::new();
+
+        for (caption, source) in super::EXAMPLES {
+            let outcome = repl.run_code(source);
+            assert!(
+                outcome.is_ok(),
+                "the {:?} example is Redblue: {:?}",
+                caption,
+                outcome.err()
+            );
+            assert!(
+                !source.contains("{{") && !source.contains("}}"),
+                "the {:?} example does not promise an interpolation `say` does not do",
+                caption
+            );
+        }
+    }
+}
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2328,5 +2328,124 @@
+                 caption
+             );
+         }
+     }
++
++    /// A source that keeps the prompt it was handed, so the prompt is something a
++    /// test can read rather than something only a terminal ever sees.
++    struct PromptRecordingSource {
++        prompts: Vec<String>,
++        remaining: VecDeque<String>,
++    }
++
++    impl PromptRecordingSource {
++        fn new(lines: &[&str]) -> Self {
++            PromptRecordingSource {
++                prompts: Vec::new(),
++                remaining: lines.iter().map(|line| (*line).to_string()).collect(),
++            }
++        }
++    }
++
++    impl LineSource for PromptRecordingSource {
++        fn read_line(&mut self, prompt: &str) -> io::Result<Line> {
++            self.prompts.push(prompt.to_string());
++            Ok(match self.remaining.pop_front() {
++                Some(line) => Line::Text(line),
++                None => Line::Eof,
++            })
++        }
++    }
++
++    /// The prompt a session waits at is the one its style paints, and a session
++    /// that does not paint shows the four plain characters it always showed.
++    ///
++    /// Written against [`Repl::color_style`] rather than against a literal escape
++    /// sequence so the assertion holds on a platform whose console cannot be told
++    /// to show colour: there the style paints nothing, and the prompt is the plain
++    /// one, which is the whole point of the gate.
++    #[test]
++    fn edge_the_prompt_is_painted_only_when_the_session_paints() {
++        let mut painted = Repl::with_color_mode(ColorMode::On);
++        let mut painted_source = PromptRecordingSource::new(&["set painted_prompt to 1"]);
++        let names = Rc::new(RefCell::new(Vec::new()));
++        painted.session_loop(&mut painted_source, &names);
++
++        let expected = painted
++            .color_style()
++            .paint(super::Paint::Prompt, ">>> ");
++        assert_eq!(
++            painted_source.prompts.first().map(String::as_str),
++            Some(expected.as_str()),
++            "the prompt a session shows is the one its style paints"
++        );
++
++        let mut plain = Repl::with_color_mode(ColorMode::Off);
++        let mut plain_source = PromptRecordingSource::new(&["set plain_prompt to 1"]);
++        plain.session_loop(&mut plain_source, &names);
++
++        assert_eq!(
++            plain_source.prompts.first().map(String::as_str),
++            Some(">>> "),
++            "a session with colour off waits at the prompt it always waited at"
++        );
++    }
++
++    /// `:colors` moves the session between the three modes, and the mode survives
++    /// into `:help` — including the one it refuses.
++    #[test]
++    fn a_session_carries_the_color_mode_it_was_given_into_its_help() {
++        let mut repl = Repl::with_color_mode(ColorMode::Auto);
++
++        assert_eq!(repl.color_mode(), ColorMode::Auto, "auto is the default");
++        assert!(
++            repl.color_report().starts_with("Colors: auto"),
++            "and :help says so: {}",
++            repl.color_report()
++        );
++
++        assert!(repl.handle_command(":colors off"));
++        assert_eq!(repl.color_mode(), ColorMode::Off);
++        assert!(!repl.paints_color());
++        assert_eq!(repl.color_report(), "Colors: off.");
++
++        assert!(repl.handle_command(":colors on"));
++        assert_eq!(repl.color_mode(), ColorMode::On);
++        assert_eq!(repl.color_report(), "Colors: on.");
++
++        assert!(repl.handle_command(":colors auto"));
++        assert_eq!(repl.color_mode(), ColorMode::Auto);
++    }
++
++    /// A word that names no mode is refused and changes nothing, and `:colors`
++    /// with no word at all is the usage line rather than a mode.
++    #[test]
++    fn edge_colors_refuses_a_word_that_names_no_mode() {
++        let mut repl = Repl::with_color_mode(ColorMode::Off);
++
++        assert!(
++            repl.handle_command(":colors chartreuse"),
++            "the command is still a command, and is handled rather than run as source"
++        );
++        assert_eq!(
++            repl.color_mode(),
++            ColorMode::Off,
++            "a mode the user did not type must not be applied"
++        );
++        assert!(!repl.paints_color());
++
++        for argument in ["on extra", "1", "yellow"] {
++            repl.handle_command(&format!(":colors {}", argument));
++            assert_eq!(
++                repl.color_mode(),
++                ColorMode::Off,
++                "{argument:?} names no mode either, and must leave the session alone"
++            );
++        }
++
++        assert!(
++            repl.handle_command(":colors"),
++            ":colors with no argument is a usage line, not a crash and not a mode"
++        );
++        assert_eq!(repl.color_mode(), ColorMode::Off);
++    }
+ }
+
+[0m
+[0m$ [0mgrep -n 'use super::{farewell' -A 6 src/repl/mod.rs | head
+1224:    use super::{farewell, Repl, SessionEnd};
+1225-    use crate::repl::editor::{Line, LineSource};
+1226-    use crate::value::Value;
+1227-
+1228-    /// Where the `.rb` file under test is written, inside the project checkout
+1229-    /// rather than in a user's temp directory.
+1230-    fn scratch_file(name: &str, source: &str) -> PathBuf {
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -1221,8 +1221,9 @@
+ use std::rc::Rc;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ use super::{farewell, Repl, SessionEnd};
++use crate::repl::color::ColorMode;
+ use crate::repl::editor::{Line, LineSource};
+ use crate::value::Value;
+ 
+ /// Where the `.rb` file under test is written, inside the project checkout
+
+[0m
+[0m$ [0mgrep -n 'use std::collections\|VecDeque\|use std::rc' src/repl/mod.rs | sed -n '1,8p'
+8:use std::collections::HashMap;
+10:use std::rc::Rc;
+1221:    use std::rc::Rc;
+1277:        lines: std::collections::VecDeque<io::Result<Line>>,
+2338:        remaining: VecDeque<String>,
+[0m
+[0m$ [0msed -n '1216,1226p' src/repl/mod.rs
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::io;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{farewell, Repl, SessionEnd};
+    use crate::repl::color::ColorMode;
+    use crate::repl::editor::{Line, LineSource};
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -1215,8 +1215,9 @@
+ 
+ #[cfg(test)]
+ mod tests {
+     use std::cell::RefCell;
++    use std::collections::VecDeque;
+     use std::io;
+     use std::path::PathBuf;
+     use std::rc::Rc;
+     use std::sync::atomic::{AtomicUsize, Ordering};
+
+[0m
+[0m$ [0mcargo test --lib repl:: 2>&1 | tail -40
+test repl::tests::edge_inspect_finds_a_name_the_session_bound ... ok
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+test repl::tests::edge_inspect_reports_the_redblue_type_of_the_value ... ok
+hi
+test repl::tests::edge_reset_drops_a_block_the_session_had_not_finished_typing ... ok
+test repl::tests::edge_restore_of_a_missing_file_leaves_the_history_alone ... ok
+test repl::tests::edge_the_prompt_is_painted_only_when_the_session_paints ... ok
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+test repl::tests::edge_the_report_of_an_unclosed_block_echoes_only_some_of_it ... ok
+test repl::tests::edge_vars_lists_every_name_in_a_fixed_order ... ok
+test repl::tests::edge_vars_lists_the_names_the_session_has_bound ... ok
+test repl::tests::funcs_lists_the_functions_the_session_declared ... ok
+test repl::tests::handle_command_consumes_a_command_and_leaves_source_alone ... ok
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+test repl::tests::edge_a_block_of_few_very_long_lines_is_dropped_too ... ok
+test repl::tests::handle_command_of_quit_stops_the_session ... ok
+test repl::tests::handle_command_reports_a_command_missing_its_argument ... ok
+test repl::tests::interrupt_abandons_the_line_and_keeps_the_session_alive ... ok
+test repl::tests::load_keeps_a_value_the_file_bound_where_run_does_not ... ok
+test repl::tests::load_runs_the_file_so_its_declarations_become_the_sessions_own ... ok
+saved
+test repl::tests::the_read_loop_trims_and_skips_a_blank_line_exactly_as_the_pipe_did ... ok
+saved
+1
+test repl::tests::save_and_restore_round_trip_the_session_through_the_repl ... ok
+x
+x
+x
+x
+x
+x
+x
+x
+x
+x
+test repl::tests::edge_a_block_that_outgrows_the_buffer_is_dropped_not_kept ... ok
+test repl::tests::edge_every_block_form_asks_for_its_continuation_line ... ok
+
+test result: ok. 122 passed; 0 failed; 0 ignored; 0 measured; 53 filtered out; finished in 0.36s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E 'test result|^error|FAILED|panicked at' | head -40
+test result: ok. 175 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 318.11s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 391.39s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 70.79s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+error
+error
+error
+error
+error
+error
+error ✓ 🎉 café
+error
+error
+error
+error
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E '^test result|FAILED|^failures' | tail -40
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.89s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.91s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.10s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.59s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -cE '^test result: ok'; cargo test --all-targets 2>&1 | grep -E '^test result: FAILED' | head
+56
+[0m
+[0m$ [0mcargo fmt --all -- --check 2>&1 | head -60
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/color.rs:749:
+         }
+     }
+ }
++
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:15:
+ pub use history::ReplHistory;
+ 
+ use crate::analyzer;
+-use crate::repl::color::{ColorMode, Paint, Style};
+ use crate::debugger::{lock, DebugAction, DebugSession, SharedDebugSession, StepMode};
+ use crate::interpreter::Vm;
+ use crate::lexer::Lexer;
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:22:
+ use crate::parser::{open_block_depth, Parser, Program};
++use crate::repl::color::{ColorMode, Paint, Style};
+ use crate::value::Value;
+ 
+ /// How many lines a session keeps before the oldest is dropped. A terminal
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:537:
+             ReplCommand::MissingArgument { command, usage } => {
+                 println!(
+                     "{}",
+-                    self.style.paint(
+-                        Paint::Error,
+-                        &format!("Usage: :{} {}", command, usage)
+-                    )
++                    self.style
++                        .paint(Paint::Error, &format!("Usage: :{} {}", command, usage))
+                 );
+                 true
+             }
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:684:
+                 if !matches!(value, Value::Nothing) {
+                     println!(
+                         "{}",
+-                        self.style
+-                            .paint(Paint::Result, &format!("= {}", value))
++                        self.style.paint(Paint::Result, &format!("= {}", value))
+                     );
+                     self.variables.insert("_".to_string(), value);
+                 }
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:696:
+                 // or not this session is painting.
+                 println!(
+                     "{}",
+-                    self.style
+-                        .paint(Paint::Error, &format!("Error: {}", e))
++                    self.style.paint(Paint::Error, &format!("Error: {}", e))
+                 );
+             }
+         }
+Diff in /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:803:
+              — {alt}quit is :quit."
+         );
+         println!();
+-        println!(
+-            "{}",
+-            self.style.paint(Paint::Heading, "Quick Reference:")
+-        );
+[0m
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check && echo FMT_CLEAN
+FMT_CLEAN
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 5.20s
+[0m
