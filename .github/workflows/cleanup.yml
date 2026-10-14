@@ -1,0 +1,61 @@
+name: cleanup
+
+# Artifacts are the entire Actions storage cost for this repo. Each dispatched
+# phase uploads one `rbops-phase-NNN` artifact at roughly 3.8 MB, so the budget
+# fills at ~100 phases. That is not hypothetical: a 12-hour deferral loop left
+# ~200 artifacts and filled a 0.5 GB storage budget.
+#
+# This runs on a schedule and keeps only a recent window, so storage cannot fill
+# again. It deletes ARTIFACTS ONLY - never runs, never branches, never commits.
+on:
+  schedule:
+    # 03:17 UTC daily. Off the hour on purpose: GitHub delays scheduled
+    # workflows that fire on :00 when the platform is busiest.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete artifacts older than the retention window
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP_DAYS: "14"
+        run: |
+          set -uo pipefail
+          echo "Retention: ${KEEP_DAYS} days"
+          total_before=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=1" \
+            --jq '.total_count')
+          echo "artifacts before: ${total_before}"
+
+          # total_count is a single number for the whole repo, so deleting by
+          # index would be wrong past the first page. Page until empty.
+          deleted=0
+          for page in 1 2 3 4 5 6 7 8 9 10; do
+            ids=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=100&page=${page}" \
+              --jq '.artifacts[] | select(.expired == false) | select(.created_at < (now - ('"${KEEP_DAYS}"' * 86400) | todateiso8601)) | .id')
+            [ -z "$ids" ] && break
+            n=0
+            for id in $ids; do
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/${id}" >/dev/null 2>&1 && n=$((n+1))
+            done
+            deleted=$((deleted + n))
+            echo "page ${page}: deleted ${n}"
+            # Every artifact on the page was old, so the next page is all older
+            # still and worth scanning.
+          done
+
+          total_after=$(gh api "repos/${{ github.repository }}/actions/artifacts?per_page=1" \
+            --jq '.total_count')
+          echo "deleted ${deleted}; artifacts after: ${total_after}"
+          if [ "${deleted}" -eq 0 ]; then
+            echo "::notice::nothing older than ${KEEP_DAYS} days - nothing to prune"
+          else
+            echo "::notice::pruned ${deleted} artifact(s) older than ${KEEP_DAYS} days"
+          fi
