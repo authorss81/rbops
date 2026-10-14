@@ -695,6 +695,21 @@ TPL
         printf 'Report the test counts you actually observe. Do not claim a gate you\n'
         printf 'did not run. Only then consider whether the work itself needs changes.\n'
       fi
+      # The gate's own verdict from the attempt that just failed. This is the one
+      # input that cannot be wrong: it is not a claim about the work, it IS the
+      # work's score. Without it the agent gets the previous report (which claims
+      # success), a warning not to trust it, and no substitute — which is how
+      # phase-082 spent three attempts and ~4.5 hours rediscovering that the gate
+      # wanted an edge_* test.
+      if [ -s "$LOG_DIR/$phase.gateout" ] && grep -q '^ *FAIL' "$LOG_DIR/$phase.gateout" 2>/dev/null; then
+        printf '\n### WHAT THE GATE ACTUALLY SAID — this is the real failure\n\n'
+        printf 'The lines below are the gate output from the attempt you are resuming.\n'
+        printf 'They are the authoritative failure reason. Fix what they name. Do not\n'
+        printf 're-derive it, and do not assume the previous REPORT.md describes the\n'
+        printf 'problem — it did not.\n\n```\n'
+        grep -E '^ *(FAIL|WARN)' "$LOG_DIR/$phase.gateout" | head -25 | sed 's/^/  /'
+        printf '```\n'
+      fi
       # A human-ordered retry carries a RETRY-NOTE.md. Phase-037 proved why it
       # must be IN the context rather than beside it: the note said the manifest
       # had been corrected, but nothing reads it, so the retry never saw it and
@@ -757,8 +772,22 @@ done
   # --- THE GATE -------------------------------------------------------------
   normalize_tree
   log "running verify gate for $phase"
-  RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" RBOPS_BASE_REF="$base" "$VERIFY" "$phase"
-  code=$?
+  # Capture the gate's own verdict to a file the NEXT attempt can read, while
+  # still printing it. verify.sh writes both streams, and the diagnostic that
+  # matters - the FAIL lines - is the part that gets lost: the next attempt
+  # receives the previous REPORT.md (which claims success) plus a warning not to
+  # trust it, and nothing about what actually failed. Phase-082 burned three
+  # attempts and ~4.5 hours re-deriving a failure the gate had already named in
+  # one line: "FAIL no test named edge_* - mandatory".
+  #
+  # tee, NOT `> file`. Redirecting alone captures the verdict but takes the
+  # output off the console, and the run log IS how a human reads the gate -
+  # smoke caught that immediately. Both consumers, one execution.
+  set -o pipefail
+  RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" RBOPS_BASE_REF="$base" \
+    "$VERIFY" "$phase" 2>&1 | tee "$LOG_DIR/$phase.gateout"
+  code=${PIPESTATUS[0]}
+  set +o pipefail
   if [ "$code" -ne 0 ]; then
     rm -f "$(marker "$phase" .done)" "$(marker "$phase" .checkpoint)"
     touch "$(marker "$phase" .failed)"
@@ -776,6 +805,10 @@ done
   # gate passed — do NOT mark done yet, the reviewer must sign off first
   rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .deferred)" "$(marker "$phase" .deferred_attempts)"
   log "$phase passed the gate — awaiting review"
+  # A green gate means there is no failure left to report, so the verdict file
+  # must not survive into a future attempt for this phase. Left in place it
+  # would inject a stale FAIL list into the context of whatever runs next.
+  rm -f "$LOG_DIR/$phase.gateout"
   return 0
 }
 
