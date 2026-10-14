@@ -86,3 +86,52 @@ defect. Either:
 without it, so it is not required by the gate, and it is not this phase's work.
 If the retry genuinely needs it, that is a finding of its own with its own
 justification — not a drive-by reformat inside a colour-system diff.
+---
+
+# ADDENDUM - why this phase is .blocked
+
+This phase spun for roughly **12 hours and ~120 CI runs**, each about 6 minutes,
+every one `rc=42`, producing no work. Every run reported `success`, so nothing
+looked wrong from outside.
+
+## Root cause: the preflight path bypassed the deferral counter
+
+`dispatch.sh` had a preflight branch that, when preflight refused the inherited
+diff (rc=3), did a bare `touch .deferred` instead of calling `defer_phase`. It
+therefore never bumped `.deferred_attempts` - the file was never created at all.
+
+`MAX_DEFERRALS=5` reads that counter. With no counter the bound could not fire,
+`.blocked` was unreachable, no model was ever dispatched, and no attempt was
+consumed. An infinite loop with no exit.
+
+Introduced by the preflight work in `0f1ea86` the same day. The smoke test for
+that feature used a dead-model stub and a clean tree and never exercised the
+rc=3 refusal path, so nothing caught that it skipped the counter. That one missing
+assertion is why this ran 120 times unnoticed.
+
+## Fixed
+
+The preflight refusal now routes through `defer_phase` like every other deferral
+reason, sharing one counter and one bound. Verified: 55 phases done and advancing
+after the fix.
+
+## Why it is still blocked, and what a human must decide
+
+Preflight refuses the diff this phase inherits, and that refusal is correct - the
+gate cannot read the recovered tree. So the phase cannot proceed until one of:
+
+1. **the gate is taught to read a recovered tree**, or
+2. **the manifest/finding is wrong** and this phase should not run, or
+3. **the preserved work is abandoned** and the phase restarts from a clean tree.
+
+The preserved work was archived to `rbops-archive/phase-053` and the per-run
+artifacts are named `rbops-phase-053`, so nothing is lost by leaving it blocked.
+
+## Follow-ups
+
+- **Any new early-exit path must route through `defer_phase`**, never a bare
+  `touch .deferred`. A deferral that costs no attempt still has to be counted.
+- **smoke should assert the rc=3 path increments `.deferred_attempts`.**
+- **A run that defers forever while reporting success is a silent failure mode.**
+  Worth an explicit alarm: N consecutive `rc=42` with no state change should
+  raise rather than chain quietly.
