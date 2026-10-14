@@ -135,3 +135,52 @@ artifacts are named `rbops-phase-053`, so nothing is lost by leaving it blocked.
 - **A run that defers forever while reporting success is a silent failure mode.**
   Worth an explicit alarm: N consecutive `rc=42` with no state change should
   raise rather than chain quietly.
+
+---
+
+# UPDATE- why 053 was blocked (supersedes the decision list above)
+
+Blocked manually rather than waiting out the deferral budget, which stood at
+3/5 with two ticks remaining and nothing to gain from them.
+
+The deferrals are **not** a code defect. The model log ends identically every
+run, right after clippy compiles:
+
+    Finished \dev\ profile [unoptimized] target(s) in 5.20s
+
+...and then nothing, on runs of ~12 minutes rather than the 90-minute attempt
+timeout. That signature is the free-tier model chain being unavailable -
+\infra_failure\, not a work failure - which is why no attempt was ever
+consumed. Nothing in the repository can fix that; it is an upstream
+availability problem.
+
+It was left deferred rather than blocked because a blocked phase needs a human,
+and blocking would have stalled a legitimate REPL colour-system phase over a
+transient upstream outage.
+
+## The real problem: deferred phases have selection priority
+
+\dispatch.sh\ picks \.deferred\ phases first ("retry, cheapest continuity").
+While 053 sat deferred, it was re-selected on every tick while phase-083,
+phase-084 and phase-085 sat ready and untouched. A deferred phase therefore
+**starves ready work** for as long as its deferral budget lasts.
+
+The budget bounds it - five ticks, then blocked - so this is a delay, not a
+runaway. But the bound is the only thing stopping it, and when the bound was
+bypassed (the bare \	ouch .deferred\ bug fixed earlier today) the result was
+~12 hours of nothing.
+
+## What this phase needs, when the model chain is healthy again
+
+1. Unblock it. It is a real phase with real work to do.
+2. Run it **without** a preserved recovery, so it starts clean - the previous
+   attempt's work was a 0-byte patch and its checkpoint was 0 bytes, so there
+   was never anything to inherit.
+3. Watch the first run for the same symptom: log ending after clippy with a
+   short run time means the model chain is still down, not that the phase is
+   wrong.
+
+Worth considering separately: should a deferred phase yield to ready work
+after one retry instead of holding selection for five? Priority is right for
+continuity, but it lets one transient outage stall a queue that has 15 ready
+phases behind it.
