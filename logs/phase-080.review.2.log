@@ -1,0 +1,24 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the round-2 gaps — verifying the word-form indexing against the contract.
+[0m→ [0mRead src/parser.rs
+[0m→ [0mRead src/linter.rs
+[0m→ [0mRead src/formatter.rs
+[0m→ [0mRead src/parser.rs[90m [offset=1519][0m
+[0m→ [0mRead SPEC.md[90m [offset=315, limit=80][0m
+[0m→ [0mRead tests/index_words_test.rs
+[0m→ [0mRead bootstrap/compiler.rb[90m [offset=1070, limit=120][0m
+I've spotted a likely precedence flaw in the word-form parsing — now digging for the remaining defects to complete the verdict.
+[0m→ [0mRead docs/GRAMMAR.md[90m [offset=385, limit=190][0m
+[0m→ [0mRead tests/linter_test.rs
+[0m→ [0mRead bootstrap/compiler.rb[90m [offset=1940, limit=180][0m
+FINDINGS:
+1. [BLOCKER] src/parser.rs:2420 — `xs at` parses its index with full `parse_expression()`, so `say xs at 0 is 10` is `xs at (0 is 10)` not `(xs at 0) is 10`; same at src/parser.rs:2479 where `length of xs is 3` is `length(xs is 3)` — why it matters: every comparison/logic outer operator is swallowed into the operand, turning working programs into `Index must be a number` / `length requires a list or text` runtime errors, while bracket form `xs[0] is 10` is unaffected — concrete fix: parse the operand at a tighter level (additive/unary/postfix chain) that excludes `is`/`and`/`or`, and add the missing `is`/`and`/`or` tests (tests/index_words_test.rs:615 only pins `n + 1` / `3 - 1`).
+2. [MAJOR] tests/linter_test.rs:257 — fixture `show with 2` has no `with` syntax and parses as three Expr statements (`show`, `with`, `2`) that the analyzer refuses, but the test checks only `warnings(source)` — why it matters: same unrunnable-`with` defect just fixed for `greet with` was left here, and the analyzer refusal the phase adds is invisible to this assertion — concrete fix: change fixture to `show(2)` as was done for `greet("world")`.
+3. [MAJOR] src/linter.rs:480 — `lint_program()` walks the tree only and never asks the analyzer, while `lint()` at src/linter.rs:457 always appends it — why it matters: CLI `rb lint` and LSP diagnostics disagree about every analyzer-refused file, contradicting the REPORT's "rb lint reports the refusal" claim — concrete fix: share one analyzer-append step between both entry points or pin the divergence with a test.
+4. [MAJOR] bootstrap/compiler.rb:1129 — `is_expression_start` returns yes for `mightfail` while `parse_primary` still refuses it (admitted in the comment at bootstrap/compiler.rb:1085), so `xs at might fail f()` triggers the word-index in both engines but Rust parses the index as `MightFail` (src/parser.rs:1793) and stage-2 refuses/misparses — why it matters: silent stage-1/stage-2 program divergence, the exact class the table claims to prevent — concrete fix: implement the `mightfail` primary in bootstrap or remove it from the table with a differential test.
+5. [MAJOR] docs/GRAMMAR.md:563 — precedence table claims index (`[...]` and `at`) is Left, but src/parser.rs:2405 plus SPEC.md:345 documents `xs at 1 at 0` as `xs at (1 at 0)` (right-nested, index swallows the second `at`) — why it matters: spec drift; readers implementing Left get `((xs at 1) at 0)` and a different runtime error — concrete fix: correct row 9 to special/right-with-note or change the implementation to loop left-associatively.
+6. [MINOR] src/parser.rs:2472 — `length of` with the operand on the next line is a Parser error (`is_expression_start` fails on Newline) while `xs at` split across lines silently becomes two statements via src/parser.rs:2235 — why it matters: asymmetric line rule for the two word forms, untested either way — concrete fix: decide one rule, pin `length of\nxs` and `xs at\n0` tests.
+REVIEW VERDICT: FINDINGS 6

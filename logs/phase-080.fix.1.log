@@ -1,0 +1,2290 @@
+[0m
+> build · space-bunny-free
+[0m
+[0m# [0mTodos
+[•] Read relevant code: bootstrap/compiler.rb is_expression_start, src/parser.rs expression starts
+[ ] Fix BLOCKER: bootstrap is_expression_start missing Nothing/MightFail
+[ ] Add byte-identity/stage-2 test case for `xs at nothing`
+[ ] Fix MAJOR: lint() only consults analyzer when no errors/warnings
+[ ] Add combined warning+unknown-name lint test
+[ ] Re-run four gates
+[0m
+I'll start by reading the relevant files to understand the findings.
+[0m✱ [0mGrep "is_expression_start|word_at|token_line|token_kind"[90m in bootstrap · 100 matches[0m
+[0m
+[0m$ [0mgit log --oneline -10 && git status --short
+c8156ab rbops: phase-078 (2026-10-14T03:04:44Z)
+3fbf739 rbops: phase-078 audit the checkpoint ancestry of main instead of commenting on it
+c7eb320 ci: add cargo fmt --check, and correct the false claim that kept it out
+303467e record 093 as done, with the trigger split abandoned rather than deferred
+4672f75 Record phase 092 and 093 by hand, with the measured result and the part left undone
+589d8ca ci: fix a workflow expression that made the whole build unparseable
+d1380a4 ci: shard the test suite so a phase is not gated on one target
+57aea5e rbops: phase-052 (2026-10-13T05:59:57Z)
+d410ea8 REPL module completion reads the language's own module table
+7395c24 rbops: phase-050 (2026-10-12T21:46:56Z)
+ M README.md
+ M SPEC.md
+ M bootstrap/compiler.rb
+ A corpus/lists-0021.expected
+ A corpus/lists-0021.rb
+ A corpus/lists-0022.expected
+ A corpus/lists-0022.rb
+ A corpus/lists-0023.expected
+ A corpus/lists-0023.rb
+ A corpus/lists-0024.expected
+ A corpus/lists-0024.rb
+ A corpus/lists-0025.expected
+ A corpus/lists-0025.rb
+ A corpus/lists-0026.expected
+ A corpus/lists-0026.rb
+ M docs/GRAMMAR.md
+ A phases/phase-080/FINDINGS.md
+ A phases/phase-080/REPORT.md
+ M src/formatter.rs
+ M src/linter.rs
+ M src/parser.rs
+ M tests/bootstrap_selfhost_test.rs
+ M tests/common/generator.rs
+ A tests/index_words_test.rs
+ M tests/linter_test.rs
+[0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [offset=1020, limit=130][0m
+[0m→ [0mRead src/parser.rs[90m [offset=1730, limit=120][0m
+[0m
+[0m$ [0mgit diff src/parser.rs | head -300
+diff --git a/src/parser.rs b/src/parser.rs
+index ee3c046..95b4a1f 100644
+--- a/src/parser.rs
++++ b/src/parser.rs
+@@ -2219,6 +2219,59 @@ impl Parser {
+         self.parse_postfix()
+     }
+ 
++    /// Whether the current position is the `at` of a spelled-out `items at 0`
++    /// rather than the variable `at`.
++    ///
++    /// It is the word `at` followed by **an operand on the same line**. The
++    /// operand is what makes the disambiguation, exactly as it does for
++    /// [`Parser::catch_keyword_ahead`]: `at` is not a reserved word and must not
++    /// become one, so `set at to 0`, `say at` and `items at at` — whose operand
++    /// is the variable — keep working. Only the third has an operand that is
++    /// not itself the name, and all three read back as what they always were.
++    ///
++    /// Same line matters for the same reason: a program that writes `at` at the
++    /// end of one line and an expression on the next is two statements, and
++    /// joining them would silently move the expression into this one.
++    fn at_index_ahead(&self) -> bool {
++        if !self.is_word_ahead(0, "at") {
++            return false;
++        }
++        let Some(first) = self.current() else {
++            return false;
++        };
++        let operand = self.tokens.get(self.pos + 1);
++        match operand {
++            Some(Token { kind, line, .. }) => {
++                *line == first.line && Self::kind_starts_expression(kind)
++            }
++            None => false,
++        }
++    }
++
++    /// Whether the current position is the `length` of a spelled-out
++    /// `length of x` rather than the variable `length`.
++    ///
++    /// The word `length` followed by the word `of` on the same line. `length` is
++    /// the name of a builtin and may be bound by a program of its own, so only
++    /// the two-word spelling is the word form: `length(x)`, `say length` and a
++    /// program that shadows the name are untouched.
++    fn length_of_ahead(&self) -> bool {
++        if !self.is_word_ahead(0, "length") {
++            return false;
++        }
++        let Some(first) = self.current() else {
++            return false;
++        };
++        matches!(
++            self.tokens.get(self.pos + 1),
++            Some(Token {
++                kind: TokenKind::Identifier(found),
++                line,
++                ..
++            }) if found == "of" && *line == first.line
++        )
++    }
++
+     fn parse_postfix(&mut self) -> Result<Expr> {
+         let mut expr = self.parse_primary()?;
+ 
+@@ -2349,6 +2402,27 @@ impl Parser {
+                     object: Box::new(expr),
+                     index: Box::new(index),
+                 };
++            } else if self.at_index_ahead() {
++                // `items at 0` — SPEC.md § List Operations writes this as the
++                // indexing form and nothing about it worked, because `at` is an
++                // ordinary identifier: `set first to items at 0` reached the
++                // statement parser, which read `set first to items` as one
++                // statement and left `at 0` for the next, so the line became
++                // three statements and the analyzer then reported
++                // `Unknown variable 'at'`.
++                //
++                // It becomes an index rather than a new expression kind, so
++                // there is exactly one indexing operation with exactly one set
++                // of bounds, error messages and bytecodes behind the two
++                // spellings.
++                self.advance(); // consume 'at'
++                self.enter_nesting()?;
++                let index = self.parse_expression()?;
++                self.leave_nesting(1);
++                expr = Expr::Index {
++                    object: Box::new(expr),
++                    index: Box::new(index),
++                };
+             } else {
+                 break;
+             }
+@@ -2381,6 +2455,34 @@ impl Parser {
+                 Ok(Expr::Nothing)
+             }
+             TokenKind::Identifier(name) => {
++                // `length of x` — SPEC.md § List Operations writes it as the
++                // length form, and it did not work: `of` is an ordinary
++                // identifier, so the line became a `set` that stopped at
++                // `length` and an `of x` of its own, and the analyzer reported
++                // `Unknown variable 'of'`.
++                //
++                // It becomes the call `length(x)` rather than a new expression
++                // kind, so the builtin stays the one place that answers and the
++                // two spellings cannot drift apart — a list's element count and
++                // a text's byte count are decided once, in `stdlib.rs`.
++                if self.length_of_ahead() {
++                    let span = self.span();
++                    self.advance(); // consume 'length'
++                    self.advance(); // consume 'of'
++                    if !self.is_expression_start() {
++                        return Err(Error::Parser(
++                            "Expected something to measure after `length of`".to_string(),
++                            span,
++                        ));
++                    }
++                    self.enter_nesting()?;
++                    let operand = self.parse_expression()?;
++                    self.leave_nesting(1);
++                    return Ok(Expr::Call {
++                        name: name.clone(),
++                        args: vec![operand],
++                    });
++                }
+                 self.advance();
+                 Ok(Expr::Variable(name.clone()))
+             }
+[0m
+[0m$ [0mgit diff bootstrap/compiler.rb | head -400
+diff --git a/bootstrap/compiler.rb b/bootstrap/compiler.rb
+index a072d3a..394edca 100644
+--- a/bootstrap/compiler.rb
++++ b/bootstrap/compiler.rb
+@@ -1921,6 +1921,37 @@ to parse_postfix(tokens, pos, depth)
+     give back parse_postfix_more(tokens, parse_postfix_base[1], depth, parse_postfix_base[0])
+ end
+ 
++// The word `at` followed by an operand **on the same line**. Same rule as the
++// Rust parser's `Parser::at_index_ahead`, and for the same reason: `at` is not a
++// reserved word and must not become one, so `set at to 0`, `say at` and
++// `xs at at` are the names they have always been.
++to at_index_ahead(tokens, pos)
++    set at_index_ahead_ok to no
++    if word_at(tokens, pos) is "at" then
++        if is_expression_start(tokens, pos + 1) then
++            if token_line(tokens, pos + 1) is token_line(tokens, pos) then
++                set at_index_ahead_ok to yes
++            end
++        end
++    end
++    give back at_index_ahead_ok
++end
++
++// The words `length of` on the same line — the only shape in which `length` is
++// the worded form rather than the variable, the builtin, or a program's own
++// binding of the name.
++to length_of_ahead(tokens, pos)
++    set length_of_ahead_ok to no
++    if word_at(tokens, pos) is "length" then
++        if word_at(tokens, pos + 1) is "of" then
++            if token_line(tokens, pos + 1) is token_line(tokens, pos) then
++                set length_of_ahead_ok to yes
++            end
++        end
++    end
++    give back length_of_ahead_ok
++end
++
+ to parse_postfix_more(tokens, pos, depth, node)
+     set parse_postfix_more_out to nothing
+     if token_kind(tokens, pos) is "dot" then
+@@ -1945,6 +1976,17 @@ to parse_postfix_more(tokens, pos, depth, node)
+             set parse_postfix_more_out to parse_postfix_more(tokens, parse_postfix_more_q, depth, parse_postfix_more_next)
+         end
+     end
++    // `xs at 0` — the worded index SPEC.md § List Operations documents. It is
++    // the same `index` node as `[0]`, not a second kind, so stage 1 and stage 2
++    // cannot answer differently about its bounds. `at_index_ahead` is what keeps
++    // `at` an ordinary name.
++    if type_of(parse_postfix_more_out) is "nothing" then
++        if at_index_ahead(tokens, pos) then
++            set parse_postfix_more_worded to parse_expression(tokens, pos + 1, 0, depth + 1)
++            set parse_postfix_more_next to {k: "index", o: node, i: parse_postfix_more_worded[0]}
++            set parse_postfix_more_out to parse_postfix_more(tokens, parse_postfix_more_worded[1], depth, parse_postfix_more_next)
++        end
++    end
+     if type_of(parse_postfix_more_out) is "nothing" then
+         set parse_postfix_more_out to [node, pos]
+     end
+@@ -2022,6 +2064,23 @@ to parse_primary(tokens, pos, depth)
+             set parse_primary_out to [{k: "nothing"}, pos + 1]
+         end
+     end
++    // `length of x` — the worded length. It compiles to the same `call` node as
++    // `length(x)`, so the builtin stays the one place that answers and the two
++    // spellings cannot drift. Checked before the plain-identifier arm below,
++    // because `length` reaches that arm as an ordinary name when it is not
++    // followed by `of`.
++    if type_of(parse_primary_out) is "nothing" then
++        if length_of_ahead(tokens, pos) then
++            if is_expression_start(tokens, pos + 2) is not yes then
++                refuse(token_line(tokens, pos), "expected something to measure after 'length of'")
++            end
++            set parse_primary_operand to parse_expression(tokens, pos + 2, 0, depth + 1)
++            // `tokens[pos].b`, not the text "length": a name reaches the constant
++            // pool as bytes, and a text would intern a different entry and put a
++            // different length in the encoded chunk.
++            set parse_primary_out to [{k: "call", n: tokens[pos].b, args: [parse_primary_operand[0]]}, parse_primary_operand[1]]
++        end
++    end
+     // `this` is a plain variable that only a method call binds.
+     if type_of(parse_primary_out) is "nothing" then
+         if token_kind(tokens, pos) is "id" then
+[0m
+[0m$ [0mgrep -n '"nothing"\|"mightfail"\|"noth\|"might"' bootstrap/compiler.rb | head -40
+457:    if type_of(lex_one_result) is "nothing" then
+466:    if type_of(lex_one_result) is "nothing" then
+488:    if type_of(lex_one_result) is "nothing" then
+493:    if type_of(lex_one_result) is "nothing" then
+498:    if type_of(lex_one_result) is "nothing" then
+503:    if type_of(lex_one_result) is "nothing" then
+672:    set keyword_of_words to ["set", "constant", "to", "is", "are", "if", "then", "else", "end", "when", "unless", "for", "each", "in", "from", "times", "while", "repeat", "until", "break", "skip", "return", "give", "back", "might", "fail", "say", "print", "ask", "try", "catch", "finally", "and", "or", "not", "mod", "yes", "no", "nothing", "module", "import", "export", "as", "test", "expect", "object", "has", "can", "this", "that", "new", "extends", "async", "wait", "parallel"]
+673:    set keyword_of_kinds to ["set", "constant", "to", "is", "are", "if", "then", "else", "end", "when", "unless", "for", "each", "in", "from", "times", "while", "repeat", "until", "break", "skip", "return", "giveback", "giveback", "mightfail", "mightfail", "say", "print", "ask", "try", "catch", "finally", "and", "or", "not", "mod", "yes", "no", "nothing", "module", "import", "export", "as", "test", "expect", "object", "has", "can", "this", "that", "new", "extends", "async", "wait", "parallel"]
+854:    if type_of(parse_statements_out) is "nothing" then
+1069:    if type_of(parse_return_out) is "nothing" then
+1170:    if type_of(parse_import_out) is "nothing" then
+1190:        if type_of(parse_import_more_tail) is "nothing" then
+1194:        if type_of(parse_import_more_tail) is not "nothing" then
+1199:    if type_of(parse_import_more_out) is "nothing" then
+1218:    if type_of(parse_block_statements_out) is "nothing" then
+1223:    if type_of(parse_block_statements_out) is "nothing" then
+1247:    if type_of(parse_if_then_out) is "nothing" then
+1307:    if type_of(parse_for_body_out) is "nothing" then
+1328:    if type_of(parse_for_range_out) is "nothing" then
+1380:    if type_of(parse_method_out) is "nothing" then
+1399:    if type_of(parse_callable_params_out) is "nothing" then
+1417:        if type_of(parse_callable_args_out) is "nothing" then
+1422:    if type_of(parse_callable_args_out) is "nothing" then
+1447:    if type_of(parse_has_out) is "nothing" then
+1471:    if type_of(parse_object_parent_out) is "nothing" then
+1490:    if type_of(parse_object_statements_out) is "nothing" then
+1536:    if type_of(parse_try_catch_out) is "nothing" then
+1554:    if type_of(parse_try_catch_body_out) is "nothing" then
+1559:    if type_of(parse_try_catch_body_out) is "nothing" then
+1579:    if type_of(parse_try_finally_out) is "nothing" then
+1603:    if type_of(parse_export_out) is "nothing" then
+1608:    if type_of(parse_export_out) is "nothing" then
+1619:    if type_of(parse_export_more_out) is "nothing" then
+1631:    if type_of(parse_test_out) is "nothing" then
+1636:    if type_of(parse_test_out) is "nothing" then
+1685:    if type_of(parse_expression_out) is "nothing" then
+1710:    if type_of(parse_levels_out) is "nothing" then
+1904:    if type_of(parse_unary_out) is "nothing" then
+1910:    if type_of(parse_unary_out) is "nothing" then
+1964:    if type_of(parse_postfix_more_out) is "nothing" then
+[0m
+[0m✱ [0mGrep "Nothing|MightFail"[90m 7 matches[0m
+[0m
+[0m$ [0mgrep -n 'mightfail' bootstrap/compiler.rb
+673:    set keyword_of_kinds to ["set", "constant", "to", "is", "are", "if", "then", "else", "end", "when", "unless", "for", "each", "in", "from", "times", "while", "repeat", "until", "break", "skip", "return", "giveback", "giveback", "mightfail", "mightfail", "say", "print", "ask", "try", "catch", "finally", "and", "or", "not", "mod", "yes", "no", "nothing", "module", "import", "export", "as", "test", "expect", "object", "has", "can", "this", "that", "new", "extends", "async", "wait", "parallel"]
+[0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [offset=2040, limit=80][0m
+[0m
+[0m$ [0mgrep -n 'might' bootstrap/compiler.rb | grep -v 'mightfail"' | head -30; echo "---"; grep -rn 'might fail' bootstrap/ | head -20
+672:    set keyword_of_words to ["set", "constant", "to", "is", "are", "if", "then", "else", "end", "when", "unless", "for", "each", "in", "from", "times", "while", "repeat", "until", "break", "skip", "return", "give", "back", "might", "fail", "say", "print", "ask", "try", "catch", "finally", "and", "or", "not", "mod", "yes", "no", "nothing", "module", "import", "export", "as", "test", "expect", "object", "has", "can", "this", "that", "new", "extends", "async", "wait", "parallel"]
+---
+[0m
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs
+[0m
+[0m$ [0mgit diff tests/common/generator.rs tests/linter_test.rs docs/GRAMMAR.md | head -200
+diff --git a/docs/GRAMMAR.md b/docs/GRAMMAR.md
+index 9a15bd6..40a137c 100644
+--- a/docs/GRAMMAR.md
++++ b/docs/GRAMMAR.md
+@@ -390,8 +390,14 @@ primary          = identifier
+                  | list_literal
+                  | record_literal
+                  | function_literal
++                 | 'length' 'of' expression             // worded length
+ ```
+ 
++`length` and `at` are ordinary identifiers. `length 'of'` is the worded form
++only as the two words together, and `postfix 'at' expression` is the worded
++index only when an operand follows `at` on the same line — otherwise `at` is the
++name it has always been.
++
+ ### 5.2 Postfix Expressions
+ 
+ ```
+@@ -399,9 +405,14 @@ postfix          = primary
+                  | postfix '.' identifier              // property access
+                  | postfix '(' [ argument { ',' argument } ] ')'  // function call
+                  | postfix '[' expression ']'         // indexing
+-                 | postfix 'of' expression            // generic type
++                 | postfix 'at' expression            // indexing, worded
+ ```
+ 
++The index of `'at'` is the whole expression that follows it, so `xs at n + 1`
++indexes by `n + 1`, and a second `at` belongs to that index rather than to
++`xs`: `xs at 1 at 0` is `xs at (1 at 0)`. Bind the intermediate value to step
++twice (`set row to xs at 1`, then `row at 0`).
++
+ ### 5.3 Prefix Expressions
+ 
+ ```
+@@ -549,8 +560,8 @@ object_literal   = 'new' identifier '(' [ argument { ',' argument } ] ')'
+ | 5 | `+`, `-` | Left |
+ | 6 | `*`, `/`, `mod`, `%` | Left |
+ | 7 | `not`, unary `-` | Right |
+-| 8 | `of` | Left |
+-| 9 | property access, call, index | Left |
++| 8 | `length of` | — (primary) |
++| 9 | property access, call, index (`[...]` and `at`) | Left |
+ 
+ ---
+ 
+diff --git a/tests/common/generator.rs b/tests/common/generator.rs
+index 774ea6e..1d99180 100644
+--- a/tests/common/generator.rs
++++ b/tests/common/generator.rs
+@@ -660,6 +660,21 @@ const LISTS: &[&str] = &[
+     "set xs to [1, 2, 3]\nsay xs[9]\n",
+     "set xs to [1]\nsay xs[1]\n",
+     "set xs to []\nsay xs[0]\n",
++    // `at` and `length of` — the two word forms SPEC.md § List Operations
++    // documents. They are here, in the same family as the bracket form they
++    // stand for, so the differential harness runs them on **both** engines and
++    // diffs the answers rather than taking either engine's word for them.
++    //
++    // The first three are the documented lines themselves. The last three are
++    // the edges: the negative index with nothing to point at, the index whose
++    // operand is a variable named `at`, and the index that names no element
++    // because it is not a whole number.
++    "set xs to [10, 20, 30]\nsay xs at 0\nsay xs at 2\nsay xs at -1\nset first to xs at 0\nset last to xs at -1\nsay first\nsay last\n",
++    "set xs to [10, 20, 30]\nsay length of xs\nsay length of []\nsay length of \"héllo\"\nset count to length of xs\nsay count\n",
++    "set xs to [10, 20, 30]\nsay xs at 3\n",
++    "set xs to []\nsay xs at -1\n",
++    "set at to 2\nset xs to [1, 2, 3]\nsay xs at at\n",
++    "set xs to [10, 20, 30]\nsay xs at 0.5\n",
+ ];
+ 
+ fn lists(out: &mut Vec<(String, String)>) {
+diff --git a/tests/linter_test.rs b/tests/linter_test.rs
+index 2bb898d..8fb45f6 100644
+--- a/tests/linter_test.rs
++++ b/tests/linter_test.rs
+@@ -84,7 +84,13 @@ fn a_variable_that_is_read_is_not_reported() {
+ 
+ #[test]
+ fn function_parameter_is_not_a_false_positive() {
+-    let source = "to greet(name)\n    say \"hello\"\nend\n\ngreet with \"world\"\n";
++    // `greet("world")`, not `greet with "world"`: there is no `with` syntax, so
++    // the old fixture was a program `rb` cannot run — the analyzer refused it
++    // with `Unknown variable 'with'`. `rb lint` used to stay silent about that
++    // only because it stopped at the syntax tree; now it reports a file the
++    // analyzer refuses, which is the point. The parameter is still unread, so
++    // the assertion this test exists for is unchanged.
++    let source = "to greet(name)\n    say \"hello\"\nend\n\ngreet(\"world\")\n";
+     assert!(
+         every_message(source).is_empty(),
+         "an unread function parameter is part of the signature, not an unused variable: {:?}",
+[0m
+[0m$ [0mfor f in corpus/lists-002*.rb corpus/lists-002*.expected; do echo "=== $f"; cat "$f"; done
+=== corpus/lists-0020.rb
+set xs to []
+say xs[0]
+=== corpus/lists-0021.rb
+set xs to [10, 20, 30]
+say xs at 0
+say xs at 2
+say xs at -1
+set first to xs at 0
+set last to xs at -1
+say first
+say last
+=== corpus/lists-0022.rb
+set xs to [10, 20, 30]
+say length of xs
+say length of []
+say length of "héllo"
+set count to length of xs
+say count
+=== corpus/lists-0023.rb
+set xs to [10, 20, 30]
+say xs at 3
+=== corpus/lists-0024.rb
+set xs to []
+say xs at -1
+=== corpus/lists-0025.rb
+set at to 2
+set xs to [1, 2, 3]
+say xs at at
+=== corpus/lists-0026.rb
+set xs to [10, 20, 30]
+say xs at 0.5
+=== corpus/lists-0020.expected
+#label RuntimeError
+#position 2:1
+#value nothing
+#message Index 0 is out of bounds: length is 0, the list is empty, so it has no valid index
+=== corpus/lists-0021.expected
+#label none
+#position none
+#value nothing
+10
+30
+30
+10
+30
+=== corpus/lists-0022.expected
+#label none
+#position none
+#value nothing
+3
+0
+6
+3
+=== corpus/lists-0023.expected
+#label RuntimeError
+#position 2:1
+#value nothing
+#message Index 3 is out of bounds: length is 3, valid indexes are 0 to 2
+=== corpus/lists-0024.expected
+#label RuntimeError
+#position 2:1
+#value nothing
+#message Index -1 is out of bounds: length is 0, the list is empty, so it has no valid index
+=== corpus/lists-0025.expected
+#label none
+#position none
+#value nothing
+3
+=== corpus/lists-0026.expected
+#label RuntimeError
+#position 2:1
+#value nothing
+#message Index 0.5 is out of bounds: a list index must be a whole number
+[0m
+[0m→ [0mRead phases/phase-080/FINDINGS.md
+[0m→ [0mRead phases/phase-080/REPORT.md
+[0m
+[0m$ [0mgit diff src/linter.rs src/formatter.rs
+diff --git a/src/formatter.rs b/src/formatter.rs
+index d52f468..4c45ffd 100644
+--- a/src/formatter.rs
++++ b/src/formatter.rs
+@@ -748,8 +748,12 @@ impl Formatter {
+                 self.write(method);
+                 self.write_arguments(args);
+             }
+-            // `object at index` is not syntax the parser accepts; only the
+-            // bracketed form reads back as an index.
++            // `object at index` is the spelling SPEC.md § List Operations
++            // documents, and the parser reads both it and `object[index]` as
++            // one `Expr::Index`. The bracketed form is written back because it
++            // is the one that is also valid on a line whose expression has not
++            // been fully parenthesised — canonicalising to one spelling is the
++            // formatter's job, and the two are the same operation.
+             Expr::Index { object, index } => {
+                 self.format_expression_at(object, PRECEDENCE_PRIMARY);
+                 self.write("[");
+diff --git a/src/linter.rs b/src/linter.rs
+index 9cb0bd7..9e341c0 100644
+--- a/src/linter.rs
++++ b/src/linter.rs
+@@ -432,20 +432,41 @@ impl Default for Linter {
+ }
+ 
+ /// Lints `source`, lexing and parsing it first. Returns no findings when the
+-/// source does not parse: there is no program to lint.
++/// source does not get that far: there is no program to lint.
++///
++/// When the program itself produces nothing, the analyzer is asked whether `rb`
++/// could run it, and its refusal is reported. `rb lint` is the tool a reader
++/// reaches for when `rb run` refuses a file, and it used to say nothing at all
++/// about one the analyzer rejected — `set x to items at 0` produced an empty
++/// report and exit 0, so a file that cannot run was reported as a file with
++/// nothing wrong with it.
++///
++/// **Only when there is nothing else to say.** A finding the tree walk already
++/// made is kept and the analyzer is not consulted: `tests/linter_test.rs` pins
++/// that an undeclared `extends` parent is reported as an unused child *and* not
++/// read as a declaration, on a program the analyzer refuses, so a linter that
++/// dropped its own findings to report someone else's would be a strictly worse
++/// linter than the one this replaces.
+ pub fn lint(source: &str) -> (Vec<LintError>, Vec<LintWarning>) {
+     let tokens = match Lexer::tokenize(source) {
+         Ok(t) => t,
+-        Err(e) => return (vec![syntax_error(&e)], Vec::new()),
++        Err(e) => return (vec![stage_error("Syntax error", &e)], Vec::new()),
+     };
+ 
+     let mut parser = crate::parser::Parser::new(tokens);
+     let program = match parser.parse() {
+         Ok(p) => p,
+-        Err(e) => return (vec![syntax_error(&e)], Vec::new()),
++        Err(e) => return (vec![stage_error("Syntax error", &e)], Vec::new()),
+     };
+ 
+-    lint_program(&program)
++    let (errors, warnings) = lint_program(&program);
++    if errors.is_empty() && warnings.is_empty() {
++        if let Err(e) = crate::analyzer::analyze(&program) {
++            return (vec![stage_error("Analysis error", &e)], Vec::new());
++        }
++    }
++
++    (errors, warnings)
+ }
+ 
+ /// Lints an already-parsed [`Program`], for a caller that has the AST in hand
+@@ -458,12 +479,19 @@ pub fn lint_program(program: &Program) -> (Vec<LintError>, Vec<LintWarning>) {
+     (linter.get_errors(), linter.get_warnings())
+ }
+ 
+-/// Turns a failure from the lexer or the parser into a lint error, so that a
+-/// file which does not parse is reported instead of being silently passed over.
+-fn syntax_error(error: &Error) -> LintError {
++/// Turns a failure from the lexer, the parser or the analyzer into a lint
++/// error, so that a file which does not run is reported instead of being
++/// silently passed over.
++///
++/// `prefix` names the stage that refused it, which is the difference a reader
++/// acts on: `Syntax error` means the file is not Redblue, `Analysis error` means
++/// it is Redblue and means something the language has no value for.
++fn stage_error(prefix: &str, error: &Error) -> LintError {
+     let rendered;
+     let (message, span) = match error {
+-        Error::Lexer(message, span) | Error::Parser(message, span) => (message.as_str(), *span),
++        Error::Lexer(message, span)
++        | Error::Parser(message, span)
++        | Error::Analyzer(message, span) => (message.as_str(), *span),
+         other => {
+             rendered = other.to_string();
+             (rendered.as_str(), Span::unknown())
+@@ -471,7 +499,7 @@ fn syntax_error(error: &Error) -> LintError {
+     };
+ 
+     LintError {
+-        message: format!("Syntax error: {}", message),
++        message: format!("{}: {}", prefix, message),
+         line: span.line,
+         column: span.column,
+     }
+[0m
+[0m$ [0mls; echo "--- rbops?"; ls rbops 2>&1 | head; echo "--- verify.sh"; find / -name "verify.sh" -not -path "*/node_modules/*" 2>/dev/null | head
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+--- rbops?
+ls: cannot access 'rbops': No such file or directory
+--- verify.sh
+/home/runner/work/rbops/rbops/rbops/verify.sh
+[0m
+[0m→ [0mRead /home/runner/work/rbops/rbops/rbops/verify.sh
+[0m
+[0m$ [0mcargo build 2>&1 | tail -5
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.05s
+[0m
+[0m$ [0mmkdir -p /tmp/opencode/p80 && printf 'set xs to [1, 2, 3]\nsay xs at nothing\n' > /tmp/opencode/p80/at_nothing.rb && ./target/debug/rb run /tmp/opencode/p80/at_nothing.rb; echo "stage1 exit=$?"; ./target/debug/rb run bootstrap/compiler.rb /tmp/opencode/p80/at_nothing.rb /tmp/opencode/p80/at_nothing.rbc; echo "stage2 exit=$?"; ls -l /tmp/opencode/p80/
+Error: RuntimeError: Index must be a number
+  --> /tmp/opencode/p80/at_nothing.rb:2:1
+2 | say xs at nothing
+  | ^
+stage1 exit=1
+stage2 exit=0
+total 8
+-rw-r--r-- 1 runner runner  38 Oct 14 05:08 at_nothing.rb
+-rw-r--r-- 1 runner runner 246 Oct 14 05:08 at_nothing.rbc
+[0m
+[0m$ [0mcd /tmp/opencode/p80 && /home/runner/work/rbops/rbops/redblue/target/debug/rb compile at_nothing.rb -o at_nothing.stage1.rbc 2>&1; ls -l; cmp at_nothing.stage1.rbc at_nothing.rbc && echo IDENTICAL || echo DIFFERENT
+Compiled at_nothing.rb -> at_nothing.stage1.rbc
+total 12
+-rw-r--r-- 1 runner runner  38 Oct 14 05:08 at_nothing.rb
+-rw-r--r-- 1 runner runner 246 Oct 14 05:08 at_nothing.rbc
+-rw-r--r-- 1 runner runner 213 Oct 14 05:08 at_nothing.stage1.rbc
+at_nothing.stage1.rbc at_nothing.rbc differ: byte 7, line 1
+DIFFERENT
+[0m
+[0m$ [0mgrep -rln "might fail" corpus/ tests/ examples/ modules/ 2>/dev/null | head -20; echo "--- count in corpus:"; grep -rl "might fail" corpus/ 2>/dev/null | wc -l
+tests/stdlib_module_names_test.rs
+tests/loop_bounds_test.rs
+tests/for_range_test.rs
+tests/might_fail_test.rs
+tests/differential_test.rs
+tests/keyword_reservation_test.rs
+tests/loop_control_test.rs
+tests/catch_binding_test.rs
+tests/object_model_test.rs
+--- count in corpus:
+0
+[0m
+[0m$ [0mcd /tmp/opencode/p80 && printf 'to f()\n    give back 1\nend\nto g()\n    give back might fail f()\nend\nsay g()\n' > mightfail.rb && /home/runner/work/rbops/rbops/redblue/target/debug/rb compile mightfail.rb -o mightfail.s1.rbc 2>&1; echo "s1=$?"; /home/runner/work/rbops/rbops/redblue/target/debug/rb run /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb mightfail.rb mightfail.s2.rbc 2>&1 | tail -3; echo "s2=$?"; ls -l mightfail*
+Compiled mightfail.rb -> mightfail.s1.rbc
+s1=0
+  --> /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb:115:5
+115 |     say refuse_stop_here[1]
+    |     ^
+s2=0
+-rw-r--r-- 1 runner runner  75 Oct 14 05:08 mightfail.rb
+-rw-r--r-- 1 runner runner 428 Oct 14 05:08 mightfail.s1.rbc
+[0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=60, offset=2117][0m
+[0m
+[0m$ [0mcd /tmp/opencode/p80 && /home/runner/work/rbops/rbops/redblue/target/debug/rb run /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb mightfail.rb mightfail.s2.rbc; echo "s2=$?"
+bootstrap/compiler.rb: 5: unexpected token mightfail
+Error: RuntimeError: Index 1 is out of bounds: length is 1, valid indexes are 0 to 0
+  --> /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb:115:5
+115 |     say refuse_stop_here[1]
+    |     ^
+s2=1
+[0m
+[0m$ [0mgrep -n "fn parse_return" -A 30 src/parser.rs | head -45
+(no output)
+[0m
+[0m$ [0mcd /tmp/opencode/p80 && printf 'to f()\n    give back nothing\nend\nsay f()\n' > gb_nothing.rb && /home/runner/work/rbops/rbops/redblue/target/debug/rb run gb_nothing.rb; echo "s1=$?"; /home/runner/work/rbops/rbops/redblue/target/debug/rb run /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb gb_nothing.rb gb_nothing.s2.rbc; echo "s2=$?"; ls -l gb_nothing*
+nothing
+s1=0
+s2=0
+-rw-r--r-- 1 runner runner  41 Oct 14 05:08 gb_nothing.rb
+-rw-r--r-- 1 runner runner 248 Oct 14 05:08 gb_nothing.s2.rbc
+[0m
+[0m$ [0mgrep -n "giveback\|parse_return" bootstrap/compiler.rb | head -30
+673:    set keyword_of_kinds to ["set", "constant", "to", "is", "are", "if", "then", "else", "end", "when", "unless", "for", "each", "in", "from", "times", "while", "repeat", "until", "break", "skip", "return", "giveback", "giveback", "mightfail", "mightfail", "say", "print", "ask", "try", "catch", "finally", "and", "or", "not", "mod", "yes", "no", "nothing", "module", "import", "export", "as", "test", "expect", "object", "has", "can", "this", "that", "new", "extends", "async", "wait", "parallel"]
+930:    if token_kind(tokens, pos) is "return" or token_kind(tokens, pos) is "giveback" then
+931:        set parse_statement_r to parse_return(tokens, pos, line)
+1031:    if is_statement_keyword_k is "giveback" then
+1063:to parse_return(tokens, pos, line)
+1064:    set parse_return_out to nothing
+1066:        set parse_return_r to parse_expression(tokens, pos + 1, 0, 0)
+1067:        set parse_return_out to [{s: "return", l: line, e: parse_return_r[0]}, parse_return_r[1]]
+1069:    if type_of(parse_return_out) is "nothing" then
+1070:        set parse_return_out to [{s: "return", l: line, e: nothing}, pos + 1]
+1072:    give back parse_return_out
+[0m
+[0m$ [0mcd /tmp/opencode/p80 && /home/runner/work/rbops/rbops/redblue/target/debug/rb compile gb_nothing.rb -o gb_nothing.s1.rbc && cmp gb_nothing.s1.rbc gb_nothing.s2.rbc && echo IDENTICAL || echo DIFFERENT; ls -l
+Compiled gb_nothing.rb -> gb_nothing.s1.rbc
+gb_nothing.s1.rbc gb_nothing.s2.rbc differ: byte 7, line 1
+DIFFERENT
+total 32
+-rw-r--r-- 1 runner runner  38 Oct 14 05:08 at_nothing.rb
+-rw-r--r-- 1 runner runner 246 Oct 14 05:08 at_nothing.rbc
+-rw-r--r-- 1 runner runner 213 Oct 14 05:08 at_nothing.stage1.rbc
+-rw-r--r-- 1 runner runner  41 Oct 14 05:08 gb_nothing.rb
+-rw-r--r-- 1 runner runner 221 Oct 14 05:08 gb_nothing.s1.rbc
+-rw-r--r-- 1 runner runner 248 Oct 14 05:08 gb_nothing.s2.rbc
+-rw-r--r-- 1 runner runner  75 Oct 14 05:08 mightfail.rb
+-rw-r--r-- 1 runner runner 428 Oct 14 05:08 mightfail.s1.rbc
+[0m
+Confirmed both findings. Now fixing the BLOCKER in the stage-2 compiler:
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -1087,8 +1087,11 @@
+ end
+ if is_expression_start_k is "no" then
+     set is_expression_start_starts to yes
+ end
++if is_expression_start_k is "nothing" then
++    set is_expression_start_starts to yes
++end
+ if is_expression_start_k is "id" then
+     set is_expression_start_starts to yes
+ end
+ if is_expression_start_k is "lparen" then
+
+[0m
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -1111,8 +1111,11 @@
+     end
+     if is_expression_start_k is "to" then
+         set is_expression_start_starts to yes
+     end
++    if is_expression_start_k is "mightfail" then
++        set is_expression_start_starts to yes
++    end
+     give back is_expression_start_starts
+ end
+ 
+ // `set NAME to <expr>` and `set NAME.field to <expr>`.
+
+[0m
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -1072,8 +1072,22 @@
+     give back parse_return_out
+ end
+ 
+ // `Parser::is_expression_start`: what may follow a `give back` with no value.
++//
++// This table is the stage-1 `Parser::kind_starts_expression`, arm for arm and in
++// the same order. It has to be, and not merely be close: a kind missing here is
++// a kind the stage-2 parser will not read as the head of an expression, so a
++// stage-2 run silently produces a *different program* rather than an error. That
++// is what happened with `nothing`: `say xs at nothing` became one `say` of one
++// `index` under stage 1 and a `say xs` plus two stray statements under stage 2,
++// and the two wrote files of 213 and 246 bytes.
++//
++// `nothing` is a primary here, so it is in the table; `might fail` is *not* yet
++// a primary here — `parse_primary` refuses it, as it always has — but it is in
++// the table anyway, because the table's job is to say what an expression may
++// start with, and a table that has to be re-edited the day stage 2 gains the
++// primary is a table that will be re-edited late.
+ to is_expression_start(tokens, pos)
+     set is_expression_start_k to token_kind(tokens, pos)
+     set is_expression_start_starts to no
+     if is_expression_start_k is "num" then
+
+[0m
+Now update the doc comment on the bootstrap table to record why every entry is there:
+[0m$ [0mcargo build 2>&1 | tail -3 && cd /tmp/opencode/p80 && for f in at_nothing gb_nothing; do /home/runner/work/rbops/rbops/redblue/target/debug/rb run /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb $f.rb $f.s2.rbc && /home/runner/work/rbops/rbops/redblue/target/debug/rb compile $f.rb -o $f.s1.rbc >/dev/null && (cmp $f.s1.rbc $f.s2.rbc && echo "$f IDENTICAL" || echo "$f DIFFERENT"); done
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.83s
+at_nothing IDENTICAL
+gb_nothing IDENTICAL
+[0m
+[0m# [0mTodos
+[✓] Read relevant code: bootstrap/compiler.rb is_expression_start, src/parser.rs expression starts
+[✓] Fix BLOCKER: bootstrap is_expression_start missing Nothing/MightFail
+[•] Add byte-identity/stage-2 test case for `xs at nothing`
+[ ] Fix MAJOR: lint() only consults analyzer when no errors/warnings
+[ ] Add combined warning+unknown-name lint test
+[ ] Re-run four gates
+[0m
+[0m$ [0mgrep -n "fn \|interpreter\|bytecode\|Interpreter\|Vm\|vm" tests/differential_test.rs | head -40
+10://! specification of what a Redblue program *does*, and once through the bytecode
+11://! compiler and the bytecode VM. A corpus program whose two outcomes disagree is
+43:use common::vm::{self, Outcome, Typed};
+56:fn writing() -> bool {
+60:fn scratch(name: &str) -> PathBuf {
+69:fn source_of(path: &Path) -> String {
+77:fn corpus_holds_at_least_two_hundred_programs() {
+87:fn every_corpus_program_has_an_expected_output_file() {
+95:fn every_corpus_program_prints_what_its_expected_file_records() {
+99:        let outcome = vm::tree_walk(&source_of(&path));
+112:fn every_corpus_program_agrees_between_the_two_vms() {
+116:        let tree = vm::tree_walk(&source);
+117:        let byte = vm::bytecode(&source);
+120:                !vm::tree_walk(candidate).agrees_within_format_limits(&vm::bytecode(candidate))
+124:                    "{}:\n  tree-walking VM: {:?}\n  bytecode VM:    {:?}\n{}",
+144:fn the_corpus_holds_programs_that_must_fail() {
+172:fn the_corpus_holds_programs_that_are_worth_something() {
+182:        let outcome = vm::bytecode(&source_of(&path));
+186:            "{}: the bytecode VM is worth something the corpus does not record",
+210:fn edge_regenerating_the_corpus_reproduces_the_checked_in_one_byte_for_byte() {
+271:fn the_checked_in_corpus_is_the_one_the_generator_produces() {
+302:fn the_two_vms_agree_on_every_generated_program() {
+306:        let tree = vm::tree_walk(&generated.source);
+307:        let byte = vm::bytecode(&generated.source);
+310:                !vm::tree_walk(candidate).agrees_within_format_limits(&vm::bytecode(candidate))
+334:/// and not about one interpreter: the tree-walking VM alone would leave the
+335:/// bytecode one unheld to it, and a fault the compiler lowers into something else
+338:fn edge_a_generated_program_only_faults_on_a_fault_that_was_injected() {
+344:            ("tree-walking VM", vm::tree_walk(&generated.source)),
+345:            ("bytecode VM", vm::bytecode(&generated.source)),
+351:                    vm::show(failure),
+360:                    let text = vm::show(failure);
+392:fn edge_the_generated_corpus_compares_a_program_s_value_not_only_its_output() {
+398:        let tree = vm::tree_walk(&generated.source);
+399:        let byte = vm::bytecode(&generated.source);
+428:fn edge_a_generated_program_can_be_seen() {
+451:fn a_generated_program_runs_the_same_way_every_time() {
+454:        let first = vm::tree_walk(&generated.source);
+455:        let second = vm::tree_walk(&generated.source);
+458:            first.agrees_within_format_limits(&vm::bytecode(&generated.source)),
+[0m
+[0m$ [0mgrep -n "at nothing\|give back nothing\|length of nothing" tests/*.rs | head -20
+tests/bootstrap_selfhost_test.rs:508:            // subdirectory of the scratch directory that nothing creates.
+tests/bootstrap_selfhost_test.rs:938:/// `corpus/` prefix would name a directory under `target/tmp/` that nothing
+tests/bytecode_vm_test.rs:871:        "to first_even(xs)\n    for each x in xs\n        if x % 2 is 0 then\n            give back x\n        end\n    end\n    give back nothing\nend\nsay first_even([1, 3, 4, 5])\n".to_string(),
+tests/bytecode_vm_test.rs:1113:        "set n to 0\nrepeat nothing times\n    set n to n + 1\n    break\nend\nsay n\n".to_string(),
+tests/checkpoint_ancestry_test.rs:79:    /// pointing at nothing is how the list stops being data.
+tests/checkpoint_ancestry_test.rs:828:        "the abbreviated entry points at nothing on main"
+tests/checkpoint_ancestry_test.rs:1125:/// An acknowledgement that points at nothing is a list decaying into a comment.
+tests/index_words_test.rs:391:        "set items to [1, 2, 3]\nsay items at nothing\n",
+tests/keyword_reservation_test.rs:794:    // has to say out loud that nothing in it parses today.
+tests/stdlib_module_names_test.rs:1781:    // the runner that nothing in this file makes.
+tests/text_split_join_test.rs:12://!   as an ordinary variable read that nothing binds.
+[0m
+[0m$ [0mcd /tmp/opencode/p80 && for i in 1 2 3 4 5; do
+case $i in
+1) printf 'set xs to [1, 2, 3]\nsay xs at nothing\n' > c1.rb;;
+2) printf 'to nothing_at_all()\n    give back nothing\nend\nsay nothing_at_all()\n' > c2.rb;;
+3) printf 'say length of nothing\n' > c3.rb;;
+4) printf 'set xs to [1, 2, 3]\nsay xs[nothing]\n' > c4.rb;;
+5) printf 'set xs to [1, 2, 3]\nsay length of xs\nset n to nothing\nsay xs at n\n' > c5.rb;;
+esac
+printf '%s: ' "c$i"
+/home/runner/work/rbops/rbops/redblue/target/debug/rb compile c$i.rb -o c$i.s1.rbc >/dev/null 2>&1 || { echo "stage1 REFUSES"; continue; }
+/home/runner/work/rbops/rbops/redblue/target/debug/rb run /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb c$i.rb c$i.s2.rbc >/dev/null 2>&1 || { echo "stage2 REFUSES"; continue; }
+cmp -s c$i.s1.rbc c$i.s2.rbc && echo "identical" || echo "DIFFERENT"
+done
+c1: identical
+c2: identical
+c3: identical
+c4: identical
+c5: identical
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git stash push -- bootstrap/compiler.rb >/dev/null && cd /tmp/opencode/p80 && for i in 1 2 3 4 5; do printf '%s: ' "c$i"; /home/runner/work/rbops/rbops/redblue/target/debug/rb compile c$i.rb -o c$i.s1.rbc >/dev/null 2>&1 || { echo "stage1 REFUSES"; continue; }; /home/runner/work/rbops/rbops/redblue/target/debug/rb run /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb c$i.rb c$i.s2.rbc >/dev/null 2>&1 || { echo "stage2 REFUSES"; continue; }; cmp -s c$i.s1.rbc c$i.s2.rbc && echo "identical" || echo "DIFFERENT"; done; cd /home/runner/work/rbops/rbops/redblue && git stash pop
+error: Entry 'corpus/lists-0021.expected' not uptodate. Cannot merge.
+Cannot save the current worktree state
+No stash entries found.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cp bootstrap/compiler.rb /tmp/opencode/p80/compiler.fixed.rb && git show HEAD:bootstrap/compiler.rb > /tmp/opencode/p80/compiler.head.rb && git diff --stat HEAD -- bootstrap/compiler.rb
+bootstrap/compiler.rb | 79 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 79 insertions(+)
+[0m
+[0m$ [0mcd /tmp/opencode/p80 && python3 - <<'PY'
+src = open('compiler.fixed.rb').read()
+before = src
+before = before.replace('''    if is_expression_start_k is "nothing" then
+        set is_expression_start_starts to yes
+    end
+''', '', 1)
+before = before.replace('''    if is_expression_start_k is "mightfail" then
+        set is_expression_start_starts to yes
+    end
+''', '', 1)
+assert before != src
+open('compiler.prefix.rb','w').write(before)
+print("wrote pre-fix bootstrap")
+PY
+for i in 1 2 3 4 5; do printf '%s: ' "c$i"; /home/runner/work/rbops/rbops/redblue/target/debug/rb compile c$i.rb -o c$i.s1.rbc >/dev/null 2>&1 || { echo "stage1 REFUSES"; continue; }; /home/runner/work/rbops/rbops/redblue/target/debug/rb run compiler.prefix.rb c$i.rb c$i.s2pre.rbc >/dev/null 2>&1 || { echo "stage2 REFUSES"; continue; }; cmp -s c$i.s1.rbc c$i.s2pre.rbc && echo "identical" || echo "DIFFERENT (pre-fix)"; done
+wrote pre-fix bootstrap
+c1: DIFFERENT (pre-fix)
+c2: DIFFERENT (pre-fix)
+c3: stage2 REFUSES
+c4: identical
+c5: identical
+[0m
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=314, limit=16][0m
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -319,8 +319,71 @@
+         "if yes then\n\n    say 1\n\n    say 2\n\nend\n",
+     );
+ }
+ 
++/// `nothing` heads an expression, and a stage-2 table that forgets it writes a
++/// *different program* rather than reporting a difference.
++///
++/// `Parser::kind_starts_expression` (`src/parser.rs`) and `is_expression_start`
++/// (`bootstrap/compiler.rb`) are the same table and have to be answered by the
++/// same entries. `Nothing` was in the Rust one and missing from the Redblue one,
++/// and the result was silence on both sides: `say xs at nothing` was one `say`
++/// of one `index` under stage 1 — 213 bytes — and a `say xs` followed by two
++/// stray statements under stage 2 — 246 bytes. Neither run reported anything,
++/// because each engine produced a file, and no corpus program wrote `at nothing`
++/// in it, so nothing compared them.
++///
++/// That is why these are named rather than left to the corpus walk. A token the
++/// table omits does not fail a compilation; it compiles to another program, and
++/// the only evidence that says so is the bytes.
++///
++/// Every program below was written to fail on the pre-fix stage 2: the first two
++/// emitted a different file, the third was refused outright. The last two are the
++/// controls — the bracketed and pre-bound spellings, which never consult the
++/// table and were already byte-identical. They are here so that a future change
++/// to `nothing`'s handling is caught in the arm it actually moved.
++#[test]
++fn edge_nothing_heads_an_expression_on_both_engines() {
++    // The worded index, the line the finding names: `at` followed by `nothing`.
++    // Stage 1 parses it as one `index` whose operand is `nothing`; the pre-fix
++    // stage 2 stopped the postfix loop at `at` and made two statements of the
++    // rest.
++    assert_identical(
++        "edge_nothing_as_a_worded_index_operand",
++        "set xs to [1, 2, 3]\nsay xs at nothing\n",
++    );
++
++    // The same operand behind a `give back`. This is the second use of the table
++    // and it was wrong in the same way: without `nothing`, `give back` read as
++    // the valueless form, left `nothing` to the statement loop, and the function
++    // gained a statement it was never written with.
++    assert_identical(
++        "edge_nothing_as_a_give_back_value",
++        "to nothing_at_all()\n    give back nothing\nend\nsay nothing_at_all()\n",
++    );
++
++    // The third use: the operand check behind `length of`. Here the pre-fix
++    // stage 2 refused the program rather than compiling it differently, which is
++    // the better of the two failures and still a disagreement about whether an
++    // expression starts there.
++    assert_identical("edge_nothing_as_a_worded_length_operand", "say length of nothing\n");
++
++    // Control: the bracketed index reads its operand through `parse_expression`
++    // and never asked the table, so it was identical before the fix and must stay
++    // identical. If this one ever differs, the change is somewhere else.
++    assert_identical(
++        "edge_nothing_as_a_bracketed_index_operand",
++        "set xs to [1, 2, 3]\nsay xs[nothing]\n",
++    );
++
++    // Control: the same operand through a name bound by `set`, which is a
++    // `parse_expression` call that also never asks the table.
++    assert_identical(
++        "edge_nothing_through_a_name_bound_by_set",
++        "set xs to [1, 2, 3]\nsay length of xs\nset n to nothing\nsay xs at n\n",
++    );
++}
++
+ /// A stage-2 compiler that cannot fail is not a compiler: it writes a file for
+ /// every input, and the file is wrong for the inputs it did not understand.
+ ///
+ /// Each program here is one the frontend refuses. Stage 1 refuses them too —
+
+[0m
+[0m$ [0mcargo test --test bootstrap_selfhost_test edge_nothing 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 2.04s
+[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-5e0e684816b9fc1c)
+
+running 1 test
+test edge_nothing_heads_an_expression_on_both_engines ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.57s
+[0m
+[0m$ [0mcp bootstrap/compiler.rb /tmp/opencode/p80/compiler.keep.rb && cp /tmp/opencode/p80/compiler.prefix.rb bootstrap/compiler.rb && cargo test --test bootstrap_selfhost_test edge_nothing 2>&1 | tail -25; cp /tmp/opencode/p80/compiler.keep.rb bootstrap/compiler.rb && echo "RESTORED"
+---- edge_nothing_heads_an_expression_on_both_engines stdout ----
+
+thread 'edge_nothing_heads_an_expression_on_both_engines' (140804) panicked at tests/bootstrap_selfhost_test.rs:132:5:
+assertion `left == right` failed: stage 2 wrote 246 bytes where stage 1 wrote 213 for edge_nothing_as_a_worded_index_operand
+  left: 246
+ right: 213
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<usize, usize>
+   4: bootstrap_selfhost_test::assert_identical
+   5: bootstrap_selfhost_test::edge_nothing_heads_an_expression_on_both_engines
+   6: bootstrap_selfhost_test::edge_nothing_heads_an_expression_on_both_engines::{closure#0}
+   7: <bootstrap_selfhost_test::edge_nothing_heads_an_expression_on_both_engines::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_nothing_heads_an_expression_on_both_engines
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.15s
+
+[1m[91merror[0m: test failed, to rerun pass `--test bootstrap_selfhost_test`
+RESTORED
+[0m
+[0m# [0mTodos
+[✓] Read relevant code: bootstrap/compiler.rb is_expression_start, src/parser.rs expression starts
+[✓] Fix BLOCKER: bootstrap is_expression_start missing Nothing/MightFail
+[✓] Add byte-identity/stage-2 test case for `xs at nothing`
+[•] Fix MAJOR: lint() only consults analyzer when no errors/warnings
+[ ] Add combined warning+unknown-name lint test
+[ ] Re-run four gates
+[0m
+[0m$ [0mgrep -n "edge_extends_of_an_undeclared_parent_is_still_a_plain_read" -A 40 tests/linter_test.rs
+141:fn edge_extends_of_an_undeclared_parent_is_still_a_plain_read() {
+142-    // The analyser and the VM both reject an undeclared parent, so the linter
+143-    // must not read `One` as declared: only `Two` can be reported, and `One`
+144-    // is not one of the file's variables to report at all.
+145-    let source = "object Two extends One\nend\nsay \"hi\"\n";
+146-    assert_eq!(warnings(source), vec!["Unused variable: 'Two'"]);
+147-}
+148-
+149-#[test]
+150-fn edge_every_parent_in_a_chain_of_extends_is_read() {
+151-    let source = "object A\nend\n\nobject B extends A\nend\n\nobject C extends B\nend\n\nset c to C\nsay c.label\n";
+152-    assert_eq!(
+153-        every_message(source),
+154-        Vec::<String>::new(),
+155-        "`A` and `B` are named by `extends` and `C` is read: nothing is unused"
+156-    );
+157-    assert_eq!(warnings(source), Vec::<String>::new());
+158-}
+159-
+160-#[test]
+161-fn edge_the_leaf_of_an_extends_chain_is_still_reported_when_unread() {
+162-    let source = "object A\nend\n\nobject B extends A\nend\n\nset a to A\nsay a.label\n";
+163-    assert_eq!(
+164-        warnings(source),
+165-        vec!["Unused variable: 'B'"],
+166-        "reading the parent must not mark the child used"
+167-    );
+168-}
+169-
+170-#[test]
+171-fn an_underscore_prefixed_name_is_left_alone() {
+172-    let source = "set _ignored to 1\nsay \"hi\"\n";
+173-    assert_eq!(every_message(source), Vec::<String>::new());
+174-}
+175-
+176-// --- unused imports --------------------------------------------------------
+177-
+178-#[test]
+179-fn an_unused_file_level_import_is_reported() {
+180-    let source = "import files\nsay \"hi\"\n";
+181-    assert_eq!(warnings(source), vec!["Unused import: 'files'"]);
+[0m
+[0m→ [0mRead src/linter.rs[90m [limit=100, offset=425][0m
+[0m→ [0mRead tests/linter_test.rs[90m [limit=85][0m
+[0m
+[0m$ [0mgrep -n "a_file_rb_cannot_lex_parse_or_analyze_has_a_lint_diagnostic" -A 60 tests/index_words_test.rs
+558:fn a_file_rb_cannot_lex_parse_or_analyze_has_a_lint_diagnostic() {
+559-    let cases = [
+560-        // The analyzer failure this phase found: a name that resolves to
+561-        // nothing.
+562-        "set x to unknown_name\nsay x\n",
+563-        // A parser failure: the `end` was never written.
+564-        "if yes\n    say 1\n",
+565-        // A lexer failure: an unterminated text literal.
+566-        "say \"unterminated\n",
+567-    ];
+568-
+569-    for source in cases {
+570-        let (lint_errors, _) = lint(source);
+571-        assert!(
+572-            any_failure(source).is_some(),
+573-            "this fixture must be a file rb cannot run:\n{}",
+574-            source
+575-        );
+576-        assert!(
+577-            !lint_errors.is_empty(),
+578-            "a file rb cannot run must produce at least one lint diagnostic, got none for:\n{}",
+579-            source
+580-        );
+581-    }
+582-
+583-    // And the diagnostic says *which* stage refused it, because `Syntax error`
+584-    // and `Analysis error` are different things for a reader to act on. The
+585-    // wording is checked as a prefix so the test does not break when the
+586-    // analyzer's suggestion text changes.
+587-    let (parse_errors, _) = lint("if yes\n    say 1\n");
+588-    assert!(
+589-        parse_errors[0].message.starts_with("Syntax error: "),
+590-        "a file that does not parse is a syntax error, got {:?}",
+591-        parse_errors[0].message
+592-    );
+593-    let (analyzer_errors, _) = lint("set x to unknown_name\nsay x\n");
+594-    assert!(
+595-        analyzer_errors[0].message.starts_with("Analysis error: "),
+596-        "a file the analyzer refuses is an analysis error, got {:?}",
+597-        analyzer_errors[0].message
+598-    );
+599-}
+600-
+601-// ---------------------------------------------------------------------------
+602-// the operand: what follows `at` and what follows `length of`
+603-// ---------------------------------------------------------------------------
+604-
+605-/// The index is the **whole expression** after `at`, which is the reading an
+606-/// English-like language needs: `at n + 1` indexes by `n + 1`, and `at 3 - 1`
+607-/// is an index rather than a subtraction of nothing.
+608-///
+609-/// The consequence is stated rather than left to be discovered: a second `at`
+610-/// belongs to the index, not to the object, so `xs at 1 at 0` asks for
+611-/// `1 at 0` — a number, which is not a list — and says so. It is a clean runtime
+612-/// error naming what it tried to index, never a panic and never a silent
+613-/// misreading, and stepping twice means binding the step in between.
+614-#[test]
+615-fn edge_the_worded_index_operand_is_read_as_a_whole_expression() {
+616-    assert_eq!(
+617-        printed("set xs to [10, 20, 30]\nset n to 1\nsay xs at n + 1\n"),
+618-        vec!["30"],
+[0m
+[0m→ [0mRead src/lib.rs[90m [limit=60, offset=245][0m
+[0m
+[0m← [0mEdit src/linter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/linter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/linter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/linter.rs
+@@ -433,21 +433,28 @@
+ 
+ /// Lints `source`, lexing and parsing it first. Returns no findings when the
+ /// source does not get that far: there is no program to lint.
+ ///
+-/// When the program itself produces nothing, the analyzer is asked whether `rb`
+-/// could run it, and its refusal is reported. `rb lint` is the tool a reader
+-/// reaches for when `rb run` refuses a file, and it used to say nothing at all
+-/// about one the analyzer rejected — `set x to items at 0` produced an empty
+-/// report and exit 0, so a file that cannot run was reported as a file with
+-/// nothing wrong with it.
++/// The analyzer is always asked whether `rb` could run the program, and its
++/// refusal is **merged into** the report rather than consulted only when the
++/// report is otherwise empty. `rb lint` is the tool a reader reaches for when
++/// `rb run` refuses a file, and it used to say nothing at all about one the
++/// analyzer rejected — `set x to items at 0` produced an empty report and exit
++/// 0, so a file that cannot run was reported as a file with nothing wrong with
++/// it.
+ ///
+-/// **Only when there is nothing else to say.** A finding the tree walk already
+-/// made is kept and the analyzer is not consulted: `tests/linter_test.rs` pins
+-/// that an undeclared `extends` parent is reported as an unused child *and* not
+-/// read as a declaration, on a program the analyzer refuses, so a linter that
+-/// dropped its own findings to report someone else's would be a strictly worse
+-/// linter than the one this replaces.
++/// **Merged, not substituted.** The earlier shape asked the analyzer only when
++/// the tree walk had found nothing at all, and that made the pairing conditional
++/// on the very thing that makes a file dirty: `set u to unknown_name` with `u`
++/// unread produced one *warning* and no error, so `rb lint` still exited 0 on a
++/// file `rb run` refuses — the diagnostic disappeared the moment the file had a
++/// second, unrelated complaint. And returning early would be worse still: it
++/// deletes the linter's own findings on every file the analyzer refuses, which
++/// is what `tests/linter_test.rs` pins against in
++/// `edge_extends_of_an_undeclared_parent_is_still_a_plain_read`. So the analyzer
++/// always runs and its refusal is **appended**: nothing that used to be
++/// reported is dropped, and a file that cannot run is reported whether or not
++/// the tree walk had anything of its own to say.
+ pub fn lint(source: &str) -> (Vec<LintError>, Vec<LintWarning>) {
+     let tokens = match Lexer::tokenize(source) {
+         Ok(t) => t,
+         Err(e) => return (vec![stage_error("Syntax error", &e)], Vec::new()),
+@@ -458,13 +465,11 @@
+         Ok(p) => p,
+         Err(e) => return (vec![stage_error("Syntax error", &e)], Vec::new()),
+     };
+ 
+-    let (errors, warnings) = lint_program(&program);
+-    if errors.is_empty() && warnings.is_empty() {
+-        if let Err(e) = crate::analyzer::analyze(&program) {
+-            return (vec![stage_error("Analysis error", &e)], Vec::new());
+-        }
++    let (mut errors, warnings) = lint_program(&program);
++    if let Err(e) = crate::analyzer::analyze(&program) {
++        errors.push(stage_error("Analysis error", &e));
+     }
+ 
+     (errors, warnings)
+ }
+
+[0m
+[0m$ [0mcargo build 2>&1 | tail -3 && printf 'set u to unknown_name\n' > /tmp/opencode/p80/lint_both.rb && ./target/debug/rb lint /tmp/opencode/p80/lint_both.rb; echo "exit=$?"
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 1.83s
+Warning: line 1: Unused variable: 'u'
+Error: line 1: Analysis error: Unknown variable 'unknown_name'
+exit=1
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^(test result|error|warning: unused|failures:|---- )" | head -80
+test result: ok. 160 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 177.86s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 232.49s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 42.23s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+error
+error
+error
+error
+error
+error
+error ✓ 🎉 café
+error
+error
+error
+error
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.98s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+failures:
+---- edge_the_linter_sees_a_name_used_only_inside_braces stdout ----
+failures:
+test result: FAILED. 32 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[0m
+[0m$ [0mgrep -rn "edge_the_linter_sees_a_name_used_only_inside_braces" -A 30 tests/ | head -40
+tests/interpolation_test.rs:404:fn edge_the_linter_sees_a_name_used_only_inside_braces() {
+tests/interpolation_test.rs-405-    // Before the parser built the node, `name` was inside a text literal and
+tests/interpolation_test.rs-406-    // this program warned "Unused variable: 'name'". Reading the node is what
+tests/interpolation_test.rs-407-    // makes the warning fire here and stay quiet there.
+tests/interpolation_test.rs-408-    let used = "set name to \"x\"\nsay \"hi {name}\"\n";
+tests/interpolation_test.rs-409-    let unused = "set name to \"x\"\nsay \"hi {name2}\"\n";
+tests/interpolation_test.rs-410-    let warnings = |source: &str| -> Vec<String> {
+tests/interpolation_test.rs-411-        let (errors, warnings) = redblue::linter::lint(source);
+tests/interpolation_test.rs-412-        assert!(errors.is_empty(), "{source:?} must be valid: {errors:?}");
+tests/interpolation_test.rs-413-        warnings.into_iter().map(|w| w.message).collect()
+tests/interpolation_test.rs-414-    };
+tests/interpolation_test.rs-415-    assert_eq!(
+tests/interpolation_test.rs-416-        warnings(used),
+tests/interpolation_test.rs-417-        Vec::<String>::new(),
+tests/interpolation_test.rs-418-        "a name read inside braces is used"
+tests/interpolation_test.rs-419-    );
+tests/interpolation_test.rs-420-    assert_eq!(
+tests/interpolation_test.rs-421-        warnings(unused),
+tests/interpolation_test.rs-422-        vec!["Unused variable: 'name'".to_string()],
+tests/interpolation_test.rs-423-        "a name nothing reads is still reported"
+tests/interpolation_test.rs-424-    );
+tests/interpolation_test.rs-425-}
+tests/interpolation_test.rs-426-
+tests/interpolation_test.rs-427-#[test]
+tests/interpolation_test.rs-428-fn edge_the_linter_reads_names_through_nested_braces() {
+tests/interpolation_test.rs-429-    // The name is read inside a list literal that is itself inside a
+tests/interpolation_test.rs-430-    // substitution, so the linter has to walk InterpolatedText → List →
+tests/interpolation_test.rs-431-    // Variable to see it. It did not have that path before this phase.
+tests/interpolation_test.rs-432-    let (errors, warnings) = redblue::linter::lint("set a to 1\nsay \"{[a]}\"\n");
+tests/interpolation_test.rs-433-    assert!(errors.is_empty(), "{errors:?}");
+tests/interpolation_test.rs-434-    assert_eq!(
+[0m
+[0m$ [0mprintf 'set name to "x"\nsay "hi {name2}"\n' > /tmp/opencode/p80/interp.rb && ./target/debug/rb lint /tmp/opencode/p80/interp.rb; echo "exit=$?"; ./target/debug/rb run /tmp/opencode/p80/interp.rb; echo "run exit=$?"
+Warning: line 1: Unused variable: 'name'
+Error: line 2: Analysis error: Unknown variable 'name2'; did you mean 'name'?
+exit=1
+run exit=1
+Error: AnalyzerError: Unknown variable 'name2'; did you mean 'name'?
+  --> /tmp/opencode/p80/interp.rb:2:1
+2 | say "hi {name2}"
+  | ^
+[0m
+[0m→ [0mRead tests/interpolation_test.rs[90m [limit=28, offset=398][0m
+[0m
+[0m← [0mEdit tests/interpolation_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/interpolation_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/interpolation_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/interpolation_test.rs
+@@ -405,9 +405,17 @@
+ // Before the parser built the node, `name` was inside a text literal and
+ // this program warned "Unused variable: 'name'". Reading the node is what
+ // makes the warning fire here and stay quiet there.
+ let used = "set name to \"x\"\nsay \"hi {name}\"\n";
+-let unused = "set name to \"x\"\nsay \"hi {name2}\"\n";
++// `name2` is bound. The fixture used to read `set name to "x"` and
++// `say "hi {name2}"` with no `name2` anywhere, which is a program `rb run`
++// refuses with `Unknown variable 'name2'`; the `assert!(errors.is_empty())`
++// below passed only because `rb lint` asked the analyzer whether the file
++// ran *only* when the tree walk had found nothing, and this file had a
++// warning. The pairing now holds, so the fixture has to be a program that
++// runs: binding `name2` keeps the assertion and the intent — a name nothing
++// reads is reported, a name read inside braces is not — exactly as they were.
++let unused = "set name to \"x\"\nset name2 to \"y\"\nsay \"hi {name2}\"\n";
+ let warnings = |source: &str| -> Vec<String> {
+     let (errors, warnings) = redblue::linter::lint(source);
+     assert!(errors.is_empty(), "{source:?} must be valid: {errors:?}");
+     warnings.into_iter().map(|w| w.message).collect()
+
+[0m
+[0m$ [0mcargo test --test interpolation_test 2>&1 | tail -10
+Value: 5
+test interpolation_substitutes_a_bound_name_on_both_engines ... ok
+test interpolation_evaluates_an_arbitrary_expression ... ok
+test the_parser_builds_the_node_the_ast_declares ... ok
+test edge_a_very_long_literal_of_unmatched_opens_is_text_and_is_scanned_once ... ok
+still here
+test edge_the_corrected_redblue_test_still_exists_and_still_passes ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[0m
+[0m$ [0mgrep -n "^// ---\|^#\[test\]\|^fn \|^}" tests/linter_test.rs | tail -60
+417:fn edge_numeric_and_index_edges_are_not_lint_errors() {
+427:}
+429:#[test]
+430:fn edge_a_record_with_a_repeated_key_is_not_a_lint_error() {
+437:}
+439:#[test]
+440:fn edge_a_missing_field_is_not_a_lint_error() {
+443:}
+445:#[test]
+446:fn edge_a_long_source_is_linted_without_truncation() {
+452:}
+454:#[test]
+455:fn nested_scopes_do_not_leak_names_into_each_other() {
+459:}
+461:#[test]
+462:fn edge_a_name_bound_in_a_nested_scope_only_is_still_reported() {
+465:}
+467:// --- the corpus ------------------------------------------------------------
+472:fn corpus() -> Vec<PathBuf> {
+489:}
+493:fn identifiers(line: &str) -> Vec<String> {
+498:}
+503:fn code_only(line: &str) -> String {
+528:}
+533:fn without_properties(line: &str) -> String {
+545:}
+548:fn is_field_key(tokens: &[String], index: usize) -> bool {
+550:}
+556:fn is_binding_mention(tokens: &[String], index: usize) -> bool {
+569:}
+574:fn uses_after(source: &str, name: &str, line: usize) -> Vec<usize> {
+599:}
+602:fn mentioned_anywhere(source: &str, name: &str) -> bool {
+608:}
+610:fn warned_name(message: &str, prefix: &str) -> Option<String> {
+613:}
+615:#[test]
+616:fn the_corpus_produces_no_lint_errors() {
+622:}
+624:#[test]
+625:fn the_examples_lint_without_warnings() {
+647:}
+649:#[test]
+650:fn edge_no_unused_variable_warning_in_the_corpus_names_a_read_variable() {
+674:}
+676:#[test]
+677:fn edge_no_unused_import_warning_in_the_corpus_names_a_used_module() {
+693:}
+695:#[test]
+696:fn edge_every_shadow_warning_in_the_corpus_hides_a_real_outer_binding() {
+723:}
+725:// --- the output of `rb lint` itself ---------------------------------------
+730:fn lint_on_the_binary(source: &str) -> (i32, String) {
+749:}
+751:#[test]
+752:fn edge_rb_lint_prints_the_line_of_every_warning() {
+764:}
+766:#[test]
+767:fn edge_rb_lint_prints_the_line_of_a_syntax_error_and_exits_nonzero() {
+780:}
+[0m
+[0m→ [0mRead tests/linter_test.rs[90m [offset=720][0m
+[0m
+[0m← [0mEdit tests/linter_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/linter_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/linter_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/linter_test.rs
+@@ -777,4 +777,60 @@
+         stderr.contains("line 4"),
+         "the syntax error must name the line it is on: {stderr}"
+     );
+ }
++
++/// `rb lint` and `rb run` must agree about whether a file runs, **whatever else
++/// the linter has to say about it**.
++///
++/// `lint()` used to ask the analyzer whether the file ran only when the tree walk
++/// had produced neither an error nor a warning. That made the pairing conditional
++/// on the file being otherwise clean, which is the one condition under which a
++/// reader is most likely to act on the verdict: `set u to unknown_name` with `u`
++/// unread is dirty, so the analyzer was never asked, `rb lint` printed one
++/// warning and exited **0**, and `rb run` refused the same file. The diagnostic
++/// disappeared the moment the file had a second, unrelated complaint.
++///
++/// So the test is a *pair* — the same source through both tools — and it uses a
++/// source that triggers a warning and an analyzer refusal at once. A source that
++/// triggers only one of them passes under the old shape too, which is exactly
++/// why the original fixture did not catch this.
++#[test]
++fn edge_a_warning_does_not_hide_the_analyzer_s_refusal() {
++    // `u` is bound and never read; `unknown_name` is read and never bound. The
++    // warning and the refusal are independent: fixing either one leaves the
++    // other, so neither can be argued away.
++    let source = "set u to unknown_name\n";
++
++    // The half that was true before: the file does not run.
++    let (lint_errors, lint_warnings) = lint(source);
++    assert_eq!(
++        lint_warnings,
++        vec![LintWarning {
++            message: "Unused variable: 'u'".to_string(),
++            line: 1,
++        }],
++        "the linter's own finding must survive the analyzer's refusal: it did \
++         under the old shape too, and it must not be traded away for it"
++    );
++
++    // The half that was false before: the analyzer's refusal is reported, so
++    // `rb lint` fails on a file `rb run` refuses.
++    assert!(
++        lint_errors.iter().any(|e| e.message.starts_with("Analysis error:")),
++        "a warning must not suppress the analyzer's refusal, so a file that \
++         cannot run exits 0 when it also has a warning; got {lint_errors:?}"
++    );
++
++    // And the pairing, end to end, through the binary: the two tools must reach
++    // the same verdict on this file.
++    let (code, stderr) = lint_on_the_binary(source);
++    assert_eq!(
++        code, 1,
++        "rb lint exited 0 on a file rb run refuses, because the file also had \
++         a warning: {stderr}"
++    );
++    assert!(
++        stderr.contains("Unused variable: 'u'") && stderr.contains("Analysis error:"),
++        "both findings must reach the reader, not one of them: {stderr}"
++    );
++}
+
+[0m
+Now the test that settles the MAJOR finding:
+[0m$ [0mgrep -n "pub struct LintWarning" -A 10 src/linter.rs | head -15
+43:pub struct LintWarning {
+44-    pub message: String,
+45-    pub line: usize,
+46-    pub column: usize,
+47-}
+48-
+49-impl Linter {
+50-    pub fn new() -> Self {
+51-        Self {
+52-            errors: Vec::new(),
+53-            warnings: Vec::new(),
+[0m
+[0m← [0mEdit tests/linter_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/linter_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/linter_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/linter_test.rs
+@@ -803,16 +803,17 @@
+ 
+ // The half that was true before: the file does not run.
+ let (lint_errors, lint_warnings) = lint(source);
+ assert_eq!(
+-    lint_warnings,
+-    vec![LintWarning {
+-        message: "Unused variable: 'u'".to_string(),
+-        line: 1,
+-    }],
++    lint_warnings.iter().map(|w| w.message.as_str()).collect::<Vec<_>>(),
++    vec!["Unused variable: 'u'"],
+     "the linter's own finding must survive the analyzer's refusal: it did \
+      under the old shape too, and it must not be traded away for it"
+ );
++assert_eq!(
++    lint_warnings[0].line, 1,
++    "the warning must still point at the `set` that introduced `u`"
++);
+ 
+ // The half that was false before: the analyzer's refusal is reported, so
+ // `rb lint` fails on a file `rb run` refuses.
+ assert!(
+
+[0m
+[0m$ [0mcargo test --test linter_test 2>&1 | tail -12
+test function_parameter_is_not_a_false_positive ... ok
+test nested_scopes_do_not_leak_names_into_each_other ... ok
+test reassignment_inside_a_loop_is_not_shadowing ... ok
+test edge_every_shadow_warning_in_the_corpus_hides_a_real_outer_binding ... ok
+test edge_no_unused_import_warning_in_the_corpus_names_a_used_module ... ok
+test unused_variable_is_reported_with_its_line ... ok
+test the_examples_lint_without_warnings ... ok
+test edge_no_unused_variable_warning_in_the_corpus_names_a_read_variable ... ok
+test the_corpus_produces_no_lint_errors ... ok
+
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+[0m
+[0m$ [0mcp src/linter.rs /tmp/opencode/p80/linter.fixed.rs && python3 - <<'PY'
+p='src/linter.rs'
+s=open(p).read()
+old = '''    let (mut errors, warnings) = lint_program(&program);
+    if let Err(e) = crate::analyzer::analyze(&program) {
+        errors.push(stage_error("Analysis error", &e));
+    }
+
+    (errors, warnings)'''
+new = '''    let (errors, warnings) = lint_program(&program);
+    if errors.is_empty() && warnings.is_empty() {
+        if let Err(e) = crate::analyzer::analyze(&program) {
+            return (vec![stage_error("Analysis error", &e)], Vec::new());
+        }
+    }
+
+    (errors, warnings)'''
+assert old in s
+open(p,'w').write(s.replace(old,new,1))
+print("reverted linter shape")
+PY
+cargo test --test linter_test edge_a_warning_does_not_hide 2>&1 | tail -18; cp /tmp/opencode/p80/linter.fixed.rs src/linter.rs && echo RESTORED
+reverted linter shape
+
+thread 'edge_a_warning_does_not_hide_the_analyzer_s_refusal' (151616) panicked at tests/linter_test.rs:819:5:
+a warning must not suppress the analyzer's refusal, so a file that cannot run exits 0 when it also has a warning; got []
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: linter_test::edge_a_warning_does_not_hide_the_analyzer_s_refusal
+   3: linter_test::edge_a_warning_does_not_hide_the_analyzer_s_refusal::{closure#0}
+   4: <linter_test::edge_a_warning_does_not_hide_the_analyzer_s_refusal::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_warning_does_not_hide_the_analyzer_s_refusal
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 49 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test linter_test`
+RESTORED
+[0m
+[0m$ [0mcargo fmt --all && cargo clippy --all-targets -- -D warnings 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.76s
+[0m
+[0m$ [0mgrep -rn "linter::lint\|linter::lint_program\|use crate::linter" src/ | head -20
+src/lib.rs:261:                        let (errors, warnings) = linter::lint(&source);
+src/lsp.rs:117:/// analyzer is the one the linter reads ([`crate::linter::lint_program`]), so
+src/lsp.rs:145:    let (errors, warnings) = crate::linter::lint_program(&ast);
+[0m
+[0m$ [0mgit diff --stat; echo "=== grep lint claims"; grep -rn "Analysis error\|rb lint" SPEC.md README.md docs/ 2>/dev/null | head -20
+README.md                        |   2 +-
+ SPEC.md                          |  29 ++
+ bootstrap/compiler.rb            |  79 +++++
+ corpus/lists-0021.expected       |   8 +
+ corpus/lists-0021.rb             |   8 +
+ corpus/lists-0022.expected       |   7 +
+ corpus/lists-0022.rb             |   6 +
+ corpus/lists-0023.expected       |   4 +
+ corpus/lists-0023.rb             |   2 +
+ corpus/lists-0024.expected       |   4 +
+ corpus/lists-0024.rb             |   2 +
+ corpus/lists-0025.expected       |   4 +
+ corpus/lists-0025.rb             |   3 +
+ corpus/lists-0026.expected       |   4 +
+ corpus/lists-0026.rb             |   2 +
+ docs/GRAMMAR.md                  |  17 +-
+ phases/phase-080/FINDINGS.md     |  61 ++++
+ phases/phase-080/REPORT.md       | 218 ++++++++++++
+ src/formatter.rs                 |   8 +-
+ src/linter.rs                    |  51 ++-
+ src/parser.rs                    | 102 ++++++
+ tests/bootstrap_selfhost_test.rs |  86 ++++-
+ tests/common/generator.rs        |  15 +
+ tests/index_words_test.rs        | 719 +++++++++++++++++++++++++++++++++++++++
+ tests/interpolation_test.rs      |  10 +-
+ tests/linter_test.rs             |  70 +++-
+ 26 files changed, 1494 insertions(+), 27 deletions(-)
+=== grep lint claims
+README.md:104:rb lint hello.rb
+[0m
+Now running the four gates.
+[0m$ [0mcargo fmt --all -- --check && echo "GATE 1 fmt: PASS"
+GATE 1 fmt: PASS
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings && echo "GATE 2 clippy: PASS"
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.05s
+GATE 2 clippy: PASS
+[0m
+[0m$ [0mcargo test --all-targets > /tmp/opencode/p80/test.log 2>&1; echo "exit=$?"; grep -cE "^test .* \.\.\. ok$" /tmp/opencode/p80/test.log; grep -E "test result:" /tmp/opencode/p80/test.log | awk '{p+=$4; f+=$6; i+=$8} END {print "passed="p, "failed="f, "ignored="i}'; grep -E "FAILED|failures:" /tmp/opencode/p80/test.log | head
+exit=0
+1525
+passed=1531 failed=0 ignored=0
+[0m
+[0m$ [0mcargo test --doc > /tmp/opencode/p80/doctest.log 2>&1; echo "exit=$?"; tail -5 /tmp/opencode/p80/doctest.log
+exit=0
+test src/bytecode/mod.rs - bytecode (line 12) ... ok
+test src/bootstrap.rs - bootstrap (line 6) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+[0m
+All four gates pass. Now updating the report so it matches reality:
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -78,15 +78,22 @@
+   indexes by `n + 1`, which is the reading an English-like language needs. The
+   consequence — a second `at` belongs to the index, so `xs at 1 at 0` is
+   `xs at (1 at 0)` and fails `Cannot index non-list` — is documented in SPEC.md
+   and GRAMMAR.md and pinned by a test, rather than left to be discovered.
+-- **`rb lint` reports the analyzer's refusal only when it has nothing else to
+-  say.** Reporting it unconditionally would delete three existing linter
+-  findings, one of which (`edge_extends_of_an_undeclared_parent_is_still_a_plain_read`)
+-  exists precisely to pin that a program the analyzer *rejects* is still walked
+-  by the linter. The change is strictly additive: nothing that used to produce a
+-  finding now produces fewer, and a file that used to produce nothing now
+-  produces a diagnostic unless it runs.
++- **`rb lint` merges the analyzer's refusal into its report; it never
++  substitutes it.** The analyzer always runs and its refusal is **appended** to
++  the linter's own findings, so a file `rb run` refuses exits 1 whether or not
++  the tree walk had something of its own to say. Both of the obvious alternatives
++  are wrong and were rejected here:
++  - *Consult the analyzer only when the report is otherwise empty* — what the
++    first cut did. That made the pairing conditional on the very thing that
++    makes a file dirty: `set u to unknown_name` with `u` unread produced one
++    warning and no error, so `rb lint` exited **0** on a file `rb run` refuses.
++    The diagnostic vanished the moment the file had a second, unrelated
++    complaint. Pinned by `edge_a_warning_does_not_hide_the_analyzer_s_refusal`.
++  - *Return the analyzer's refusal in place of the report* — which deletes the
++    linter's own findings on every file the analyzer refuses, including the one
++    `edge_extends_of_an_undeclared_parent_is_still_a_plain_read` exists to pin.
+ - **`rb format` canonicalises `items at 0` to `items[0]`.** Both spell the same
+   `Expr::Index`, and one canonical spelling is the formatter's job. The property
+   that matters — statement count never changes — is asserted on the *reparsed*
+   formatted text, plus idempotence.
+
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -47,9 +47,9 @@
+ |---|---|---|
+ | `src/parser.rs` | +102 | `items at N` as a postfix arm on `Expr::Index`; `length of X` as a primary producing the `length(X)` call; `Parser::at_index_ahead` and `Parser::length_of_ahead` decide the disambiguation |
+ | `src/linter.rs` | +35 −11 | `lint()` asks the analyzer whether `rb` could run the file and reports its refusal when the linter had no finding of its own; `syntax_error` → `stage_error(prefix, …)` so the stage is named |
+ | `src/formatter.rs` | +5 −3 | the comment claiming `object at index` is not syntax the parser accepts was false after the change; corrected, and the canonical bracketed spelling documented |
+-| `bootstrap/compiler.rb` | +59 | the **stage 2 compiler written in Redblue** learned both forms, so the fixed-point tests still hold — no shim, no Rust fast path |
++| `bootstrap/compiler.rb` | +79 | the **stage 2 compiler written in Redblue** learned both forms, so the fixed-point tests still hold — no shim, no Rust fast path. `is_expression_start` also gained the two entries (`nothing`, `mightfail`) it was missing; see "Round 1 fixes" below |
+ | `SPEC.md` | +29 | § List Operations: what each spelling means, what it is equal to, how it is distinguished from the name `at`, and how to step twice |
+ | `docs/GRAMMAR.md` | +12 −5 | § 5.1 `length 'of' expression` as a primary, § 5.2 `postfix 'at' expression`, precedence table rows 8 and 9; the stale `postfix 'of' expression // generic type` line is gone |
+ | `tests/index_words_test.rs` | +620 | 19 new tests (new file) |
+ | `tests/common/generator.rs` | +15 | six new corpus programs in the `lists` family, generated not hand-listed |
+
+[0m
+[0m✗ [0mEdit phases/phase-080/REPORT.md failed
+[91m[1mError: [0mCould not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+[0m→ [0mRead phases/phase-080/REPORT.md[90m [limit=14, offset=53][0m
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -50,13 +50,14 @@
+ | `src/formatter.rs` | +5 −3 | the comment claiming `object at index` is not syntax the parser accepts was false after the change; corrected, and the canonical bracketed spelling documented |
+ | `bootstrap/compiler.rb` | +79 | the **stage 2 compiler written in Redblue** learned both forms, so the fixed-point tests still hold — no shim, no Rust fast path. `is_expression_start` also gained the two entries (`nothing`, `mightfail`) it was missing; see "Round 1 fixes" below |
+ | `SPEC.md` | +29 | § List Operations: what each spelling means, what it is equal to, how it is distinguished from the name `at`, and how to step twice |
+ | `docs/GRAMMAR.md` | +12 −5 | § 5.1 `length 'of' expression` as a primary, § 5.2 `postfix 'at' expression`, precedence table rows 8 and 9; the stale `postfix 'of' expression // generic type` line is gone |
+-| `tests/index_words_test.rs` | +620 | 19 new tests (new file) |
++| `tests/index_words_test.rs` | +719 | 19 new tests (new file) |
+ | `tests/common/generator.rs` | +15 | six new corpus programs in the `lists` family, generated not hand-listed |
+ | `corpus/lists-0021..0026.{rb,expected}` | +12 files | six corpus programs, each diffed on both engines |
+-| `tests/bootstrap_selfhost_test.rs` | +10 −10 | the corpus-size guards: 315 → 321, 306 → 312. Counts only; the guards still fail at 322 and 313 |
+-| `tests/linter_test.rs` | +5 −1 | **one fixture corrected** — see "Existing tests touched" below |
++| `tests/bootstrap_selfhost_test.rs` | +86 −10 | the corpus-size guards: 315 → 321, 306 → 312 (counts only; the guards still fail at 322 and 313), plus `edge_nothing_heads_an_expression_on_both_engines` |
++| `tests/linter_test.rs` | +69 −1 | one fixture corrected, plus `edge_a_warning_does_not_hide_the_analyzer_s_refusal` |
++| `tests/interpolation_test.rs` | +9 −1 | **one fixture corrected** — see "Existing tests touched" below |
+ | `README.md` | +1 −1 | the corpus count CI pins: 361 → 367 |
+ 
+ ### Design decisions, stated
+ 
+
+[0m
+Now the "Existing tests touched" section:
+[0m→ [0mRead phases/phase-080/REPORT.md[90m [limit=30, offset=100][0m
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -109,16 +109,60 @@
+ exists for. The fixture is now `greet("world")`. **No assertion was changed**:
+ the test still asserts `every_message(source).is_empty()` for a function whose
+ parameter is never read, which is exactly what it asserted before.
+ 
++`tests/interpolation_test.rs::edge_the_linter_sees_a_name_used_only_inside_braces`
++used the source `set name to "x"` / `say "hi {name2}"`, with `name2` bound
++nowhere. The fixture is refused by the analyzer with `Unknown variable 'name2'`,
++so it is a program `rb` cannot run, and its own `assert!(errors.is_empty(), "…
++must be valid")` passed only because `rb lint` asked the analyzer whether the
++file ran *only* when the tree walk had found nothing — and this file had a
++warning. Under the merge described above that pairing hole is closed, so the
++fixture has to be a program that runs. It is now
++`set name to "x"` / `set name2 to "y"` / `say "hi {name2}"`. **No assertion was
++changed**: the test still asserts the same two warning lists, and `name` is still
++the name nothing reads.
++
+ `tests/bootstrap_selfhost_test.rs` carries exact corpus-size guards whose own
+ failure message is "a family has been added or removed and the counts below are
+ not the whole corpus any more". Six corpus programs were added, so `315 → 321` and
+ `306 → 312`. The guards still fail at the next number.
+ 
+-`tests/interpolation_test.rs` was changed and then **reverted**: under the final
+-design its fixture keeps passing untouched.
++## Round 1 fixes
+ 
++Two defects the round-1 review found in this phase's own diff, both fixed here
++and both pinned by tests that fail without the fix.
++
++1. **`bootstrap/compiler.rb::is_expression_start` was missing two entries.**
++   That function is stage 2's copy of `Parser::kind_starts_expression`
++   (`src/parser.rs:1778`), and the two tables decide the same question — may this
++   token head an expression — for `give back`, for the `at` of a worded index,
++   and for the operand of `length of`. `Nothing` was in the Rust table and not in
++   the Redblue one, so `say xs at nothing` was one `say` of one `index` under
++   stage 1 — **213 bytes** — and a `say xs` followed by two stray statements
++   under stage 2 — **246 bytes**. Both runs succeeded and reported nothing; the
++   disagreement was only ever visible in the bytes, and no corpus program wrote
++   `at nothing` in it. `give back nothing` and `length of nothing` were wrong the
++   same way, the second one refused outright. `MightFail` was missing too;
++   `might fail` is *not* yet a stage-2 primary (`parse_primary` refuses it, as it
++   always has), so the entry changes nothing today — it is there so the two
++   tables are equal now rather than equal only until the day stage 2 gains the
++   primary. Fixed in `bootstrap/compiler.rb`, pinned by
++   `tests/bootstrap_selfhost_test.rs::edge_nothing_heads_an_expression_on_both_engines`
++   (five programs: the three that failed, plus two controls that never consult
++   the table and must keep agreeing).
++
++2. **`lint()` consulted the analyzer only when it had nothing else to say.** The
++   pairing "`rb run` refuses ⇒ `rb lint` reports" therefore held only for files
++   the linter found nothing wrong with, which is the one condition under which a
++   reader is most likely to act on the verdict. `set u to unknown_name` with `u`
++   unread produced one warning, no error, and **exit 0**. Fixed by always running
++   the analyzer and **appending** its refusal, never substituting it — see "Design
++   decisions, stated". Pinned by
++   `tests/linter_test.rs::edge_a_warning_does_not_hide_the_analyzer_s_refusal`,
++   which asserts the warning still comes out *and* the refusal does, through the
++   binary as well as the API.
++
+ ## Tests added
+ 
+ `tests/index_words_test.rs`, 19 `#[test]` functions, 8 of them named `edge_*`.
+ 
+
+[0m
+[0m→ [0mRead phases/phase-080/REPORT.md[90m [limit=60, offset=163][0m
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -195,8 +195,15 @@
+ whole number). Each runs on **both** engines and the answers are diffed by
+ `tests/differential_test.rs`; the `.expected` files are read, never rewritten, by
+ that runner.
+ 
++Two more `#[test]` functions were added outside that file, for the round-1 fixes:
++
++| Test | Edge class covered |
++|---|---|
++| `bootstrap_selfhost_test::edge_nothing_heads_an_expression_on_both_engines` | the stage-1/stage-2 disagreement on an operand the table omitted — `at nothing`, `give back nothing`, `length of nothing`, plus the two controls that never consult the table. Each program was verified to fail (different bytes, or a refusal) against the pre-fix stage 2 |
++| `linter_test::edge_a_warning_does_not_hide_the_analyzer_s_refusal` | the lint/run pairing under a file that triggers a warning **and** an analyzer refusal at once, through the API and through the `rb lint` binary's exit code |
++
+ ### Edge-case matrix (AGENTS.md § 3.2)
+ 
+ | Row | Status |
+ |---|---|
+
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -224,9 +224,9 @@
+ | Gate | Result |
+ |---|---|
+ | `cargo fmt --all -- --check` | **pass** |
+ | `cargo clippy --all-targets -- -D warnings` | **pass** — no `allow(` added, no warning |
+-| `cargo test --all-targets` | **pass** — 1529 passed, 0 failed, 0 ignored |
++| `cargo test --all-targets` | **pass** — 1531 passed, 0 failed, 0 ignored |
+ | `./rbops/verify.sh phase-080` | **not run — the file does not exist in this checkout.** `rbops/` is absent from the working tree (`ls rbops` → `No such file or directory`), and the pipeline that dispatches this phase lives outside the project. Not claimed as passing. |
+ 
+ Run by hand, because they are the checks CI performs and `verify.sh` was not
+ available:
+
+[0m
+[0m→ [0mRead phases/phase-080/REPORT.md[90m [offset=228][0m
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -233,9 +233,9 @@
+ 
+ | Check | Result |
+ |---|---|
+ | `cargo test --test differential_test` | pass — 82 passed, 0 failed; both engines agree on all 367 programs |
+-| `cargo test --test bootstrap_selfhost_test` | pass — 20 passed, 0 failed; **stage 2 and stage 3 are byte-identical to stage 1 on every one of the new corpus programs** |
++| `cargo test --test bootstrap_selfhost_test` | pass — 21 passed, 0 failed; **stage 2 and stage 3 are byte-identical to stage 1 on every one of the new corpus programs** |
+ | `cargo test --test bootstrap_ship_test` | pass — 16 passed, 0 failed |
+ | `examples/*.rb` and `modules/*.rb` | every file exits 0 |
+ | README corpus-count pin | pass — 367 programs, README says 367 |
+ | `rb run` / `rb format` / `rb lint` on the original repro | `set first to items at 0` prints `1`; `set count to length of items` prints `3`; `rb format` emits `set first to items[0]` — one statement; `rb lint` on a file `rb` cannot run now prints `Analysis error: …` and exits 1 |
+
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -237,9 +237,9 @@
+ | `cargo test --test bootstrap_selfhost_test` | pass — 21 passed, 0 failed; **stage 2 and stage 3 are byte-identical to stage 1 on every one of the new corpus programs** |
+ | `cargo test --test bootstrap_ship_test` | pass — 16 passed, 0 failed |
+ | `examples/*.rb` and `modules/*.rb` | every file exits 0 |
+ | README corpus-count pin | pass — 367 programs, README says 367 |
+-| `rb run` / `rb format` / `rb lint` on the original repro | `set first to items at 0` prints `1`; `set count to length of items` prints `3`; `rb format` emits `set first to items[0]` — one statement; `rb lint` on a file `rb` cannot run now prints `Analysis error: …` and exits 1 |
++| `rb run` / `rb format` / `rb lint` on the original repro | `set first to items at 0` prints `1`; `set count to length of items` prints `3`; `rb format` emits `set first to items[0]` — one statement; `rb lint` on a file `rb` cannot run now prints `Analysis error: …` and exits 1 — including when the file also has a warning, which was the round-1 defect |
+ 
+ ## Invariants touched
+ 
+ - None of the listed language invariants changed. `.rb` is still the extension;
+
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -249,12 +249,13 @@
+ - **New: `at` is a postfix index operator, `length of` is a primary.** Both are
+   grammar additions, not re-openings of the design: neither is a reserved word,
+   neither adds a statement form, and the bracketed and called spellings still work
+   and are asserted to be the same operation.
+-- **Changed: `rb lint` may now report `Analysis error:`.** It could already
+-  report `Syntax error:`. A file the analyzer refuses used to exit 0 with no
+-  output; it now exits 1 with a diagnostic. No file that previously produced a
+-  finding produces fewer.
++- **Changed: `rb lint` always runs the analyzer and merges its refusal into the
++  report.** It could already report `Syntax error:`. A file the analyzer refuses
++  used to exit 0 with no output; it now exits 1 with a diagnostic, *whatever else
++  the linter found* — the analyzer's verdict is appended, never substituted, so no
++  file that previously produced a finding produces fewer.
+ - **Changed: `rb format` canonicalises `items at 0` to `items[0]`.** The
+   statement count is unchanged and the program's output is unchanged; only the
+   spelling of one index is normalised.
+ - **Changed: `rb compile`'s stage-2 compiler understands both forms.** Without
+
+[0m
+[0m← [0mEdit phases/phase-080/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/REPORT.md
+@@ -269,10 +269,13 @@
+   the tree and does not run the program. → FINDINGS.md § 1
+ - `xs at 1 at 0` does not step twice; the second `at` belongs to the index. This
+   is documented in SPEC.md and GRAMMAR.md and pinned by a test, but it is a
+   limitation a reader may trip over. → FINDINGS.md § 3
+-- `rb lint` on a file that has an unused variable *and* an analyzer refusal now
+-  reports the unused variable and not the refusal. The refusal is still visible
+-  from `rb run`. → FINDINGS.md § 1
++- `might fail <call>` is still not a stage-2 construct: `bootstrap/compiler.rb`'s
++  `parse_primary` refuses it, so a program that uses one compiles under `rb` and
++  is refused by `rb run bootstrap/compiler.rb`. That gap is pre-existing and is
++  why the round-1 fix added `mightfail` to stage 2's `is_expression_start`
++  *without* adding the primary — the entry keeps the two tables equal so the day
++  the primary arrives the table is already right. → FINDINGS.md § 4
+ - `./rbops/verify.sh phase-080` was not run: `rbops/` is not in this checkout.
+-  The three `cargo` gates and every CI-specific check listed above were run by
++  The four `cargo` gates and every CI-specific check listed above were run by
+   hand instead, and none of them is a substitute for `verify.sh`.
+\ No newline at end of file
+
+[0m
+Now FINDINGS.md § 1, which still describes the old conditional behaviour:
+[0m← [0mEdit phases/phase-080/FINDINGS.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/FINDINGS.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/FINDINGS.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/FINDINGS.md
+@@ -4,11 +4,14 @@
+ here for the auditor, per AGENTS.md § 1.7. Nothing below was fixed.
+ 
+ ## 1. `rb lint` cannot report a failure that only happens when the program runs
+ 
+-`src/linter.rs` now asks the analyzer whether `rb` could run a file, and reports
+-its refusal when the linter had no finding of its own. That covers the three
+-static stages — lexer, parser, analyzer — and nothing beyond them.
++`src/linter.rs` now always asks the analyzer whether `rb` could run a file, and
++**appends** the refusal to the linter's own findings — it never substitutes it,
++so no file that previously produced a finding produces fewer. (The round-1 cut
++asked only when the report was otherwise empty, and that made the pairing
++conditional on the file being clean; see REPORT.md § Round 1 fixes.) That covers
++the three static stages — lexer, parser, analyzer — and nothing beyond them.
+ 
+ A failure that appears only during execution, such as calling a function that
+ does not exist (`RuntimeError: Unknown function 'not_a_function'`) or indexing
+ past the end of a list, is invisible to a linter: it reads the syntax tree and
+
+[0m
+[0m← [0mEdit phases/phase-080/FINDINGS.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-080/FINDINGS.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-080/FINDINGS.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-080/FINDINGS.md
+@@ -60,5 +60,29 @@
+ just learned `xs[N]` chaining left may reasonably expect `xs at N at M` to chain
+ too, and the only way to know the rule is to read the paragraph.
+ 
+ **Suggested phase.** None needed. Recorded so the auditor does not re-raise it as
+-an undiscovered bug.
+\ No newline at end of file
++an undiscovered bug.
++
++## 4. Stage 2 still cannot compile `might fail <call>`
++
++`bootstrap/compiler.rb`'s `parse_primary` refuses the `might fail` guard: it
++falls through every arm and reaches `refuse(line, "unexpected token
++mightfail")`. Stage 1 compiles such a program; stage 2 does not. This is
++pre-existing and unrelated to `at`/`length of` — it was true before this phase and
++is unchanged by it.
++
++It is written down because the round-1 fix touched the table that decides it.
++`is_expression_start` in `bootstrap/compiler.rb` gained a `mightfail` entry so
++that it equals `Parser::kind_starts_expression` entry for entry; **the entry
++changes nothing today**, because the primary it names does not exist yet. It is
++there so the two tables are equal now rather than equal only until the day the
++primary is written — the alternative is a table whose next entry is added late,
++by which time nobody remembers that a *second* copy exists.
++
++**Why it matters.** A construct stage 1 accepts and stage 2 refuses is invisible
++to every byte-identity test, because those compare programs both engines accept.
++There is no `might fail` program in `corpus/`, and no S2/S3 test can catch this
++class of gap without one.
++
++**Suggested phase.** Teach `parse_primary` the guard, and add one corpus program
++that uses it, so the gap becomes a byte-identity case instead of an absence.
+\ No newline at end of file
+
+[0m
+[0m$ [0mcargo fmt --all -- --check && echo "fmt PASS" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -3 && echo "clippy PASS"
+fmt PASS
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.74s
+clippy PASS
+[0m
+[0m$ [0mcargo test --all-targets > /tmp/opencode/p80/test.log 2>&1; echo "GATE3 exit=$?"; grep -E "test result:" /tmp/opencode/p80/test.log | awk '{p+=$4; f+=$6; i+=$8} END {print "passed="p, "failed="f, "ignored="i}'
+GATE3 exit=0
+passed=1531 failed=0 ignored=0
+[0m
+[0m$ [0mcargo test --doc > /tmp/opencode/p80/doctest.log 2>&1; echo "GATE4 exit=$?"; grep "test result:" /tmp/opencode/p80/doctest.log
+GATE4 exit=0
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+[0m
+[0m$ [0mgit add -N . >/dev/null 2>&1; echo "== gate-weakening constructs added:"; git diff -U0 HEAD -- '*.rs' | grep -nE '^\+[[:space:]]*(#\[ignore|#\[allow\((clippy|dead_code)|//[[:space:]]*skip\b)' || echo "none"; echo "== removed test fns:"; git diff -U0 HEAD -- '*.rs' | grep -E '^-([[:space:]]*#\[test\]|.*fn [a-z_]+\()' | grep -v "^---" || echo "none"; echo "== scratch files:"; git diff --name-only HEAD | grep -iE '(^|/)zz_[^/]*$|(^|/)[^/]*_scratch\.[^/]*$|\.(tmp|bak|orig|swp)$|~$' || echo "none"
+== gate-weakening constructs added:
+none
+== removed test fns:
+-fn syntax_error(error: &Error) -> LintError {
+== scratch files:
+none
+[0m
+[0m$ [0mgit diff HEAD -- src/linter.rs bootstrap/compiler.rb
+diff --git a/bootstrap/compiler.rb b/bootstrap/compiler.rb
+index a072d3a..32d290c 100644
+--- a/bootstrap/compiler.rb
++++ b/bootstrap/compiler.rb
+@@ -1073,6 +1073,20 @@ to parse_return(tokens, pos, line)
+ end
+ 
+ // `Parser::is_expression_start`: what may follow a `give back` with no value.
++//
++// This table is the stage-1 `Parser::kind_starts_expression`, arm for arm and in
++// the same order. It has to be, and not merely be close: a kind missing here is
++// a kind the stage-2 parser will not read as the head of an expression, so a
++// stage-2 run silently produces a *different program* rather than an error. That
++// is what happened with `nothing`: `say xs at nothing` became one `say` of one
++// `index` under stage 1 and a `say xs` plus two stray statements under stage 2,
++// and the two wrote files of 213 and 246 bytes.
++//
++// `nothing` is a primary here, so it is in the table; `might fail` is *not* yet
++// a primary here — `parse_primary` refuses it, as it always has — but it is in
++// the table anyway, because the table's job is to say what an expression may
++// start with, and a table that has to be re-edited the day stage 2 gains the
++// primary is a table that will be re-edited late.
+ to is_expression_start(tokens, pos)
+     set is_expression_start_k to token_kind(tokens, pos)
+     set is_expression_start_starts to no
+@@ -1088,6 +1102,9 @@ to is_expression_start(tokens, pos)
+     if is_expression_start_k is "no" then
+         set is_expression_start_starts to yes
+     end
++    if is_expression_start_k is "nothing" then
++        set is_expression_start_starts to yes
++    end
+     if is_expression_start_k is "id" then
+         set is_expression_start_starts to yes
+     end
+@@ -1109,6 +1126,9 @@ to is_expression_start(tokens, pos)
+     if is_expression_start_k is "to" then
+         set is_expression_start_starts to yes
+     end
++    if is_expression_start_k is "mightfail" then
++        set is_expression_start_starts to yes
++    end
+     give back is_expression_start_starts
+ end
+ 
+@@ -1921,6 +1941,37 @@ to parse_postfix(tokens, pos, depth)
+     give back parse_postfix_more(tokens, parse_postfix_base[1], depth, parse_postfix_base[0])
+ end
+ 
++// The word `at` followed by an operand **on the same line**. Same rule as the
++// Rust parser's `Parser::at_index_ahead`, and for the same reason: `at` is not a
++// reserved word and must not become one, so `set at to 0`, `say at` and
++// `xs at at` are the names they have always been.
++to at_index_ahead(tokens, pos)
++    set at_index_ahead_ok to no
++    if word_at(tokens, pos) is "at" then
++        if is_expression_start(tokens, pos + 1) then
++            if token_line(tokens, pos + 1) is token_line(tokens, pos) then
++                set at_index_ahead_ok to yes
++            end
++        end
++    end
++    give back at_index_ahead_ok
++end
++
++// The words `length of` on the same line — the only shape in which `length` is
++// the worded form rather than the variable, the builtin, or a program's own
++// binding of the name.
++to length_of_ahead(tokens, pos)
++    set length_of_ahead_ok to no
++    if word_at(tokens, pos) is "length" then
++        if word_at(tokens, pos + 1) is "of" then
++            if token_line(tokens, pos + 1) is token_line(tokens, pos) then
++                set length_of_ahead_ok to yes
++            end
++        end
++    end
++    give back length_of_ahead_ok
++end
++
+ to parse_postfix_more(tokens, pos, depth, node)
+     set parse_postfix_more_out to nothing
+     if token_kind(tokens, pos) is "dot" then
+@@ -1945,6 +1996,17 @@ to parse_postfix_more(tokens, pos, depth, node)
+             set parse_postfix_more_out to parse_postfix_more(tokens, parse_postfix_more_q, depth, parse_postfix_more_next)
+         end
+     end
++    // `xs at 0` — the worded index SPEC.md § List Operations documents. It is
++    // the same `index` node as `[0]`, not a second kind, so stage 1 and stage 2
++    // cannot answer differently about its bounds. `at_index_ahead` is what keeps
++    // `at` an ordinary name.
++    if type_of(parse_postfix_more_out) is "nothing" then
++        if at_index_ahead(tokens, pos) then
++            set parse_postfix_more_worded to parse_expression(tokens, pos + 1, 0, depth + 1)
++            set parse_postfix_more_next to {k: "index", o: node, i: parse_postfix_more_worded[0]}
++            set parse_postfix_more_out to parse_postfix_more(tokens, parse_postfix_more_worded[1], depth, parse_postfix_more_next)
++        end
++    end
+     if type_of(parse_postfix_more_out) is "nothing" then
+         set parse_postfix_more_out to [node, pos]
+     end
+@@ -2022,6 +2084,23 @@ to parse_primary(tokens, pos, depth)
+             set parse_primary_out to [{k: "nothing"}, pos + 1]
+         end
+     end
++    // `length of x` — the worded length. It compiles to the same `call` node as
++    // `length(x)`, so the builtin stays the one place that answers and the two
++    // spellings cannot drift. Checked before the plain-identifier arm below,
++    // because `length` reaches that arm as an ordinary name when it is not
++    // followed by `of`.
++    if type_of(parse_primary_out) is "nothing" then
++        if length_of_ahead(tokens, pos) then
++            if is_expression_start(tokens, pos + 2) is not yes then
++                refuse(token_line(tokens, pos), "expected something to measure after 'length of'")
++            end
++            set parse_primary_operand to parse_expression(tokens, pos + 2, 0, depth + 1)
++            // `tokens[pos].b`, not the text "length": a name reaches the constant
++            // pool as bytes, and a text would intern a different entry and put a
++            // different length in the encoded chunk.
++            set parse_primary_out to [{k: "call", n: tokens[pos].b, args: [parse_primary_operand[0]]}, parse_primary_operand[1]]
++        end
++    end
+     // `this` is a plain variable that only a method call binds.
+     if type_of(parse_primary_out) is "nothing" then
+         if token_kind(tokens, pos) is "id" then
+diff --git a/src/linter.rs b/src/linter.rs
+index 9cb0bd7..003ec52 100644
+--- a/src/linter.rs
++++ b/src/linter.rs
+@@ -432,20 +432,46 @@ impl Default for Linter {
+ }
+ 
+ /// Lints `source`, lexing and parsing it first. Returns no findings when the
+-/// source does not parse: there is no program to lint.
++/// source does not get that far: there is no program to lint.
++///
++/// The analyzer is always asked whether `rb` could run the program, and its
++/// refusal is **merged into** the report rather than consulted only when the
++/// report is otherwise empty. `rb lint` is the tool a reader reaches for when
++/// `rb run` refuses a file, and it used to say nothing at all about one the
++/// analyzer rejected — `set x to items at 0` produced an empty report and exit
++/// 0, so a file that cannot run was reported as a file with nothing wrong with
++/// it.
++///
++/// **Merged, not substituted.** The earlier shape asked the analyzer only when
++/// the tree walk had found nothing at all, and that made the pairing conditional
++/// on the very thing that makes a file dirty: `set u to unknown_name` with `u`
++/// unread produced one *warning* and no error, so `rb lint` still exited 0 on a
++/// file `rb run` refuses — the diagnostic disappeared the moment the file had a
++/// second, unrelated complaint. And returning early would be worse still: it
++/// deletes the linter's own findings on every file the analyzer refuses, which
++/// is what `tests/linter_test.rs` pins against in
++/// `edge_extends_of_an_undeclared_parent_is_still_a_plain_read`. So the analyzer
++/// always runs and its refusal is **appended**: nothing that used to be
++/// reported is dropped, and a file that cannot run is reported whether or not
++/// the tree walk had anything of its own to say.
+ pub fn lint(source: &str) -> (Vec<LintError>, Vec<LintWarning>) {
+     let tokens = match Lexer::tokenize(source) {
+         Ok(t) => t,
+-        Err(e) => return (vec![syntax_error(&e)], Vec::new()),
++        Err(e) => return (vec![stage_error("Syntax error", &e)], Vec::new()),
+     };
+ 
+     let mut parser = crate::parser::Parser::new(tokens);
+     let program = match parser.parse() {
+         Ok(p) => p,
+-        Err(e) => return (vec![syntax_error(&e)], Vec::new()),
++        Err(e) => return (vec![stage_error("Syntax error", &e)], Vec::new()),
+     };
+ 
+-    lint_program(&program)
++    let (mut errors, warnings) = lint_program(&program);
++    if let Err(e) = crate::analyzer::analyze(&program) {
++        errors.push(stage_error("Analysis error", &e));
++    }
++
++    (errors, warnings)
+ }
+ 
+ /// Lints an already-parsed [`Program`], for a caller that has the AST in hand
+@@ -458,12 +484,19 @@ pub fn lint_program(program: &Program) -> (Vec<LintError>, Vec<LintWarning>) {
+     (linter.get_errors(), linter.get_warnings())
+ }
+ 
+-/// Turns a failure from the lexer or the parser into a lint error, so that a
+-/// file which does not parse is reported instead of being silently passed over.
+-fn syntax_error(error: &Error) -> LintError {
++/// Turns a failure from the lexer, the parser or the analyzer into a lint
++/// error, so that a file which does not run is reported instead of being
++/// silently passed over.
++///
++/// `prefix` names the stage that refused it, which is the difference a reader
++/// acts on: `Syntax error` means the file is not Redblue, `Analysis error` means
++/// it is Redblue and means something the language has no value for.
++fn stage_error(prefix: &str, error: &Error) -> LintError {
+     let rendered;
+     let (message, span) = match error {
+-        Error::Lexer(message, span) | Error::Parser(message, span) => (message.as_str(), *span),
++        Error::Lexer(message, span)
++        | Error::Parser(message, span)
++        | Error::Analyzer(message, span) => (message.as_str(), *span),
+         other => {
+             rendered = other.to_string();
+             (rendered.as_str(), Span::unknown())
+@@ -471,7 +504,7 @@ fn syntax_error(error: &Error) -> LintError {
+     };
+ 
+     LintError {
+-        message: format!("Syntax error: {}", message),
++        message: format!("{}: {}", prefix, message),
+         line: span.line,
+         column: span.column,
+     }
+[0m
+[0m$ [0mgrep -oE '[0-9]+ passed' phases/phase-080/REPORT.md | head -3; echo "--- real: 1531"; echo "=== required sections:"; for sec in "What changed" "Tests added" "Gates" "Known gaps"; do grep -qF "$sec" phases/phase-080/REPORT.md && echo "ok: $sec" || echo "MISSING: $sec"; done
+1531 passed
+82 passed
+21 passed
+--- real: 1531
+=== required sections:
+ok: What changed
+ok: Tests added
+ok: Gates
+ok: Known gaps
+[0m
+[0m$ [0mprintf 'set items to [1,2,3]\nset first to items at 0\nsay first\n' > /tmp/opencode/p80/t1.rb && ./target/debug/rb run /tmp/opencode/p80/t1.rb && printf 'set items to [1,2,3]\nset count to length of items\nsay count\n' > /tmp/opencode/p80/t2.rb && ./target/debug/rb run /tmp/opencode/p80/t2.rb && echo "--- format:" && ./target/debug/rb format /tmp/opencode/p80/t1.rb && echo "--- lint on unrunnable + warning:" && ./target/debug/rb lint /tmp/opencode/p80/t2.rb; printf 'set u to unknown_name\n' > /tmp/opencode/p80/t3.rb; ./target/debug/rb lint /tmp/opencode/p80/t3.rb; echo "lint exit=$?"
+1
+3
+--- format:
+set items to [1, 2, 3]
+set first to items[0]
+say first
+--- lint on unrunnable + warning:
+Warning: line 1: Unused variable: 'u'
+Error: line 1: Analysis error: Unknown variable 'unknown_name'
+lint exit=1
+[0m
+Both findings fixed, all four gates green.
+
+**BLOCKER — stage-1/stage-2 divergence on `nothing`** (`bootstrap/compiler.rb:1105`, `:1129`)
+
+`is_expression_start` is stage 2's copy of `Parser::kind_starts_expression` (`src/parser.rs:1778`) but was missing `Nothing` and `MightFail`. Verified: `say xs at nothing` compiled to 213 bytes under stage 1 and 246 under stage 2, both "succeeding". `give back nothing` and `length of nothing` were wrong the same way (the third refused outright). Added both entries, in the Rust table's order, with a comment stating the contract is *equality*, not closeness. New test `bootstrap_selfhost_test::edge_nothing_heads_an_expression_on_both_engines` covers the three failures plus two controls; confirmed it fails against the pre-fix stage 2 (246 vs 213 bytes) and passes after.
+
+**MAJOR — `lint()` hid the analyzer's refusal behind a warning** (`src/linter.rs:471`)
+
+The early return dropped the linter's own findings; the conditional version suppressed the refusal whenever a file had any finding. Now the analyzer always runs and its verdict is **appended**. `set u to unknown_name` → warning *and* `Analysis error`, exit 1. New test `linter_test::edge_a_warning_does_not_hide_the_analyzer_s_refusal` asserts both, through the API and the binary's exit code; confirmed it fails against the old shape.
+
+One existing fixture broke and was corrected rather than accommodated: `interpolation_test::edge_the_linter_sees_a_name_used_only_inside_braces` used `say "hi {name2}"` with `name2` unbound, and its `assert!(errors.is_empty())` was passing only through this exact hole. Bound `name2`; no assertion changed.
+
+Gates: `cargo fmt --all -- --check` pass · `cargo clippy --all-targets -- -D warnings` pass · `cargo test --all-targets` 1531 passed / 0 failed / 0 ignored · `cargo test --doc` 2 passed. No `#[ignore]`, `// skip`, or `allow(` added; no test deleted. REPORT.md and FINDINGS.md updated to match (the stale "lint reports the refusal only when it has nothing else to say" claim and the matching known-gap bullet are gone; the `might fail` stage-2 gap is now recorded as FINDINGS § 4 since the table entry is inert without the primary).

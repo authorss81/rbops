@@ -563,12 +563,14 @@
       ],
       "timeout_min": 600,
       "bootstrap_requires": [
-        "comparison operators lex and compare (`==`, `!=`, `<`, `<=`, `>`, `>=`) - verified absent: `say 1 == 1` raises LexerError: Unexpected character '='",
-        "`break` exits its loop - verified absent: Statement::Break is a TODO no-op in src/interpreter.rs",
-        "range loops (`for each i from A to B`)",
-        "`unless` blocks",
-        "`module`/`export`/`import` for compiler structure",
-        "function literals as expressions, for emitting functions"
+        "comparison operators lex and compare (`==`, `!=`, `<`, `<=`, `>`, `>=`) - MET, verified at runtime this audit: `say (1 == 1)` prints yes, `say (1 != 2)` yes, `say (1 < 2)` yes, `say (2 <= 2)` yes, `say (2 > 1)` yes, `say (2 >= 2)` yes; all exit 0. The old entry claimed `say 1 == 1` raises LexerError: Unexpected character `=` - that is no longer true and was removed rather than left as a warning",
+        "`break` exits its loop - MET, verified at runtime this audit: over [1,2,3,4,5], breaking at 3 leaves the counter at 2. The old entry claimed `Statement::Break` is a TODO no-op in src/interpreter.rs - it is not; phase-025 landed it",
+        "range loops (`for each i from A to B`) - MET, verified at runtime this audit: `for each i from 1 to 4` summing gives 10; `... from 0 to 10 by 2` gives 30",
+        "`unless` blocks - MET, verified at runtime this audit: `unless x is 0 then say \"nonzero\" end` prints nonzero. Note `then` is required (docs/GRAMMAR.md:236); omitting it is a ParserError, not a missing feature",
+        "`module`/`export`/`import` for compiler structure - MET, verified at runtime this audit: `import math` then `math.sqrt(9)` prints 3, and `import math as m` then `m.sqrt(9)` prints 3",
+        "function literals as expressions, for emitting functions - MET, verified at runtime this audit: `set double to to (x) return x * 2 end` then `say double(21)` prints 42",
+        "NOT a bootstrap blocker but a live correctness defect the compiler will inherit: `this` is not accepted as the operand of `at`/`of` - src/parser.rs:1813 omits TokenKind::This from kind_starts_operand while src/parser.rs:2575 parses it as a primary, so `length of this` is a ParserError and `this.xs at this` misparses as `Unknown variable at`. Tracked as phase-110.",
+        "NOT a bootstrap blocker but a live correctness defect the compiler will inherit: `else if` does not parse in any position - src/parser.rs:791 has no else-if arm, so the nested if steals the outer `end`. Documented at SPEC.md:391 and docs/GRAMMAR.md:221. Tracked as phase-112."
       ]
     },
     {
@@ -2565,6 +2567,145 @@
       "must_touch": [
         "src/"
       ]
+    },
+    {
+      "id": "phase-110",
+      "title": "Let `this` be the operand of `at` and `of`, so a worded index works inside an object method",
+      "severity": "blocker",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "src/parser.rs:1813 `fn kind_starts_operand` matches Number | Text | YesNo | Nothing | Identifier | LeftParen | LeftBracket | LeftBrace | Not | Minus | To, and does NOT match `TokenKind::This` - while src/parser.rs:2575 `parse_primary` has a `TokenKind::This =>` arm that reads `this` as an ordinary primary. The two disagree, so `this` is a primary everywhere except as the operand of a worded index or worded length. Verified against the built binary this audit (`target/debug/rb`, HEAD c8156ab): inside a method, `return length of this` raises `ParserError: Expected something to measure after \\`length of\\`` at the column of `this`, while `return length of nothing` in the identical position parses and runs, and `return this.xs at this` raises `AnalyzerError: Unknown variable 'at'; did you mean 'as'?` - the `at this` split into two statements, which is the same misparse phase-080 was created to end. `this.xs at 0` works (prints 10) because `at` is reached through the normal expression path; only the worded OPERAND is blind. Both engines fail identically (bootstrap/compiler.rb:1146 omits `this` from its operand table the same way, while bootstrap/compiler.rb:2177 parses it), so tests/differential_test.rs and the S3 fixed-point test compare two wrong answers and cannot see it. This is LIVE on main: logs/phase-080.review.3.log ends `REVIEW VERDICT: FINDINGS 1` naming this exact file:line, and phases/phase-080/.done was still written at 06:51 - see phase-111.",
+      "goal": "Make `this` a legal operand of `at` and `of` in both engines, so `length of this` and `xs at this` are read as one expression instead of being refused or split into separate statements.",
+      "must_touch": [
+        "src/",
+        "bootstrap/"
+      ],
+      "accept": [
+        "`return length of this` inside an object method is an index/length expression, not `ParserError: Expected something to measure` - it must reach the same runtime check `length of nothing` reaches",
+        "`return this.xs at this` raises a clean positioned Runtime or Analyzer error naming the problem, and NEVER `Unknown variable 'at'` - the `at this` is no longer split into separate statements",
+        "`rb run` and (`rb compile` then `rb vm`) agree on every case above, byte for byte in outcome",
+        "`bootstrap/compiler.rb` operand table and src/parser.rs:1813 operand table list the same token kinds, and a test asserts the two tables agree rather than a human reading both",
+        "the already-working `this.xs at 0`, `xs at 0` and `xs[0]` keep their behaviour, each pinned by a test",
+        "edge_* tests cover: `length of this` with a zero-field object, one field, many fields; `this.xs at this`; `this` as operand of `at` inside a nested object; `this` inside a function literal nested in a method; and the same cases through the bytecode engine",
+        "`cargo test` reports 0 failures, `cargo clippy --all-targets -- -D warnings` is clean, and the S3 fixed-point test still passes"
+      ],
+      "timeout_min": 180
+    },
+    {
+      "id": "phase-111",
+      "title": "Stop dispatch from marking a phase done while its reviewer still has open MAJOR findings",
+      "severity": "blocker",
+      "depends_on": [],
+      "manual": true,
+      "risk": "medium",
+      "finding": "AGENTS.md:258 states plainly 'A phase with open BLOCKER/MAJOR findings is not `.done`', and AGENTS.md section 5 says BLOCKER and MAJOR findings 'are then fixed by a fresh implementer run, and the full gate is run again'. rbops/dispatch.sh:912 computes `blocking` with a regex over `BLOCKER|CRITICAL` only, and rbops/dispatch.sh:923-925 then reads `elif [ \"$has_sev\" -gt 0 ]; then log \"...findings present, none blocking - shipping\"; break` - so a review whose verdict is `REVIEW VERDICT: FINDINGS 1` and whose only finding is tagged [MAJOR] exits the review loop and ships. This is not theoretical: logs/phase-080.review.3.log ends with a [MAJOR] at src/parser.rs:1813 and `REVIEW VERDICT: FINDINGS 1`, and `touch phases/phase-080/.done` ran at 06:51, the same minute. The defect it shipped is still live on main and is phase-110's finding. Marked `manual: true` for the reason phase-092/093 are: fixing this means editing rbops/dispatch.sh, which AGENTS.md hard rule 1 forbids an agent to touch, so an agent cannot land it and declaring it runnable would just burn attempts.",
+      "goal": "Make dispatch treat an open MAJOR exactly as it treats an open BLOCKER - fix and re-gate - so a phase cannot reach `.done` with an unreviewed MAJOR outstanding.",
+      "must_touch": [
+        "rbops/dispatch.sh"
+      ],
+      "accept": [
+        "rbops/dispatch.sh:912 `blocking` counts MAJOR as well as BLOCKER and CRITICAL, so a review log tagged [MAJOR] does not reach the shipping branch at dispatch.sh:923",
+        "a smoke check in rbops/smoke.sh feeds the reviewer parser a synthetic review log containing one [MAJOR] and asserts dispatch does NOT write .done",
+        "a smoke check feeds it `REVIEW VERDICT: CLEAN` and asserts .done IS written, so the change did not simply block everything",
+        "the smoke suite still passes end to end",
+        "phases/phase-080/.done is re-opened for review, or its MAJOR is recorded as fixed by phase-110"
+      ],
+      "timeout_min": 90
+    },
+    {
+      "id": "phase-112",
+      "title": "Make `else if` parse, as SPEC.md and docs/GRAMMAR.md both promise",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "medium",
+      "finding": "SPEC.md:391 writes `else if x < 0` inside a worked `if/else` example, and docs/GRAMMAR.md:221 writes `{ 'else if' expression 'then' { statement } }` as part of `if_statement`. src/parser.rs:791 `fn parse_if` has no else-if arm: after consuming `TokenKind::Else` at src/parser.rs:812 it enters a plain statement loop, so the `if` is parsed as a NESTED `if`, that nested `if` consumes the `end` that belonged to the outer one, and the outer `parse_if` then fails its `self.expect(&TokenKind::End)` at src/parser.rs:830. Verified against the built binary this audit: `else if` is a parse error in EVERY position - as the last branch (`ParserError: Expected 'end' but got Eof` at 7:1), as a middle branch with a trailing `else` (9:1), and two chained `else if`s with a trailing `else` (11:1). corpus/control-flow-0003.rb:3, corpus/control-flow-0004.rb:3 and corpus/control-flow-0005.rb:3 are the only three corpus programs that write `else if`, and all three are recorded as must-fail; tests/differential_test.rs:718-746 pins that refusal on both engines so it cannot change silently. The documentation has promised this form for the whole life of the project and no program can use it.",
+      "goal": "Parse `else if <expr> then ... ` as a real else-if chain so the form SPEC.md:391 and docs/GRAMMAR.md:221 document actually runs, and move the three corpus programs off the must-fail list deliberately.",
+      "must_touch": [
+        "src/",
+        "corpus/",
+        "tests/"
+      ],
+      "accept": [
+        "`if x is 9 then say \"nine\" else if x is 1 then say \"one\" end` prints `one`, and the same with a trailing `else` prints the right branch",
+        "two or more chained `else if` arms with a trailing `else` work in both engines, and `rb run` and `rb compile` + `rb vm` agree",
+        "a plain `if`/`else` with no `else if` is unchanged, pinned by a test",
+        "an `else if` chain with a missing `then`, a missing `end`, and an `else` with nothing after it each produce a positioned ParserError naming what was expected - never a panic",
+        "corpus/control-flow-0003.rb, -0004.rb and -0005.rb stop being must-fail, their .expected files are regenerated, and `cargo test --test differential_test` still passes with tests/differential_test.rs:701-746 deliberately updated to assert the chain NOW parses rather than deleted",
+        "edge_* tests cover: else-if as the last arm, else-if in the middle, three arms, an empty then-branch in an else-if arm, `else if` inside a `for`/`while`/`repeat` body, and a nested `if` inside an `else if` arm",
+        "docs/GRAMMAR.md and SPEC.md agree with the implementation afterwards",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 180
+    },
+    {
+      "id": "phase-113",
+      "title": "Mark the type system as not implemented, or implement the annotations GRAMMAR.md §2 promises",
+      "severity": "major",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "docs/GRAMMAR.md:129-155 documents a whole static type system in '## 2. Type System' / '### 2.1 Type Expressions' - `type_expression`, `primitive_type`, `list_type`, `record_type`, `object_type`, `function_type`, `generic_type`, `union_type` - and then USES it in five productions that carry no disclaimer: :188 `declaration = 'set' identifier [ ':' type_expression ] 'to' expression`, :194 the same for `constant`, :289-290 `function_decl` with `[ 'needs' type_expression ... ]` and `[ 'gives' type_expression ]`, :294-295 `parameter = identifier [ ':' type_expression ] | identifier 'of' type_expression`, and :305 `property_decl = 'has' identifier [ ':' type_expression ] [ 'default' expression ]`. SPEC.md:147-156 repeats it under '### Complex Types' (`set numbers to list of number`, `set Point to record { x: number, y: number }`). NONE of it is implemented: verified against the built binary this audit, `set x : number to 1` raises `ParserError: Expected 'to' but got Colon`, `constant C : number to 1` the same, `object P / has x : number` raises `ParserError: Unexpected token Colon`, `to f(x : number)` raises `ParserError: Expected RightParen but got Colon`, `to f(x of number)` raises `ParserError: Expected RightParen but got Identifier(\"of\")`, `to f(a) needs number` raises `AnalyzerError: Unknown variable 'needs'`, and `set numbers to list of number` raises `AnalyzerError: Unknown variable 'list'`. The project already has the honest convention and simply missed it here: docs/GRAMMAR.md:50-68 marks nine freed keywords and writes 'A reserved word the parser cannot read is not a feature', and :228-236 marks `when_statement` NOT IMPLEMENTED - but section 2 carries neither note. A reader of SPEC.md believes Redblue has types.",
+      "goal": "Make docs/GRAMMAR.md section 2 and SPEC.md's Complex Types section tell the truth: either the annotations are implemented, or every unimplemented production is marked Not Implemented and pinned by a test that fails if the marking drifts from the parser.",
+      "must_touch": [
+        "docs/",
+        "tests/"
+      ],
+      "accept": [
+        "every one of the five type-annotation productions (GRAMMAR.md:188, :194, :289-290, :294-295, :305) and SPEC.md:147-156 either parses, or carries a Not Implemented note in the same style as GRAMMAR.md:50-68 and :228-236",
+        "a test asserts that every production marked Not Implemented is in fact REFUSED by the built parser, and fails if the parser starts accepting it without the note being removed",
+        "a test asserts every keyword that appears in a GRAMMAR production as a literal (e.g. `needs`, `gives`) is listed in GRAMMAR.md:41-50 or the production is marked Not Implemented - `needs` and `gives` are currently in neither",
+        "if annotations are implemented rather than marked, `set x : number to 1` must reject `set x : text to 1` with a positioned error, and the tests assert both directions",
+        "edge_* tests cover: the annotation present, absent, malformed (`set x : to 1`), doubled (`set x : number : text to 1`), and on `set`/`constant`/`parameter`/`has`/function-declaration respectively",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 150
+    },
+    {
+      "id": "phase-114",
+      "title": "Make `set x, y to 1, 2` and `import a.b as c` parse, or strike them from GRAMMAR.md",
+      "severity": "minor",
+      "depends_on": [],
+      "risk": "low",
+      "finding": "docs/GRAMMAR.md:190-191 documents `declaration = 'set' identifier { ',' identifier } 'to' expression { ',' expression }` as 'Multiple assignment', and docs/GRAMMAR.md:164 documents `import_statement = 'import' identifier { 'as' identifier } | 'import' identifier '.' identifier 'as' identifier`. Neither arm is read by the parser. Verified against the built binary this audit: `set x, y to 1, 2` raises `ParserError: Expected 'to' but got Comma`, and `import math.sqrt as s` raises `ParserError: Unexpected token Dot`, while the dotted-module spellings that DO work (`import math`, `import math as m`) both run. Both productions sit in GRAMMAR.md with no Not Implemented note, in the same sections that do carry one elsewhere. `set x, y to 1, 2` is the one an ordinary reader is most likely to write, because it is the form every mainstream language uses.",
+      "goal": "Make multiple assignment and the dotted `import a.b as c` either parse or be marked Not Implemented, so GRAMMAR.md stops describing two forms no program can contain.",
+      "must_touch": [
+        "src/",
+        "docs/",
+        "tests/"
+      ],
+      "accept": [
+        "`set x, y to 1, 2` binds both names and prints 1 then 2, OR docs/GRAMMAR.md:190-191 carries a Not Implemented note and a test asserts it is refused - one or the other, decided and recorded, not both silent",
+        "`import math.sqrt as s` followed by `say s(9)` prints 9, OR docs/GRAMMAR.md:164 carries a Not Implemented note and a test asserts it is refused",
+        "the existing `import Mod` and `import a as b` forms keep working, pinned by a test",
+        "edge_* tests cover: two names and three names, a trailing comma, a missing right-hand side (`set x, y to 1`), an arity mismatch (`set x, y to 1`), a dotted import of a name that does not exist, and a dotted import with no `as`",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 120
+    },
+    {
+      "id": "phase-115",
+      "title": "Check every GRAMMAR production against the parser, not just the keyword table",
+      "severity": "major",
+      "depends_on": [
+        "phase-112",
+        "phase-113",
+        "phase-114"
+      ],
+      "risk": "medium",
+      "finding": "tests/keyword_reservation_test.rs:21 does `const GRAMMAR: &str = include_str!(\"../docs/GRAMMAR.md\");` and its tests read exactly one thing out of it: the reserved-keyword list at docs/GRAMMAR.md:41-50, checked against `Lexer::keywords()`. Nothing in the 1,539-test suite checks any OTHER production in that file. That is the mechanism by which `else if` (phase-112), the whole type system (phase-113), multiple assignment and dotted import (phase-114) all shipped while the documentation promised them and the suite stayed green - three independent audits have now re-found this by hand. AGENTS.md section 2 treats docs/GRAMMAR.md as part of the language contract ('Existing tests in tests/ keep passing', 'Full grammar: docs/GRAMMAR.md'), so a production that does not parse is not a documentation nit, it is a promise the project cannot keep, and nothing currently notices.",
+      "goal": "Extend the existing GRAMMAR conformance guard so that every EBNF production in docs/GRAMMAR.md is checked against the parser - accepted, or explicitly marked Not Implemented - instead of only the keyword table.",
+      "must_touch": [
+        "tests/",
+        "docs/"
+      ],
+      "accept": [
+        "a test enumerates the EBNF productions in docs/GRAMMAR.md and asserts each one is either exercised by a program that parses or carries a Not Implemented marker - so a production cannot be neither",
+        "adding a new production to docs/GRAMMAR.md without a test and without the marker fails `cargo test`, proven by a checked-in negative case",
+        "a production marked Not Implemented is asserted to be REFUSED by the built parser, so the marker cannot go stale into a lie",
+        "the keyword-table check already at tests/keyword_reservation_test.rs still passes and is kept, not replaced",
+        "the guard covers at least sections 2 (types), 4.1 (declarations), 4.3 (control flow) and 5 (expressions) of docs/GRAMMAR.md, and the audit report names which sections are still uncovered",
+        "`cargo test` reports 0 failures and `cargo clippy --all-targets -- -D warnings` is clean"
+      ],
+      "timeout_min": 180
     }
   ]
 }
