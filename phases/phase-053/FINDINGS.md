@@ -158,7 +158,34 @@ It was left deferred rather than blocked because a blocked phase needs a human,
 and blocking would have stalled a legitimate REPL colour-system phase over a
 transient upstream outage.
 
-## The real problem: deferred phases have selection priority
+## CORRECTION: there was no starvation, and the yield guard worked
+
+An earlier version of this file claimed a deferred phase starves ready work
+because deferred phases have selection priority, and recommended changing the
+selector. **That was wrong.** I inferred it from seeing `.deferred_attempts = 3`
+without reading the selection code that consumes that value.
+
+`rbops/dispatch.sh:228` already carries a yield guard. `RBOPS_DEFER_YIELD_AT`
+defaults to 3, and it is applied in both selection steps:
+
+```bash
+# 1. resume a deferral — unless it has already yielded priority
+[ "$(read_n "$id" .deferred_attempts)" -lt "$yield_at" ] || continue
+
+# 2. first phase in manifest order whose deps are satisfied
+#    Yielded: deferred too many times in a row without progress. Skip for
+#    now so other ready work proceeds
+[ "$(read_n "$id" .deferred_attempts)" -ge "$yield_at" ] && continue
+```
+
+053 reached exactly 3 and yielded. Its deferrals stopped, the dispatcher moved
+to ready work, and selection even logs a WARNING naming which earlier phases
+are stalled so the gap is never silent.
+
+Both guards behaved correctly: the counter added earlier today, and the yield
+guard that was already in dispatch.sh. 053 converged in 3 ticks instead of 120.
+
+## It is unblocked, with a retry note
 
 \dispatch.sh\ picks \.deferred\ phases first ("retry, cheapest continuity").
 While 053 sat deferred, it was re-selected on every tick while phase-083,
@@ -172,15 +199,14 @@ bypassed (the bare \	ouch .deferred\ bug fixed earlier today) the result was
 
 ## What this phase needs, when the model chain is healthy again
 
-1. Unblock it. It is a real phase with real work to do.
-2. Run it **without** a preserved recovery, so it starts clean - the previous
-   attempt's work was a 0-byte patch and its checkpoint was 0 bytes, so there
-   was never anything to inherit.
-3. Watch the first run for the same symptom: log ending after clippy with a
-   short run time means the model chain is still down, not that the phase is
-   wrong.
+It is unblocked. `RETRY-NOTE.md` gives the next attempt a minute-by-minute
+budget, because the failure was never a loop — it was one attempt spending all
+90 minutes reading `src/repl/` and writing 0 bytes.
 
-Worth considering separately: should a deferred phase yield to ready work
-after one retry instead of holding selection for five? Priority is right for
-continuity, but it lets one transient outage stall a queue that has 15 ready
-phases behind it.
+Run it **without** a preserved recovery: the previous attempt's work was a
+0-byte patch and its checkpoint was 0 bytes, so there was never anything to
+inherit.
+
+**phase-116** now tracks the general form of this failure: an attempt that has
+written no test and touched no `must_touch` area partway through its budget
+should be ended early, turning a dead 90-minute run into a short one.
