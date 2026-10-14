@@ -2439,3 +2439,41 @@ if [ "$FAIL" -eq 0 ]; then
 fi
 printf '%sSMOKE FAIL%s  %d passed, %d failed\n' "$RED" "$OFF" "$PASS" "$FAIL"
 exit 1
+# =========================================================== 33. every deferral is counted
+# Phase-053 spun for ~12 hours and ~120 CI runs, each ~6 minutes, every one
+# reporting `success`, and produced nothing. The preflight-refusal branch did a
+# bare `touch .deferred` instead of calling defer_phase, so it never bumped
+# .deferred_attempts. The counter file was never created, MAX_DEFERRALS read a
+# value that did not exist, and the phase could never reach .blocked. An
+# infinite loop with no exit.
+#
+# The rule this section enforces: a deferral that consumes no attempt must STILL
+# be counted. Cheap in attempts is not free in wall-clock — that gap is exactly
+# what made a 5-minute decision into a 12-hour one.
+#
+# It is asserted structurally, against dispatch.sh's source, because reproducing
+# the real 120-tick spin in a smoke test would itself take 12 hours. The check is
+# that no code path writes .deferred without going through defer_phase.
+cd "$(dirname "$0")/.."
+# Only lines OUTSIDE defer_phase count. Line 167 writes .deferred from inside
+# the function itself, which is the correct place for it to be written; a naive
+# grep would flag that legitimate write and make this section useless.
+_defer_writers="$(awk '
+  /^defer_phase\(\)/ { in_fn = 1 }
+  in_fn && /^}/         { in_fn = 0; next }
+  !in_fn && /touch .*marker .*\.deferred/ { print NR": "$0 }
+' rbops/dispatch.sh | grep -vc '^\s*[0-9]*:\s*#' || true)"
+if [ "${_defer_writers:-0}" -eq 0 ]; then
+  ok "no code writes .deferred directly — every deferral is counted"
+else
+  no "dispatch.sh writes .deferred directly ($_defer_writers site(s)); that path skips .deferred_attempts and can loop forever"
+  grep -n 'touch .*marker .*\.deferred' rbops/dispatch.sh | sed 's/^/      /'
+fi
+# And the counter has to be what defer_phase actually reads.
+if grep -q 'bump "$phase" .deferred_attempts' rbops/dispatch.sh \
+   && grep -q 'defer_phase "$phase" "preflight refuses the inherited diff' rbops/dispatch.sh; then
+  ok "the preflight-refusal path routes through defer_phase"
+else
+  no "preflight refusal does not route through defer_phase — it will never be counted"
+fi
+cd - >/dev/null 2>&1 || true
