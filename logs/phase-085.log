@@ -1,0 +1,2763 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m→ [0mRead src/lexer.rs[90m [offset=280, limit=80][0m
+[0m
+[0m$ [0mls && printf 'say "\\u00e9"\n' > ./target/tmp_u.rb 2>/dev/null || mkdir -p ./target && printf 'say "\\u00e9"\n' > ./target/tmp_u.rb; cat ./target/tmp_u.rb
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+say "\u00e9"
+[0m
+[0m$ [0mls target/debug/rb target/release/rb 2>&1 | head -5
+ls: cannot access 'target/release/rb': No such file or directory
+target/debug/rb
+[0m
+[0m$ [0msed -n '70,95p' docs/GRAMMAR.md; echo "---SPEC---"; grep -n 'escape\|\\\\u' SPEC.md | head -20
+### 1.4 Literals
+
+```
+// Numbers
+number_literal     = ['-'] digit { digit } [ '.' digit { digit } ]
+                   | ['-'] digit { digit } [ '.' ] [ exponent ]
+exponent           = ('e' | 'E') ['+' | '-'] digit { digit }
+
+// Text (Strings)
+text_literal       = '"' { any_unicode_character_except_quote | escape } '"'
+escape             = '\' ( 'n' | 't' | 'r' | '"' | '\' | 'u' hex_digit hex_digit hex_digit hex_digit )
+hex_digit          = digit | 'a'..'f' | 'A'..'F'
+
+// Boolean
+boolean_literal    = 'yes' | 'no'
+
+// Nothing
+nothing_literal   = 'nothing'
+
+// List literal
+list_literal       = '[' [ expression { ',' expression } ] ']'
+
+// Record literal
+record_literal     = 'record' '{' [ property { ',' property } ] '}'
+property           = identifier ':' expression
+```
+---SPEC---
+737:escape to the declaration by itself: a record is a value, so a method that
+1027:The limit stops it either way; `might fail` is not an escape hatch from it. A
+1258:A text is written between double quotes, and a quote *inside* one is escaped
+[0m
+[0m$ [0msed -n '1250,1290p' SPEC.md
+### json and csv
+
+```redblue
+set obj to json.parse("{ \"name\": \"Alice\" }")  // {name: Alice}
+set text to json.stringify(obj)                   // {"name": "Alice"}
+set rows to csv.parse("name,age\nAlice,30")       // [[name, age], [Alice, 30]]
+```
+
+A text is written between double quotes, and a quote *inside* one is escaped
+`\"` — there are no single-quoted strings, so `'{"name": "Alice"}'` is a
+`LexerError` at the first quote rather than a JSON document.
+
+There is no `formats` module. JSON and CSV are their own modules, spelled
+`json.*` and `csv.*`.
+
+### bytes
+
+```redblue
+set data to bytes.from_text("Hi")        // [72, 105] — a byte list
+set back to bytes.text(data)             // "Hi"
+bytes.write("out.bin", data)             // write a byte list to a file
+```
+
+A byte is the whole number 0 to 255. `files.write` writes the UTF-8 encoding of
+a text, so `bytes` is how a program writes a byte it cannot spell — which a
+compiler writing a bytecode file cannot avoid. A value that is not a byte, or a
+byte list that is not valid UTF-8, is a refusal naming the byte rather than a
+wrapped value or a replacement character three files later.
+
+### sys
+
+```redblue
+for each argument in sys.argv()
+    say argument
+end
+```
+
+`sys.argv()` is the list of arguments after the program path, and it is empty
+for a program run from the REPL or from a test, because only `rb run` collects
+them.
+[0m
+[0m$ [0m./target/debug/rb run ./target/tmp_u.rb | od -c | head -3; printf 'say "A\\u0042C"\n' > ./target/tmp_b.rb; ./target/debug/rb run ./target/tmp_b.rb | od -c | head -3
+0000000   u   0   0   e   9  \n
+0000006
+0000000   A   u   0   0   4   2   C  \n
+0000010
+[0m
+Reproduced exactly as described. Now let me look at the lexer structure and existing tests.
+[0m→ [0mRead src/lexer.rs[90m [limit=120][0m
+[0m
+[0m$ [0mls tests/ | head -40; echo "---"; grep -rn "read_text\|Unterminated string" src/ tests/ --include=*.rs | head -20
+assertions_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+catch_binding_test.rs
+checkpoint_ancestry_ack.txt
+checkpoint_ancestry_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+debugger_test.rs
+diagnostics_test.rs
+differential_test.rs
+discovery_test.rs
+doc_blocks_fragments.txt
+doc_blocks_known_fail.txt
+doc_blocks_runs.txt
+doc_blocks_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+index_words_test.rs
+integration_test.rb
+interpolation_test.rs
+keyword_reservation_test.rs
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+might_fail_test.rs
+---
+src/lexer.rs:306:    fn read_text(&mut self, span: Span) -> Result<String> {
+src/lexer.rs:342:        Error::Lexer("Unterminated string".to_string(), span)
+src/lexer.rs:465:                let text = lexer.read_text(Span::new(line, column))?;
+tests/tooling_grammar_test.rs:314:        diagnostic.message.contains("Unterminated string"),
+tests/diagnostics_test.rs:177:LexerError: Unterminated string
+tests/diagnostics_test.rs:199:LexerError: Unterminated string
+tests/diagnostics_test.rs:398:LexerError: Unterminated string
+tests/diagnostics_test.rs:418:LexerError: Unterminated string
+tests/lexer_robustness_test.rs:39:// Unterminated strings
+tests/common/corpus.rs:555:            "#label LexerError\n#position 1:5\n#value nothing\n#message Unterminated string\n",
+tests/parser_hardening_test.rs:102:                message.contains("Unterminated string"),
+[0m
+[0m→ [0mRead src/lexer.rs[90m [offset=400, limit=90][0m
+[0m
+[0m$ [0mls tests/ | tail -30; echo "--- common ---"; ls tests/common/
+redblue_test.rs
+repeat_until_test.rs
+repl_module_completion_test.rs
+repl_test.rs
+span_test.rs
+stdlib_module_docs_test.rs
+stdlib_module_names_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+test_closures.rb
+test_comparisons.rb
+test_control_flow.rb
+test_functions.rb
+test_lists.rb
+test_loop_control.rb
+test_mod_in.rb
+test_modules.rb
+test_numeric_edges.rb
+test_object_model.rb
+test_objects.rb
+test_records.rb
+test_text.rb
+text_split_join_test.rs
+time_builtin_test.rs
+tooling_extension_test.rs
+tooling_grammar_test.rs
+unless_test.rs
+unreviewed_work_ack_test.rs
+wasm_test.rs
+--- common ---
+corpus.rs
+generator.rs
+mod.rs
+rng.rs
+shrink.rs
+vm.rs
+[0m
+[0m$ [0msed -n '1,60p' tests/interpolation_test.rs; echo "=== common/mod ==="; sed -n '1,60p' tests/common/mod.rs
+//! `{expr}` substitution in text literals (phase-047).
+//!
+//! `Expr::InterpolatedText` was declared by the AST and handled by the
+//! analyzer, both VMs, the formatter and the linter, but nothing constructed
+//! it: the text arm of `parse_primary` returned `Expr::Text` with the braces
+//! intact, so `say "Hello, {name}!"` printed the *name*. SPEC.md documents the
+//! form as working and AGENTS.md § 2 lists it as a language invariant.
+//!
+//! Every assertion about what a program *prints* runs on **both** engines,
+//! because "it works" means the tree-walking VM and the bytecode VM substitute
+//! identically or not at all — so those go through `both_engines_print`. The
+//! rest assert something one engine cannot show: the shape of the node the
+//! parser built, the linter's use analysis, and the budget and brace-scan the
+//! parser holds itself to, which are `src/parser.rs`'s own unit tests rather
+//! than this file's.
+
+use redblue::parser::{Expr, Statement};
+use redblue::{analyzer, compile_source, lexer::Lexer, parser};
+
+/// The expression a one-statement program holds, or a panic that says what it
+/// holds instead.
+fn expression_of(source: &str) -> Expr {
+    let ast = parser::parse(Lexer::tokenize(source).expect("the source lexes"))
+        .expect("the source parses");
+    match &ast.statements[0].statement {
+        Statement::Expr(expr) => expr.clone(),
+        other => panic!("{source:?} is not an expression statement: {other:?}"),
+    }
+}
+
+/// Runs `source` through the tree-walking pipeline, the way `rb run` does.
+fn tree_walk(source: &str) -> Result<(Vec<String>, redblue::Value), redblue::Error> {
+    let tokens = Lexer::tokenize(source)?;
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze(&ast)?;
+    let (mut vm, result) = redblue::run_isolated(&ast);
+    let output = vm.take_output();
+    result.map(|value| (output, value))
+}
+
+/// Runs `source` through the bytecode compiler and then the bytecode VM, the
+/// way `rb compile` then `rb vm` does.
+fn bytecode(source: &str) -> Result<(Vec<String>, redblue::Value), redblue::Error> {
+    let chunk = compile_source(source)?;
+    let mut vm = redblue::bytecode::vm::BytecodeVm::new();
+    vm.set_echo(false);
+    let result = vm.run(&chunk);
+    let output = vm.take_output();
+    result.map(|value| (output, value))
+}
+
+/// The lines a program printed, with a message naming the program if it failed.
+fn printed(source: &str) -> Vec<String> {
+    tree_walk(source)
+        .map(|(lines, _)| lines)
+        .unwrap_or_else(|error| panic!("{source:?} must run: {error:?}"))
+}
+
+fn printed_bytecode(source: &str) -> Vec<String> {
+    bytecode(source)
+=== common/mod ===
+//! The differential + property harness (phase-020).
+//!
+//! Four modules, each test-only, each next to the code it checks:
+//!
+//! - [`rng`] — SplitMix64, so a seed rebuilds the same bytes on any machine.
+//! - [`vm`] — one program, run on both engines, compared as one value.
+//! - [`corpus`] — the corpus on disk: its loader, golden format, writer, compare.
+//! - [`generator`] — the curated families and the seeded property grammar.
+//! - [`shrink`] — delta debugging, from a failing seed to the shortest program.
+//!
+//! Nothing here is production code. The harness runs two interpreters over a
+//! corpus and asks whether they said the same thing, and a caller that needed
+//! that outside a test would be a caller who needed a bug report, not a library.
+
+pub mod corpus;
+pub mod generator;
+pub mod rng;
+pub mod shrink;
+pub mod vm;
+[0m
+[0m→ [0mRead src/lexer.rs[90m [limit=80, offset=200][0m
+[0m
+[0m$ [0msed -n '60,110p' tests/interpolation_test.rs; echo "=== compile_source ==="; grep -rn "pub fn compile_source" src/ ; echo "=== Error ==="; grep -n "pub enum Error" -A 20 src/error.rs
+bytecode(source)
+        .map(|(lines, _)| lines)
+        .unwrap_or_else(|error| panic!("{source:?} must run: {error:?}"))
+}
+
+/// Asserts that both engines printed exactly `expected`.
+fn both_engines_print(source: &str, expected: &[&str]) {
+    let want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+    assert_eq!(printed(source), want, "tree-walking VM: {source}");
+    assert_eq!(printed_bytecode(source), want, "bytecode VM: {source}");
+}
+
+/// The error a program produced on the tree-walking pipeline, or a panic that
+/// names what it produced instead.
+fn tree_failure(source: &str) -> redblue::Error {
+    tree_walk(source).expect_err(&format!("{source:?} must fail"))
+}
+
+/// The same error on the bytecode VM.
+fn bytecode_failure(source: &str) -> redblue::Error {
+    bytecode(source)
+        .err()
+        .unwrap_or_else(|| panic!("{source:?} must fail"))
+}
+
+#[test]
+fn interpolation_substitutes_a_bound_name_on_both_engines() {
+    let source = "set name to \"World\"\nsay \"Hello, {name}!\"\n";
+    both_engines_print(source, &["Hello, World!"]);
+}
+
+#[test]
+fn interpolation_evaluates_an_arbitrary_expression() {
+    // SPEC.md:297 — `set message to "Value: {x + y}"`. The braces hold an
+    // *expression*, not a bare name, so arithmetic inside them is evaluated.
+    let source = "set x to 2\nset y to 3\nsay \"Value: {x + y}\"\n";
+    both_engines_print(source, &["Value: 5"]);
+}
+
+// --- a literal with no substitution is unchanged --------------------------------
+
+#[test]
+fn edge_a_literal_without_braces_is_the_text_it_was_written_as() {
+    let source = "say \"plain\"\nsay \"a, b; c: 1/2\"\n";
+    both_engines_print(source, &["plain", "a, b; c: 1/2"]);
+}
+
+#[test]
+fn edge_an_empty_literal_is_still_empty() {
+    both_engines_print("say \"\"\n", &[""]);
+}
+=== compile_source ===
+src/bytecode/format.rs:390:pub fn compile_source(source: &str) -> Result<Chunk> {
+=== Error ===
+78:pub enum Error {
+79-    Lexer(String, Span),
+80-    Parser(String, Span),
+81-    Analyzer(String, Span),
+82-    Runtime(String, Span),
+83-    /// One of the host's own resource limits — the step budget, the call-depth
+84-    /// limit, or a loop's iteration cap.
+85-    ///
+86-    /// A variant rather than a `Runtime` whose message happens to read like one,
+87-    /// because the question `might fail` asks of a failure — *is this the host
+88-    /// stopping the program, or the program's own expression going wrong?* — has
+89-    /// to be answerable from the failure itself. Matching a message prefix made
+90-    /// the answer depend on the wording: rewording a limit message would silently
+91-    /// turn every guard around a runaway program into one that swallows it, and
+92-    /// any failure a program produced that began the same way would be reported as
+93-    /// a resource error and escape the guard written for it. It renders as a
+94-    /// `RuntimeError` and reads exactly as one — a limit is a runtime failure — but
+95-    /// nothing has to agree on how it is spelled for it to be told apart.
+96-    Limit(String, Span),
+97-    Io(String),
+98-}
+[0m
+[0m$ [0mgrep -rn '\\\\' --include=*.rb examples modules tests bootstrap corpus 2>/dev/null | head -20; echo "=== fmt ==="; grep -n '\\\\' src/formatter.rs | head -20; echo "=== compile_source body ==="; sed -n '388,400p' src/bytecode/format.rs
+tests/test_text.rb:122:    set slashed to "a\\b"
+corpus/text-ops-0007.rb:1:say "\\"
+=== fmt ===
+74:            } else if c == '\\' {
+987:            '\\' => out.push_str("\\\\"),
+988:            '"' => out.push_str("\\\""),
+989:            '\n' => out.push_str("\\n"),
+990:            '\r' => out.push_str("\\r"),
+991:            '\t' => out.push_str("\\t"),
+=== compile_source body ===
+
+/// Compiles Redblue source to bytecode: the whole frontend, then codegen.
+pub fn compile_source(source: &str) -> Result<Chunk> {
+    Chunk::compile(source)
+}
+
+// ---------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------
+
+fn write_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+[0m
+[0m$ [0mgrep -n "pub struct Span" -A 40 src/error.rs | head -60
+8:pub struct Span {
+9-    pub line: usize,
+10-    pub column: usize,
+11-    /// Where the offending thing stops, when it covers more than one line.
+12-    ///
+13-    /// A span that covers one line records no end, so a span and its position
+14-    /// are the same value and everything that compared the two keeps meaning
+15-    /// what it meant. Only a range — an unterminated string, which runs to the
+16-    /// end of the file — records one, because only a range has to be *drawn*.
+17-    pub end_line: usize,
+18-    pub end_column: usize,
+19-}
+20-
+21-impl Span {
+22-    pub fn new(line: usize, column: usize) -> Self {
+23-        Self {
+24-            line,
+25-            column,
+26-            end_line: line,
+27-            end_column: column,
+28-        }
+29-    }
+30-
+31-    /// This span, extended to cover up to `end_line:end_column`.
+32-    ///
+33-    /// An end that is not past the start is dropped: a span that covers one line
+34-    /// is drawn as one line, with the same caret it has always been drawn with.
+35-    pub fn extended_to(self, end_line: usize, end_column: usize) -> Self {
+36-        if end_line <= self.line {
+37-            return self;
+38-        }
+39-
+40-        Self {
+41-            line: self.line,
+42-            column: self.column,
+43-            end_line,
+44-            end_column,
+45-        }
+46-    }
+47-
+48-    /// Whether this span covers more than one line, and so has to be rendered as
+[0m
+Now the failing test:
+[0m← [0mWrite tests/unicode_escape_test.rs
+Wrote file successfully.
+[0m
+[0m$ [0mcargo test --test unicode_escape_test 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0369][0m[1m: binary operation `==` cannot be applied to type `Result<Vec<String>, redblue::Error>`[0m
+  [1m[94m--> [0mtests/unicode_escape_test.rs:41:5
+   [1m[94m|[0m
+[1m[94m41[0m [1m[94m|[0m     assert_eq!(tree_walk(source).map(|(l, _)| l), Ok(want.clone()), "tree-walking VM: {source}");
+   [1m[94m|[0m     [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m     [1m[91m|[0m
+   [1m[94m|[0m     [1m[91mResult<Vec<String>, redblue::Error>[0m
+   [1m[94m|[0m     [1m[91mResult<Vec<String>, redblue::Error>[0m
+   [1m[94m|[0m
+[1m[92mnote[0m: `redblue::Error` does not implement `PartialEq`
+  [1m[94m--> [0msrc/error.rs:78:1
+   [1m[94m|[0m
+[1m[94m78[0m [1m[94m|[0m pub enum Error {
+   [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^[0m [1m[92m`redblue::Error` is defined in another crate[0m
+
+[1m[91merror[E0369][0m[1m: binary operation `==` cannot be applied to type `Result<Vec<String>, redblue::Error>`[0m
+  [1m[94m--> [0mtests/unicode_escape_test.rs:42:5
+   [1m[94m|[0m
+[1m[94m42[0m [1m[94m|[0m     assert_eq!(bytecode(source).map(|(l, _)| l), Ok(want), "bytecode VM: {source}");
+   [1m[94m|[0m     [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m
+   [1m[94m|[0m     [1m[91m|[0m
+   [1m[94m|[0m     [1m[91mResult<Vec<String>, redblue::Error>[0m
+   [1m[94m|[0m     [1m[91mResult<Vec<String>, redblue::Error>[0m
+   [1m[94m|[0m
+[1m[92mnote[0m: `redblue::Error` does not implement `PartialEq`
+  [1m[94m--> [0msrc/error.rs:78:1
+   [1m[94m|[0m
+[1m[94m78[0m [1m[94m|[0m pub enum Error {
+   [1m[94m|[0m [1m[92m^^^^^^^^^^^^^^[0m [1m[92m`redblue::Error` is defined in another crate[0m
+
+[1mFor more information about this error, try `rustc --explain E0369`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "unicode_escape_test") due to 2 previous errors
+[0m
+[0m← [0mEdit tests/unicode_escape_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+@@ -37,10 +37,15 @@
+ 
+ /// Asserts that both engines printed exactly `expected`.
+ fn both_engines_print(source: &str, expected: &[&str]) {
+     let want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+-    assert_eq!(tree_walk(source).map(|(l, _)| l), Ok(want.clone()), "tree-walking VM: {source}");
+-    assert_eq!(bytecode(source).map(|(l, _)| l), Ok(want), "bytecode VM: {source}");
++    let printed = |result: Result<(Vec<String>, redblue::Value), redblue::Error>, engine: &str| {
++        let (lines, _) =
++            result.unwrap_or_else(|e| panic!("{source:?} must run on {engine}: {e:?}"));
++        lines
++    };
++    assert_eq!(printed(tree_walk(source), "tree-walking VM"), want, "tree-walking VM");
++    assert_eq!(printed(bytecode(source), "bytecode VM"), want, "bytecode VM");
+ }
+ 
+ /// The one line a program printed, on both engines, asserted as a Rust `&str`.
+ ///
+
+[0m
+[0m$ [0mcargo test --test unicode_escape_test 2>&1 | tail -45
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- unicode_escape_survives_interpolation stdout ----
+
+thread 'unicode_escape_survives_interpolation' (5942) panicked at tests/unicode_escape_test.rs:46:5:
+assertion `left == right` failed: tree-walking VM
+  left: ["hi u0041Bob"]
+ right: ["hi Abel"]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<alloc::vec::Vec<alloc::string::String>, alloc::vec::Vec<alloc::string::String>>
+   4: unicode_escape_test::both_engines_print
+   5: unicode_escape_test::unicode_escape_survives_interpolation
+   6: unicode_escape_test::unicode_escape_survives_interpolation::{closure#0}
+   7: <unicode_escape_test::unicode_escape_survives_interpolation::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_bare_backslash_u_is_refused
+    edge_a_bare_trailing_backslash_is_refused
+    edge_a_literal_may_mix_escapes_and_raw_unicode
+    edge_a_refused_escape_is_refused_on_the_bytecode_path_too
+    edge_a_run_of_escapes_decodes_left_to_right
+    edge_a_short_escape_is_refused_not_padded
+    edge_a_surrogate_half_is_refused
+    edge_an_escape_at_the_end_of_input_is_refused
+    edge_an_escaped_quote_after_an_escape_does_not_end_the_literal
+    edge_an_unknown_escape_is_refused
+    edge_an_unterminated_string_is_refused
+    edge_escape_above_the_basic_plane_is_one_character
+    edge_escape_immediately_before_the_closing_quote_is_decoded
+    edge_non_hex_digits_after_backslash_u_are_refused
+    edge_the_refusal_names_the_line_it_is_on
+    edge_two_byte_escape_is_one_code_point_not_two_bytes
+    edge_upper_and_lowercase_hex_digits_decode_identically
+    unicode_escape_decodes_adjacent_to_ordinary_text
+    unicode_escape_decodes_to_the_character_it_names
+    unicode_escape_survives_interpolation
+
+test result: FAILED. 2 passed; 20 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unicode_escape_test`
+[0m
+[0m$ [0msed -n '55,100p' src/formatter.rs; echo "=== escape_out ==="; sed -n '975,1000p' src/formatter.rs; echo "=== Display Lexer ==="; grep -n "Lexer(" src/error.rs
+}
+}
+
+/// Reads every `//` comment out of `source`, with its 1-based line.
+///
+/// A `//` inside a text literal is text, not a comment, so the scan tracks
+/// string state exactly as the lexer does: `"` opens and closes, `\` escapes
+/// the next character, and a literal may span lines.
+fn collect_comments(source: &str) -> Vec<Comment> {
+    let mut comments = Vec::new();
+    let mut in_text = false;
+    let mut escaped = false;
+    let mut line = 1usize;
+
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_text {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_text = false;
+            }
+            if c == '\n' {
+                line += 1;
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_text = true;
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            let mut text = String::from("//");
+            chars.next();
+            while let Some(&next) = chars.peek() {
+                if next == '\n' {
+                    break;
+                }
+                text.push(next);
+                chars.next();
+            }
+            comments.push(Comment {
+                line,
+                text: text.trim_end().to_string(),
+            });
+=== escape_out ===
+
+impl Default for Formatter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Escapes the characters a text literal cannot carry verbatim.
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether `formatted` differs from `source`.
+///
+/// The comparison is exact: a missing trailing newline, a line of trailing
+=== Display Lexer ===
+79:    Lexer(String, Span),
+105:            Error::Lexer(_, span)
+127:            Error::Lexer(_, _) => "LexerError",
+159:            Error::Lexer(msg, _)
+[0m
+[0m→ [0mRead src/error.rs[90m [offset=140, limit=30][0m
+[0m
+[0m$ [0msed -n '170,215p' src/error.rs
+Some(match file {
+            Some(name) => format!("{}:{}", name, span),
+            None => span.to_string(),
+        })
+    }
+
+    /// Renders the message, the source position, the offending source line and
+    /// a caret under the column. A span covering more than one line renders
+    /// every line it covers. Falls back to the message alone when the line is
+    /// not present in `source`.
+    pub fn render(&self, source: &str, file: Option<&str>) -> String {
+        let mut out = format!("{}: {}", self.label(), self.message());
+
+        let location = match self.location(file) {
+            Some(location) => location,
+            None => return out,
+        };
+
+        let span = self.span().expect("location implies a known span");
+
+        out.push_str(&format!("\n  --> {}", location));
+
+        let lines: Vec<&str> = source.lines().collect();
+        if span.line == 0 || span.line > lines.len() {
+            return out;
+        }
+
+        if span.is_multiline() {
+            render_range(&mut out, span, &lines);
+        } else {
+            render_single(&mut out, span, lines[span.line - 1]);
+        }
+
+        out
+    }
+}
+
+/// Draws one line of source and a caret under the offending column.
+fn render_single(out: &mut String, span: &Span, line: &str) {
+    let line_number = span.line.to_string();
+    let gutter = " ".repeat(line_number.len());
+
+    out.push('\n');
+    out.push_str(&format!("{} | {}", line_number, line));
+    out.push('\n');
+    out.push_str(&format!(
+[0m
+[0m$ [0mgrep -n "impl fmt::Display for Error" -A 15 src/error.rs; grep -n "impl fmt::Display for Span" -A 10 src/error.rs
+258:impl fmt::Display for Error {
+259-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+260-        write!(f, "{}: {}", self.label(), self.message())?;
+261-
+262-        if let Some(location) = self.location(None) {
+263-            write!(f, "\n  --> {}", location)?;
+264-        }
+265-
+266-        Ok(())
+267-    }
+268-}
+269-
+270-impl std::error::Error for Error {}
+271-
+272-pub type Result<T> = std::result::Result<T, Error>;
+71:impl fmt::Display for Span {
+72-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+73-        write!(f, "{}:{}", self.line, self.column)
+74-    }
+75-}
+76-
+77-#[derive(Debug, Clone)]
+78-pub enum Error {
+79-    Lexer(String, Span),
+80-    Parser(String, Span),
+81-    Analyzer(String, Span),
+[0m
+[0m← [0mEdit src/lexer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lexer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lexer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lexer.rs
+@@ -314,16 +314,23 @@
+     self.advance();
+     return Ok(text);
+ }
+ if c == '\\' {
++    let escape = Span::new(self.line, self.column);
+     self.advance();
+     match self.advance() {
+         Some('n') => text.push('\n'),
+         Some('t') => text.push('\t'),
+         Some('r') => text.push('\r'),
+         Some('\\') => text.push('\\'),
+         Some('"') => text.push('"'),
+-        Some(c) => text.push(c),
++        Some('u') => text.push(self.read_unicode_escape(escape)?),
++        Some(other) => {
++            return Err(Error::Lexer(
++                format!("Unknown escape '\\{other}' in text"),
++                escape,
++            ))
++        }
+         None => return Err(self.unterminated(span)),
+     }
+ } else {
+     text.push(c);
+
+[0m
+Good. Now the fix:
+[0m← [0mEdit src/lexer.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lexer.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lexer.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lexer.rs
+@@ -338,8 +338,45 @@
+         }
+     }
+ }
+ 
++/// The character named by the four hex digits of a `\u` escape.
++///
++/// The escape names one code point and nothing else. `docs/GRAMMAR.md:80`
++/// says four `hex_digit`s, and that is exactly what it takes: a shorter run
++/// is a typo, not a number to be padded out to four digits. Everything the
++/// grammar does not spell out is refused rather than guessed at — the
++/// catch-all that used to sit in `read_text` pushed only the first character
++/// after the backslash, so `"\u00e9"` read as `u00e9` and a program written
++/// in a language's own escape printed text nobody had written.
++///
++/// `span` is the backslash, so the refusal points at the escape rather than
++/// at the character four positions past it.
++fn read_unicode_escape(&mut self, span: Span) -> Result<char> {
++    let mut value: u32 = 0;
++    for _ in 0..4 {
++        let Some(digit) = self.current().and_then(|c| c.to_digit(16)) else {
++            return Err(Error::Lexer(
++                "Unicode escape needs four hex digits, such as \"\\u00e9\"".to_string(),
++                span,
++            ));
++        };
++        value = value * 16 + digit;
++        self.advance();
++    }
++
++    // A half of a surrogate pair — `char::from_u32` refuses it because it
++    // names no character, and a lone surrogate has no UTF-8 encoding at all.
++    // Substituting the replacement character here would be the same silent
++    // rewrite this escape used to be, one level down.
++    char::from_u32(value).ok_or_else(|| {
++        Error::Lexer(
++            format!("Unicode escape \\u{value:04X} names no character of its own"),
++            span,
++        )
++    })
++}
++
+ /// The failure for a string that ran to the end of input without closing.
+ ///
+ /// It spans from the opening quote to wherever the reading stopped, which for
+ /// a string broken across lines is several lines and not one: the reader has
+
+[0m
+[0m$ [0mcargo test --test unicode_escape_test 2>&1 | tail -30
+left: ["hi ABob"]
+ right: ["hi Abel"]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<alloc::vec::Vec<alloc::string::String>, alloc::vec::Vec<alloc::string::String>>
+   4: unicode_escape_test::both_engines_print
+   5: unicode_escape_test::unicode_escape_survives_interpolation
+   6: unicode_escape_test::unicode_escape_survives_interpolation::{closure#0}
+   7: <unicode_escape_test::unicode_escape_survives_interpolation::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_a_bare_backslash_u_is_refused
+    edge_a_bare_trailing_backslash_is_refused
+    edge_a_short_escape_is_refused_not_padded
+    edge_a_surrogate_half_is_refused
+    edge_an_escape_at_the_end_of_input_is_refused
+    edge_an_unknown_escape_is_refused
+    edge_an_unterminated_string_is_refused
+    edge_escape_above_the_basic_plane_is_one_character
+    edge_non_hex_digits_after_backslash_u_are_refused
+    edge_the_refusal_names_the_line_it_is_on
+    unicode_escape_survives_interpolation
+
+test result: FAILED. 11 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unicode_escape_test`
+[0m
+[0m← [0mEdit tests/unicode_escape_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+@@ -105,10 +105,10 @@
+ }
+ 
+ #[test]
+ fn unicode_escape_survives_interpolation() {
+-    let source = "set name to \"Bob\"\nsay \"hi \\u0041{name}\"\n";
+-    both_engines_print(source, &["hi Abel"]);
++    let source = "set name to \"lice\"\nsay \"\\u0041{name}\"\n";
++    both_engines_print(source, &["Alice"]);
+ }
+ 
+ #[test]
+ fn existing_escapes_keep_their_behaviour() {
+
+[0m
+[0m$ [0mcargo test --test unicode_escape_test 2>&1 | grep -A 6 "^---- " | head -80
+---- edge_a_bare_trailing_backslash_is_refused stdout ----
+
+thread 'edge_a_bare_trailing_backslash_is_refused' (6361) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"abc\\" must name a line and column, reported "LexerError: Unterminated string\n  --> 1:5"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_a_bare_backslash_u_is_refused stdout ----
+
+thread 'edge_a_bare_backslash_u_is_refused' (6360) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"\\u\"\n" must name a line and column, reported "LexerError: Unicode escape needs four hex digits, such as \"\\u00e9\"\n  --> 1:6"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_a_short_escape_is_refused_not_padded stdout ----
+
+thread 'edge_a_short_escape_is_refused_not_padded' (6367) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"\\u00e\"\n" must name a line and column, reported "LexerError: Unicode escape needs four hex digits, such as \"\\u00e9\"\n  --> 1:6"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_a_surrogate_half_is_refused stdout ----
+
+thread 'edge_a_surrogate_half_is_refused' (6368) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"\\ud83d\"\n" must name a line and column, reported "LexerError: Unicode escape \\uD83D names no character of its own\n  --> 1:6"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_an_escape_at_the_end_of_input_is_refused stdout ----
+
+thread 'edge_an_escape_at_the_end_of_input_is_refused' (6370) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"\\u00e9" must name a line and column, reported "LexerError: Unterminated string\n  --> 1:5"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_an_unknown_escape_is_refused stdout ----
+
+thread 'edge_an_unknown_escape_is_refused' (6374) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"\\q\"\n" must name a line and column, reported "LexerError: Unknown escape '\\q' in text\n  --> 1:6"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_an_unterminated_string_is_refused stdout ----
+
+thread 'edge_an_unterminated_string_is_refused' (6375) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"\\u0041" must name a line and column, reported "LexerError: Unterminated string\n  --> 1:5"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_non_hex_digits_after_backslash_u_are_refused stdout ----
+
+thread 'edge_non_hex_digits_after_backslash_u_are_refused' (6380) panicked at tests/unicode_escape_test.rs:89:5:
+"say \"\\uZZZZ\"\n" must name a line and column, reported "LexerError: Unicode escape needs four hex digits, such as \"\\u00e9\"\n  --> 1:6"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_the_refusal_names_the_line_it_is_on stdout ----
+
+thread 'edge_the_refusal_names_the_line_it_is_on' (6381) panicked at tests/unicode_escape_test.rs:239:5:
+the escape is on line 3, reported "LexerError: Unicode escape needs four hex digits, such as \"\\u00e9\"\n  --> 3:6"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+--
+---- edge_escape_above_the_basic_plane_is_one_character stdout ----
+
+thread 'edge_escape_above_the_basic_plane_is_one_character' (6376) panicked at tests/unicode_escape_test.rs:136:5:
+assertion `left == right` failed: \u1f600 must be U+1F600, not "ὠ0"
+  left: 8032
+ right: 128512
+stack backtrace:
+[0m
+[0m← [0mEdit tests/unicode_escape_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+@@ -86,9 +86,9 @@
+         rendered.contains(needle),
+         "{source:?} must report {needle:?}, reported {rendered:?}"
+     );
+     assert!(
+-        rendered.contains(":1:"),
++        rendered.contains("\n  --> 1:"),
+         "{source:?} must name a line and column, reported {rendered:?}"
+     );
+ }
+ 
+
+[0m
+[0m← [0mEdit tests/unicode_escape_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+@@ -126,19 +126,34 @@
+     assert_eq!(printed_text("say \"\"\n"), "");
+ }
+ 
+ #[test]
+-fn edge_escape_above_the_basic_plane_is_one_character() {
+-    // U+1F600 GRINNING FACE, asserted by code point: two UTF-8 bytes here would
+-    // not be a failure of the lexer but would still be the wrong character.
+-    let printed = printed_text("say \"\\u1f600\"\n");
++fn edge_the_highest_four_digit_escape_is_the_last_basic_plane_character() {
++    // U+FFFF is the largest code point four hex digits can name, and the last
++    // character of the Basic Multilingual Plane.
++    let printed = printed_text("say \"\\uffff\"\n");
+     let mut chars = printed.chars();
+     let first = chars.next().expect("the escape printed one character");
+-    assert_eq!(first as u32, 0x1F600, "\\u1f600 must be U+1F600, not {printed:?}");
+-    assert!(chars.next().is_none(), "\\u1f600 must be one character, printed {printed:?}");
++    assert_eq!(first as u32, 0xFFFF, "\\uffff must be U+FFFF, not {printed:?}");
++    assert!(chars.next().is_none(), "\\uffff must be one character, printed {printed:?}");
+ }
+ 
+ #[test]
++fn edge_five_hex_digits_are_an_escape_then_ordinary_text() {
++    // `\u` takes exactly four hex digits (docs/GRAMMAR.md:80), so U+1F600 is
++    // not one escape — it is `\u1f60` followed by a literal `0`. Written
++    // plainly, GRINNING FACE is just the character; the escape is for the
++    // code points a file cannot otherwise carry.
++    let printed = printed_text("say \"\\u1f600\"\n");
++    assert_eq!(printed, "\u{1F60}0", "\\u1f600 is U+1F60 then a literal zero");
++    assert_eq!(
++        printed_text("say \"\\u{1f600}\"\n"),
++        "",
++        "an unknown escape is refused, not printed"
++    );
++}
++
++#[test]
+ fn edge_two_byte_escape_is_one_code_point_not_two_bytes() {
+     let printed = printed_text("say \"\\u00e9\"\n");
+     let mut chars = printed.chars();
+     let first = chars.next().expect("the escape printed one character");
+
+[0m
+[0m← [0mEdit tests/unicode_escape_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+@@ -144,13 +144,9 @@
+     // plainly, GRINNING FACE is just the character; the escape is for the
+     // code points a file cannot otherwise carry.
+     let printed = printed_text("say \"\\u1f600\"\n");
+     assert_eq!(printed, "\u{1F60}0", "\\u1f600 is U+1F60 then a literal zero");
+-    assert_eq!(
+-        printed_text("say \"\\u{1f600}\"\n"),
+-        "",
+-        "an unknown escape is refused, not printed"
+-    );
++    assert_refused_at("say \"\\u{1f600}\"\n", "Unicode escape");
+ }
+ 
+ #[test]
+ fn edge_two_byte_escape_is_one_code_point_not_two_bytes() {
+
+[0m
+[0m$ [0mcargo test --test unicode_escape_test 2>&1 | grep -A 5 "^---- \|test result" | head -40
+---- edge_the_refusal_names_the_line_it_is_on stdout ----
+
+thread 'edge_the_refusal_names_the_line_it_is_on' (6616) panicked at tests/unicode_escape_test.rs:250:5:
+the escape is on line 3, reported "LexerError: Unicode escape needs four hex digits, such as \"\\u00e9\"\n  --> 3:6"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+--
+test result: FAILED. 22 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test unicode_escape_test`
+[0m
+[0m← [0mEdit tests/unicode_escape_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs
+@@ -247,8 +247,8 @@
+ fn edge_the_refusal_names_the_line_it_is_on() {
+     let error = lex_error("set a to 1\nset b to 2\nsay \"\\uZZZZ\"\n");
+     let rendered = format!("{error}");
+     assert!(
+-        rendered.contains(":3:"),
++        rendered.contains("\n  --> 3:"),
+         "the escape is on line 3, reported {rendered:?}"
+     );
+ }
+\ No newline at end of file
+
+[0m
+[0m$ [0mcargo test --test unicode_escape_test 2>&1 | grep -A 5 "^---- \|test result" | head -40
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+Green. Now the full suite:
+[0m$ [0mcargo test 2>&1 | grep -E "^(test result|error|warning: unused)|FAILED|^---- |^failures:" | head -60
+test result: ok. 160 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 174.91s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 223.88s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.94s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+error
+error
+error
+error
+error
+error
+error ✓ 🎉 café
+error
+error
+error
+error
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.96s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.97s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.60s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mcargo test 2>&1 | grep -E "test result: FAILED|failures:|^error(\[|:)" | head -30; echo "EXIT-GREP-DONE"; cargo test 2>&1 | grep -c "test result: ok"
+EXIT-GREP-DONE
+61
+[0m
+[0m$ [0mcargo test 2>&1 | grep -E "test result" | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed:",p," failed:",f}'
+passed: 1582  failed: 0
+[0m
+1582 passed, 0 failed. Now the remaining gates and docs:
+[0m$ [0mcargo fmt --all -- --check 2>&1 | head -30; echo "FMT-EXIT:$?"
+Diff in /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs:43:
+             result.unwrap_or_else(|e| panic!("{source:?} must run on {engine}: {e:?}"));
+         lines
+     };
+-    assert_eq!(printed(tree_walk(source), "tree-walking VM"), want, "tree-walking VM");
+-    assert_eq!(printed(bytecode(source), "bytecode VM"), want, "bytecode VM");
++    assert_eq!(
++        printed(tree_walk(source), "tree-walking VM"),
++        want,
++        "tree-walking VM"
++    );
++    assert_eq!(
++        printed(bytecode(source), "bytecode VM"),
++        want,
++        "bytecode VM"
++    );
+ }
+ 
+ /// The one line a program printed, on both engines, asserted as a Rust `&str`.
+Diff in /home/runner/work/rbops/rbops/redblue/tests/unicode_escape_test.rs:55:
+ /// once, because both read the same token.
+ fn printed_text(source: &str) -> String {
+     let line = |result: Result<(Vec<String>, redblue::Value), redblue::Error>, engine: &str| {
+-        let (lines, _) = result.unwrap_or_else(|e| panic!("{source:?} must run on {engine}: {e:?}"));
+-        assert_eq!(lines.len(), 1, "{source:?} printed one line on {engine}, not {lines:?}");
++        let (lines, _) =
++            result.unwrap_or_else(|e| panic!("{source:?} must run on {engine}: {e:?}"));
++        assert_eq!(
++            lines.len(),
++            1,
+FMT-EXIT:0
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -30
+[1m[92m    Checking[0m base64 v0.21.7
+[1m[92m    Checking[0m regex-syntax v0.8.11
+[1m[92m    Checking[0m scopeguard v1.2.0
+[1m[92m    Checking[0m encoding_rs v0.8.42
+[1m[92m    Checking[0m serde v1.0.229
+[1m[92m    Checking[0m serde_urlencoded v0.7.1
+[1m[92m    Checking[0m rustls-pemfile v1.0.4
+[1m[92m    Checking[0m radix_trie v0.3.0
+[1m[92m    Checking[0m url v2.5.8
+[1m[92m    Checking[0m nix v0.31.3
+[1m[92m    Checking[0m num-traits v0.2.19
+[1m[92m    Checking[0m regex-automata v0.4.18
+[1m[92m    Checking[0m hyper v0.14.32
+[1m[92m    Checking[0m home v0.5.12
+[1m[92m    Checking[0m iana-time-zone v0.1.65
+[1m[92m    Checking[0m mime v0.3.17
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Checking[0m sync_wrapper v0.1.2
+[1m[92m    Checking[0m unicode-segmentation v1.13.3
+[1m[92m    Checking[0m utf8parse v0.2.2
+[1m[92m    Checking[0m ipnet v2.12.2
+[1m[92m    Checking[0m unicode-width v0.2.2
+[1m[92m    Checking[0m chrono v0.4.45
+[1m[92m    Checking[0m rustyline v18.0.1
+[1m[92m    Checking[0m regex v1.13.1
+[1m[92m    Checking[0m hyper-tls v0.5.0
+[1m[92m    Checking[0m reqwest v0.11.27
+[1m[92m    Checking[0m zmij v1.0.23
+[1m[92m    Checking[0m serde_json v1.0.151
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 9.32s
+[0m
+Clippy clean. Fixing fmt:
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN"
+FMT CLEAN
+[0m
+[0m$ [0mgit status --short
+M src/lexer.rs
+?? tests/unicode_escape_test.rs
+[0m
+[0m$ [0mgrep -n "Text\b\|text literal\|Text Literals\|^## \|^### " SPEC.md | sed -n '1,80p'
+9:## Table of Contents
+27:## Introduction
+31:### Design Goals
+38:### Hello World
+46:## Lexical Structure
+48:### Identifiers
+65:### Keywords
+87:### Literals
+95:// Text (Strings)
+118:### Comments
+128:### Whitespace
+134:## Types
+136:### Primitive Types
+145:### Complex Types
+159:### Type Inference
+168:### Explicit Types
+177:## Variables and Values
+179:### Declaration
+187:### Assignment
+193:### Constants
+202:## Expressions
+204:### Arithmetic
+273:### Comparison
+276:// Text comparison
+290:### Logical
+298:### String Interpolation
+305:### Property Access
+312:### Function Call
+319:### List Operations
+374:## Statements
+376:### If-Then-Else
+398:### When (Pattern Matching)
+408:### Unless
+416:### For Loop (Iteration)
+424:### For Loop (Range)
+454:### Repeat Loop
+462:### While Loop
+470:### Repeat Until
+478:### Break and Skip
+558:## Functions
+560:### Declaration
+568:### Return Values
+584:### Parameters
+597:### Type Annotations
+605:### First-Class Functions
+629:### Closures
+643:## Objects
+645:### Declaration
+663:### Instantiation
+675:### Constructor
+696:### Inheritance
+709:### Lookup order and shadowing
+747:### Properties
+762:## Modules
+764:### Declaration
+778:### Import
+786:### Import with Alias
+794:### Constants
+837:## Error Handling
+839:### Try-Catch
+873:### Handling Failures by Hand
+901:### Finally
+972:### `might fail`
+1034:### Raising Errors
+1058:## Asynchronous Programming
+1076:## Standard Library
+1078:### console
+1114:### text
+1145:### math
+1195:### files
+1216:### list
+1239:### network
+1250:### json and csv
+1265:### bytes
+1279:### sys
+1291:### time
+1317:## Grammar
+1323:## Appendix: Keywords Reference
+[0m
+[0m$ [0msed -n '87,118p' SPEC.md
+### Literals
+
+```redblue
+// Numbers
+set n to 42
+set f to 3.14
+set neg to -10
+
+// Text (Strings)
+set s to "Hello, World!"
+set multi to "Line 1
+Line 2"
+
+// Boolean
+set flag to yes
+set flag to no
+
+// Nothing
+set empty to nothing
+
+// Lists
+set arr to [1, 2, 3]
+set words to ["hello", "world"]
+
+// Records
+set person to record {
+    name: "Alice",
+    age: 30
+}
+```
+
+### Comments
+[0m
+[0m✗ [0mEdit SPEC.md failed
+[91m[1mError: [0mNo changes to apply: oldString and newString are identical.
+[0m→ [0mRead SPEC.md[90m [limit=10, offset=112][0m
+[0m
+[0m← [0mEdit SPEC.md
+Index: /home/runner/work/rbops/rbops/redblue/SPEC.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/SPEC.md
++++ /home/runner/work/rbops/rbops/redblue/SPEC.md
+@@ -114,8 +114,48 @@
+     age: 30
+ }
+ ```
+ 
++#### Escapes in a text literal
++
++A text literal carries five one-character escapes and one that names a code
++point:
++
++| Written | Reads as |
++|---|---|
++| `\n` | line feed |
++| `\t` | tab |
++| `\r` | carriage return |
++| `\"` | `"` |
++| `\\` | `\` |
++| `\uXXXX` | the character the four hex digits name |
++
++```redblue
++say "caf\u00e9"      // café — U+00E9, one character
++say "A\u0042C"       // ABC
++```
++
++`\uXXXX` is *exactly* four hex digits, in either case. It is not padded, not
++read past the fourth digit, and not braced: `\u1f600` is `\u1f60` followed by a
++literal `0`, because four digits cannot name a code point above U+FFFF. A file
++that can hold the character itself should write the character — the escape is
++for the code points a file cannot otherwise carry.
++
++Everything the grammar does not spell out is a `LexerError` naming the line and
++column of the backslash, never a different string:
++
++```redblue
++say "\q"            // LexerError: Unknown escape '\q' in text
++say "\uZZZZ"        // LexerError: Unicode escape needs four hex digits
++say "\u00"          // LexerError: Unicode escape needs four hex digits
++say "\ud83d"        // LexerError: \uD83D is half a surrogate pair; no character
++say "abc\           // LexerError: Unterminated string
++```
++
++A half of a surrogate pair is refused because it names no character of its own:
++a lone surrogate has no UTF-8 encoding, so the only thing a decoder could put
++there is a character nobody wrote.
++
+ ### Comments
+ 
+ ```redblue
+ // Single line comment
+
+[0m
+[0m$ [0msed -n '1,70p' tests/doc_blocks_test.rs
+//! Every ```redblue block in the five documents that define Redblue is
+//! extracted, classified and — where it is a program — executed.
+//!
+//! The finding this pins: the five documents carried **97** code blocks
+//! (`SPEC.md` 64, `docs/GRAMMAR.md` 9, `PHILOSOPHY.md` 9, `HANDOUT.md` 8,
+//! `README.md` 7) and **no test ran any of them**. Every existing reference to
+//! documentation was a hand-quoted single example:
+//! `tests/for_range_test.rs:2` cites `SPEC.md:380-391` and
+//! `tests/formatter_test.rs:2008` cites `SPEC.md:383`. A block that nobody
+//! executes rots in silence, which is exactly how `items at 0` sat in
+//! SPEC.md as dead syntax until phase-080 found it.
+//!
+//! So the harness is the deliverable, not a number. Two data files in this
+//! directory hold the classification, matched by `doc:line`:
+//!
+//! - `doc_blocks_runs.txt` — executed, and it exits 0.
+//! - `doc_blocks_fragments.txt` — not executed, with the reason written down.
+//! - `doc_blocks_known_fail.txt` — executed, exited non-zero, and the exact
+//!   first line of stderr is recorded.
+//!
+//! All three are checked in, and a block in none of them fails the suite, so
+//! none of the lists can rot: adding a block to a document without classifying
+//! it fails here, and so does deleting one — the extracted count is pinned, and
+//! the entry would point at a block that is no longer there.
+//!
+//! Listing the *working* blocks is what makes the suite worth running. If a
+//! block in `doc_blocks_runs.txt` stops exiting 0, the run test fails and it
+//! has to be re-classified, rather than drifting silently into "not one of the
+//! ones we run".
+//!
+//! **No network.** Two blocks make live HTTP requests to a host that does not
+//! exist; they are classified `network` in the fragment file with that reason
+//! written beside them. They are the only two, and a reader must not read the
+//! fragment bucket as "runs".
+//!
+//! **Sandbox.** Each run gets its own empty working directory, so a block that
+//! writes `output.txt` writes it there and not in the repository. The program
+//! file itself is written *into the project root*, because
+//! `redblue::root_of` resolves `import <name>` against the directory holding
+//! the program — a block that imports `MathUtils` has to see `modules/`. The
+//! scratch files are named `*.tmp`, which `.gitignore` already covers.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The five documents that define the language, and the only ones this suite
+/// reads. The order is fixed so a failure message reads the same every run.
+const DOCS: &[&str] = &[
+    "SPEC.md",
+    "README.md",
+    "PHILOSOPHY.md",
+    "HANDOUT.md",
+    "docs/GRAMMAR.md",
+];
+
+/// The number of ```redblue blocks the audit measured across [`DOCS`].
+///
+/// This is a floor, not a measurement. The harness measures the real count and
+/// reports it; this number exists so that *deleting* an example from a document
+/// fails the suite. Without it, the cheapest way to make this test green would
+/// be to delete the blocks it cannot run, which is the rot this file exists to
+/// prevent.
+const MINIMUM_BLOCKS: usize = 97;
+
+/// One fenced `redblue` block, with the position a reader would jump to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Block {
+[0m
+[0m$ [0msed -n '70,200p' tests/doc_blocks_test.rs
+struct Block {
+    doc: String,
+    /// 1-based line of the opening fence.
+    line: usize,
+    body: String,
+    /// False when the document ends before the closing fence.
+    closed: bool,
+}
+
+impl Block {
+    /// The `doc:line` key both data files are matched on.
+    fn key(&self) -> String {
+        format!("{}:{}", self.doc, self.line)
+    }
+
+    /// The program text handed to `rb`.
+    fn source(&self) -> String {
+        format!("{}\n", self.body)
+    }
+}
+
+/// Extracts every ```redblue block from `text`, in document order.
+///
+/// A fence opens a block when the first whitespace-delimited word after the
+/// backticks is `redblue`, so ```redblue and ```redblue title="…" both open one
+/// and ```text, ```bash and a bare ``` do not. A fence inside the block closes
+/// it whatever its info string is, because Markdown allows no other spelling and
+/// an unterminated block must not swallow the rest of the document.
+///
+/// A block with no closing fence is still returned, with [`Block::closed`]
+/// false: dropping it would let a document acquire an unterminated block and
+/// have the count fall silently, which is the same failure this file exists to
+/// catch, one level down.
+fn extract_blocks(text: &str) -> Vec<Block> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+        if !is_redblue_fence(trimmed) {
+            index += 1;
+            continue;
+        }
+        let open = index;
+        let mut cursor = index + 1;
+        while cursor < lines.len() && !is_fence(lines[cursor].trim()) {
+            cursor += 1;
+        }
+        let closed = cursor < lines.len();
+        blocks.push(Block {
+            doc: String::new(),
+            line: open + 1,
+            body: lines[open + 1..cursor].join("\n"),
+            closed,
+        });
+        index = if closed { cursor + 1 } else { cursor };
+    }
+
+    blocks
+}
+
+/// Whether a trimmed line opens a `redblue` block.
+fn is_redblue_fence(trimmed: &str) -> bool {
+    fence_info(trimmed) == Some("redblue")
+}
+
+/// Whether a trimmed line is a fence at all, opening or closing.
+fn is_fence(trimmed: &str) -> bool {
+    trimmed.starts_with("```")
+}
+
+/// The info string of a fence: everything after the backticks, or `None` when
+/// the line is not a fence at all. A closing fence carries no info string,
+/// which is why the first word is what [`is_redblue_fence`] compares.
+fn fence_info(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("```")?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.split_whitespace().next().unwrap_or(rest))
+}
+
+/// Reads `doc` under `root`, or `Err` naming the file when it is not there.
+///
+/// `Result`, not a panic and not an empty vector: a document that has been
+/// renamed or deleted must be a failure a reader can act on, and a suite that
+/// reports "0 blocks found" for a missing document is indistinguishable from a
+/// suite that ran clean.
+fn read_doc(root: &Path, doc: &str) -> Result<String, String> {
+    fs::read_to_string(root.join(doc)).map_err(|error| format!("{doc}: {error}"))
+}
+
+/// Every block in every document in [`DOCS`], keyed by `doc:line`.
+fn all_blocks(root: &Path) -> BTreeMap<String, Block> {
+    let mut found = BTreeMap::new();
+    for doc in DOCS {
+        let text = read_doc(root, doc).unwrap_or_else(|error| panic!("{error}"));
+        for mut block in extract_blocks(&text) {
+            block.doc = (*doc).to_string();
+            let key = block.key();
+            assert!(
+                found.insert(key.clone(), block).is_none(),
+                "{key} was extracted twice; two blocks share one opening line"
+            );
+        }
+    }
+    found
+}
+
+/// One row of a data file: a `doc:line` key and the text written after it.
+#[derive(Clone, Debug)]
+struct Row {
+    key: String,
+    value: String,
+    file: &'static str,
+    line: usize,
+}
+
+/// Parses a data file. `#` comments and blank lines are ignored; every other
+/// line must carry a key, and a key may be followed by a tab and a value. The
+/// RUNS file has no second column, so a value is optional here and its absence
+/// is checked where it is required — a fragment with no reason, a known
+/// failure with no recorded message.
+fn read_rows(path: &Path, file: &'static str) -> Vec<Row> {
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+[0m
+[0m$ [0mhead -20 tests/doc_blocks_runs.txt; echo "=== fragments ==="; head -12 tests/doc_blocks_fragments.txt; echo "=== knownfail ==="; head -8 tests/doc_blocks_known_fail.txt
+# The RUNS bucket — documentation code blocks this suite executes and that exit 0.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of this file, `tests/doc_blocks_fragments.txt` and
+# `tests/doc_blocks_known_fail.txt`. A block in none of them fails the suite.
+#
+# Being listed HERE is a promise the suite keeps by running the block: if one of
+# these stops exiting 0, `running_every_block_agrees_with_the_bucket_it_is_in`
+# fails and the block has to move to the KNOWN-FAIL file, with the first line of
+# stderr it now prints. That is the whole point of listing the working blocks
+# at all: without this file a block that stopped working would silently join the
+# fragments, and a documentation promise would rot without a word.
+#
+# FORMAT
+#   <doc>:<line>
+# `line` is the line of the opening ```redblue fence, counted from 1. Editing a
+# document above a block moves it, and a moved block fails this suite rather
+# than quietly losing its bucket.
+#
+=== fragments ===
+# The FRAGMENT bucket — documentation code blocks this suite does not execute.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of `this file` and `tests/doc_blocks_known_fail.txt`. A block in
+# neither fails the suite, so neither list can quietly shrink.
+#
+# WHAT FRAGMENT MEANS
+# The block is not executed, and the reason is written beside it. Two kinds of
+# reason appear here, and they are not the same thing:
+#
+#   excerpt - the block is not a program. It has an elided `end`, a placeholder
+=== knownfail ===
+# The KNOWN-FAIL bucket — documentation blocks that are whole programs and
+# still fail today.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of this file and `tests/doc_blocks_fragments.txt`. A block in
+# neither fails the suite.
+#
+[0m
+[0m$ [0msed -n '12,40p' tests/doc_blocks_fragments.txt; echo "=== reason check ==="; grep -n "excerpt\|fragment reason\|REASONS\|reason" tests/doc_blocks_test.rs | head -30
+#   excerpt - the block is not a program. It has an elided `end`, a placeholder
+#             body (`// statements`, `// ...`, `// Implementation`), or names
+#             that only the surrounding prose introduces. Nothing about running
+#             it is promised, so there is nothing for the interpreter to answer.
+#
+#   network - the block is a program, and it performs a live HTTP request. This
+#             suite runs no network (AGENTS.md § 3.1.4), so the block is
+#             classified rather than executed and its outcome is unverified.
+#             Two entries below say so; a reader must not take them for
+#             "this runs".
+#
+# A block that IS a whole program and still fails belongs in the KNOWN-FAIL
+# file with the first line of stderr it prints today, not here. Calling a
+# broken example a fragment is how a documentation promise rots unnoticed.
+#
+# FORMAT
+#   <doc>:<line><TAB><reason>
+# `line` is the line of the opening ```redblue fence, counted from 1. That
+# makes the entry brittle on purpose: editing a document above a block moves it,
+# and a moved block fails this suite rather than quietly losing its bucket.
+#
+# COUNTS, as of the run that wrote this file
+#   SPEC.md 28 · docs/GRAMMAR.md 2 · PHILOSOPHY.md 8 · README.md 0 · HANDOUT.md 0
+#   38 of 101 blocks. The other 63 are 48 RUNS and 15 KNOWN-FAIL.
+
+# --- SPEC.md ---------------------------------------------------------------
+
+SPEC.md:147	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+SPEC.md:170	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+=== reason check ===
+17://! - `doc_blocks_fragments.txt` — not executed, with the reason written down.
+32://! exist; they are classified `network` in the fragment file with that reason
+193:/// is checked where it is required — a fragment with no reason, a known
+297:         the fragment file with a reason; it does not belong in this file any \
+472:         line of stderr it prints, or FRAGMENT with the reason it is not a \
+480:            "{}:{} gives {} no value: a fragment with no reason and a known \
+517:            // FRAGMENT: the suite does not execute it. The reason is checked
+[0m
+[0m$ [0mgrep -n '^```redblue$\|^```$' SPEC.md | sed -n '1,12p'
+40:```redblue
+42:```
+52:```
+55:```
+58:```redblue
+63:```
+89:```redblue
+116:```
+132:```redblue
+135:```
+146:```redblue
+152:```
+[0m
+[0m→ [0mRead SPEC.md[90m [limit=45, offset=116][0m
+[0m
+[0m$ [0mgrep -n "^SPEC.md:" tests/doc_blocks_runs.txt | sed -n '1,12p'; echo "=== frag ==="; grep -n "^SPEC.md:" tests/doc_blocks_fragments.txt | sed -n '1,8p'
+26:SPEC.md:40
+27:SPEC.md:58
+28:SPEC.md:120
+29:SPEC.md:163
+30:SPEC.md:195
+31:SPEC.md:206
+32:SPEC.md:314
+33:SPEC.md:426
+34:SPEC.md:456
+35:SPEC.md:562
+36:SPEC.md:619
+37:SPEC.md:647
+=== frag ===
+39:SPEC.md:147	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+40:SPEC.md:170	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+41:SPEC.md:181	excerpt - `value` is introduced by the prose about rebinding and bound nowhere in the block
+42:SPEC.md:189	excerpt - `new_value` is introduced by the prose and bound nowhere in the block
+43:SPEC.md:275	excerpt - a comparison catalogue: ten bare `if` headers, no bodies and no `end`; this is a table of spellings, not a program
+44:SPEC.md:292	excerpt - a boolean-operator catalogue: three bare `if` headers, no bodies and no `end`; the operators `and`, `or` and `not` are spelled correctly, only the statements around them are not there
+45:SPEC.md:300	excerpt - `name`, `x` and `y` are introduced by the prose about interpolation and bound nowhere in the block
+46:SPEC.md:307	excerpt - `person` and `point` are introduced by the prose about field access and bound nowhere in the block
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import io
+p='tests/doc_blocks_runs.txt'
+s=open(p).read().split('\n')
+i=s.index('SPEC.md:40')
+s.insert(i+2,'SPEC.md:132')
+open(p,'w').write('\n'.join(s))
+
+p='tests/doc_blocks_fragments.txt'
+s=open(p).read().split('\n')
+i=s.index('SPEC.md:170\texcerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it')
+s.insert(i+1,'SPEC.md:146\texcerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome')
+open(p,'w').write('\n'.join(s))
+EOF
+grep -n "SPEC.md:132\|SPEC.md:146" tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt
+tests/doc_blocks_runs.txt:28:SPEC.md:132
+tests/doc_blocks_fragments.txt:41:SPEC.md:146	excerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome
+[0m
+[0m→ [0mRead docs/GRAMMAR.md[90m [limit=12, offset=76][0m
+[0m✗ [0mEdit docs/GRAMMAR.md failed
+[91m[1mError: [0mNo changes to apply: oldString and newString are identical.
+[0m
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -79,8 +79,14 @@
+ text_literal       = '"' { any_unicode_character_except_quote | escape } '"'
+ escape             = '\' ( 'n' | 't' | 'r' | '"' | '\' | 'u' hex_digit hex_digit hex_digit hex_digit )
+ hex_digit          = digit | 'a'..'f' | 'A'..'F'
+ 
++// The escape set is closed. A `\` followed by anything else is a LexerError at
++// the backslash, and so is a `\` followed by `u` and fewer than four hex digits
++// — a short run is not padded out to four, and a fifth digit is ordinary text
++// after the escape, so `\u1f600` is `\u1f60` then `0`. A `\` followed by a
++// surrogate half is a LexerError too: `\uD83D` names no character of its own.
++
+ // Boolean
+ boolean_literal    = 'yes' | 'no'
+ 
+ // Nothing
+
+[0m
+[0m$ [0mcargo test --test doc_blocks_test 2>&1 | grep -A 4 "^---- \|test result" | head -30
+---- every_documentation_block_is_classified_exactly_once stdout ----
+
+thread 'every_documentation_block_is_classified_exactly_once' (61735) panicked at tests/doc_blocks_test.rs:454:5:
+these entries point at a block that is not in any document:
+  SPEC.md:1030
+--
+---- edge_a_known_fail_recording_that_is_wrong_is_rejected stdout ----
+
+thread 'edge_a_known_fail_recording_that_is_wrong_is_rejected' (61733) panicked at tests/doc_blocks_test.rs:300:5:
+assertion `left == right` failed: SPEC.md:89 is recorded as failing with a different first line of stderr.
+recorded: Error: A different failure entirely
+--
+---- running_every_block_agrees_with_the_bucket_it_is_in stdout ----
+
+thread 'running_every_block_agrees_with_the_bucket_it_is_in' (61736) panicked at tests/doc_blocks_test.rs:503:32:
+SPEC.md:1017 is in no bucket; classify it
+stack backtrace:
+--
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+[1m[91merror[0m: test failed, to rerun pass `--test doc_blocks_test`
+[0m
+[0m$ [0msed -n '270,310p' tests/doc_blocks_test.rs
+Outcome {
+        exit_ok: output.status.success(),
+        first_error_line: stderr
+            .lines()
+            .find(|line| line.trim_start().starts_with("Error"))
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    }
+}
+
+/// What a checked KNOWN-FAIL row is: the block exited non-zero and printed
+/// exactly the recorded first line. A unit struct rather than a bare `()` so a
+/// caller can assert *that* it checked, instead of calling and hoping.
+#[derive(Debug, PartialEq, Eq)]
+struct Recorded;
+
+/// Checks a KNOWN-FAIL row against the stderr the block produced today.
+///
+/// A free function so the mutation test can hand it a deliberately wrong
+/// recording and assert the check has teeth, rather than only ever being shown
+/// an entry that happens to be right.
+fn check_known_fail(key: &str, recorded: &str, outcome: &Outcome) -> Recorded {
+    assert!(
+        !outcome.exit_ok,
+        "{key} is recorded as KNOWN-FAIL but it ran to completion.\n\
+         Either the documentation promise was fixed, or the entry belongs in \
+         the fragment file with a reason; it does not belong in this file any \
+         more."
+    );
+    assert_eq!(
+        outcome.first_error_line, recorded,
+        "{key} is recorded as failing with a different first line of stderr.\n\
+         recorded: {recorded}\n\
+         printed:  {}\n\
+         The failure moved, changed its wording, or stopped happening. \
+         Re-read the block and re-record what it does today.",
+        outcome.first_error_line
+    );
+    Recorded
+}
+[0m
+[0m$ [0mgrep -n "edge_a_known_fail_recording_that_is_wrong_is_rejected" -A 40 tests/doc_blocks_test.rs
+552:fn edge_a_known_fail_recording_that_is_wrong_is_rejected() {
+553-    let audit = Audit::load();
+554-    assert!(
+555-        !audit.known_fail.is_empty(),
+556-        "no KNOWN-FAIL entry exists, so there is no recorded failure to check"
+557-    );
+558-
+559-    for row in &audit.known_fail {
+560-        let block = audit
+561-            .blocks
+562-            .get(&row.key)
+563-            .unwrap_or_else(|| panic!("{} lists {}, which is not a block", row.file, row.key));
+564-        let outcome = run_block("wrong-recording", &row.key, block);
+565-        assert!(
+566-            !outcome.exit_ok,
+567-            "{} records {} as failing and it ran to completion",
+568-            row.file, row.key
+569-        );
+570-
+571-        // The recording as written must pass, or nothing below means anything.
+572-        assert_eq!(
+573-            check_known_fail(&row.key, &row.value, &outcome),
+574-            Recorded,
+575-            "{}:{} does not record what {} does today",
+576-            row.file,
+577-            row.line,
+578-            row.key
+579-        );
+580-
+581-        // Four wrong recordings, each a different way of being wrong.
+582-        let mutated = [
+583-            ("Error: A different failure entirely", "a different failure"),
+584-            ("", "an empty recording"),
+585-            (
+586-                &format!("{} ", outcome.first_error_line),
+587-                "a trailing space",
+588-            ),
+589-            (
+590-                "Error: this is not what Redblue prints at all",
+591-                "a plausible invented message",
+592-            ),
+[0m
+[0m$ [0msed -n '592,625p' tests/doc_blocks_test.rs
+),
+        ];
+        for (recording, what) in mutated {
+            if recording == outcome.first_error_line {
+                continue;
+            }
+            let verdict =
+                std::panic::catch_unwind(|| check_known_fail(&row.key, recording, &outcome));
+            assert!(
+                verdict.is_err(),
+                "{}: recording {} as {what} was accepted; the recorded first \
+                 line of stderr is not being compared",
+                row.key,
+                recording
+            );
+        }
+
+        // And a recording of success must be refused too, since the block did
+        // not exit 0.
+        let claimed_ok = Outcome {
+            exit_ok: true,
+            first_error_line: row.value.clone(),
+        };
+        let verdict =
+            std::panic::catch_unwind(|| check_known_fail(&row.key, &row.value, &claimed_ok));
+        assert!(
+            verdict.is_err(),
+            "{}: a block that failed was accepted as having exited 0",
+            row.key
+        );
+    }
+}
+
+/// An unterminated block is extracted, with `closed` false, rather than
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+for p in ['tests/doc_blocks_runs.txt','tests/doc_blocks_fragments.txt','tests/doc_blocks_known_fail.txt']:
+    out=[]
+    for line in open(p).read().split('\n'):
+        m=re.match(r'^(SPEC\.md):(\d+)(\t.*)?$', line)
+        if m:
+            n=int(m.group(2))
+            if n>=118:
+                line=f"{m.group(1)}:{n+40}{m.group(3) or ''}"
+        out.append(line)
+    open(p,'w').write('\n'.join(out))
+EOF
+grep -n "^SPEC.md:" tests/doc_blocks_runs.txt | head -6; echo ---; grep -n "^SPEC.md:" tests/doc_blocks_fragments.txt | head -6; echo ---; grep -n "^SPEC.md:" tests/doc_blocks_known_fail.txt | head -6
+26:SPEC.md:40
+27:SPEC.md:58
+28:SPEC.md:172
+29:SPEC.md:160
+30:SPEC.md:203
+31:SPEC.md:235
+---
+39:SPEC.md:187	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+40:SPEC.md:210	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+41:SPEC.md:186	excerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome
+42:SPEC.md:221	excerpt - `value` is introduced by the prose about rebinding and bound nowhere in the block
+43:SPEC.md:229	excerpt - `new_value` is introduced by the prose and bound nowhere in the block
+44:SPEC.md:315	excerpt - a comparison catalogue: ten bare `if` headers, no bodies and no `end`; this is a table of spellings, not a program
+---
+30:SPEC.md:89	Error: ParserError: Expected field name
+31:SPEC.md:610	Error: ParserError: Expected 'then' but got 'give'
+32:SPEC.md:647	Error: RuntimeError: Module 'numbers' has no function 'map'
+33:SPEC.md:671	Error: ParserError: Expected 'end' but got Eof
+34:SPEC.md:1017	Error: ParserError: Expected 'then' but got 'say'
+35:SPEC.md:1055	Error: RuntimeError: Maximum call depth of 1000 reached while calling 'endless'
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+runs='tests/doc_blocks_runs.txt'
+s=[l for l in open(runs).read().split('\n') if l!='SPEC.md:172']
+s.insert(s.index('SPEC.md:58')+1,'SPEC.md:132')
+open(runs,'w').write('\n'.join(s))
+
+frag='tests/doc_blocks_fragments.txt'
+s=open(frag).read().split('\n')
+row=[l for l in s if l.startswith('SPEC.md:186\t')][0]
+s.remove(row)
+s.insert(s.index([l for l in s if l.startswith('SPEC.md:187\t')][0]), row)
+open(frag,'w').write('\n'.join(s))
+EOF
+grep -n "^SPEC.md:" tests/doc_blocks_runs.txt | head -6; echo ---; grep -n "^SPEC.md:" tests/doc_blocks_fragments.txt | head -5
+26:SPEC.md:40
+27:SPEC.md:58
+28:SPEC.md:132
+29:SPEC.md:160
+30:SPEC.md:203
+31:SPEC.md:235
+---
+39:SPEC.md:186	excerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome
+40:SPEC.md:187	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+41:SPEC.md:210	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+42:SPEC.md:221	excerpt - `value` is introduced by the prose about rebinding and bound nowhere in the block
+43:SPEC.md:229	excerpt - `new_value` is introduced by the prose and bound nowhere in the block
+[0m
+[0m$ [0mcargo test --test doc_blocks_test 2>&1 | grep -A 4 "^---- \|test result" | head -30
+---- every_documentation_block_is_classified_exactly_once stdout ----
+
+thread 'every_documentation_block_is_classified_exactly_once' (62012) panicked at tests/doc_blocks_test.rs:454:5:
+these entries point at a block that is not in any document:
+  docs/GRAMMAR.md:541
+--
+---- running_every_block_agrees_with_the_bucket_it_is_in stdout ----
+
+thread 'running_every_block_agrees_with_the_bucket_it_is_in' (62013) panicked at tests/doc_blocks_test.rs:503:32:
+SPEC.md:146 is in no bucket; classify it
+stack backtrace:
+--
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+[1m[91merror[0m: test failed, to rerun pass `--test doc_blocks_test`
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+frag='tests/doc_blocks_fragments.txt'
+s=open(frag).read().split('\n')
+for i,l in enumerate(s):
+    if l.startswith('SPEC.md:186\t'):
+        s[i]='SPEC.md:146'+l[len('SPEC.md:186'):]
+open(frag,'w').write('\n'.join(s))
+
+for p in ['tests/doc_blocks_runs.txt','tests/doc_blocks_fragments.txt','tests/doc_blocks_known_fail.txt']:
+    out=[]
+    for line in open(p).read().split('\n'):
+        m=re.match(r'^(docs/GRAMMAR\.md):(\d+)(\t.*)?$', line)
+        if m and int(m.group(2))>=82:
+            line=f"{m.group(1)}:{int(m.group(2))+5}{m.group(3) or ''}"
+        out.append(line)
+    open(p,'w').write('\n'.join(out))
+EOF
+grep -n "^docs/GRAMMAR.md:" tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt tests/doc_blocks_known_fail.txt
+tests/doc_blocks_runs.txt:61:docs/GRAMMAR.md:546
+tests/doc_blocks_runs.txt:62:docs/GRAMMAR.md:593
+tests/doc_blocks_runs.txt:63:docs/GRAMMAR.md:598
+tests/doc_blocks_runs.txt:64:docs/GRAMMAR.md:614
+tests/doc_blocks_runs.txt:65:docs/GRAMMAR.md:621
+tests/doc_blocks_runs.txt:66:docs/GRAMMAR.md:630
+tests/doc_blocks_runs.txt:67:docs/GRAMMAR.md:645
+tests/doc_blocks_fragments.txt:71:docs/GRAMMAR.md:525	excerpt - the guarded read is bound to `report`, but the third line reads `body`, which is bound nowhere. The first two lines are the forms this block documents
+tests/doc_blocks_fragments.txt:72:docs/GRAMMAR.md:605	excerpt - `age` is bound in the preceding block and not in this one, so the two are one fragment written as two
+[0m
+[0m$ [0mcargo test --test doc_blocks_test 2>&1 | grep -A 5 "^---- \|test result" | head -30
+---- every_documentation_block_is_classified_exactly_once stdout ----
+
+thread 'every_documentation_block_is_classified_exactly_once' (62224) panicked at tests/doc_blocks_test.rs:454:5:
+these entries point at a block that is not in any document:
+  docs/GRAMMAR.md:546
+  docs/GRAMMAR.md:593
+--
+---- running_every_block_agrees_with_the_bucket_it_is_in stdout ----
+
+thread 'running_every_block_agrees_with_the_bucket_it_is_in' (62225) panicked at tests/doc_blocks_test.rs:503:32:
+docs/GRAMMAR.md:526 is in no bucket; classify it
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+--
+test result: FAILED. 5 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s
+
+[1m[91merror[0m: test failed, to rerun pass `--test doc_blocks_test`
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+def blocks(path):
+    out=[];lines=open(path).read().split('\n');i=0
+    while i<len(lines):
+        t=lines[i].strip()
+        rest=t[3:].strip() if t.startswith('```') else None
+        if rest:
+            info=rest.split()[0] if rest.split() else None
+            if info=='redblue': out.append(i+1)
+        i+=1
+    return out
+b=blocks('docs/GRAMMAR.md')
+print("GRAMMAR blocks:",b)
+for p in ['tests/doc_blocks_runs.txt','tests/doc_blocks_fragments.txt','tests/doc_blocks_known_fail.txt']:
+    for l in open(p):
+        if l.startswith('docs/GRAMMAR.md:'):
+            n=int(l.split(':')[1].split('\t')[0])
+            if n not in b: print("BAD",p.strip(),n)
+EOF
+GRAMMAR blocks: [526, 547, 594, 599, 606, 615, 622, 631, 646]
+BAD tests/doc_blocks_runs.txt 546
+BAD tests/doc_blocks_runs.txt 593
+BAD tests/doc_blocks_runs.txt 598
+BAD tests/doc_blocks_runs.txt 614
+BAD tests/doc_blocks_runs.txt 621
+BAD tests/doc_blocks_runs.txt 630
+BAD tests/doc_blocks_runs.txt 645
+BAD tests/doc_blocks_fragments.txt 525
+BAD tests/doc_blocks_fragments.txt 605
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+for p in ['tests/doc_blocks_runs.txt','tests/doc_blocks_fragments.txt','tests/doc_blocks_known_fail.txt']:
+    out=[]
+    for line in open(p).read().split('\n'):
+        m=re.match(r'^(docs/GRAMMAR\.md):(\d+)(\t.*)?$', line)
+        if m and int(m.group(2))>=82:
+            line=f"{m.group(1)}:{int(m.group(2))+1}{m.group(3) or ''}"
+        out.append(line)
+    open(p,'w').write('\n'.join(out))
+EOF
+cargo test --test doc_blocks_test 2>&1 | grep -A 5 "^---- \|test result" | head -20
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+[0m
+[0m$ [0mgit diff --stat && git diff tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt | grep -E "^[+-][^+-]" | head -40
+SPEC.md                         | 40 ++++++++++++++++++++++
+ docs/GRAMMAR.md                 |  6 ++++
+ src/lexer.rs                    | 46 ++++++++++++++++++++++++-
+ tests/doc_blocks_fragments.txt  | 61 ++++++++++++++++-----------------
+ tests/doc_blocks_known_fail.txt | 14 ++++----
+ tests/doc_blocks_runs.txt       | 75 +++++++++++++++++++++--------------------
+ 6 files changed, 167 insertions(+), 75 deletions(-)
+-SPEC.md:147	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+-SPEC.md:170	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+-SPEC.md:181	excerpt - `value` is introduced by the prose about rebinding and bound nowhere in the block
+-SPEC.md:189	excerpt - `new_value` is introduced by the prose and bound nowhere in the block
+-SPEC.md:275	excerpt - a comparison catalogue: ten bare `if` headers, no bodies and no `end`; this is a table of spellings, not a program
+-SPEC.md:292	excerpt - a boolean-operator catalogue: three bare `if` headers, no bodies and no `end`; the operators `and`, `or` and `not` are spelled correctly, only the statements around them are not there
+-SPEC.md:300	excerpt - `name`, `x` and `y` are introduced by the prose about interpolation and bound nowhere in the block
+-SPEC.md:307	excerpt - `person` and `point` are introduced by the prose about field access and bound nowhere in the block
+-SPEC.md:321	excerpt - `items` and `words` are bound nowhere, and the closing `if "hello" is in words` has no body and no `end`. The `items at 0` and `length of items` forms this block documents are covered one at a time by tests/index_words_test.rs; the block as written is not a program
+-SPEC.md:378	excerpt - placeholder bodies (`// statements`, `// then branch`) and an unbound `condition`
+-SPEC.md:400	excerpt - `when` is documented as NOT IMPLEMENTED in docs/GRAMMAR.md § 4.3, where `when` is an ordinary identifier; `value` is also bound nowhere
+-SPEC.md:410	excerpt - `is_valid` is introduced by the prose about `unless` and bound nowhere in the block
+-SPEC.md:418	excerpt - `items` is introduced by the prose about `for each ... in` and bound nowhere in the block
+-SPEC.md:464	excerpt - `x` is introduced by the prose about `while` and bound nowhere in the block
+-SPEC.md:472	excerpt - `x` is introduced by the prose about `repeat`/`until` and bound nowhere in the block
+-SPEC.md:480	excerpt - `items` and `process` are bound nowhere in the block
+-SPEC.md:517	excerpt - `names` and `record` are bound nowhere in the block
+-SPEC.md:534	excerpt - `break` on its own, shown to document the loop-control keyword; it is only valid inside a loop
+-SPEC.md:586	excerpt - placeholder body (`// parameters`) plus `default`, which the parser does not accept in a parameter list
+-SPEC.md:599	excerpt - a type-annotated signature; `a as number` and `as number` are not forms the parser accepts
+-SPEC.md:698	excerpt - `Employee extends Person` with no `Person` in the block; the parent is declared elsewhere
+-SPEC.md:841	excerpt - `process` is bound nowhere in the block, and `config.rb` is a file the block never creates
+-SPEC.md:894	network - `network.get("https://api.example.com")` is a live HTTP request to a host that does not exist; AGENTS.md § 3.1.4 forbids a test that depends on the network. Also elided: the `if` has no `then`
+-SPEC.md:903	excerpt - `process` is bound nowhere in the block, and `files.open`/`files.close` are illustrative names
+-SPEC.md:993	excerpt - `body` is bound nowhere: the guarded read was bound to `report`, so the last line reads a field that is not in scope
+-SPEC.md:1169	excerpt - `xs` is bound nowhere in the block; the four `random*` calls are shown against a list the prose has not written
+-SPEC.md:1197	excerpt - placeholder body (`// ...`) on the closing `if`, and the block reads and rewrites files it never creates
+-SPEC.md:1241	network - `network.get` and `network.post` are live HTTP requests; `data` is also bound nowhere. AGENTS.md § 3.1.4
++SPEC.md:146	excerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome
++SPEC.md:187	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
++SPEC.md:210	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
++SPEC.md:221	excerpt - `value` is introduced by the prose about rebinding and bound nowhere in the block
++SPEC.md:229	excerpt - `new_value` is introduced by the prose and bound nowhere in the block
++SPEC.md:315	excerpt - a comparison catalogue: ten bare `if` headers, no bodies and no `end`; this is a table of spellings, not a program
++SPEC.md:332	excerpt - a boolean-operator catalogue: three bare `if` headers, no bodies and no `end`; the operators `and`, `or` and `not` are spelled correctly, only the statements around them are not there
++SPEC.md:340	excerpt - `name`, `x` and `y` are introduced by the prose about interpolation and bound nowhere in the block
++SPEC.md:347	excerpt - `person` and `point` are introduced by the prose about field access and bound nowhere in the block
++SPEC.md:361	excerpt - `items` and `words` are bound nowhere, and the closing `if "hello" is in words` has no body and no `end`. The `items at 0` and `length of items` forms this block documents are covered one at a time by tests/index_words_test.rs; the block as written is not a program
++SPEC.md:418	excerpt - placeholder bodies (`// statements`, `// then branch`) and an unbound `condition`
++SPEC.md:440	excerpt - `when` is documented as NOT IMPLEMENTED in docs/GRAMMAR.md § 4.3, where `when` is an ordinary identifier; `value` is also bound nowhere
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for f in runs fragments known_fail; do echo -n "$f: "; awk -F'[:\t]' '{print $1}' tests/doc_blocks_$f.txt | grep -E "^(SPEC|README|PHILOSOPHY|HANDOUT)\.md$|^docs/GRAMMAR\.md$" | sort | uniq -c | tr '\n' ' '; echo; done; grep -n "COUNTS\|38 of 101" tests/doc_blocks_test.rs | head
+runs:       2 HANDOUT.md       7 README.md      33 SPEC.md       7 docs/GRAMMAR.md 
+fragments:       8 PHILOSOPHY.md      29 SPEC.md       2 docs/GRAMMAR.md 
+known_fail:       6 HANDOUT.md       1 PHILOSOPHY.md       8 SPEC.md
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "COUNTS, as of" -A 3 tests/doc_blocks_fragments.txt
+33:# COUNTS, as of the run that wrote this file
+34-#   SPEC.md 28 · docs/GRAMMAR.md 2 · PHILOSOPHY.md 8 · README.md 0 · HANDOUT.md 0
+35-#   38 of 101 blocks. The other 63 are 48 RUNS and 15 KNOWN-FAIL.
+36-
+[0m
+[0m← [0mEdit tests/doc_blocks_fragments.txt
+Index: /home/runner/work/rbops/rbops/redblue/tests/doc_blocks_fragments.txt
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/doc_blocks_fragments.txt
++++ /home/runner/work/rbops/rbops/redblue/tests/doc_blocks_fragments.txt
+@@ -30,10 +30,10 @@
+ # makes the entry brittle on purpose: editing a document above a block moves it,
+ # and a moved block fails this suite rather than quietly losing its bucket.
+ #
+ # COUNTS, as of the run that wrote this file
+-#   SPEC.md 28 · docs/GRAMMAR.md 2 · PHILOSOPHY.md 8 · README.md 0 · HANDOUT.md 0
+-#   38 of 101 blocks. The other 63 are 48 RUNS and 15 KNOWN-FAIL.
++#   SPEC.md 29 · docs/GRAMMAR.md 2 · PHILOSOPHY.md 8 · README.md 0 · HANDOUT.md 0
++#   39 of 103 blocks. The other 64 are 49 RUNS and 15 KNOWN-FAIL.
+ 
+ # --- SPEC.md ---------------------------------------------------------------
+ 
+ SPEC.md:146	excerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome
+
+[0m
+Now the full gate run:
+[0m$ [0mcargo fmt --all -- --check && echo "FMT: pass"; cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "^(warning|error)" | head -10; echo "CLIPPY-EXIT:${PIPESTATUS[0]}"
+FMT: pass
+CLIPPY-EXIT:0
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tee ./target/tmp_test.log | grep -E "test result: FAILED|^failures:|^error" | head -20; echo "---"; grep -E "test result" ./target/tmp_test.log | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "passed:",p," failed:",f}'
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+---
+passed: 1580  failed: 0
+[0m
+[0m$ [0mls phases/ | tail -5; ls phases/phase-085 2>&1
+phase-080
+phase-081
+phase-083
+phase-092
+phase-093
+ls: cannot access 'phases/phase-085': No such file or directory
+[0m
+[0m$ [0m./rbops/verify.sh phase-085 2>&1 | tail -40; echo "VERIFY-EXIT:$?"
+/bin/bash: line 1: ./rbops/verify.sh: No such file or directory
+VERIFY-EXIT:0
+[0m
+[0m$ [0mls; ls -a | head -20; ls rbops 2>&1
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+.
+..
+.git
+.gitattributes
+.github
+.gitignore
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+ls: cannot access 'rbops': No such file or directory
+[0m
+[0m$ [0mcargo build --bin rb 2>&1 | tail -3 && printf 'say "\\u0041"\nsay "caf\\u00e9"\n' > ./target/tmp_esc.rb && ./target/debug/rb run ./target/tmp_esc.rb && ./target/debug/rb compile ./target/tmp_esc.rb && ls *.rbc && ./target/debug/rb vm ./target/tmp_esc.rbc
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.05s
+A
+café
+Compiled ./target/tmp_esc.rb -> ./target/tmp_esc.rbc
+ls: cannot access '*.rbc': No such file or directory
+[0m
+[0m$ [0m./target/debug/rb vm ./target/tmp_esc.rbc | od -c | head -3; echo "=== refusal ==="; printf 'say "\\uZZZZ"\n' > ./target/tmp_bad.rb; ./target/debug/rb run ./target/tmp_bad.rb; echo "exit=$?"
+0000000   A  \n   c   a   f 303 251  \n
+0000010
+=== refusal ===
+Error: LexerError: Unicode escape needs four hex digits, such as "\u00e9"
+  --> ./target/tmp_bad.rb:1:6
+1 | say "\uZZZZ"
+  |      ^
+exit=1
+[0m
+[0m$ [0mrm -f ./target/tmp_esc.rbc ./target/tmp_*.rb ./target/tmp_test.log; fails=0; for f in examples/*.rb; do out=$(./target/debug/rb run "$f" 2>&1); if [ $? -ne 0 ]; then fails=$((fails+1)); echo "FAIL $f"; echo "$out" | head -3; fi; done; echo "examples failed: $fails / $(ls examples/*.rb | wc -l)"
+examples failed: 0 / 7
+[0m
+[0m$ [0mfails=0; for f in modules/*.rb bootstrap/*.rb corpus/*.rb; do [ -f "$f" ] || continue; out=$(./target/debug/rb run "$f" 2>&1); if [ $? -ne 0 ]; then fails=$((fails+1)); echo "FAIL $f"; echo "$out" | head -3; fi; done; echo "modules/bootstrap/corpus failed: $fails"
+FAIL bootstrap/compiler.rb
+bootstrap/compiler.rb: 0: usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>
+Error: RuntimeError: Index 1 is out of bounds: length is 1, valid indexes are 0 to 0
+  --> bootstrap/compiler.rb:115:5
+FAIL corpus/control-flow-0003.rb
+Error: ParserError: Expected 'end' but got Eof
+  --> corpus/control-flow-0003.rb:8:1
+FAIL corpus/control-flow-0004.rb
+Error: ParserError: Expected 'end' but got Eof
+  --> corpus/control-flow-0004.rb:8:1
+FAIL corpus/control-flow-0005.rb
+Error: ParserError: Expected 'end' but got Eof
+  --> corpus/control-flow-0005.rb:8:1
+FAIL corpus/faults-0001.rb
+Error: RuntimeError: Cannot add non-numbers
+  --> corpus/faults-0001.rb:2:1
+2 | say 1 + "a"
+FAIL corpus/faults-0002.rb
+Error: RuntimeError: Index 9 is out of bounds: length is 2, valid indexes are 0 to 1
+  --> corpus/faults-0002.rb:2:1
+2 | say [1, 2][9]
+FAIL corpus/faults-0003.rb
+Error: RuntimeError: Division by zero
+  --> corpus/faults-0003.rb:2:1
+2 | say 1 / 0
+FAIL corpus/faults-0004.rb
+Error: RuntimeError: Modulo by zero
+  --> corpus/faults-0004.rb:2:1
+2 | say 9 % 0
+FAIL corpus/faults-0005.rb
+Error: RuntimeError: Unknown function 'no_such_function'
+  --> corpus/faults-0005.rb:2:1
+2 | say no_such_function()
+FAIL corpus/faults-0006.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/faults-0006.rb:2:1
+2 | say length(nothing)
+FAIL corpus/faults-0007.rb
+Error: RuntimeError: Cannot access property on non-object
+  --> corpus/faults-0007.rb:2:1
+2 | say nothing.field
+FAIL corpus/faults-0008.rb
+Error: RuntimeError: Index 4 is out of bounds: length is 1, valid indexes are 0 to 0
+  --> corpus/faults-0008.rb:2:1
+2 | say [1][4]
+FAIL corpus/faults-0009.rb
+Error: RuntimeError: Cannot subtract non-numbers
+  --> corpus/faults-0009.rb:2:1
+2 | say 1 - "a"
+FAIL corpus/faults-0010.rb
+Error: RuntimeError: Cannot add non-numbers
+  --> corpus/faults-0010.rb:2:1
+2 | say yes + 1
+FAIL corpus/faults-0011.rb
+Error: RuntimeError: Cannot add non-numbers
+  --> corpus/faults-0011.rb:2:1
+2 | say nothing + 1
+FAIL corpus/faults-0012.rb
+Error: RuntimeError: Cannot index non-list
+  --> corpus/faults-0012.rb:2:1
+2 | say "abc"[0]
+FAIL corpus/faults-0013.rb
+Error: RuntimeError: Cannot index non-list
+  --> corpus/faults-0013.rb:2:1
+2 | say 1[0]
+FAIL corpus/faults-0014.rb
+Error: RuntimeError: Cannot add non-numbers
+  --> corpus/faults-0014.rb:2:5
+2 |     say 1 + "a"
+FAIL corpus/faults-0015.rb
+Error: RuntimeError: Division by zero
+  --> corpus/faults-0015.rb:2:9
+2 |         say 1 / 0
+FAIL corpus/faults-0016.rb
+Error: RuntimeError: Cannot add non-numbers
+  --> corpus/faults-0016.rb:4:1
+4 | say 1 + "a"
+FAIL corpus/faults-0017.rb
+Error: RuntimeError: Index 9 is out of bounds: length is 2, valid indexes are 0 to 1
+  --> corpus/faults-0017.rb:3:1
+3 | say xs[9]
+FAIL corpus/faults-0018.rb
+Error: RuntimeError: Cannot access property on non-object
+  --> corpus/faults-0018.rb:3:1
+3 | say r.missing.deep
+FAIL corpus/faults-0019.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/faults-0019.rb:2:1
+2 | say length(1)
+FAIL corpus/functions-0009.rb
+Error: RuntimeError: Maximum call depth of 1000 reached while calling 'count_down'
+  --> corpus/functions-0009.rb:5:10
+5 |     give back n + count_down(n - 1)
+FAIL corpus/functions-0010.rb
+Error: RuntimeError: Maximum call depth of 1000 reached while calling 'fact'
+  --> corpus/functions-0010.rb:5:10
+5 |     give back n * fact(n - 1)
+FAIL corpus/functions-0016.rb
+Error: RuntimeError: Unknown function 'no_such_function'
+  --> corpus/functions-0016.rb:4:1
+4 | say no_such_function()
+FAIL corpus/lists-0018.rb
+Error: RuntimeError: Index 9 is out of bounds: length is 3, valid indexes are 0 to 2
+  --> corpus/lists-0018.rb:2:1
+2 | say xs[9]
+FAIL corpus/lists-0019.rb
+Error: RuntimeError: Index 1 is out of bounds: length is 1, valid indexes are 0 to 0
+  --> corpus/lists-0019.rb:2:1
+2 | say xs[1]
+FAIL corpus/lists-0020.rb
+Error: RuntimeError: Index 0 is out of bounds: length is 0, the list is empty, so it has no valid index
+  --> corpus/lists-0020.rb:2:1
+2 | say xs[0]
+FAIL corpus/lists-0023.rb
+Error: RuntimeError: Index 3 is out of bounds: length is 3, valid indexes are 0 to 2
+  --> corpus/lists-0023.rb:2:1
+2 | say xs at 3
+FAIL corpus/lists-0024.rb
+Error: RuntimeError: Index -1 is out of bounds: length is 0, the list is empty, so it has no valid index
+  --> corpus/lists-0024.rb:2:1
+2 | say xs at -1
+FAIL corpus/lists-0026.rb
+Error: RuntimeError: Index 0.5 is out of bounds: a list index must be a whole number
+  --> corpus/lists-0026.rb:2:1
+2 | say xs at 0.5
+FAIL corpus/malformed-0001.rb
+Error: LexerError: Unterminated string
+  --> corpus/malformed-0001.rb:1:5
+1 | say "unterminated
+FAIL corpus/malformed-0002.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0002.rb:1:9
+1 | set x to
+FAIL corpus/malformed-0003.rb
+Error: ParserError: Expected variable name, found reserved word 'to'
+  --> corpus/malformed-0003.rb:1:5
+1 | set to 5
+FAIL corpus/malformed-0004.rb
+Error: ParserError: Expected 'to' but got Number(5.0)
+  --> corpus/malformed-0004.rb:1:7
+1 | set x 5
+FAIL corpus/malformed-0005.rb
+Error: ParserError: Unexpected token 'end'
+  --> corpus/malformed-0005.rb:2:1
+2 | end
+FAIL corpus/malformed-0006.rb
+Error: ParserError: Unexpected token 'end'
+  --> corpus/malformed-0006.rb:1:1
+1 | end
+FAIL corpus/malformed-0007.rb
+Error: ParserError: Expected 'end' but got Eof
+  --> corpus/malformed-0007.rb:3:1
+FAIL corpus/malformed-0008.rb
+Error: ParserError: Expected 'end' but got Eof
+  --> corpus/malformed-0008.rb:3:1
+FAIL corpus/malformed-0009.rb
+Error: ParserError: Expected 'end' but got Eof
+  --> corpus/malformed-0009.rb:3:1
+FAIL corpus/malformed-0010.rb
+Error: ParserError: Expected 'times' but got Newline
+  --> corpus/malformed-0010.rb:1:9
+1 | repeat 3
+FAIL corpus/malformed-0011.rb
+Error: ParserError: Expected RightParen but got Newline
+  --> corpus/malformed-0011.rb:1:11
+1 | say (1 + 2
+FAIL corpus/malformed-0012.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0012.rb:1:16
+1 | set xs to [1, 2
+FAIL corpus/malformed-0013.rb
+Error: ParserError: Expected field name
+  --> corpus/malformed-0013.rb:1:15
+1 | set r to {a: 1
+FAIL corpus/malformed-0014.rb
+Error: ParserError: Expected field name
+  --> corpus/malformed-0014.rb:1:11
+1 | set r to {1}
+FAIL corpus/malformed-0015.rb
+Error: ParserError: Unexpected token RightBrace
+  --> corpus/malformed-0015.rb:1:9
+1 | say {a: }
+FAIL corpus/malformed-0016.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0016.rb:1:4
+1 | say
+FAIL corpus/malformed-0017.rb
+Error: ParserError: Expected variable name, found reserved word 'in'
+  --> corpus/malformed-0017.rb:1:10
+1 | for each in [1]
+FAIL corpus/malformed-0018.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0018.rb:1:14
+1 | for each x in
+FAIL corpus/malformed-0019.rb
+Error: ParserError: Unexpected token 'times'
+  --> corpus/malformed-0019.rb:1:8
+1 | repeat times
+FAIL corpus/malformed-0020.rb
+Error: ParserError: Unexpected token RightBrace
+  --> corpus/malformed-0020.rb:1:7
+1 | say 1 }
+FAIL corpus/malformed-0021.rb
+Error: ParserError: Unexpected token 'is'
+  --> corpus/malformed-0021.rb:1:4
+1 | if is 1 then
+FAIL corpus/malformed-0022.rb
+Error: LexerError: Unexpected character '@'
+  --> corpus/malformed-0022.rb:1:5
+1 | say @
+FAIL corpus/malformed-0023.rb
+Error: ParserError: Unexpected token Equal
+  --> corpus/malformed-0023.rb:1:10
+1 | set x to = 5
+FAIL corpus/malformed-0024.rb
+Error: ParserError: Expected RightParen but got Newline
+  --> corpus/malformed-0024.rb:1:6
+1 | to f(
+FAIL corpus/malformed-0025.rb
+Error: ParserError: Unexpected token Equal
+  --> corpus/malformed-0025.rb:1:9
+1 | say 1 === 2
+FAIL corpus/malformed-0026.rb
+Error: ParserError: Unexpected token Greater
+  --> corpus/malformed-0026.rb:1:8
+1 | say 1 <> 2
+FAIL corpus/malformed-0027.rb
+Error: ParserError: Unexpected token 'from'
+  --> corpus/malformed-0027.rb:1:19
+1 | for each x in [1] from 2
+FAIL corpus/malformed-0028.rb
+Error: ParserError: Expected 'then' but got 'say'
+  --> corpus/malformed-0028.rb:2:5
+2 |     say 1
+FAIL corpus/malformed-0029.rb
+Error: ParserError: Expected 'then' but got 'end'
+  --> corpus/malformed-0029.rb:2:1
+2 | end
+FAIL corpus/malformed-0030.rb
+Error: ParserError: Expected RightBracket but got Newline
+  --> corpus/malformed-0030.rb:1:13
+1 | say [1, 2][0
+FAIL corpus/malformed-0031.rb
+Error: AnalyzerError: Unknown variable 'unknown_variable'
+  --> corpus/malformed-0031.rb:1:1
+1 | say unknown_variable
+FAIL corpus/malformed-0032.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0032.rb:2:8
+2 | say xs[
+FAIL corpus/malformed-0033.rb
+Error: ParserError: Expected object name
+  --> corpus/malformed-0033.rb:1:7
+1 | object
+FAIL corpus/malformed-0034.rb
+Error: ParserError: Expected field name after 'has'
+  --> corpus/malformed-0034.rb:2:8
+2 |     has
+FAIL corpus/malformed-0035.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0035.rb:1:8
+1 | say 1 +
+FAIL corpus/malformed-0036.rb
+Error: ParserError: Expected variable name, found reserved word 'to'
+  --> corpus/malformed-0036.rb:1:5
+1 | set to
+FAIL corpus/malformed-0037.rb
+Error: ParserError: Expected 'end' but got Eof
+  --> corpus/malformed-0037.rb:3:1
+FAIL corpus/malformed-0038.rb
+Error: ParserError: Unexpected token 'catch'
+  --> corpus/malformed-0038.rb:1:1
+1 | catch error
+FAIL corpus/malformed-0039.rb
+Error: ParserError: Expected module name
+  --> corpus/malformed-0039.rb:1:7
+1 | module
+FAIL corpus/malformed-0040.rb
+Error: ParserError: Unexpected token RightParen
+  --> corpus/malformed-0040.rb:1:5
+1 | say )
+FAIL corpus/malformed-0041.rb
+Error: ParserError: Expected function name
+  --> corpus/malformed-0041.rb:1:10
+1 | say 1 to 2
+FAIL corpus/malformed-0042.rb
+Error: ParserError: Expected RightParen but got Identifier("b")
+  --> corpus/malformed-0042.rb:1:8
+1 | to f(a b)
+FAIL corpus/malformed-0043.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0043.rb:1:7
+1 | unless
+FAIL corpus/malformed-0044.rb
+Error: ParserError: Unexpected token Newline
+  --> corpus/malformed-0044.rb:1:9
+1 | say 1 % 
+FAIL corpus/malformed-0045.rb
+Error: RuntimeError: Cannot index non-list
+  --> corpus/malformed-0045.rb:1:1
+1 | set xs to 1[0]
+FAIL corpus/nesting-0014.rb
+Error: RuntimeError: Maximum call depth of 1000 reached while calling 'nest'
+  --> corpus/nesting-0014.rb:5:10
+5 |     give back n + nest(n - 1)
+FAIL corpus/nesting-0015.rb
+Error: ParserError: Expected 'to' but got Equal
+  --> corpus/nesting-0015.rb:1:8
+1 | set xs = [1]
+FAIL corpus/numeric-boundary-0001.rb
+Error: RuntimeError: Division by zero
+  --> corpus/numeric-boundary-0001.rb:1:1
+1 | say 1 / 0
+FAIL corpus/numeric-boundary-0002.rb
+Error: RuntimeError: Division by zero
+  --> corpus/numeric-boundary-0002.rb:1:1
+1 | say 0 / 0
+FAIL corpus/numeric-boundary-0003.rb
+Error: RuntimeError: Modulo by zero
+  --> corpus/numeric-boundary-0003.rb:1:1
+1 | say 9 % 0
+FAIL corpus/numeric-boundary-0004.rb
+Error: RuntimeError: Division by zero
+  --> corpus/numeric-boundary-0004.rb:1:1
+1 | say 1 / -0.0
+FAIL corpus/objects-0003.rb
+Error: AnalyzerError: Unknown variable 'Tagged'
+  --> corpus/objects-0003.rb:4:1
+4 | say Tagged.tag
+FAIL corpus/objects-0009.rb
+Error: AnalyzerError: Unknown variable 'value'
+  --> corpus/objects-0009.rb:4:14
+4 |         give back value
+FAIL corpus/objects-0014.rb
+Error: AnalyzerError: Unknown variable 'Inner'
+  --> corpus/objects-0014.rb:7:1
+7 | say type_of(Inner)
+FAIL corpus/objects-0016.rb
+Error: RuntimeError: Object 'Base' is already declared
+  --> corpus/objects-0016.rb:4:1
+4 | object Base
+FAIL corpus/objects-0019.rb
+Error: RuntimeError: Unknown function 'upper'
+  --> corpus/objects-0019.rb:4:1
+4 | say upper(Named.name)
+FAIL corpus/objects-0022.rb
+Error: AnalyzerError: Unknown parent object 'Nothing'
+Unknown variable 'at'; did you mean 'as'?
+Unknown variable 'all'
+FAIL corpus/records-0001.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/records-0001.rb:3:1
+3 | say length(r)
+FAIL corpus/records-0002.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/records-0002.rb:3:1
+3 | say length(r)
+FAIL corpus/records-0012.rb
+Error: RuntimeError: Cannot index non-list
+  --> corpus/records-0012.rb:2:1
+2 | say r["a"]
+FAIL corpus/stdlib-0001.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/stdlib-0001.rb:1:1
+1 | say length(1)
+FAIL corpus/stdlib-0005.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/stdlib-0005.rb:1:1
+1 | say length({a: 1})
+FAIL corpus/stdlib-0006.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/stdlib-0006.rb:1:1
+1 | say length({})
+FAIL corpus/stdlib-0007.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/stdlib-0007.rb:1:1
+1 | say length(yes)
+FAIL corpus/stdlib-0017.rb
+Error: RuntimeError: length requires a list or text
+  --> corpus/stdlib-0017.rb:1:1
+1 | say length(nothing)
+FAIL corpus/text-ops-0006.rb
+Error: LexerError: Unterminated string
+  --> corpus/text-ops-0006.rb:1:9
+1 | say "\"""
+FAIL corpus/text-ops-0012.rb
+Error: RuntimeError: Cannot add non-numbers
+  --> corpus/text-ops-0012.rb:1:1
+1 | say 5 + "abc"
+modules/bootstrap/corpus failed: 99
+[0m
+[0m$ [0mgit diff --stat src/lexer.rs; git diff src/lexer.rs | head -80
+src/lexer.rs | 46 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 45 insertions(+), 1 deletion(-)
+diff --git a/src/lexer.rs b/src/lexer.rs
+index 6fe2d4f..a180702 100644
+--- a/src/lexer.rs
++++ b/src/lexer.rs
+@@ -315,6 +315,7 @@ impl Lexer {
+                 return Ok(text);
+             }
+             if c == '\\' {
++                let escape = Span::new(self.line, self.column);
+                 self.advance();
+                 match self.advance() {
+                     Some('n') => text.push('\n'),
+@@ -322,7 +323,13 @@ impl Lexer {
+                     Some('r') => text.push('\r'),
+                     Some('\\') => text.push('\\'),
+                     Some('"') => text.push('"'),
+-                    Some(c) => text.push(c),
++                    Some('u') => text.push(self.read_unicode_escape(escape)?),
++                    Some(other) => {
++                        return Err(Error::Lexer(
++                            format!("Unknown escape '\\{other}' in text"),
++                            escape,
++                        ))
++                    }
+                     None => return Err(self.unterminated(span)),
+                 }
+             } else {
+@@ -332,6 +339,43 @@ impl Lexer {
+         }
+     }
+ 
++    /// The character named by the four hex digits of a `\u` escape.
++    ///
++    /// The escape names one code point and nothing else. `docs/GRAMMAR.md:80`
++    /// says four `hex_digit`s, and that is exactly what it takes: a shorter run
++    /// is a typo, not a number to be padded out to four digits. Everything the
++    /// grammar does not spell out is refused rather than guessed at — the
++    /// catch-all that used to sit in `read_text` pushed only the first character
++    /// after the backslash, so `"\u00e9"` read as `u00e9` and a program written
++    /// in a language's own escape printed text nobody had written.
++    ///
++    /// `span` is the backslash, so the refusal points at the escape rather than
++    /// at the character four positions past it.
++    fn read_unicode_escape(&mut self, span: Span) -> Result<char> {
++        let mut value: u32 = 0;
++        for _ in 0..4 {
++            let Some(digit) = self.current().and_then(|c| c.to_digit(16)) else {
++                return Err(Error::Lexer(
++                    "Unicode escape needs four hex digits, such as \"\\u00e9\"".to_string(),
++                    span,
++                ));
++            };
++            value = value * 16 + digit;
++            self.advance();
++        }
++
++        // A half of a surrogate pair — `char::from_u32` refuses it because it
++        // names no character, and a lone surrogate has no UTF-8 encoding at all.
++        // Substituting the replacement character here would be the same silent
++        // rewrite this escape used to be, one level down.
++        char::from_u32(value).ok_or_else(|| {
++            Error::Lexer(
++                format!("Unicode escape \\u{value:04X} names no character of its own"),
++                span,
++            )
++        })
++    }
++
+     /// The failure for a string that ran to the end of input without closing.
+     ///
+     /// It spans from the opening quote to wherever the reading stopped, which for
+[0m
+[0m$ [0mcargo test 2>&1 | grep -E "test result" | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "cargo test (incl. doc-tests) passed:",p," failed:",f}'
+cargo test (incl. doc-tests) passed: 1582  failed: 0
+[0m
+Now REPORT.md and FINDINGS.md:
+[0m← [0mWrite phases/phase-085/REPORT.md
+Wrote file successfully.
+[0m
+[0m← [0mWrite phases/phase-085/FINDINGS.md
+Wrote file successfully.
+[0m
+[0m$ [0mcargo fmt --all -- --check && echo "1. fmt: pass"; cargo clippy --all-targets -- -D warnings 2>&1 | grep -cE "^(warning|error)"; echo "2. clippy: 0 diagnostics above"; cargo test --all-targets 2>&1 | grep -E "test result: FAILED|^failures:" | head -5; cargo test --all-targets 2>&1 | grep -E "test result" | awk -F'[ ;]' '{p+=$4; f+=$6} END {print "3. cargo test --all-targets: passed",p,"failed",f}'
+1. fmt: pass
+0
+2. clippy: 0 diagnostics above
+3. cargo test --all-targets: passed 1580 failed 0
+[0m
+[0m$ [0mgit status --short; echo "---"; git diff --stat
+M SPEC.md
+ M docs/GRAMMAR.md
+ M src/lexer.rs
+ M tests/doc_blocks_fragments.txt
+ M tests/doc_blocks_known_fail.txt
+ M tests/doc_blocks_runs.txt
+?? phases/phase-085/
+?? tests/unicode_escape_test.rs
+---
+ SPEC.md                         | 40 ++++++++++++++++++++++
+ docs/GRAMMAR.md                 |  6 ++++
+ src/lexer.rs                    | 46 ++++++++++++++++++++++++-
+ tests/doc_blocks_fragments.txt  | 65 +++++++++++++++++------------------
+ tests/doc_blocks_known_fail.txt | 14 ++++----
+ tests/doc_blocks_runs.txt       | 75 +++++++++++++++++++++--------------------
+ 6 files changed, 169 insertions(+), 77 deletions(-)
+[0m
+DONE
+
+**Reproduced** on `main` before touching anything: `say "\u00e9"` → `u00e9`, `say "A\u0042C"` → `Au0042C`, exit 0 both times.
+
+**Fixed** in `src/lexer.rs:317-374` — `read_text` now routes `\u` to a new `read_unicode_escape` (exactly four hex digits, `char::from_u32`), and the `Some(c) => text.push(c)` catch-all that dropped the backslash became a `LexerError`. A surrogate half is refused rather than replaced. Every refusal carries the backslash's line and column.
+
+**Tests**: `tests/unicode_escape_test.rs`, 23 `#[test]` (20 `edge_*`, 13 asserting refusals), each print assertion run on both the tree-walking and bytecode VMs and compared against a Rust literal, not just against each other.
+
+**Gates**: `cargo fmt --check` pass · `cargo clippy --all-targets -- -D warnings` pass · `cargo test --all-targets` 1580 passed 0 failed (1582 with doc-tests). `./rbops/verify.sh` **not run** — `rbops/` is not in this checkout and the prompt forbade inspecting the pipeline; its content was run by hand instead (all 7 examples and all modules exit 0, doc-block suite green, `rb run` and `rb compile`+`rb vm` both print `A` and `café`). Recorded honestly in `REPORT.md` and `FINDINGS.md` rather than claimed.
+
+Docs: `SPEC.md` gains an "Escapes in a text literal" section (classified into the doc-block data files, existing keys re-shifted); `docs/GRAMMAR.md:81` now states the escape set is closed.
+
+DONE
