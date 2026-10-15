@@ -741,10 +741,54 @@ TPL
   # --dir points the agent at the PROJECT checkout. Without it the agent runs in
   # the rbops repo, spends its whole budget looking for src/testing/harness.rs,
   # edits nothing, and its output is discarded.
-  run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" "$LOG_DIR/$phase.ctx" \
-      --dir "$PROJECT_DIR" --agent build --title "rbops-${phase}"
+# The attempt clock starts HERE, not at the top of the run: checkout, cache warm
+# and select are real minutes that are not the agent's, and charging them to the
+# budget is how a watchdog fires on an attempt that has barely begun.
+RBOPS_ATTEMPT_START="$(date +%s)"
+run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" "$LOG_DIR/$phase.ctx" \
+    --dir "$PROJECT_DIR" --agent build --title "rbops-${phase}"
 code=$?
 stop_checkpoint_loop
+
+# --- progress watchdog ------------------------------------------------------
+# An attempt can burn its whole budget and produce nothing, and the pipeline
+# learns that only at the end. Phase-053 read src/repl/ for 90 minutes and was
+# killed with a 0-byte patch. Phase-082 shipped correct code and wrote no tests
+# at all, failing the gate's mandatory quota three times over ~4.5 hours.
+#
+# This runs AFTER the agent exits, against the attempt's own base commit, and
+# only ends the attempt when there is nothing to gate. It never shortens a
+# budget: a phase that wrote its tests early keeps every remaining minute. If it
+# cannot read the project it says so and stays out of it, because a watchdog
+# that kills good work is worse than no watchdog.
+#
+# Diffed against $base and NOT against the worktree, because the agent is
+# allowed to commit its own work — a clean worktree after a commit is a finished
+# attempt, not an idle one.
+if [ ! -f "$RBOPS_ROOT/phases/.stop" ]; then
+  budget="${RBOPS_ATTEMPT_BUDGET_SECONDS:-5400}"
+  # When the attempt began. Recorded immediately before the agent call so the
+  # watchdog measures the attempt and not the run: select, checkout and warm-cache
+  # are all real time that is not the agent's.
+  elapsed=$(( $(date +%s) - ${RBOPS_ATTEMPT_START:-$(date +%s)} ))
+  [ "$elapsed" -lt 0 ] && elapsed=0
+  wd_out="$(RBOPS_PROJECT_DIR="$PROJECT_DIR" bash "$RBOPS_ROOT/rbops/progress_watchdog.sh" \
+              "$phase" "$base" "$elapsed" "$budget" 2>&1)"
+  wd_rc=$?
+  case "${wd_rc:-0}" in 0|10) ;; *) wd_rc=0 ;; esac
+  [ -n "$wd_out" ] && printf '%s\n' "$wd_out" | sed 's/^/  | /'
+  if [ "$wd_rc" -eq 10 ]; then
+    log "$phase attempt ended early by the progress watchdog — nothing to gate; no attempt consumed"
+    # Deliberately NOT .deferred: nothing was attempted, so this is not a
+    # deferral and must not consume the deferral budget either. The phase keeps
+    # its state and the next tick re-dispatches it fresh.
+    rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .deferred)" \
+          "$(marker "$phase" .deferred_attempts)"
+    touch "$(marker "$phase" .watchdog)"
+    return 1
+  fi
+  rm -f "$(marker "$phase" .watchdog)"
+fi
 
 # Harvest what the agent wrote. The agent's working directory is the PROJECT
 # checkout, so anything it wrote to a relative path - REPORT.md, FINDINGS.md -
