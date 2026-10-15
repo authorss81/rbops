@@ -1,0 +1,20 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting round-2 surface defects — reading the changed REPL files to verify the fixes.
+[0m→ [0mRead src/repl/banner.rs
+[0m→ [0mRead src/repl/mod.rs
+[0m→ [0mRead tests/repl_test.rs
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/repl/editor.rs
+First pass done — now digging into the remaining session logic and prompt handling.
+[0m→ [0mRead src/repl/mod.rs[90m [offset=1285][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=2688][0m
+[0m→ [0mRead src/repl/history.rs
+FINDINGS:
+1. [BLOCKER] src/repl/mod.rs:454 — piped `:prompt` stores a trailing newline in the history and in the prompt itself — `PlainSource::read_line` (src/repl/editor.rs:152) returns `Line::Text` with the `\n` still attached, and `session_loop` derives `typed = line.trim_start()` which keeps it; the verbatim path then records `typed` (src/repl/mod.rs:463) and dispatches it, and `ReplCommand::parse`'s verbatim arm (src/repl/commands.rs:448) keeps trailing whitespace including that `\n`, so `set_prompt_format` (src/repl/mod.rs:542) stores e.g. `"rb> \n"` and every later prompt prints an embedded newline while the history entry breaks the one-entry-per-line invariant (`save_to_file` then emits a stray blank line) — strip only trailing `\r\n` from `line` once in `session_loop` (or in `PlainSource`), keeping trailing spaces, before `trim_start`/dispatch/record.
+2. [MAJOR] src/repl/mod.rs:2487 — the `surface` unit tests cannot catch finding 1 because `ScriptedSource` feeds `Line::Text("...")` with no newline while production `PlainSource` (src/repl/editor.rs:152) yields newline-terminated text, so `edge_a_repeated_prompt_keeps_the_space_that_is_part_of_it` and the `:prompt` tests exercise a different input shape than the pipe the integration tests use — construct `ScriptedSource` lines with trailing `\n` (or add one piped `:prompt` case asserting the stored format/history entry has no `\n`).
+3. [MINOR] src/repl/mod.rs:130 — `check_prompt_format` only scans for `{` and never rejects a stray `}`, so `:prompt foo}` is accepted and rendered literally despite the closed-set claim in `PROMPT_PLACEHOLDERS` — reject a `}` with no matching `{` the same way an unclosed `{` is rejected.
+4. [MINOR] src/repl/mod.rs:506 — continuation prompts render as `..  2` with no trailing space while the primary prompt is `>>> ` with one, so typed text touches the digit interactively; the unit expectation at src/repl/mod.rs:2591 pins the inconsistency (`vec![">>> ", "..  2", "..  3", ">>> "]`) — render `format!("..  {} ", ...)` and update the pinned prompts.
+REVIEW VERDICT: FINDINGS 4
