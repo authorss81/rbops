@@ -1,0 +1,37 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · muse-spark-1.3-contributor-free
+[0m
+Hunting the remaining defects in the round-2 changes.
+[0m→ [0mRead src/interpreter.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead src/bytecode/codegen.rs
+I've mapped the new function-literal compilation; now I'll probe the error-message unification for gaps.
+[0m✱ [0mGrep "map_function|map_builtin|called_as|call_function"[90m in src · 22 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=80, offset=195][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=220, offset=1970][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=280, offset=2710][0m
+[0m✱ [0mGrep "fn call_named|fn call_user|fn start_map|fn advance_map"[90m in src/bytecode · 3 matches[0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=130, offset=2670][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=130, offset=2985][0m
+[0m✱ [0mGrep "FunctionLiteral|ANONYMOUS_FUNCTION"[90m in src · 14 matches[0m
+[0m→ [0mRead tests/doc_blocks_test.rs
+[0m→ [0mRead src/interpreter.rs[90m [limit=130, offset=1860][0m
+[0m→ [0mRead src/parser.rs[90m [limit=60, offset=60][0m
+The documentation gate only verifies compilation exits cleanly — now I'll check whether the compiled programs actually produce correct results.
+[0m→ [0mRead tests/method_map_test.rs
+[0m→ [0mRead tests/function_literal_test.rs
+[0m✱ [0mGrep "fn make_function|fn call_user_function"[90m in src · 3 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=130, offset=1200][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=130, offset=2300][0m
+[0m→ [0mRead tests/doc_blocks_runs.txt
+[0m→ [0mRead tests/doc_blocks_known_fail.txt
+[0m→ [0mRead tests/doc_blocks_fragments.txt
+[0m→ [0mRead tests/stdlib_module_names_test.rs
+[0m→ [0mRead tests/random_builtin_test.rs
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+FINDINGS:
+1. [MAJOR] tests/doc_blocks_test.rs:578 — RUNS gate asserts `rb compile` exits 0 but never runs `rb vm` on the artifact, so a literal lowering that compiles to the wrong answer still passes — why it matters: the phase claims the gate "now can see" a compile gap, but miscompilation (wrong captures, wrong value) is invisible to it — concrete fix: after `compiled.compiled` succeeds, run `rb vm <rbc>` and require exit 0 (and same stdout as `rb run`), or move the block to KNOWN-FAIL if the compiled run diverges.
+2. [MINOR] src/bytecode/codegen.rs:807 — `Expr::FunctionLiteral` builds its nested `Decl` with `span: Span::unknown()`, discarding even the enclosing statement `line` — why it matters: any error attributed to that `Decl` (notably the `depth > MAX_BLOCK_DEPTH` refusal in `Compiler::block`) loses line/column versus every named declaration which passes `stmt.span` — concrete fix: use `Span::new(line as usize, 1)` (or thread the literal's own span from the parser) instead of `Span::unknown()`.
+3. [MAJOR] src/interpreter.rs:2028 — unified `map_builtin`/`call_named` (src/bytecode/vm.rs:2722) claims all spellings agree for the missing-function row (`map(xs)` / `xs.map()` / `list.map(xs)`), but no test asks `list.map([1,2,3])` (module spelling, list supplied, function missing) on either engine — why it matters: `list.map` takes the `list_map` path through `call_named`, a different call site from flat `map` and method `xs.map`, so the unification's third spelling is an untested branch — concrete fix: add `edge_*` test asserting `both_errors("list.map([1,2,3])")` equals `map requires a function, but no argument was given` on both engines, alongside the existing `map([1,2,3])` and `xs.map()` assertions.
+REVIEW VERDICT: FINDINGS 3
