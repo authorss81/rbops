@@ -2,45 +2,836 @@
 [0m
 > build · muse-spark-1.3-contributor-free
 [0m
-Hunting the gaps behind the green gate — inspecting the dispatch.
+Hunting the still-broken paths in this green gate — verifying the map fallback and compile fixes.
 [0m→ [0mRead .
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead phases/phase-086/REPORT.md
-[0m→ [0mRead phases/phase-086/FINDINGS.md
-The phase report leans on prior work — now digging into the implementation itself.
-[0m→ [0mRead src/stdlib.rs[90m [offset=190, limit=60][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2060, limit=110][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2765, limit=110][0m
-[0m✱ [0mGrep "apply_map|start_map|MAX_CALL_DEPTH|call_depth"[90m in src · 62 matches[0m
-[0m→ [0mRead SPEC.md[90m [offset=635, limit=40][0m
+[0m
+[0m$ [0mgit log --oneline -20; echo ---; git status --short | head -n 100
+d484de2 rbops: phase-086 (2026-10-15T03:32:40Z)
+a721434 resume phase-086: adopt preserved work
+e4197f4 rbops: phase-085 (2026-10-14T22:40:58Z)
+64390ff rbops: phase-083 (2026-10-14T14:07:09Z)
+ae2ad78 rbops: phase-081 (2026-10-14T09:16:08Z)
+d90f42d rbops: phase-080 (2026-10-14T07:33:01Z)
+c8156ab rbops: phase-078 (2026-10-14T03:04:44Z)
+3fbf739 rbops: phase-078 audit the checkpoint ancestry of main instead of commenting on it
+c7eb320 ci: add cargo fmt --check, and correct the false claim that kept it out
+303467e record 093 as done, with the trigger split abandoned rather than deferred
+4672f75 Record phase 092 and 093 by hand, with the measured result and the part left undone
+589d8ca ci: fix a workflow expression that made the whole build unparseable
+d1380a4 ci: shard the test suite so a phase is not gated on one target
+57aea5e rbops: phase-052 (2026-10-13T05:59:57Z)
+d410ea8 REPL module completion reads the language's own module table
+7395c24 rbops: phase-050 (2026-10-12T21:46:56Z)
+10f9750 resume phase-050: adopt preserved work
+feee5a4 rbops: phase-048 (2026-10-12T20:11:11Z)
+e26659d resume phase-048: adopt preserved work
+5a0e54a rbops: phase-049 (2026-10-12T02:03:47Z)
+---
+[0m
+[0m$ [0mgit show --stat HEAD; echo ===; git show --name-only HEAD | head -n 50
+commit d484de2206a08efa6c4ce442f29a9cbcd2cf0b9e
+Author: rbops-bot <rbops-bot@users.noreply.github.com>
+Date:   Thu Oct 15 03:32:40 2026 +0000
+
+    rbops: phase-086 (2026-10-15T03:32:40Z)
+
+ phases/phase-086/FINDINGS.md      | 120 +++++++++++++++++
+ phases/phase-086/REPORT.md        | 216 +++++++++++++++++++++++++++++++
+ src/bytecode/codegen.rs           | 119 ++++++++++-------
+ src/bytecode/vm.rs                |  33 ++++-
+ src/interpreter.rs                |  13 +-
+ tests/doc_blocks_fragments.txt    |   2 +-
+ tests/doc_blocks_known_fail.txt   |   2 +-
+ tests/doc_blocks_runs.txt         |  10 +-
+ tests/doc_blocks_test.rs          |  78 +++++++++++-
+ tests/function_literal_test.rs    | 262 +++++++++++++++++++++++++++++++++++++-
+ tests/method_map_test.rs          | 103 +++++++++++----
+ tests/random_builtin_test.rs      |   7 +-
+ tests/stdlib_module_names_test.rs |   6 +-
+ tests/unreviewed_work_ack_test.rs |   1 +
+ 14 files changed, 880 insertions(+), 92 deletions(-)
+===
+commit d484de2206a08efa6c4ce442f29a9cbcd2cf0b9e
+Author: rbops-bot <rbops-bot@users.noreply.github.com>
+Date:   Thu Oct 15 03:32:40 2026 +0000
+
+    rbops: phase-086 (2026-10-15T03:32:40Z)
+
+phases/phase-086/FINDINGS.md
+phases/phase-086/REPORT.md
+src/bytecode/codegen.rs
+src/bytecode/vm.rs
+src/interpreter.rs
+tests/doc_blocks_fragments.txt
+tests/doc_blocks_known_fail.txt
+tests/doc_blocks_runs.txt
+tests/doc_blocks_test.rs
+tests/function_literal_test.rs
+tests/method_map_test.rs
+tests/random_builtin_test.rs
+tests/stdlib_module_names_test.rs
+tests/unreviewed_work_ack_test.rs
+[0m
+[0m$ [0mgit show HEAD -- src/interpreter.rs src/bytecode/vm.rs src/stdlib.rs src/bytecode/codegen.rs | head -n 600
+commit d484de2206a08efa6c4ce442f29a9cbcd2cf0b9e
+Author: rbops-bot <rbops-bot@users.noreply.github.com>
+Date:   Thu Oct 15 03:32:40 2026 +0000
+
+    rbops: phase-086 (2026-10-15T03:32:40Z)
+
+diff --git a/src/bytecode/codegen.rs b/src/bytecode/codegen.rs
+index 60be75c..2c6ad28 100644
+--- a/src/bytecode/codegen.rs
++++ b/src/bytecode/codegen.rs
+@@ -13,6 +13,7 @@
+ use indexmap::IndexMap;
+ 
+ use crate::error::{Error, Result, Span};
++use crate::interpreter::ANONYMOUS_FUNCTION;
+ use crate::parser::{BinaryOp, Expr, Program, Statement, Stmt, UnaryOp};
+ 
+ use crate::bytecode::format::{Block, BlockKind, Chunk, Constant, Instruction, MAX_BLOCK_DEPTH};
+@@ -247,15 +248,15 @@ impl Compiler {
+ 
+         match &stmt.statement {
+             Statement::Say(expr) => {
+-                self.expr(expr, code, line)?;
++                self.expr(expr, code, blocks, depth, line)?;
+                 emit(code, Opcode::Say, 0, 0, line);
+             }
+             Statement::Print(expr) => {
+-                self.expr(expr, code, line)?;
++                self.expr(expr, code, blocks, depth, line)?;
+                 emit(code, Opcode::Print, 0, 0, line);
+             }
+             Statement::Expr(expr) => {
+-                self.expr(expr, code, line)?;
++                self.expr(expr, code, blocks, depth, line)?;
+                 // A block whose value nobody reads is a statement, and a
+                 // statement consumes what it produced; `POP` is how the file
+                 // says so.
+@@ -271,7 +272,7 @@ impl Compiler {
+                 }
+             }
+             Statement::Set { name, value } => {
+-                self.expr(value, code, line)?;
++                self.expr(value, code, blocks, depth, line)?;
+                 let name = self.text(name);
+                 emit(code, Opcode::Store, name, 0, line);
+             }
+@@ -281,7 +282,7 @@ impl Compiler {
+             // tree-walking VM refuses at runtime and what `DECLARE_CONST`
+             // declares in the file.
+             Statement::Constant { name, value } => {
+-                self.expr(value, code, line)?;
++                self.expr(value, code, blocks, depth, line)?;
+                 let name = self.text(name);
+                 emit(code, Opcode::DeclareConst, name, 0, line);
+             }
+@@ -292,7 +293,7 @@ impl Compiler {
+             } => {
+                 let object = self.text(object_name);
+                 emit(code, Opcode::Load, object, 0, line);
+-                self.expr(value, code, line)?;
++                self.expr(value, code, blocks, depth, line)?;
+                 let target = self.text(&format!("{object_name}.{property}"));
+                 emit(code, Opcode::SetProperty, target, 0, line);
+             }
+@@ -301,7 +302,7 @@ impl Compiler {
+                 then_branch,
+                 else_branch,
+             } => {
+-                self.expr(condition, code, line)?;
++                self.expr(condition, code, blocks, depth, line)?;
+                 // The `end` of an `if` with no `else` is where a false
+                 // condition lands, so there is one jump either way.
+                 let to_else = jump(code, Opcode::JumpIfFalse, line);
+@@ -331,7 +332,7 @@ impl Compiler {
+                 }
+             }
+             Statement::Unless { condition, body } => {
+-                self.expr(condition, code, line)?;
++                self.expr(condition, code, blocks, depth, line)?;
+                 // There is no `JumpIfTrue`, so the condition is negated and the
+                 // existing jump runs the body exactly when it was false. The
+                 // `end` of a one-branch block is that jump's landing pad.
+@@ -345,7 +346,7 @@ impl Compiler {
+                 iterable,
+                 body,
+             } => {
+-                self.expr(iterable, code, line)?;
++                self.expr(iterable, code, blocks, depth, line)?;
+                 emit(code, Opcode::GetIter, 0, 0, line);
+                 let top = code.len() as u32;
+                 let variable = self.text(variable);
+@@ -360,11 +361,11 @@ impl Compiler {
+                 step,
+                 body,
+             } => {
+-                self.expr(start, code, line)?;
+-                self.expr(end, code, line)?;
++                self.expr(start, code, blocks, depth, line)?;
++                self.expr(end, code, blocks, depth, line)?;
+                 let arity = match step {
+                     Some(step) => {
+-                        self.expr(step, code, line)?;
++                        self.expr(step, code, blocks, depth, line)?;
+                         3
+                     }
+                     None => 2,
+@@ -377,7 +378,7 @@ impl Compiler {
+                 emit(code, Opcode::Jump, top, 0, line);
+             }
+             Statement::Repeat { count, body } => {
+-                self.expr(count, code, line)?;
++                self.expr(count, code, blocks, depth, line)?;
+                 emit(code, Opcode::GetRange, 0, 1, line);
+                 let top = code.len() as u32;
+                 let counter = self.text(REPEAT_COUNTER);
+@@ -387,7 +388,7 @@ impl Compiler {
+             }
+             Statement::While { condition, body } => {
+                 let top = code.len() as u32;
+-                self.expr(condition, code, line)?;
++                self.expr(condition, code, blocks, depth, line)?;
+                 let to_end = jump(code, Opcode::JumpIfFalse, line);
+                 self.statements(body, code, blocks, depth, false, BodyKind::Statements)?;
+                 emit(code, Opcode::Jump, top, 0, line);
+@@ -411,14 +412,14 @@ impl Compiler {
+                 // compiled with the condition's own line and a failure in the
+                 // condition is reported where it was written.
+                 let condition_line = condition_span.line as u32;
+-                self.expr(condition, code, condition_line)?;
++                self.expr(condition, code, blocks, depth, condition_line)?;
+                 emit(code, Opcode::JumpIfFalse, top, 0, condition_line);
+             }
+             Statement::Break => emit(code, Opcode::Break, 0, 0, line),
+             Statement::Skip => emit(code, Opcode::Skip, 0, 0, line),
+             Statement::Return(expr) | Statement::GiveBack(expr) => {
+                 match expr {
+-                    Some(expr) => self.expr(expr, code, line)?,
++                    Some(expr) => self.expr(expr, code, blocks, depth, line)?,
+                     None => {
+                         let nothing = self.constant(Constant::Nothing);
+                         emit(code, Opcode::PushConst, nothing, 0, line);
+@@ -465,7 +466,7 @@ impl Compiler {
+                 // no `default` is initialised to `nothing`, which is what the
+                 // tree-walking VM gives it.
+                 match default {
+-                    Some(expr) => self.expr(expr, code, line)?,
++                    Some(expr) => self.expr(expr, code, blocks, depth, line)?,
+                     None => {
+                         let nothing = self.constant(Constant::Nothing);
+                         emit(code, Opcode::PushConst, nothing, 0, line);
+@@ -649,7 +650,21 @@ impl Compiler {
+         Ok(())
+     }
+ 
+-    fn expr(&mut self, expr: &Expr, code: &mut Vec<Instruction>, line: u32) -> Result<()> {
++    /// Compiles one expression into `code`.
++    ///
++    /// `blocks` is the enclosing block's own list of nested declarations and
++    /// `depth` is how many blocks deep it sits; both are threaded here because
++    /// an expression can be a *function literal*, which is a declaration that
++    /// happens to be written where a value goes. Everything else in the
++    /// expression grammar is a value already and needs neither.
++    fn expr(
++        &mut self,
++        expr: &Expr,
++        code: &mut Vec<Instruction>,
++        blocks: &mut Vec<Block>,
++        depth: usize,
++        line: u32,
++    ) -> Result<()> {
+         match expr {
+             Expr::Number(n) => {
+                 let index = self.constant(Constant::Number(*n));
+@@ -672,12 +687,12 @@ impl Compiler {
+                 emit(code, Opcode::Load, name, 0, line);
+             }
+             Expr::Binary { op, left, right } => {
+-                self.expr(left, code, line)?;
+-                self.expr(right, code, line)?;
++                self.expr(left, code, blocks, depth, line)?;
++                self.expr(right, code, blocks, depth, line)?;
+                 emit(code, binary_opcode(op), 0, 0, line);
+             }
+             Expr::Unary { op, expr: inner } => {
+-                self.expr(inner, code, line)?;
++                self.expr(inner, code, blocks, depth, line)?;
+                 emit(
+                     code,
+                     match op {
+@@ -691,7 +706,7 @@ impl Compiler {
+             }
+             Expr::Call { name, args } => {
+                 for arg in args {
+-                    self.expr(arg, code, line)?;
++                    self.expr(arg, code, blocks, depth, line)?;
+                 }
+                 let name = self.text(name);
+                 emit(code, Opcode::Call, name, args.len() as u32, line);
+@@ -708,33 +723,33 @@ impl Compiler {
+                 // never a variable. A receiver that is an expression is loaded,
+                 // because the value is what says whether it is an object at all.
+                 if !matches!(receiver.as_ref(), Expr::Variable(_)) {
+-                    self.expr(receiver, code, line)?;
++                    self.expr(receiver, code, blocks, depth, line)?;
+                 }
+                 for arg in args {
+-                    self.expr(arg, code, line)?;
++                    self.expr(arg, code, blocks, depth, line)?;
+                 }
+                 let name = self.method_name(receiver, method);
+                 emit(code, Opcode::CallMethod, name, args.len() as u32, line);
+             }
+             Expr::Property { object, property } => {
+-                self.expr(object, code, line)?;
++                self.expr(object, code, blocks, depth, line)?;
+                 let property = self.text(property);
+                 emit(code, Opcode::LoadProperty, property, 0, line);
+             }
+             Expr::Index { object, index } => {
+-                self.expr(object, code, line)?;
+-                self.expr(index, code, line)?;
++                self.expr(object, code, blocks, depth, line)?;
++                self.expr(index, code, blocks, depth, line)?;
+                 emit(code, Opcode::Index, 0, 0, line);
+             }
+             Expr::InterpolatedText(parts) => {
+                 for part in parts {
+-                    self.expr(part, code, line)?;
++                    self.expr(part, code, blocks, depth, line)?;
+                 }
+                 emit(code, Opcode::BuildText, parts.len() as u32, 0, line);
+             }
+             Expr::List(items) => {
+                 for item in items {
+-                    self.expr(item, code, line)?;
++                    self.expr(item, code, blocks, depth, line)?;
+                 }
+                 emit(code, Opcode::BuildList, items.len() as u32, 0, line);
+             }
+@@ -742,13 +757,13 @@ impl Compiler {
+                 for (key, value) in fields {
+                     let key = self.text(key);
+                     emit(code, Opcode::PushConst, key, 0, line);
+-                    self.expr(value, code, line)?;
++                    self.expr(value, code, blocks, depth, line)?;
+                 }
+                 emit(code, Opcode::BuildRecord, fields.len() as u32, 0, line);
+             }
+             Expr::Expect { actual, expected } => {
+-                self.expr(actual, code, line)?;
+-                self.expr(expected, code, line)?;
++                self.expr(actual, code, blocks, depth, line)?;
++                self.expr(expected, code, blocks, depth, line)?;
+                 emit(code, Opcode::Expect, 0, 0, line);
+             }
+             // `might fail <call>`: a guard, the call, the marker that takes the
+@@ -760,7 +775,7 @@ impl Compiler {
+             // because it is one instruction and needs none of a frame's scope.
+             Expr::MightFail(inner) => {
+                 let guard = jump(code, Opcode::MightFail, line);
+-                self.expr(inner, code, line)?;
++                self.expr(inner, code, blocks, depth, line)?;
+                 emit(code, Opcode::Nop, MIGHT_FAIL_END_MARKER, 0, line);
+                 let over = jump(code, Opcode::Jump, line);
+                 let recovery = code.len() as u32;
+@@ -769,18 +784,32 @@ impl Compiler {
+                 patch_here(code, over);
+                 patch(code, guard, recovery);
+             }
+-            // A literal needs a block of its own, and a block is compiled by the
+-            // statement path: `expr` has no block pool to add one to. Rather
+-            // than compile a literal to something the bytecode VM would read
+-            // differently from the tree-walker, `rb compile` refuses it and says
+-            // which runner can. See FINDINGS.md.
+-            Expr::FunctionLiteral { .. } => {
+-                return Err(Error::Parser(
+-                    "`to (x) ... end` as an expression is not compiled yet; run \
+-                     programs that use one with `rb run`"
+-                        .to_string(),
+-                    Span::unknown(),
+-                ));
++            // A literal is a declaration written where a value goes, so it
++            // compiles to a block of its own and leaves the closure it names on
++            // the stack — which is exactly what the enclosing expression wants
++            // to read. `DEF_FUNCTION` pushes and the `STORE` that follows it in
++            // the statement path is the only thing that pops: a literal has no
++            // name to bind, so nothing follows, and the closure *is* the value.
++            //
++            // The block is named [`ANONYMOUS_FUNCTION`] and has the kind of a
++            // function, so a call-depth failure reached through one reports the
++            // same name the tree-walking VM reports. Both spellings SPEC.md
++            // gives a literal — the one-line `to (x) give back x * 2` and the
++            // block closed by its own `end` — arrive here as this one node.
++            Expr::FunctionLiteral { params, body } => {
++                let block = self.nested(
++                    Decl {
++                        kind: BlockKind::Function,
++                        name: ANONYMOUS_FUNCTION,
++                        arity: params.len(),
++                        params,
++                        body,
++                        span: Span::unknown(),
++                    },
++                    depth,
++                    blocks,
++                )?;
++                emit(code, Opcode::DefFunction, block, params.len() as u32, line);
+             }
+         }
+ 
+diff --git a/src/bytecode/vm.rs b/src/bytecode/vm.rs
+index 4527b6a..7571215 100644
+--- a/src/bytecode/vm.rs
++++ b/src/bytecode/vm.rs
+@@ -2720,13 +2720,16 @@ impl BytecodeVm {
+         // error. The tree-walking VM excludes the same two names before its own
+         // call into `stdlib::builtin`; see [`crate::interpreter::Vm::call`].
+         if matches!(name, "map" | "list_map") {
+-            let [Value::List(items), Value::Function(function)] = args else {
++            let [Value::List(items), rest @ ..] = args else {
+                 return Err(Error::Runtime(
+                     "map requires a list and a function".to_string(),
+                     self.span(),
+                 ));
+             };
+-            self.start_map(frame, items.clone(), function.clone())?;
++            let function = crate::stdlib::map_function(rest)
++                .map_err(|message| Error::Runtime(message, self.span()))?
++                .clone();
++            self.start_map(frame, items.clone(), function)?;
+             self.advance(frame);
+             return Ok(());
+         }
+@@ -2739,7 +2742,7 @@ impl BytecodeVm {
+         }
+         match self.get_var(name) {
+             Some(Value::Function(function)) => {
+-                self.call_function(&function, args, None)?;
++                self.call_function(name, &function, args, None)?;
+                 self.advance(frame);
+                 Ok(())
+             }
+@@ -2874,7 +2877,7 @@ impl BytecodeVm {
+         // `this` is bound below the callee's captured scopes and its parameters,
+         // so a parameter named `this` shadows the receiver the way it shadows a
+         // captured binding in the tree-walking VM.
+-        self.call_function(&function, &args, receiver)?;
++        self.call_function(method, &function, &args, receiver)?;
+         self.advance(frame);
+         Ok(())
+     }
+@@ -2917,7 +2920,12 @@ impl BytecodeVm {
+             mapped: Vec::new(),
+             function: function.clone(),
+         });
+-        self.call_function(&function, std::slice::from_ref(&first), None)
++        self.call_function(
++            &function.name,
++            &function,
++            std::slice::from_ref(&first),
++            None,
++        )
+     }
+ 
+     /// Carries the finished callee's `value` on to the `map` `frame` started.
+@@ -2935,12 +2943,23 @@ impl BytecodeVm {
+         let next = map.items[map.next].clone();
+         map.next += 1;
+         let function = map.function.clone();
+-        self.call_function(&function, std::slice::from_ref(&next), None)
++        self.call_function(&function.name, &function, std::slice::from_ref(&next), None)
+     }
+ 
+     /// Runs a closure's block, binding `args` to its parameters.
++    ///
++    /// `called_as` is the name the call site spelled, and it is what a call-depth
++    /// failure reports rather than `function.name`. The two are the same for
++    /// every named declaration, and differ for exactly one shape: a function
++    /// *literal*, whose declaration name is [`crate::interpreter::ANONYMOUS_FUNCTION`]
++    /// whichever name it is bound to. `set loop to to (n) … end` then recursing
++    /// on `loop` is the tree-walking VM's `Vm::call_user_function`, which is
++    /// given the call-site name; naming the declaration here would have the
++    /// compiled engine say `anonymous function` for a program the other engine
++    /// reports under `loop`.
+     fn call_function(
+         &mut self,
++        called_as: &str,
+         function: &FunctionValue,
+         args: &[Value],
+         this: Option<Value>,
+@@ -2958,7 +2977,7 @@ impl BytecodeVm {
+             return Err(Error::Limit(
+                 format!(
+                     "Maximum call depth of {} reached while calling '{}'",
+-                    self.max_call_depth, function.name
++                    self.max_call_depth, called_as
+                 ),
+                 self.span(),
+             ));
+diff --git a/src/interpreter.rs b/src/interpreter.rs
+index 6c87148..2d1901b 100644
+--- a/src/interpreter.rs
++++ b/src/interpreter.rs
+@@ -2017,14 +2017,25 @@ impl Vm {
+     /// budget. The function runs once per element in order and its result
+     /// becomes the mapped element; a failure inside it fails the whole call,
+     /// with the depth released as `call_user_function` releases it.
++    ///
++    /// The list is the receiver and is matched here; the function is the
++    /// argument and is left to [`stdlib::map_function`], which is also what the
++    /// method spelling asks. One operation has one wording: `map(xs, 5)` and
++    /// `xs.map(5)` both name the `5`, and `map(xs, f, extra)` says how many
++    /// arguments it was given instead of only that the shape was wrong. Only a
++    /// first argument that is not a list is refused here, because that is the
++    /// receiver and no argument check could describe it.
+     fn map_builtin(&mut self, args: &[Value]) -> Result<Value> {
+-        let [Value::List(items), Value::Function(function)] = args else {
++        let [Value::List(items), rest @ ..] = args else {
+             return Err(Error::Runtime(
+                 "map requires a list and a function".to_string(),
+                 self.span(),
+             ));
+         };
+ 
++        let function =
++            stdlib::map_function(rest).map_err(|message| Error::Runtime(message, self.span()))?;
++
+         self.apply_map(items, function)
+     }
+[0m
+[0m$ [0mgit show HEAD -- src/stdlib.rs src/interpreter.rs src/bytecode/vm.rs tests/method_map_test.rs tests/doc_blocks_test.rs tests/function_literal_test.rs | wc -l; git show HEAD --stat
+653
+commit d484de2206a08efa6c4ce442f29a9cbcd2cf0b9e
+Author: rbops-bot <rbops-bot@users.noreply.github.com>
+Date:   Thu Oct 15 03:32:40 2026 +0000
+
+    rbops: phase-086 (2026-10-15T03:32:40Z)
+
+ phases/phase-086/FINDINGS.md      | 120 +++++++++++++++++
+ phases/phase-086/REPORT.md        | 216 +++++++++++++++++++++++++++++++
+ src/bytecode/codegen.rs           | 119 ++++++++++-------
+ src/bytecode/vm.rs                |  33 ++++-
+ src/interpreter.rs                |  13 +-
+ tests/doc_blocks_fragments.txt    |   2 +-
+ tests/doc_blocks_known_fail.txt   |   2 +-
+ tests/doc_blocks_runs.txt         |  10 +-
+ tests/doc_blocks_test.rs          |  78 +++++++++++-
+ tests/function_literal_test.rs    | 262 +++++++++++++++++++++++++++++++++++++-
+ tests/method_map_test.rs          | 103 +++++++++++----
+ tests/random_builtin_test.rs      |   7 +-
+ tests/stdlib_module_names_test.rs |   6 +-
+ tests/unreviewed_work_ack_test.rs |   1 +
+ 14 files changed, 880 insertions(+), 92 deletions(-)
+[0m
+[0m$ [0mgit show HEAD -- src/stdlib.rs tests/method_map_test.rs tests/doc_blocks_test.rs | head -n 800
+commit d484de2206a08efa6c4ce442f29a9cbcd2cf0b9e
+Author: rbops-bot <rbops-bot@users.noreply.github.com>
+Date:   Thu Oct 15 03:32:40 2026 +0000
+
+    rbops: phase-086 (2026-10-15T03:32:40Z)
+
+diff --git a/tests/doc_blocks_test.rs b/tests/doc_blocks_test.rs
+index 3f87834..7124a59 100644
+--- a/tests/doc_blocks_test.rs
++++ b/tests/doc_blocks_test.rs
+@@ -18,7 +18,18 @@
+ //! - `doc_blocks_known_fail.txt` — executed, exited non-zero, and the exact
+ //!   first line of stderr is recorded.
+ //!
+-//! All three are checked in, and a block in none of them fails the suite, so
++//! **A RUNS block has to compile as well as run.** `rb run` reads the
++//! tree-walking engine and nothing else, so before `compile_block` existed a
++//! block could be listed here as working documentation while `rb compile`
++//! refused it outright — and `SPEC.md:647`, the program the specification uses
++//! to introduce function values, sat in that file for a whole phase with
++//! `rb compile` stopping on it with "`to (x) ... end` as an expression is not
++//! compiled yet". Every gate was green and the headline example still could
++//! not be compiled. RUNS now means `rb run` exits 0 **and** `rb compile`
++//! exits 0; the compiler lowers a function literal now, and
++//! `tests/function_literal_test.rs` is where that is pinned.
++//!
++//! All three lists are checked in, and a block in none of them fails the suite, so
+ //! none of the lists can rot: adding a block to a document without classifying
+ //! it fails here, and so does deleting one — the extracted count is pinned, and
+ //! the entry would point at a block that is no longer there.
+@@ -237,6 +248,58 @@ fn scratch(tag: &str) -> PathBuf {
+     dir
+ }
+ 
++/// What `rb compile` produced for one block.
++#[derive(Clone, Debug)]
++struct Compiled {
++    compiled: bool,
++    first_error_line: String,
++}
++
++/// Compiles `block` with `rb compile`, the same way [`run_block`] runs it, and
++/// reports whether a `.rbc` was written at all.
++///
++/// `rb run` only ever reads the tree-walking engine, so a block in the RUNS
++/// bucket could be listed as working documentation while `rb compile` refused
++/// it outright — and that is not a hypothetical: `SPEC.md:647`, the program the
++/// specification uses to introduce function values, was in this file for a
++/// whole phase while `rb compile` stopped on it with `` `to (x) ... end` as an
++/// expression is not compiled yet ``, a limitation no other check in the suite
++/// could see. The classification said "runs", so every gate was green and the
++/// specification's headline example still could not be compiled.
++///
++/// So a RUNS block has to be *both* runnable and compilable, and this is the
++/// half that was missing. It checks that the compile succeeds and nothing more:
++/// whether the compiled program then *answers* the same thing is what
++/// `tests/differential_test.rs` is for, and a block can legitimately differ
++/// there for reasons recorded in `phases/` rather than in a bucket here.
++fn compile_block(tag: &str, key: &str, block: &Block) -> Compiled {
++    let file = root().join(format!("docblocks-{tag}.tmp"));
++    fs::write(&file, block.source()).unwrap_or_else(|error| panic!("{}: {error}", file.display()));
++    let dir = scratch(tag);
++
++    let output = Command::new(env!("CARGO_BIN_EXE_rb"))
++        .arg("compile")
++        .arg(&file)
++        .arg("-o")
++        .arg(dir.join(format!("{tag}.rbc")))
++        .current_dir(&dir)
++        .stdin(std::process::Stdio::null())
++        .output()
++        .unwrap_or_else(|error| panic!("rb compile {key}: {error}"));
++
++    let _ = fs::remove_file(&file);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    Compiled {
++        compiled: output.status.success(),
++        first_error_line: stderr
++            .lines()
++            .find(|line| line.trim_start().starts_with("Error"))
++            .unwrap_or("")
++            .trim()
++            .to_string(),
++    }
++}
++
+ /// What running one block produced.
+ #[derive(Clone, Debug)]
+ struct Outcome {
+@@ -512,6 +575,19 @@ fn running_every_block_agrees_with_the_bucket_it_is_in() {
+                      body:\n{}",
+                     outcome.first_error_line, block.body
+                 );
++                let compiled = compile_block("agrees-compile", key, block);
++                assert!(
++                    compiled.compiled,
++                    "{key} is classified RUNS and `rb compile` refused it.\n\
++                     first error line: {}\n\
++                     body:\n{}\n\
++                     A RUNS block is a program `rb` runs *and* compiles. Either \
++                     the compiler cannot lower this program yet — in which case \
++                     that is the gap to fix and not this list to edit — or it \
++                     belongs in the fragment file with the reason it is not a \
++                     program.",
++                    compiled.first_error_line, block.body
++                );
+                 ran += 1;
+             }
+             // FRAGMENT: the suite does not execute it. The reason is checked
+diff --git a/tests/method_map_test.rs b/tests/method_map_test.rs
+index 59e08d2..680da0e 100644
+--- a/tests/method_map_test.rs
++++ b/tests/method_map_test.rs
+@@ -138,22 +138,25 @@ const DOUBLE: &str = "to double(x)\n    give back x * 2\nend\n";
+ /// values does not run, which is the whole finding. The example ends in `say`,
+ /// so what it answers is the line it printed rather than a value.
+ ///
+-/// The compiled half uses the **block form** of the same declaration rather
+-/// than the literal `set double to to (x) …`. That is a standing limit of the
+-/// bytecode compiler and not of this fix: a function *literal* is refused by
+-/// `compile_source` as "not compiled yet" (see `phases/phase-086/FINDINGS.md`),
+-/// so `rb compile` cannot be handed the literal form at all. The block form is
+-/// the other of the two spellings SPEC.md gives for the same value, so what is
+-/// being checked on the compiled engine is the same call with the same receiver.
++/// The compiled half is SPEC.md's example **verbatim** — literal and all.
++///
++/// It used to run the block form of the same declaration on this half, because
++/// `compile_source` refused a function *literal*. It does not any more: a
++/// literal is a declaration written where a value goes, so `codegen` compiles
++/// it to a block of its own and leaves the closure on the stack, which is what
++/// `DEF_FUNCTION` already does for `to double(x) … end`. A test that ran the
++/// block form here was checking a different program from the one SPEC.md
++/// prints, and the gap it papered over was reachable from the specification's
++/// own headline example.
+ #[test]
+ fn edge_the_specification_example_of_a_first_class_function_runs() {
+-    let literal = "set double to to (x) give back x * 2\n\
+-                   \n\
+-                   set numbers to [1, 2, 3]\n\
+-                   set doubled to numbers.map(double)\n\
+-                   say doubled\n";
++    let source = "set double to to (x) give back x * 2\n\
++                  \n\
++                  set numbers to [1, 2, 3]\n\
++                  set doubled to numbers.map(double)\n\
++                  say doubled\n";
+ 
+-    let tokens = redblue::lexer::Lexer::tokenize(literal).expect("SPEC.md's example should lex");
++    let tokens = redblue::lexer::Lexer::tokenize(source).expect("SPEC.md's example should lex");
+     let ast = redblue::parser::parse(tokens).expect("it should parse");
+     let (mut vm, result) = redblue::run_isolated(&ast);
+     assert_eq!(
+@@ -171,16 +174,11 @@ fn edge_the_specification_example_of_a_first_class_function_runs() {
+         "SPEC.md's example printed something other than the doubled list"
+     );
+ 
+-    // The bytecode path separately, because the tree-walker output above cannot
+-    // see the compiler that `rb compile` would emit.
+-    let block = "to double(x)\n\
+-                 give back x * 2\n\
+-                 end\n\
+-                 \n\
+-                 set numbers to [1, 2, 3]\n\
+-                 set doubled to numbers.map(double)\n\
+-                 say doubled\n";
+-    let chunk = redblue::compile_source(block).expect("SPEC.md's example should compile");
++    // The same source, compiled. `rb compile` used to stop before emitting
++    // anything for this file, so the two halves of SPEC.md's headline example —
++    // the one that runs it and the one that can be compiled at all — were
++    // never the same program.
++    let chunk = redblue::compile_source(source).expect("SPEC.md's example should compile");
+     let mut compiled = BytecodeVm::new();
+     compiled.set_echo(false);
+     compiled
+@@ -516,10 +514,10 @@ fn edge_a_receiver_whose_value_is_nothing_is_refused() {
+ 
+ /// A bad argument to `xs.map` is a clean runtime error, not a panic.
+ ///
+-/// Two refusals: a number where a function is required, and no argument at
+-/// all. The error has to name what it got — the finding's rule is that
+-/// `xs.map(5)` "names the argument it got" — so the message is asserted, not
+-/// merely that `Err` came back.
++/// Three refusals: a number where a function is required, no argument at all,
++/// and a second function that cannot be used. The error has to name what it
++/// got — the finding's rule is that `xs.map(5)` "names the argument it got" —
++/// so the message is asserted, not merely that `Err` came back.
+ #[test]
+ fn edge_a_bad_argument_to_a_variable_receiver_map_is_a_named_runtime_error() {
+     let number = both_errors(&format!("{DOUBLE}set xs to [1, 2, 3]\nxs.map(5)\n"));
+@@ -539,6 +537,57 @@ fn edge_a_bad_argument_to_a_variable_receiver_map_is_a_named_runtime_error() {
+     );
+ }
+ 
++/// One operation, one refusal — for a second function it cannot use.
++///
++/// `map` takes a list and one function. Handed a third value it has to say how
++/// many arguments it was given, and it has to say the *same* thing whichever
++/// spelling reached it: `xs.map(f, g)`, `map(xs, f, g)` and `list.map(xs, f, g)`
++/// are one operation and each of them used to be answered differently, the two
++/// flat ones saying only that the shape was wrong and the method one counting
++/// the arguments. Both engines are asked for each.
++///
++/// The count is what makes this a test and not a restatement: the third value is
++/// itself a function, so a refusal that only looked at the *last* argument
++/// would have run it, and one that only looked at the second would have said
++/// the arity without saying how far past it the call went.
++#[test]
++fn edge_a_map_given_a_second_function_is_refused_the_same_way_by_every_spelling() {
++    let expected = "map requires a function, but was given 2 arguments";
++
++    for call in [
++        "xs.map(double, double)",
++        "map(xs, double, double)",
++        "list.map(xs, double, double)",
++    ] {
++        let source = format!("{DOUBLE}set xs to [1, 2, 3]\n{call}\n");
++        assert_eq!(
++            both_errors(&source),
++            expected,
++            "`{call}` refused the extra function differently from the other spellings"
++        );
++    }
++
++    // Three arguments count as three, so the count is read rather than a fixed
++    // string with `2` in it.
++    let three = both_errors(&format!(
++        "{DOUBLE}set xs to [1, 2, 3]\nxs.map(double, double, double)\n"
++    ));
++    assert_eq!(
++        three, "map requires a function, but was given 3 arguments",
++        "the refusal counted the extra arguments rather than reporting the count it got"
++    );
++
++    // And a receiver that is not a list is still the receiver's refusal: the
++    // count belongs to the function side, and a call whose *first* argument is
++    // wrong never reaches it.
++    let not_a_list = both_errors(&format!("{DOUBLE}set xs to 5\nxs.map(double, double)\n"));
++    assert!(
++        !not_a_list.contains("2 arguments"),
++        "a non-list receiver was refused with the argument count instead of with the \
++         receiver it got: {not_a_list:?}"
++    );
++}
++
+ /// A receiver that is not a list at all keeps the refusal it already had.
+ ///
+ /// The fallback is for a list and nothing else: a number, a text and a record
+[0m
+I've mapped the headline fixes — now digging into the implementation for hidden defects.
+[0m✱ [0mGrep "map_function|call_method|ANONYMOUS_FUNCTION|MAX_BLOCK_DEPTH|nested\("[90m in src · 60 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=140, limit=110][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2005, limit=180][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2710, limit=260][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=100, limit=100][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=600, limit=240][0m
+[0m→ [0mRead tests/doc_blocks_test.rs[90m [offset=248, limit=130][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2184, limit=80][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2960, limit=120][0m
+[0m✱ [0mGrep "MODULES|MODULE_MEMBERS|is_module"[90m in src · 37 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1, limit=140][0m
+The core map logic checks out — now probing edge cases and test coverage for gaps.
+[0m→ [0mRead tests/doc_blocks_test.rs[90m [offset=540, limit=150][0m
+[0m→ [0mRead tests/doc_blocks_test.rs[90m [offset=220, limit=40][0m
+[0m→ [0mRead tests/function_literal_test.rs
+[0m✱ [0mGrep "Span::unknown\(\)"[90m in src · 51 matches[0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=30, limit=80][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=400, limit=160][0m
 [0m→ [0mRead tests/method_map_test.rs
-[0m→ [0mRead src/interpreter.rs[90m [offset=2015, limit=50][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2885, limit=120][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=2700, limit=70][0m
-Core dispatch looks plausible — now checking whether the test claims hold up.
-[0m→ [0mRead tests/doc_blocks_runs.txt
-[0m→ [0mRead tests/doc_blocks_known_fail.txt
-[0m✱ [0mGrep "doc_blocks_known_fail|doc_blocks_runs"[90m in tests · 8 matches[0m
-[0m→ [0mRead tests/doc_blocks_test.rs
-[0m✱ [0mGrep "fn split_dotted|fn get_var|fn constant_text|fn pop\b|fn call_user_function"[90m in src · 9 matches[0m
-[0m→ [0mRead src/value.rs[90m [limit=120][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=1210, limit=50][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2291, limit=70][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=632, limit=50][0m
-[0m✱ [0mGrep "CallMethod|call_method|split_dotted|dotted"[90m in src/bytecode · 29 matches[0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1221, limit=60][0m
-[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=690, limit=170][0m
-I've mapped the shadowing quirks and spec gaps — now verifying the final details for the verdict.
-[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|as u32|as usize|\[0\]|\[i\]|/ 0"[90m in src/stdlib.rs · 100 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=600, limit=30][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=830, limit=50][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1340, limit=30][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1490, limit=80][0m
-[0m✱ [0mGrep "edge_a_higher_order_call_answers_the_same_way_on_both_engines"[90m in tests · 1 match[0m
-[0m→ [0mRead tests/differential_test.rs[90m [offset=920, limit=80][0m
-[0m→ [0mRead tests/differential_test.rs[90m [offset=1000, limit=60][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2265, limit=80][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [offset=860, limit=75][0m
+Coverage so far looks solid — now checking for nondeterminism, panics, and error-span regressions.
+[0m✱ [0mGrep "impl.*Display.*Value|HashMap|IndexMap|BTreeMap"[90m in src/value.rs · 56 matches[0m
+[0m→ [0mRead phases/phase-086/FINDINGS.md
+[0m✱ [0mGrep "fn make_function|fn run_isolated|ANONYMOUS_FUNCTION"[90m in src · 13 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1200, limit=50][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1875, limit=40][0m
+[0m✱ [0mGrep "fn get_var|fn set_var|fn is_declared_module|fn declare"[90m in src/bytecode/vm.rs · 6 matches[0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1245, limit=80][0m
+No determinism issues found — now examining type handling and differential coverage.
+[0m✱ [0mGrep "enum Value|Function\(|Builtin"[90m in src/value.rs · 91 matches[0m
+[0m✱ [0mGrep "higher_order_call_answers"[90m in tests · 1 match[0m
+[0m→ [0mRead tests/differential_test.rs[90m [offset=920, limit=120][0m
+[0m→ [0mRead tests/differential_test.rs[90m [offset=1040, limit=60][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=250, limit=120][0m
+[0m✱ [0mGrep "fn module_member_name|fn builtin"[90m in src/stdlib.rs · 6 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=810, limit=80][0m
+The module-collision logic holds — now verifying the analyzer and formatter handle the new shapes.
+[0m✱ [0mGrep "MethodCall|has no function|Unknown variable"[90m in src/analyzer.rs · 29 matches[0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=575, limit=80][0m
+[0m✱ [0mGrep "struct Shared|impl.*Index.*Shared|fn.*\[0\]|items\["[90m in src · 4 matches[0m
+[0m✱ [0mGrep "type Shared|pub.*Shared"[90m in src/value.rs · 4 matches[0m
+Basic safety looks good — now hunting for the subtle correctness bugs that survive green gates.
+[0m✱ [0mGrep "decl\.span|Decl \{"[90m in src/bytecode · 9 matches[0m
+[0m→ [0mRead tests/function_literal_test.rs[90m [offset=701, limit=15][0m
+[0m✱ [0mGrep "Error:|ParserError|fn main|eprintln"[90m in src/main.rs · 100 matches[0m
+[0m✱ [0mGrep "first_error_line|starts_with\("Error"[90m in tests/doc_blocks_test.rs · 14 matches[0m
+[0m✱ [0mGrep "eprintln|fn report|Display.*Error|impl.*Error"[90m in src/error.rs · 37 matches[0m
+[0m→ [0mRead src/error.rs[90m [offset=258, limit=15][0m
+[0m→ [0mRead src/lib.rs[90m [offset=80, limit=30][0m
+Error-format checks look consistent — final sweep for scope and edge-case gaps.
+[0m✱ [0mGrep "fn render|fn label|fn location"[90m in src/error.rs · 9 matches[0m
+[0m→ [0mRead src/error.rs[90m [offset=125, limit=85][0m
 FINDINGS:
-1. [BLOCKER] src/bytecode/codegen.rs:777 — `Expr::FunctionLiteral` is refused by `compile_source` (`to (x) ... end as an expression is not compiled yet`), so SPEC.md:647 verbatim cannot be compiled, yet tests/doc_blocks_runs.txt:37 lists SPEC.md:647 as RUNS and tests/method_map_test.rs:176 runs the compiled half on the block form (`to double(x)...end`), a different program — the gate (tests/doc_blocks_test.rs:256 only runs `rb run`, never `rb compile`) stays green while `rb compile`+`rb vm` fails, contradicting SPEC.md:647 which headlines `numbers.map(double)` and SPEC.md:654 stating both literal forms mean the same thing — admit incomplete DoD or teach `compile_source` to lower a function literal.
-2. [MAJOR] src/stdlib.rs:211 — the `many` arm of `map_function` (`was given {} arguments` for 2+ args to a variable-receiver `map`) has no test on either side: tests/method_map_test.rs:524 only asserts `xs.map(5)` (one arg) and `xs.map()` (zero args), and no test calls `xs.map(f, g)` on either engine — a new branch with no test on either side; add `both_errors` for `xs.map(double, double)` asserting the message on both engines.
-3. [MINOR] src/interpreter.rs:2021 — flat `map(xs, f, extra)` refuses as `map requires a list and a function` while the new method spelling src/stdlib.rs:211 refuses the same arity mistake as `map requires a function, but was given 2 arguments` (same split in src/bytecode/vm.rs:2722 vs `map_function`); two spellings of one operation name different errors and neither names the extra args — share one wording via `map_function` or pin the split.
+1. [MAJOR] tests/doc_blocks_test.rs:578 — RUNS now requires `rb compile` to exit 0 but `compile_block` (tests/doc_blocks_test.rs:275) never runs the emitted `.rbc`, so a literal lowering that compiles to the wrong closure still passes the doc gate — concrete fix: after a successful compile, run `rb vm` on the artifact and require exit 0 plus identical stdout to `rb run`.
+2. [MAJOR] src/bytecode/codegen.rs:807 — `Expr::FunctionLiteral` builds its `Decl` with `span: Span::unknown()` while every statement-level `Decl` (e.g. src/bytecode/codegen.rs:438 uses `stmt.span`), so a block-depth refusal inside a literal loses its line/column — concrete fix: carry the literal's source line into the `Span` instead of `unknown`.
+3. [MINOR] tests/function_literal_test.rs:703 — `both_fail` asserts only `message()` equality while the equivalent `both_errors` in tests/method_map_test.rs:99 asserts `label()` and `message()`, so a Runtime-vs-Limit divergence with identical text passes here — concrete fix: assert `label()` equality too, as the map helper does.
 REVIEW VERDICT: FINDINGS 3
