@@ -211,7 +211,7 @@ identical) before the final gate run.
 |---|---|
 | `cargo fmt --all -- --check` | **pass** — exit 0, no output, no diff |
 | `cargo clippy --all-targets -- -D warnings` | **pass** — exit 0, `Finished dev profile`, no warnings; `git diff -- '*.rs' \| grep -c "allow(clippy::"` → `0` |
-| `cargo test --all-targets` | **pass** — exit 0, **1572 passed, 0 failed, 0 ignored** across 60 test binaries (run with `--no-fail-fast`, log at `target/tmp/final.log`; `grep -c "FAILED\|^error:"` → `0`) |
+| `cargo test --all-targets` | **pass** — exit 0, **1572 passed, 0 failed, 0 ignored** across 60 test binaries (run with `--no-fail-fast`, log at `target/tmp/full_test.log`; `grep -c "FAILED\|^error:"` → `0`) |
 | `./rbops/verify.sh phase-084` | **NOT RUN — absent from this checkout** |
 
 On the fourth gate: `./rbops/verify.sh` does not exist here.
