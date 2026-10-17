@@ -766,7 +766,12 @@ stop_checkpoint_loop
 # allowed to commit its own work — a clean worktree after a commit is a finished
 # attempt, not an idle one.
 if [ ! -f "$RBOPS_ROOT/phases/.stop" ]; then
-  budget="${RBOPS_ATTEMPT_BUDGET_SECONDS:-5400}"
+  # This MUST match RBOPS_MODEL_TIMEOUT in the workflow. It was hardcoded to
+  # 5400 while the model call ran 10800, which meant the watchdog was measuring
+  # the attempt against a budget two-thirds of the real one and would have fired
+  # at 63 minutes of a 180-minute attempt - killing work that was still going.
+  # Defaults to the same 10800 the workflow sets.
+  budget="${RBOPS_ATTEMPT_BUDGET_SECONDS:-10800}"
   # When the attempt began. Recorded immediately before the agent call so the
   # watchdog measures the attempt and not the run: select, checkout and warm-cache
   # are all real time that is not the agent's.
