@@ -1,0 +1,3799 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reproducing the finding.
+[0m$ [0msed -n '30,80p' docs/GRAMMAR.md
+```
+identifier    = letter { letter | digit | '_' }
+letter        = 'a'..'z' | 'A'..'Z' | unicode_letter
+digit         = '0'..'9'
+```
+
+**Note:** Identifiers can contain Unicode letters (e.g., `nom`, `名前`, `имя`)
+
+### 1.3 Keywords (Reserved)
+
+```
+keywords = 'set' | 'constant' | 'to' | 'is' | 'nothing' | 'yes' | 'no'
+         | 'if' | 'then' | 'else' | 'end' | 'unless'
+         | 'for' | 'each' | 'in' | 'from' | 'times' | 'while' | 'repeat'
+         | 'until'
+         | 'break' | 'skip' | 'return'
+         | 'give' 'back'             // `give back <expr>` is one form
+         | 'might' 'fail'            // `might fail <call>` is one form
+         | 'say' | 'print'
+         | 'module' | 'import' | 'export' | 'as'
+         | 'and' | 'or' | 'not' | 'mod'
+         | 'try' | 'catch' | 'finally'
+         | 'test' | 'expect'
+         | 'object' | 'has' | 'can' | 'this' | 'extends'
+```
+
+A word is listed here only while the parser has a rule that reads it. A reserved
+word the parser cannot read is not a feature: it cannot be an identifier either,
+and the rejection names an internal token kind rather than the word the writer
+typed. Nine words — `are`, `ask`, `async`, `done`, `new`, `parallel`, `that`,
+`wait`, `when` — were listed and read by nothing; they are identifiers now, so
+they are not listed here. The productions that once read them are kept as the
+shape a future implementation has to match, each under a **Not implemented**
+note: §4.3's `when_statement`, §4.8's `async_function` / `async_call` /
+`parallel_block`, and §7's `object_literal`. `object_literal` is therefore not an
+alternative of `primary` in §5.1. The table is checked against
+`Lexer::keywords()` by `tests/keyword_reservation_test.rs`, so a word added here
+without a parser arm fails the suite rather than shipping.
+
+### 1.4 Literals
+
+```
+// Numbers
+number_literal     = ['-'] digit { digit } [ '.' digit { digit } ]
+                   | ['-'] digit { digit } [ '.' ] [ exponent ]
+exponent           = ('e' | 'E') ['+' | '-'] digit { digit }
+
+// Text (Strings)
+text_literal       = '"' { any_unicode_character_except_quote | escape } '"'
+escape             = '\' ( 'n' | 't' | 'r' | '"' | '\' | 'u' hex_digit hex_digit hex_digit hex_digit )
+[0m
+[0m$ [0mls; git log --oneline -3; git status --short
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+e008f0b rbops: phase-089 (2026-10-16T20:52:46Z)
+bf9ffc3 resume phase-089: adopt WIP checkpoint
+ad19910 rbops: phase-087 (2026-10-16T15:31:00Z)
+[0m
+[0m$ [0msed -n '120,200p' docs/GRAMMAR.md
+// Logical
+and_op       = 'and' | '&&'
+or_op        = 'or' | '||'
+not_op       = 'not' | '!'
+
+// Special operators
+in_op        = 'in'
+has_op       = 'has'
+of_op        = 'of'
+to_op        = 'to'
+```
+
+---
+
+## 2. Type System
+
+### 2.1 Type Expressions
+
+```
+type_expression  = primitive_type
+                 | list_type
+                 | record_type
+                 | object_type
+                 | function_type
+                 | generic_type
+                 | union_type
+                 | 'nothing'
+
+primitive_type   = 'number' | 'text' | 'yes/no'
+list_type        = 'list of' type_expression
+record_type      = 'record of' '{' type_field { ',' type_field } '}'
+type_field       = identifier ':' type_expression
+object_type      = 'object' identifier [ 'extends' identifier ]
+function_type    = 'function' [ type_expression ] 'to' [ type_expression ]
+                 | 'function' '(' [ type_expression { ',' type_expression } ] ')' 'to' [ type_expression ]
+generic_type     = identifier 'of' type_expression { 'and' type_expression }
+union_type       = type_expression 'or' type_expression
+```
+
+---
+
+## 3. Program Structure
+
+### 3.1 Module
+
+```
+module           = 'module' identifier
+                   { import_statement }
+                   { statement }
+                   [ export_statement ]
+                   'end'
+
+import_statement = 'import' identifier { 'as' identifier }
+                 | 'import' identifier '.' identifier 'as' identifier
+
+export_statement = 'export' identifier { ',' identifier }
+                 | 'export' 'all'
+```
+
+### 3.2 Standalone Script
+
+```
+script           = { statement }
+```
+
+---
+
+## 4. Statements
+
+### 4.1 Declaration Statements
+
+```
+// Variable declaration
+declaration      = 'set' identifier [ ':' type_expression ] 'to' expression
+
+// Multiple assignment
+declaration      = 'set' identifier { ',' identifier } 'to' expression { ',' expression }
+
+// Constant declaration
+declaration      = 'constant' identifier [ ':' type_expression ] 'to' expression
+[0m
+[0m$ [0msed -n '280,320p' docs/GRAMMAR.md; echo ---; sed -n '220,245p' docs/GRAMMAR.md
+| 'give back' [ expression ]
+```
+
+Neither `break` nor `skip` takes an operand: both act on the innermost loop the
+statement is written inside, and end the block they were written in as well as
+the loop — a `catch`, `finally`, `test`, `object` or `module` body, or an `unless`
+body, inside a loop is inside that loop. With no enclosing loop they are a
+runtime error, `'<keyword>' is only valid inside a loop`, which
+`try ... catch error` catches; a function body is not inside the loop that called
+it, so a `break` in one is refused too. See SPEC.md, "Break and Skip".
+
+### 4.5 Function Declaration
+
+```
+function_decl    = 'to' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+                   [ 'needs' type_expression { ',' type_expression } ]
+                   [ 'gives' type_expression ]
+                   { statement }
+                   'end'
+
+parameter        = identifier [ ':' type_expression ]
+                 | identifier 'of' type_expression
+```
+
+### 4.6 Object Declaration
+
+```
+object_decl      = 'object' identifier [ 'extends' identifier ]
+                    { property_decl | method_decl }
+                    'end'
+
+property_decl    = 'has' identifier [ ':' type_expression ] [ 'default' expression ]
+
+method_decl      = 'to' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+                    { statement }
+                    'end'
+
+method_decl      = 'to' 'can' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+                    { statement }
+                    'end'
+```
+---
+### 4.3 Control Flow Statements
+
+```
+// If statement
+if_statement     = 'if' expression
+                    'then'
+                    { statement }
+                    { 'else if' expression
+                      'then'
+                      { statement } }
+                    [ 'else'
+                      { statement } ]
+                    'end'
+
+// When statement (pattern matching) — NOT IMPLEMENTED, and `when` is not a
+// reserved word: it is an ordinary identifier. Left here so the form a future
+// `when` has to parse is written down rather than invented again.
+when_statement    = 'when' expression
+                    { 'case' pattern 'then' expression }
+                    [ 'else' expression ]
+                    'end'
+
+// Unless statement
+unless_statement = 'unless' expression
+                    'then'
+                    { statement }
+[0m
+[0m$ [0msed -n '140,165p' SPEC.md
+that can hold the character itself should write the character — the escape is
+for the code points a file cannot otherwise carry.
+
+Everything the grammar does not spell out is a `LexerError` naming the line and
+column of the backslash, never a different string:
+
+```redblue
+say "\q"            // LexerError: Unknown escape '\q' in text
+say "\uZZZZ"        // LexerError: Unicode escape needs four hex digits
+say "\u00"          // LexerError: Unicode escape needs four hex digits
+say "\ud83d"        // LexerError: \uD83D is half a surrogate pair; no character
+say "abc\           // LexerError: Unterminated string
+```
+
+A half of a surrogate pair is refused because it names no character of its own:
+a lone surrogate has no UTF-8 encoding, so the only thing a decoder could put
+there is a character nobody wrote.
+
+### Comments
+
+```redblue
+// Single line comment
+
+// This is a multi-line
+// comment spanning
+// multiple lines
+[0m
+[0m$ [0mls tests/ | head -60; echo ---; sed -n '1,80p' tests/keyword_reservation_test.rs
+assertions_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+catch_binding_test.rs
+checkpoint_ancestry_ack.txt
+checkpoint_ancestry_test.rs
+closure_capture_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+debugger_test.rs
+diagnostics_test.rs
+differential_test.rs
+discovery_test.rs
+doc_blocks_fragments.txt
+doc_blocks_known_fail.txt
+doc_blocks_runs.txt
+doc_blocks_test.rs
+expect_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+index_bounds_test.rs
+index_words_test.rs
+integration_test.rb
+interpolation_test.rs
+keyword_reservation_test.rs
+lexer_robustness_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+method_map_test.rs
+might_fail_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+random_builtin_test.rs
+record_order_test.rs
+redblue_suite_test.rs
+redblue_test.rs
+repeat_until_test.rs
+repl_color_test.rs
+repl_module_completion_test.rs
+repl_test.rs
+span_test.rs
+stdlib_module_docs_test.rs
+stdlib_module_names_test.rs
+stdlib_modules_test.rs
+suite.rb
+test_arithmetic.rb
+---
+//! Every word the lexer reserves must be a word the parser can read.
+//!
+//! The lexer's keyword table and the parser's `match` arms are two halves of one
+//! contract, and nothing in either file checked the other. Nine words sat in the
+//! table with no arm anywhere in `src/parser.rs` to match them, so the lexer
+//! produced a token the parser could not consume: the program died with
+//! `ParserError: Unexpected token Async`, naming an internal `TokenKind` variant
+//! the reader has never seen, and the word could not be used as an ordinary
+//! identifier either (`set async to 1` died the same way).
+//!
+//! The first test here is the enumeration that would have caught it. It reads
+//! `src/parser.rs` as text and requires a `TokenKind::<Kind>` arm for every
+//! keyword the lexer reserves, so adding a word to `KEYWORDS` without giving the
+//! parser a rule for it fails this test rather than shipping.
+
+use redblue::lexer::{Lexer, TokenKind, KEYWORDS};
+use redblue::Error;
+
+const PARSER_SOURCE: &str = include_str!("../src/parser.rs");
+const SPEC: &str = include_str!("../SPEC.md");
+const GRAMMAR: &str = include_str!("../docs/GRAMMAR.md");
+
+/// The two-word forms the table spells as one keyword.
+const TWO_WORD: &[&str] = &["give back", "might fail"];
+
+/// The words this phase freed: the lexer reserved them and no parser arm read
+/// them, so they are identifiers again.
+const FREED: &[&str] = &[
+    "are", "ask", "async", "done", "new", "parallel", "that", "wait", "when",
+];
+
+/// The kind name as written in the `TokenKind` enum, without the payload a
+/// `Debug` print puts on a value-carrying variant: the parser writes
+/// `TokenKind::YesNo(_)`, not `TokenKind::YesNo(true)`.
+fn kind_name(kind: &TokenKind) -> String {
+    let printed = format!("{:?}", kind);
+    match printed.find('(') {
+        Some(open) => printed[..open].to_string(),
+        None => printed,
+    }
+}
+
+/// Runs a program through the full pipeline and returns what it printed, or the
+/// error it reported.
+fn run(source: &str) -> Result<Vec<String>, Error> {
+    let tokens = Lexer::tokenize(source)?;
+    let ast = redblue::parser::parse(tokens)?;
+    redblue::analyzer::analyze(&ast)?;
+    let (mut vm, result) = redblue::run_isolated(&ast);
+    result.map(|_| vm.take_output())
+}
+
+/// The parser's complaint about a token, or `None` when the token parsed.
+fn parse_error(source: &str) -> Option<String> {
+    Lexer::tokenize(source)
+        .ok()
+        .and_then(|tokens| redblue::parser::parse(tokens).err())
+        .map(|error| error.to_string())
+}
+
+/// The message and position a parse failed at, or `None` when it parsed.
+fn parse_failure(source: &str) -> Option<(String, (usize, usize))> {
+    let error = Lexer::tokenize(source)
+        .ok()
+        .and_then(|tokens| redblue::parser::parse(tokens).err())?;
+
+    let position = error.span().map(|span| (span.line, span.column));
+    Some((
+        error.to_string(),
+        position.expect("a parser error carries a span"),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// The enumeration: no keyword without a parser arm
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_reserved_keyword_has_a_parser_arm() {
+    let mut orphans = Vec::new();
+[0m
+[0m$ [0mgrep -n "Complex Types" -A 30 SPEC.md | head -60
+185:### Complex Types
+186-
+187-```redblue
+188-// List of a type
+189-set numbers to list of number
+190-set names to list of text
+191-
+192-// Record type
+193-set Point to record { x: number, y: number }
+194-
+195-// Object type
+196-set Person to object
+197-```
+198-
+199-### Type Inference
+200-
+201-Redblue infers types automatically:
+202-
+203-```redblue
+204-set x to 10        // x is number
+205-set name to "Hi"   // name is text
+206-```
+207-
+208-### Explicit Types
+209-
+210-```redblue
+211-set x to 10 as number
+212-set name to "Hi" as text
+213-```
+214-
+215----
+[0m
+[0m$ [0mgrep -n "not_implemented\|NOT IMPLEMENTED\|Not implemented\|not implemented" docs/GRAMMAR.md SPEC.md | head -40
+docs/GRAMMAR.md:63:shape a future implementation has to match, each under a **Not implemented**
+docs/GRAMMAR.md:234:// When statement (pattern matching) — NOT IMPLEMENTED, and `when` is not a
+docs/GRAMMAR.md:377:Not implemented. `async`, `wait`, `parallel` and `done` are ordinary
+docs/GRAMMAR.md:571:Not implemented, and `new` is not a reserved word: it is an ordinary identifier,
+SPEC.md:705:Not implemented. There is no `new`: the word is an ordinary identifier, and
+SPEC.md:1175:Not implemented. The words `async`, `wait`, `parallel` and `done` are ordinary
+SPEC.md:1283:`math.random` is not implemented. The random builtins are spelled flat: `random`,
+[0m
+Now let me reproduce the finding exactly.
+[0m$ [0msed -n '365,385p' docs/GRAMMAR.md; echo ===; sed -n '560,580p' docs/GRAMMAR.md; echo === ; sed -n '695,715p' SPEC.md
+own to stop with. See `SPEC.md`, "Finally".
+
+Two things in that `finally` are not the failure being reported:
+
+- a `finally` that **fails** replaces it — the failure that reaches the enclosing
+  `try` is the cleanup's own;
+- a `finally` that leaves its region **abruptly** — a `break` or a `skip` — drops
+  it, because the region was left by the jump rather than by the failure, so a
+  `catch` written around the `try` does not run. See `SPEC.md`, "Finally".
+
+### 4.8 Async Statements
+
+Not implemented. `async`, `wait`, `parallel` and `done` are ordinary
+identifiers — the lexer reserved them with no rule in the parser to read them.
+The productions are kept here as the shape a future implementation has to match;
+nothing below parses today.
+
+```
+async_function   = 'async' function_decl
+async_call       = 'async' set_statement
+
+===
+set doubled to list.map([1, 2, 3], to (x) give back x * 2)
+```
+
+A body that runs onto a second line needs its `end`; without it the parser
+reports a spanned error naming the `end` it wanted rather than reading the rest
+of the file as the body.
+
+---
+
+## 7. Object Literals
+
+Not implemented, and `new` is not a reserved word: it is an ordinary identifier,
+so `new Person(...)` reads as two identifiers in a row and is a parser error. The
+production is kept here as the shape a future implementation has to match;
+nothing below parses today. `object_literal` is therefore not an alternative of
+`primary` in §5.1. A declaration is its own prototype in the meantime, so the
+worked spelling is a write to the declaration — see `SPEC.md`, "Lookup order and
+shadowing".
+
+```
+object_literal   = 'new' identifier '(' [ argument { ',' argument } ] ')'
+===
+    end
+    
+    to can email(message)
+        // email implementation
+    end
+end
+```
+
+### Instantiation
+
+Not implemented. There is no `new`: the word is an ordinary identifier, and
+`new Person` reads as two identifiers in a row and is a parser error. A
+declaration is its own prototype, so a program writes to the declaration where
+it would otherwise construct one — see "Lookup order and shadowing".
+
+```redblue
+set Person.name to "Alice"
+set Person.age to 30
+```
+
+### Constructor
+[0m
+[0m$ [0mls target/debug/rb 2>/dev/null; ls target/release/rb 2>/dev/null; cargo --version
+target/debug/rb
+cargo 1.99.1 (5f94df478 2026-08-27)
+[0m
+[0m$ [0mmkdir -p target/tmp && cd target/tmp && printf 'set x : number to 1\nsay x\n' > t1.rb && ../../target/debug/rb run t1.rb; echo "exit=$?"
+Error: ParserError: Expected 'to' but got Colon
+  --> t1.rb:1:7
+1 | set x : number to 1
+  |       ^
+exit=1
+[0m
+[0m$ [0mcd target/tmp && for p in 'constant C : number to 1' 'object P
+has x : number
+end' 'to f(x : number)
+give back x
+end' 'to f(x of number)
+give back x
+end' 'to f(a)
+needs number
+end' 'set numbers to list of number'; do printf '%s\n' "$p" > t.rb; printf '=== %s\n' "$p"; ../../target/debug/rb run t.rb 2>&1 | head -3; done
+=== constant C : number to 1
+Error: ParserError: Expected 'to' but got Colon
+  --> t.rb:1:12
+1 | constant C : number to 1
+=== object P
+has x : number
+end
+Error: ParserError: Unexpected token Colon
+  --> t.rb:2:7
+2 | has x : number
+=== to f(x : number)
+give back x
+end
+Error: ParserError: Expected RightParen but got Colon
+  --> t.rb:1:8
+1 | to f(x : number)
+=== to f(x of number)
+give back x
+end
+Error: ParserError: Expected RightParen but got Identifier("of")
+  --> t.rb:1:8
+1 | to f(x of number)
+=== to f(a)
+needs number
+end
+Error: AnalyzerError: Unknown variable 'needs'
+Unknown variable 'number'
+  --> t.rb:2:1
+=== set numbers to list of number
+Error: AnalyzerError: Unknown variable 'list'
+Unknown variable 'of'; did you mean 'if'?
+Unknown variable 'number'; did you mean 'numbers'?
+[0m
+[0m$ [0msed -n '80,400p' tests/keyword_reservation_test.rs
+let mut orphans = Vec::new();
+
+    for (word, kind) in KEYWORDS {
+        // `YesNo(true)` and friends carry a payload; the arm is written as
+        // `TokenKind::YesNo(_)`, which the bare name still matches.
+        let arm = format!("TokenKind::{}", kind_name(kind));
+        if !PARSER_SOURCE.contains(&arm) {
+            orphans.push(format!("`{}` ({})", word, arm));
+        }
+    }
+
+    assert!(
+        orphans.is_empty(),
+        "the lexer reserves {} word(s) no parser arm can read: {}. Either give the \
+         parser a rule for them, or free the words so they lex as identifiers",
+        orphans.len(),
+        orphans.join(", ")
+    );
+}
+
+/// One snippet per reserved word, each putting the word in the position its own
+/// grammar gives it. The scan above proves a `TokenKind::<Kind>` string appears
+/// somewhere in `src/parser.rs`, which is evidence about text, not about the
+/// parser. This table is the behavioural half: every word below has to survive a
+/// real `parse`, so a word that is reserved but unread shows up here as a
+/// concrete error message instead of a silent string match.
+const REACHABLE: &[(&str, &str)] = &[
+    ("set", "set total to 1\n"),
+    ("constant", "constant answer to 42\n"),
+    ("to", "set total to 1\n"),
+    ("is", "set same to 1 is 1\n"),
+    ("if", "if 1 is 1 then\n    say \"a\"\nend\n"),
+    ("then", "if 1 is 1 then\n    say \"a\"\nend\n"),
+    (
+        "else",
+        "if 1 is 1 then\n    say \"a\"\nelse\n    say \"b\"\nend\n",
+    ),
+    ("end", "if 1 is 1 then\n    say \"a\"\nend\n"),
+    ("unless", "unless 1 is 2 then\n    say \"a\"\nend\n"),
+    ("for", "for each x in [1]\n    say x\nend\n"),
+    ("each", "for each x in [1]\n    say x\nend\n"),
+    ("in", "for each x in [1]\n    say x\nend\n"),
+    ("from", "for each x from 1 to 2\n    say x\nend\n"),
+    ("times", "repeat 3 times\n    say \"a\"\nend\n"),
+    ("while", "while 1 is 2\n    say \"a\"\nend\n"),
+    (
+        "repeat",
+        "repeat 3 times\n    say \"a\"\nend\n",
+    ),
+    // The row has to run as well as parse: a reserved word whose construct
+    // parses but dies at run time is not reachable, and the reader only finds
+    // out when they write the word themselves. `n` counts to three so `until`
+    // terminates on the third turn instead of running to the loop guard.
+    ("until", "set n to 0\nrepeat\n    set n to n + 1\nuntil n is 3\nsay n\n"),
+    ("break", "for each x in [1]\n    break\nend\n"),
+    ("skip", "for each x in [1]\n    skip\nend\n"),
+    (
+        "return",
+        "to answer()\n    return 1\nend\n",
+    ),
+    ("give", "to answer()\n    give back 1\nend\n"),
+    ("back", "to answer()\n    give back 1\nend\n"),
+    (
+        "might",
+        "set data to might fail files.read(\"x\")\n",
+    ),
+    (
+        "fail",
+        "set data to might fail files.read(\"x\")\n",
+    ),
+    ("say", "say \"a\"\n"),
+    ("print", "print \"a\"\n"),
+    (
+        "try",
+        "try\n    say \"a\"\ncatch error\n    say \"b\"\nend\n",
+    ),
+    (
+        "catch",
+        "try\n    say \"a\"\ncatch error\n    say \"b\"\nend\n",
+    ),
+    (
+        "finally",
+        "try\n    say \"a\"\nfinally\n    say \"b\"\nend\n",
+    ),
+    ("and", "set both to 1 and 2\n"),
+    ("or", "set either to 1 or 2\n"),
+    ("not", "set negated to not 1\n"),
+    ("mod", "set remainder to 5 mod 2\n"),
+    ("nothing", "set empty to nothing\n"),
+    ("module", "module Helpers\n    say \"a\"\nend\n"),
+    ("import", "import files\n"),
+    (
+        "export",
+        "module Helpers\n    to helper()\n        say \"a\"\n    end\n    export helper\nend\n",
+    ),
+    ("as", "import files as f\n"),
+    ("test", "test \"a case\"\n    say \"a\"\nend\n"),
+    (
+        "expect",
+        "test \"a case\"\n    expect 1 to be 1\nend\n",
+    ),
+    (
+        "object",
+        "object Counter\n    has count\nend\n",
+    ),
+    (
+        "has",
+        "object Counter\n    has count\nend\n",
+    ),
+    // A field is only in scope through `this`, so the `can` row writes it the
+    // way the row above does; the two differ only in the word each is filed
+    // under, and both spell the word they are filed under.
+    (
+        "can",
+        "object Counter\n    has count\n    to can bump()\n        set this.count to this.count + 1\n    end\nend\n",
+    ),
+    (
+        "this",
+        "object Counter\n    has count\n    to can bump()\n        set this.count to this.count + 1\n    end\nend\n",
+    ),
+    // The parent has to exist in the same file, or the analyzer refuses the
+    // declaration at run time with `Unknown parent object`.
+    (
+        "extends",
+        "object Base\n    has n\nend\nobject Tally extends Base\n    has total\nend\n",
+    ),
+    // `yes` and `no` are reserved in their own right and have one kind between
+    // them, so their row carries the literal the parser writes.
+    ("yes", "set flag to yes\n"),
+    ("no", "set flag to no\n"),
+];
+
+/// Whether `source` contains `word` as a whole word, which is what a row of
+/// `REACHABLE` has to do: a snippet that never spells the word it is filed
+/// under proves nothing about that word, and the row can go stale — or be
+/// copied from its neighbour — without any test noticing.
+fn contains_word(source: &str, word: &str) -> bool {
+    source
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|piece| piece == word)
+}
+
+#[test]
+fn edge_every_reserved_keyword_parses_in_the_position_its_grammar_gives_it() {
+    let covered: std::collections::BTreeSet<&str> =
+        REACHABLE.iter().map(|(word, _)| *word).collect();
+    let missing: Vec<&str> = KEYWORDS
+        .iter()
+        .map(|(word, _)| *word)
+        .filter(|word| !covered.contains(word))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the reachability table does not cover every reserved word: {}. Add the word \
+         with the snippet that exercises it, so no reserved word ships unproven",
+        missing.join(", ")
+    );
+
+    for (word, source) in REACHABLE {
+        // The row has to spell the word it is filed under. A snippet that never
+        // writes it exercises whatever else it contains, and the word it is
+        // meant to cover goes unproven.
+        assert!(
+            contains_word(source, word),
+            "the reachability row for `{}` never writes that word, so it proves nothing \
+             about it: {}",
+            word,
+            source
+        );
+
+        if let Some(message) = parse_error(source) {
+            panic!(
+                "`{}` is reserved but the parser cannot read it where it belongs: {}\n  in {}",
+                word, message, source
+            );
+        }
+
+        // And it has to run. A word whose construct parses and then dies at run
+        // time is reserved-but-unreachable all the same, and the reader finds
+        // out only by writing the word. `run` lexes, parses, analyzes and
+        // executes in one go, so this is the whole pipeline, not a parse.
+        if let Err(error) = run(source) {
+            panic!(
+                "`{}` is reserved and parses, but the program it builds does not run: {}\n  in {}",
+                word, error, source
+            );
+        }
+    }
+}
+
+#[test]
+fn the_freed_words_lex_as_identifiers_and_run_as_names() {
+    for word in FREED {
+        assert!(
+            !Lexer::keywords().contains(word),
+            "`{}` is still reserved by the lexer",
+            word
+        );
+
+        let source = format!("set {} to 1\nsay {}\n", word, word);
+        let output = run(&source)
+            .unwrap_or_else(|error| panic!("`{}` should be an ordinary name: {}", word, error));
+
+        assert_eq!(
+            output,
+            vec!["1".to_string()],
+            "`set {} to 1` then `say {}` printed the wrong thing",
+            word,
+            word
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error messages name the word, not the token kind
+// ---------------------------------------------------------------------------
+
+/// Words the parser really does own: a rejection here is a correct one, and it
+/// has to say which word it rejected. Each is one that reaches the expression
+/// reader with no rule for it, which is the path that used to name a `TokenKind`.
+const RESERVED: &[&str] = &[
+    "and", "as", "can", "catch", "each", "else", "extends", "finally", "from", "has", "in", "or",
+    "then", "times",
+];
+
+/// Words the parser owns and that can stand where a name is required.
+const NAME_POSITION: &[&str] = &["if", "end", "say", "from", "each", "while"];
+
+#[test]
+fn a_rejected_keyword_names_the_word_not_the_token_kind() {
+    for word in RESERVED {
+        let message = parse_error(&format!("{} 1\n", word))
+            .unwrap_or_else(|| panic!("`{}` should not start an expression", word));
+
+        assert!(
+            message.contains(word),
+            "the rejection of `{}` does not name the word: {}",
+            word,
+            message
+        );
+        assert!(
+            !message.contains("TokenKind::"),
+            "the rejection of `{}` names an internal type instead of the word: {}",
+            word,
+            message
+        );
+    }
+}
+
+#[test]
+fn a_reserved_word_as_a_variable_name_is_refused_by_name() {
+    for word in NAME_POSITION {
+        let message = parse_error(&format!("set {} to 1\n", word))
+            .unwrap_or_else(|| panic!("`set {} to 1` should be refused", word));
+
+        assert!(
+            message.contains(word),
+            "`set {} to 1` should name the offending word: {}",
+            word,
+            message
+        );
+    }
+}
+
+/// The exact text a reader sees, so the message cannot drift back to a
+/// `TokenKind` name one edit away without this going red.
+///
+/// The finding this phase fixes was a rejection reading `Unexpected token Async`
+/// — a name from inside the implementation, at a position the writer could not
+/// act on. Both halves are pinned: the word, and the column that points at it.
+/// `set if to 1` puts `if` at 1-based column 5.
+#[test]
+fn edge_the_rejection_of_a_reserved_word_names_the_word_at_its_column() {
+    let (message, position) = parse_failure("set if to 1\n")
+        .expect("`set if to 1` must be refused because `if` is a keyword");
+
+    assert!(
+        message.contains("Expected variable name, found reserved word 'if'"),
+        "the rejection must name the word, got: {}",
+        message
+    );
+    assert!(
+        !message.contains("TokenKind::"),
+        "the rejection names an internal type instead of the word: {}",
+        message
+    );
+    assert_eq!(
+        position,
+        (1, 5),
+        "the rejection must point at the offending word's column"
+    );
+
+    // The same holds for a word that reaches the expression reader with no rule
+    // for it: `and` alone is a rejection, and it names `and`.
+    let (message, position) =
+        parse_failure("and 1\n").expect("a bare `and` is not an expression and must be refused");
+    assert!(
+        message.contains("Unexpected token 'and'"),
+        "the rejection must name the word, got: {}",
+        message
+    );
+    assert_eq!(position, (1, 1), "the rejection must point at column 1");
+}
+
+/// The name positions that ask for a name of their own rather than sharing the
+/// generic one: an `object`'s own name, the name of the object it `extends`, and
+/// a `test`'s name.
+///
+/// These three read their names by hand and were the last three sites still
+/// reporting a bare `Expected object name` / `Expected parent object name` /
+/// `Expected test name`, which names what was wanted and not what was found —
+/// the reader is left looking for a missing word rather than at the reserved one
+/// in front of them.
+#[test]
+fn edge_a_reserved_word_where_an_object_or_test_name_is_required_is_refused_by_name() {
+    for (source, expected, position) in [
+        (
+            "object if\n    has a\nend\n",
+            "Expected object name, found reserved word 'if'",
+            (1, 8),
+        ),
+[0m
+[0m$ [0mgrep -n "GRAMMAR\|SPEC" tests/keyword_reservation_test.rs
+20:const SPEC: &str = include_str!("../SPEC.md");
+21:const GRAMMAR: &str = include_str!("../docs/GRAMMAR.md");
+612:/// The words `docs/GRAMMAR.md` §1.3 lists, read out of the fenced block that
+616:    let section = GRAMMAR
+620:        .expect("GRAMMAR.md must keep a fenced keyword table under §1.3");
+643:        "docs/GRAMMAR.md §1.3 lists {} word(s) the lexer does not reserve, so a \
+656:        "the lexer reserves {} word(s) docs/GRAMMAR.md §1.3 does not list: {}",
+664:    // SPEC.md documented `async`, `wait`, `parallel` and `done` as working
+667:    let asynchronous = SPEC
+671:        .expect("SPEC.md must keep an Asynchronous Programming section");
+680:            !SPEC.contains(&format!("| {} |", word)),
+681:            "SPEC.md's keyword appendix still lists `{}` as a keyword",
+689:            SPEC.contains(phrase),
+690:            "SPEC.md should still document `{}`",
+694:            GRAMMAR.contains(phrase),
+695:            "docs/GRAMMAR.md should still document `{}`",
+703:    let keywords_section = SPEC
+707:        .expect("SPEC.md must keep a Keywords section under the lexical structure");
+712:            "SPEC.md § Keywords lists `{}` as a keyword; it is an ordinary identifier \
+722:    for (name, document) in [("SPEC.md", SPEC), ("docs/GRAMMAR.md", GRAMMAR)] {
+796:        for section in sections_containing(GRAMMAR, &format!("'{}'", word)) {
+799:                "docs/GRAMMAR.md spells `'{}'` as a keyword in `{}`, which does not say the \
+[0m
+[0m$ [0msed -n '400,520p' tests/keyword_reservation_test.rs
+),
+        (
+            "object Base\n    has a\nend\nobject Child extends end\n",
+            "Expected parent object name, found reserved word 'end'",
+            (4, 22),
+        ),
+        (
+            "test end\n    say \"a\"\nend\n",
+            "Expected test name, found reserved word 'end'",
+            (1, 6),
+        ),
+    ] {
+        let (message, at) =
+            parse_failure(source).unwrap_or_else(|| panic!("`{}` must be refused", source.trim()));
+
+        assert!(
+            message.contains(expected),
+            "the rejection of `{}` must read `{}`, got: {}",
+            source.trim(),
+            expected,
+            message
+        );
+        assert!(
+            !message.contains("TokenKind::"),
+            "the rejection names an internal type instead of the word: {}",
+            message
+        );
+        assert_eq!(
+            at, position,
+            "the rejection must point at the offending word's column"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Edge cases: the four positions a reserved word shows up in
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edge_reserved_word_in_each_name_position() {
+    // A freed word is an ordinary name in all four positions: a `set` target, a
+    // record key, a function parameter and a module name.
+    let source = "\
+to twice(done)
+    give back done * 2
+end
+set parallel to 2
+set ask to twice(parallel)
+set that to ask
+say that
+";
+    let output = run(source)
+        .unwrap_or_else(|error| panic!("freed words should be ordinary names: {}", error));
+
+    assert_eq!(
+        output,
+        vec!["4".to_string()],
+        "a freed word did not survive as a parameter and a local name"
+    );
+
+    // A word the parser owns is still refused, still by name, in each position.
+    // Each rejection has to carry a span — the reader has to be able to find the
+    // word — and has to name the word rather than a `TokenKind` from inside the
+    // implementation. `parse_failure` panics on a parser error without a span,
+    // so the span is asserted by being able to reach the column at all.
+    for (word, source, column) in [
+        ("if", "set if to 1\n", 5),
+        ("if", "set r to { if: 1 }\n", 12),
+        ("if", "set f to (if) give back 1\n", 11),
+        ("if", "import if\n", 8),
+    ] {
+        let (message, (line, at)) = parse_failure(source)
+            .unwrap_or_else(|| panic!("`{}` should be refused", source.trim()));
+
+        assert!(
+            message.contains(word),
+            "`{}` in `{}` should name the offending word: {}",
+            word,
+            source.trim(),
+            message
+        );
+        assert!(
+            !message.contains("TokenKind::"),
+            "`{}` in `{}` names an internal type instead of the word: {}",
+            word,
+            source.trim(),
+            message
+        );
+        assert_eq!(
+            (line, at),
+            (1, column),
+            "`{}` should be refused with a span pointing at the offending word",
+            source.trim()
+        );
+    }
+}
+
+#[test]
+fn edge_freed_word_keeps_working_inside_records_lists_and_fields() {
+    // The point of freeing a word is that it stops being special everywhere, not
+    // only in a `set`. A record key, a list element, a field read and a string
+    // all have to treat it as an ordinary name.
+    let source = "\
+set row to { new: \"a\", that: \"b\" }
+set names to [\"when\", \"done\", \"wait\"]
+say row.new
+say row.that
+say names[0]
+say names[2]
+";
+    let output =
+        run(source).unwrap_or_else(|error| panic!("freed words should work everywhere: {}", error));
+
+    assert_eq!(
+        output,
+        vec![
+            "a".to_string(),
+            "b".to_string(),
+            "when".to_string(),
+            "wait".to_string(),
+        ],
+[0m
+[0m$ [0msed -n '600,830p' tests/keyword_reservation_test.rs
+assert!(
+            PARSER_SOURCE.contains(&format!("TokenKind::{}", kind)),
+            "`{}` should be handled by phase-038/040, not by this phase",
+            word
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The documentation says the same thing as the lexer
+// ---------------------------------------------------------------------------
+
+/// The words `docs/GRAMMAR.md` §1.3 lists, read out of the fenced block that
+/// holds the table. The one-word forms only: the table also spells the two-word
+/// keywords `give back` and `might fail`.
+fn grammar_keywords() -> Vec<String> {
+    let section = GRAMMAR
+        .split("### 1.3 Keywords (Reserved)")
+        .nth(1)
+        .and_then(|rest| rest.split("```").nth(1))
+        .expect("GRAMMAR.md must keep a fenced keyword table under §1.3");
+
+    section
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .filter(|word| !word.contains(' '))
+        .map(|word| word.to_string())
+        .collect()
+}
+
+#[test]
+fn the_documented_keyword_set_is_the_lexers_keyword_set() {
+    let documented = grammar_keywords();
+    let reserved = Lexer::keywords();
+
+    let listed_but_not_reserved: Vec<&str> = documented
+        .iter()
+        .filter(|word| !reserved.contains(&word.as_str()))
+        .map(|word| word.as_str())
+        .collect();
+    assert!(
+        listed_but_not_reserved.is_empty(),
+        "docs/GRAMMAR.md §1.3 lists {} word(s) the lexer does not reserve, so a \
+         program cannot use them: {}",
+        listed_but_not_reserved.len(),
+        listed_but_not_reserved.join(", ")
+    );
+
+    let reserved_but_not_listed: Vec<&str> = reserved
+        .iter()
+        .filter(|word| !documented.contains(&word.to_string()))
+        .copied()
+        .collect();
+    assert!(
+        reserved_but_not_listed.is_empty(),
+        "the lexer reserves {} word(s) docs/GRAMMAR.md §1.3 does not list: {}",
+        reserved_but_not_listed.len(),
+        reserved_but_not_listed.join(", ")
+    );
+}
+
+#[test]
+fn spec_no_longer_promises_the_forms_this_phase_freed() {
+    // SPEC.md documented `async`, `wait`, `parallel` and `done` as working
+    // syntax. They are identifiers now, and the section says so where a reader
+    // of the async section will look, not only in the appendix at the end.
+    let asynchronous = SPEC
+        .split("## Asynchronous Programming")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("SPEC.md must keep an Asynchronous Programming section");
+
+    assert!(
+        asynchronous.contains("Not implemented"),
+        "the Asynchronous Programming section must say the form is not implemented"
+    );
+
+    for word in FREED {
+        assert!(
+            !SPEC.contains(&format!("| {} |", word)),
+            "SPEC.md's keyword appendix still lists `{}` as a keyword",
+            word
+        );
+    }
+
+    // The two-word forms the lexer does spell as one keyword stay documented.
+    for phrase in TWO_WORD {
+        assert!(
+            SPEC.contains(phrase),
+            "SPEC.md should still document `{}`",
+            phrase
+        );
+        assert!(
+            GRAMMAR.contains(phrase),
+            "docs/GRAMMAR.md should still document `{}`",
+            phrase
+        );
+    }
+
+    // § Keywords is the first table a reader meets, and it has to agree with the
+    // appendix. A freed word listed here is a promise the parser cannot keep,
+    // whatever the appendix says three hundred lines later.
+    let keywords_section = SPEC
+        .split("### Keywords")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("SPEC.md must keep a Keywords section under the lexical structure");
+    let listed = listed_keyword_words(keywords_section);
+    for word in FREED {
+        assert!(
+            !listed.iter().any(|listed| listed == word),
+            "SPEC.md § Keywords lists `{}` as a keyword; it is an ordinary identifier \
+             since this phase",
+            word
+        );
+    }
+
+    // Neither the async forms nor object instantiation may be written as working
+    // syntax anywhere but under a Not-implemented note. `wait` and `new` are
+    // names a program may bind, so `wait network.get(...)` and `new Person` are
+    // two expressions in a row and a parse error.
+    for (name, document) in [("SPEC.md", SPEC), ("docs/GRAMMAR.md", GRAMMAR)] {
+        for promise in ["wait network.get", "wait network.post", "new Person"] {
+            for section in sections_containing(document, promise) {
+                assert!(
+                    section.to_lowercase().contains("not implemented"),
+                    "{} writes `{}` in `{}`, which does not say the form is Not \
+                     implemented; `wait` and `new` are ordinary identifiers, so the form \
+                     is a parse error rather than syntax",
+                    name,
+                    promise,
+                    heading_of(&section)
+                );
+            }
+        }
+    }
+}
+
+/// The keyword words a Markdown table in `section` lists, split on every
+/// separator a table row uses, so a cell written `set, constant, to` or
+/// `if/then/else/end` yields its words and not the cell.
+fn listed_keyword_words(section: &str) -> Vec<String> {
+    section
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .flat_map(|line| line.trim_matches('|').split('|'))
+        .flat_map(|cell| cell.split([',', '/', ' ', '`']))
+        .map(|word| word.trim().to_lowercase())
+        .filter(|word| !word.is_empty() && !word.chars().all(|c| c == '-'))
+        .collect()
+}
+
+/// Every section of a Markdown document: the text from one heading to the next,
+/// heading of either level.
+fn sections_of(document: &str) -> Vec<String> {
+    let mut sections = Vec::new();
+    let mut current = String::new();
+
+    for line in document.lines() {
+        if line.starts_with('#') {
+            sections.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    sections.push(current);
+
+    sections
+}
+
+/// The sections of `document` that mention `needle`.
+fn sections_containing(document: &str, needle: &str) -> Vec<String> {
+    sections_of(document)
+        .into_iter()
+        .filter(|section| section.contains(needle))
+        .collect()
+}
+
+/// The heading line of a section, for a message that has to say where it looked.
+fn heading_of(section: &str) -> &str {
+    section
+        .lines()
+        .find(|line| line.starts_with('#'))
+        .unwrap_or("<no heading>")
+}
+
+#[test]
+fn a_freed_word_is_only_spelled_as_a_keyword_under_a_not_implemented_note() {
+    // A freed word may still appear in the grammar as the shape a future
+    // implementation has to match — `when_statement`, `async_call`,
+    // `parallel_block`, `object_literal` all do. What it may not do is sit in a
+    // section that reads as live grammar, because a reader writes the production
+    // down and the program then dies in the parser. Every section that spells one
+    // has to say out loud that nothing in it parses today.
+    for word in FREED {
+        for section in sections_containing(GRAMMAR, &format!("'{}'", word)) {
+            assert!(
+                section.to_lowercase().contains("not implemented"),
+                "docs/GRAMMAR.md spells `'{}'` as a keyword in `{}`, which does not say the \
+                 form is Not implemented; a freed word is an identifier, so a production that \
+                 reads it is a promise the parser cannot keep",
+                word,
+                heading_of(&section)
+            );
+        }
+    }
+}
+[0m
+[0m$ [0msed -n '1,120p' tests/doc_blocks_test.rs
+//! Every ```redblue block in the five documents that define Redblue is
+//! extracted, classified and — where it is a program — executed.
+//!
+//! The finding this pins: the five documents carried **97** code blocks
+//! (`SPEC.md` 64, `docs/GRAMMAR.md` 9, `PHILOSOPHY.md` 9, `HANDOUT.md` 8,
+//! `README.md` 7) and **no test ran any of them**. Every existing reference to
+//! documentation was a hand-quoted single example:
+//! `tests/for_range_test.rs:2` cites `SPEC.md:380-391` and
+//! `tests/formatter_test.rs:2008` cites `SPEC.md:383`. A block that nobody
+//! executes rots in silence, which is exactly how `items at 0` sat in
+//! SPEC.md as dead syntax until phase-080 found it.
+//!
+//! So the harness is the deliverable, not a number. Two data files in this
+//! directory hold the classification, matched by `doc:line`:
+//!
+//! - `doc_blocks_runs.txt` — executed, and it exits 0.
+//! - `doc_blocks_fragments.txt` — not executed, with the reason written down.
+//! - `doc_blocks_known_fail.txt` — executed, exited non-zero, and the exact
+//!   first line of stderr is recorded.
+//!
+//! **A RUNS block has to compile as well as run.** `rb run` reads the
+//! tree-walking engine and nothing else, so before `compile_block` existed a
+//! block could be listed here as working documentation while `rb compile`
+//! refused it outright — and `SPEC.md:647`, the program the specification uses
+//! to introduce function values, sat in that file for a whole phase with
+//! `rb compile` stopping on it with "`to (x) ... end` as an expression is not
+//! compiled yet". Every gate was green and the headline example still could
+//! not be compiled. RUNS now means `rb run` exits 0 **and** `rb compile`
+//! exits 0; the compiler lowers a function literal now, and
+//! `tests/function_literal_test.rs` is where that is pinned.
+//!
+//! All three lists are checked in, and a block in none of them fails the suite, so
+//! none of the lists can rot: adding a block to a document without classifying
+//! it fails here, and so does deleting one — the extracted count is pinned, and
+//! the entry would point at a block that is no longer there.
+//!
+//! Listing the *working* blocks is what makes the suite worth running. If a
+//! block in `doc_blocks_runs.txt` stops exiting 0, the run test fails and it
+//! has to be re-classified, rather than drifting silently into "not one of the
+//! ones we run".
+//!
+//! **No network.** Two blocks make live HTTP requests to a host that does not
+//! exist; they are classified `network` in the fragment file with that reason
+//! written beside them. They are the only two, and a reader must not read the
+//! fragment bucket as "runs".
+//!
+//! **Sandbox.** Each run gets its own empty working directory, so a block that
+//! writes `output.txt` writes it there and not in the repository. The program
+//! file itself is written *into the project root*, because
+//! `redblue::root_of` resolves `import <name>` against the directory holding
+//! the program — a block that imports `MathUtils` has to see `modules/`. The
+//! scratch files are named `*.tmp`, which `.gitignore` already covers.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The five documents that define the language, and the only ones this suite
+/// reads. The order is fixed so a failure message reads the same every run.
+const DOCS: &[&str] = &[
+    "SPEC.md",
+    "README.md",
+    "PHILOSOPHY.md",
+    "HANDOUT.md",
+    "docs/GRAMMAR.md",
+];
+
+/// The number of ```redblue blocks the audit measured across [`DOCS`].
+///
+/// This is a floor, not a measurement. The harness measures the real count and
+/// reports it; this number exists so that *deleting* an example from a document
+/// fails the suite. Without it, the cheapest way to make this test green would
+/// be to delete the blocks it cannot run, which is the rot this file exists to
+/// prevent.
+const MINIMUM_BLOCKS: usize = 97;
+
+/// One fenced `redblue` block, with the position a reader would jump to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Block {
+    doc: String,
+    /// 1-based line of the opening fence.
+    line: usize,
+    body: String,
+    /// False when the document ends before the closing fence.
+    closed: bool,
+}
+
+impl Block {
+    /// The `doc:line` key both data files are matched on.
+    fn key(&self) -> String {
+        format!("{}:{}", self.doc, self.line)
+    }
+
+    /// The program text handed to `rb`.
+    fn source(&self) -> String {
+        format!("{}\n", self.body)
+    }
+}
+
+/// Extracts every ```redblue block from `text`, in document order.
+///
+/// A fence opens a block when the first whitespace-delimited word after the
+/// backticks is `redblue`, so ```redblue and ```redblue title="…" both open one
+/// and ```text, ```bash and a bare ``` do not. A fence inside the block closes
+/// it whatever its info string is, because Markdown allows no other spelling and
+/// an unterminated block must not swallow the rest of the document.
+///
+/// A block with no closing fence is still returned, with [`Block::closed`]
+/// false: dropping it would let a document acquire an unterminated block and
+/// have the count fall silently, which is the same failure this file exists to
+/// catch, one level down.
+fn extract_blocks(text: &str) -> Vec<Block> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+[0m
+[0m$ [0mcat tests/doc_blocks_known_fail.txt; echo ===; head -20 tests/doc_blocks_runs.txt
+# The KNOWN-FAIL bucket — documentation blocks that are whole programs and
+# still fail today.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of this file and `tests/doc_blocks_fragments.txt`. A block in
+# neither fails the suite.
+#
+# WHAT KNOWN-FAIL MEANS
+# The block is a program — every name it reads is bound somewhere above it in
+# the same block — and this suite wrote it to a file and ran it, and it exited
+# non-zero. The second column is the exact first line of stderr, so an entry
+# goes stale the moment the behaviour changes: fixing any of these without
+# re-running the suite fails here, and so does the failure moving, or changing
+# its wording, or being reclassified as a fragment.
+#
+# This is the list a human can act on. Each entry is a sentence in a document
+# that `rb` contradicts. Nothing here is implemented by this phase and nothing
+# here is fixed by it: AGENTS.md § 1.7, one phase one concern.
+#
+# FORMAT
+#   <doc>:<line><TAB><first line of stderr>
+#
+# COUNTS, as of the run that wrote this file
+#   SPEC.md 7 · PHILOSOPHY.md 1 · HANDOUT.md 6 · docs/GRAMMAR.md 0 · README.md 0
+#   14 of 103 blocks.
+
+# --- SPEC.md ---------------------------------------------------------------
+
+SPEC.md:89	Error: ParserError: Expected field name
+SPEC.md:610	Error: ParserError: Expected 'then' but got 'give'
+SPEC.md:671	Error: ParserError: Expected 'end' but got Eof
+SPEC.md:1092	Error: ParserError: Expected 'then' but got 'say'
+SPEC.md:1130	Error: RuntimeError: Maximum call depth of 1000 reached while calling 'endless'
+SPEC.md:1181	Error: AnalyzerError: Unknown variable 'async'
+SPEC.md:1384	Error: ParserError: Expected variable name, found reserved word 'back'
+
+# --- PHILOSOPHY.md ----------------------------------------------------------
+
+PHILOSOPHY.md:132	Error: ParserError: Expected variable name, found reserved word 'is'
+
+# --- HANDOUT.md -------------------------------------------------------------
+
+HANDOUT.md:42	Error: ParserError: Expected 'then' but got 'say'
+HANDOUT.md:133	Error: RuntimeError: Module 'math' has no function 'random'
+HANDOUT.md:140	Error: ParserError: Expected 'then' but got 'say'
+HANDOUT.md:149	Error: LexerError: Unexpected character '\''
+HANDOUT.md:155	Error: RuntimeError: Module 'list' has no function 'filter'
+HANDOUT.md:161	Error: AnalyzerError: Unknown variable 'ask'; did you mean 'as'?
+===
+# The RUNS bucket — documentation code blocks this suite executes and that exit 0.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of this file, `tests/doc_blocks_fragments.txt` and
+# `tests/doc_blocks_known_fail.txt`. A block in none of them fails the suite.
+#
+# Being listed HERE is a promise the suite keeps by running the block: if one of
+# these stops exiting 0, `running_every_block_agrees_with_the_bucket_it_is_in`
+# fails and the block has to move to the KNOWN-FAIL file, with the first line of
+# stderr it now prints. That is the whole point of listing the working blocks
+# at all: without this file a block that stopped working would silently join the
+# fragments, and a documentation promise would rot without a word.
+#
+# "Runs" means BOTH runners now. `rb run` has to exit 0 AND `rb compile` has to
+# exit 0. `SPEC.md:647` sat in this file for a whole phase while `rb compile`
+# refused the function literal it is written with — "`to (x) ... end` as an
+# expression is not compiled yet" — and no gate in the suite could see it,
+# because `rb run` never asked the compiler anything.
+#
+[0m
+[0m$ [0mgrep -n "SPEC.md:1[6-9][0-9]\b" tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt tests/doc_blocks_known_fail.txt
+tests/doc_blocks_runs.txt:35:SPEC.md:160
+tests/doc_blocks_fragments.txt:40:SPEC.md:187	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+[0m
+[0m$ [0mgrep -n "GRAMMAR.md:" tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt tests/doc_blocks_known_fail.txt
+tests/doc_blocks_runs.txt:70:docs/GRAMMAR.md:558
+tests/doc_blocks_runs.txt:71:docs/GRAMMAR.md:605
+tests/doc_blocks_runs.txt:72:docs/GRAMMAR.md:610
+tests/doc_blocks_runs.txt:73:docs/GRAMMAR.md:626
+tests/doc_blocks_runs.txt:74:docs/GRAMMAR.md:633
+tests/doc_blocks_runs.txt:75:docs/GRAMMAR.md:642
+tests/doc_blocks_runs.txt:76:docs/GRAMMAR.md:657
+tests/doc_blocks_fragments.txt:71:docs/GRAMMAR.md:537	excerpt - the guarded read is bound to `report`, but the third line reads `body`, which is bound nowhere. The first two lines are the forms this block documents
+tests/doc_blocks_fragments.txt:72:docs/GRAMMAR.md:617	excerpt - `age` is bound in the preceding block and not in this one, so the two are one fragment written as two
+[0m
+[0m$ [0mgrep -n "^SPEC.md:" tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt tests/doc_blocks_known_fail.txt | sort -t: -k3 -n
+tests/doc_blocks_fragments.txt:39:SPEC.md:146	excerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome
+tests/doc_blocks_fragments.txt:40:SPEC.md:187	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+tests/doc_blocks_fragments.txt:41:SPEC.md:210	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+tests/doc_blocks_fragments.txt:42:SPEC.md:221	excerpt - `value` is introduced by the prose about rebinding and bound nowhere in the block
+tests/doc_blocks_fragments.txt:43:SPEC.md:229	excerpt - `new_value` is introduced by the prose and bound nowhere in the block
+tests/doc_blocks_fragments.txt:44:SPEC.md:315	excerpt - a comparison catalogue: ten bare `if` headers, no bodies and no `end`; this is a table of spellings, not a program
+tests/doc_blocks_fragments.txt:45:SPEC.md:332	excerpt - a boolean-operator catalogue: three bare `if` headers, no bodies and no `end`; the operators `and`, `or` and `not` are spelled correctly, only the statements around them are not there
+tests/doc_blocks_fragments.txt:46:SPEC.md:340	excerpt - `name`, `x` and `y` are introduced by the prose about interpolation and bound nowhere in the block
+tests/doc_blocks_fragments.txt:47:SPEC.md:347	excerpt - `person` and `point` are introduced by the prose about field access and bound nowhere in the block
+tests/doc_blocks_fragments.txt:48:SPEC.md:361	excerpt - `items` and `words` are bound nowhere, and the closing `if "hello" is in words` has no body and no `end`. The `items at 0` and `length of items` forms this block documents are covered one at a time by tests/index_words_test.rs; the block as written is not a program
+tests/doc_blocks_fragments.txt:49:SPEC.md:418	excerpt - placeholder bodies (`// statements`, `// then branch`) and an unbound `condition`
+tests/doc_blocks_fragments.txt:50:SPEC.md:440	excerpt - `when` is documented as NOT IMPLEMENTED in docs/GRAMMAR.md § 4.3, where `when` is an ordinary identifier; `value` is also bound nowhere
+tests/doc_blocks_fragments.txt:51:SPEC.md:450	excerpt - `is_valid` is introduced by the prose about `unless` and bound nowhere in the block
+tests/doc_blocks_fragments.txt:52:SPEC.md:458	excerpt - `items` is introduced by the prose about `for each ... in` and bound nowhere in the block
+tests/doc_blocks_fragments.txt:53:SPEC.md:504	excerpt - `x` is introduced by the prose about `while` and bound nowhere in the block
+tests/doc_blocks_fragments.txt:54:SPEC.md:512	excerpt - `x` is introduced by the prose about `repeat`/`until` and bound nowhere in the block
+tests/doc_blocks_fragments.txt:55:SPEC.md:520	excerpt - `items` and `process` are bound nowhere in the block
+tests/doc_blocks_fragments.txt:56:SPEC.md:557	excerpt - `names` and `record` are bound nowhere in the block
+tests/doc_blocks_fragments.txt:57:SPEC.md:574	excerpt - `break` on its own, shown to document the loop-control keyword; it is only valid inside a loop
+tests/doc_blocks_fragments.txt:58:SPEC.md:626	excerpt - placeholder body (`// parameters`) plus `default`, which the parser does not accept in a parameter list
+tests/doc_blocks_fragments.txt:59:SPEC.md:639	excerpt - a type-annotated signature; `a as number` and `as number` are not forms the parser accepts
+tests/doc_blocks_fragments.txt:60:SPEC.md:738	excerpt - `Employee extends Person` with no `Person` in the block; the parent is declared elsewhere
+tests/doc_blocks_fragments.txt:61:SPEC.md:881	excerpt - `process` is bound nowhere in the block, and `config.rb` is a file the block never creates
+tests/doc_blocks_fragments.txt:62:SPEC.md:1009	network - `network.get("https://api.example.com")` is a live HTTP request to a host that does not exist; AGENTS.md § 3.1.4 forbids a test that depends on the network. Also elided: the `if` has no `then`
+tests/doc_blocks_fragments.txt:63:SPEC.md:1018	excerpt - `process` is bound nowhere in the block, and `files.open`/`files.close` are illustrative names
+tests/doc_blocks_fragments.txt:64:SPEC.md:1108	excerpt - `body` is bound nowhere: the guarded read was bound to `report`, so the last line reads a field that is not in scope
+tests/doc_blocks_fragments.txt:65:SPEC.md:1286	excerpt - `xs` is bound nowhere in the block; the four `random*` calls are shown against a list the prose has not written
+tests/doc_blocks_fragments.txt:66:SPEC.md:1314	excerpt - placeholder body (`// ...`) on the closing `if`, and the block reads and rewrites files it never creates
+tests/doc_blocks_fragments.txt:67:SPEC.md:1358	network - `network.get` and `network.post` are live HTTP requests; `data` is also bound nowhere. AGENTS.md § 3.1.4
+tests/doc_blocks_known_fail.txt:30:SPEC.md:89	Error: ParserError: Expected field name
+tests/doc_blocks_known_fail.txt:31:SPEC.md:610	Error: ParserError: Expected 'then' but got 'give'
+tests/doc_blocks_known_fail.txt:32:SPEC.md:671	Error: ParserError: Expected 'end' but got Eof
+tests/doc_blocks_known_fail.txt:33:SPEC.md:1092	Error: ParserError: Expected 'then' but got 'say'
+tests/doc_blocks_known_fail.txt:34:SPEC.md:1130	Error: RuntimeError: Maximum call depth of 1000 reached while calling 'endless'
+tests/doc_blocks_known_fail.txt:35:SPEC.md:1181	Error: AnalyzerError: Unknown variable 'async'
+tests/doc_blocks_known_fail.txt:36:SPEC.md:1384	Error: ParserError: Expected variable name, found reserved word 'back'
+tests/doc_blocks_runs.txt:32:SPEC.md:40
+tests/doc_blocks_runs.txt:33:SPEC.md:58
+tests/doc_blocks_runs.txt:34:SPEC.md:132
+tests/doc_blocks_runs.txt:35:SPEC.md:160
+tests/doc_blocks_runs.txt:36:SPEC.md:203
+tests/doc_blocks_runs.txt:37:SPEC.md:235
+tests/doc_blocks_runs.txt:38:SPEC.md:246
+tests/doc_blocks_runs.txt:39:SPEC.md:354
+tests/doc_blocks_runs.txt:40:SPEC.md:466
+tests/doc_blocks_runs.txt:41:SPEC.md:496
+tests/doc_blocks_runs.txt:42:SPEC.md:602
+tests/doc_blocks_runs.txt:43:SPEC.md:647
+tests/doc_blocks_runs.txt:44:SPEC.md:659
+tests/doc_blocks_runs.txt:45:SPEC.md:687
+tests/doc_blocks_runs.txt:46:SPEC.md:710
+tests/doc_blocks_runs.txt:47:SPEC.md:721
+tests/doc_blocks_runs.txt:48:SPEC.md:789
+tests/doc_blocks_runs.txt:49:SPEC.md:806
+tests/doc_blocks_runs.txt:50:SPEC.md:820
+tests/doc_blocks_runs.txt:51:SPEC.md:828
+tests/doc_blocks_runs.txt:52:SPEC.md:840
+tests/doc_blocks_runs.txt:53:SPEC.md:893
+tests/doc_blocks_runs.txt:54:SPEC.md:919
+tests/doc_blocks_runs.txt:55:SPEC.md:962
+tests/doc_blocks_runs.txt:56:SPEC.md:1000
+tests/doc_blocks_runs.txt:57:SPEC.md:1034
+tests/doc_blocks_runs.txt:58:SPEC.md:1058
+tests/doc_blocks_runs.txt:59:SPEC.md:1145
+tests/doc_blocks_runs.txt:60:SPEC.md:1160
+tests/doc_blocks_runs.txt:61:SPEC.md:1195
+tests/doc_blocks_runs.txt:62:SPEC.md:1231
+tests/doc_blocks_runs.txt:63:SPEC.md:1264
+tests/doc_blocks_runs.txt:64:SPEC.md:1335
+tests/doc_blocks_runs.txt:65:SPEC.md:1369
+tests/doc_blocks_runs.txt:66:SPEC.md:1398
+tests/doc_blocks_runs.txt:67:SPEC.md:1410
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import re
+text=open('docs/GRAMMAR.md').read()
+lines=text.split('\n')
+# fenced blocks (no language tag)
+blocks=[]
+cur=None
+for i,l in enumerate(lines,1):
+    t=l.strip()
+    if t.startswith('```'):
+        if cur is None:
+            cur=(i,[])
+        else:
+            blocks.append((cur[0],cur[1]))
+            cur=None
+    elif cur is not None:
+        cur[1].append(l)
+# sections
+heads=[]
+for i,l in enumerate(lines):
+    if l.startswith('#'): heads.append((i+1,l))
+def section_of(line):
+    h=''
+    for n,t in heads:
+        if n<=line: h=t
+        else: break
+    return h
+kw=set()
+# keywords table
+m=text.split('### 1.3 Keywords (Reserved)')[1].split('```')[1]
+kw=set(w for w in re.findall(r"'([^']+)'",m) if ' ' not in w)
+print("KEYWORDS:",sorted(kw))
+seen={}
+for start,body in blocks:
+    if start<130: pass
+    for l in body:
+        for w in re.findall(r"'([^']+)'",l):
+            if w in kw: continue
+            if not re.fullmatch(r"[a-z][a-z /]*",w): continue
+            seen.setdefault(w,set()).add(section_of(start))
+for w,s in sorted(seen.items()):
+    print(repr(w), sorted(s))
+PY
+KEYWORDS: ['and', 'as', 'back', 'break', 'can', 'catch', 'constant', 'each', 'else', 'end', 'expect', 'export', 'extends', 'fail', 'finally', 'for', 'from', 'give', 'has', 'if', 'import', 'in', 'is', 'might', 'mod', 'module', 'no', 'not', 'nothing', 'object', 'or', 'print', 'repeat', 'return', 'say', 'set', 'skip', 'test', 'then', 'this', 'times', 'to', 'try', 'unless', 'until', 'while', 'yes']
+'a' ['### 1.2 Identifiers', '### 1.4 Literals']
+'all' ['### 3.1 Module']
+'async' ['### 4.8 Async Statements']
+'at' ['### 5.2 Postfix Expressions']
+'by' ['### 4.3 Control Flow Statements']
+'case' ['### 4.3 Control Flow Statements']
+'default' ['### 4.6 Object Declaration']
+'done' ['### 4.8 Async Statements']
+'e' ['### 1.4 Literals']
+'else if' ['### 4.3 Control Flow Statements']
+'f' ['### 1.4 Literals']
+'function' ['### 2.1 Type Expressions']
+'give back' ['### 4.4 Jump Statements']
+'gives' ['### 4.5 Function Declaration']
+'is equal to' ['### 1.5 Operators', '### 5.6 Comparison Expressions']
+'is greater than' ['### 1.5 Operators', '### 5.6 Comparison Expressions']
+'is greater than or equal to' ['### 1.5 Operators', '### 5.6 Comparison Expressions']
+'is in' ['### 5.6 Comparison Expressions']
+'is less than' ['### 1.5 Operators', '### 5.6 Comparison Expressions']
+'is less than or equal to' ['### 1.5 Operators', '### 5.6 Comparison Expressions']
+'is not' ['### 1.5 Operators', '### 5.6 Comparison Expressions']
+'isnt' ['### 1.5 Operators']
+'length' ['### 5.1 Primary Expressions']
+'list of' ['### 2.1 Type Expressions']
+'might fail' ['### 5.11 Expression (Final)']
+'n' ['### 1.4 Literals']
+'needs' ['### 4.5 Function Declaration']
+'new' ['## 7. Object Literals']
+'number' ['### 2.1 Type Expressions']
+'of' ['### 1.5 Operators', '### 2.1 Type Expressions', '### 4.5 Function Declaration', '### 4.7 Try Statement (Error Handling)', '### 5.1 Primary Expressions']
+'parallel' ['### 4.8 Async Statements']
+'r' ['### 1.4 Literals']
+'record' ['### 1.4 Literals']
+'record of' ['### 2.1 Type Expressions']
+'t' ['### 1.4 Literals']
+'text' ['### 2.1 Type Expressions', '### Notation']
+'u' ['### 1.4 Literals']
+'wait' ['### 4.8 Async Statements']
+'when' ['### 4.3 Control Flow Statements']
+'yes/no' ['### 2.1 Type Expressions']
+'z' ['### 1.2 Identifiers']
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue/target/tmp && for p in 'module M
+say "a"
+export all
+end' 'say split("a b", by " ")' 'set items to [1,2]
+say items at 0' 'set items to [1,2]
+say length of items' 'say 1 isnt 2' 'set r to record of { }' 'say "record"'; do printf '%s\n' "$p" > q.rb; printf '=== %s\n' "$(printf '%s' "$p" | head -1)"; ../../target/debug/rb run q.rb 2>&1 | head -2; done; grep -n "'record'" ../../docs/GRAMMAR.md | head
+=== module M
+a
+=== say split("a b", by " ")
+[a, b]
+=== set items to [1,2]
+1
+=== set items to [1,2]
+2
+=== say 1 isnt 2
+Error: AnalyzerError: Unknown variable 'isnt'
+  --> q.rb:1:7
+=== set r to record of { }
+Error: AnalyzerError: Unknown variable 'record'
+Unknown variable 'of'; did you mean 'if'?
+=== say "record"
+record
+99:record_literal     = 'record' '{' [ property { ',' property } ] '}'
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && awk 'NR>=85 && NR<=105' docs/GRAMMAR.md
+// — a short run is not padded out to four, and a fifth digit is ordinary text
+// after the escape, so `\u1f600` is `\u1f60` then `0`. A `\` followed by a
+// surrogate half is a LexerError too: `\uD83D` names no character of its own.
+
+// Boolean
+boolean_literal    = 'yes' | 'no'
+
+// Nothing
+nothing_literal   = 'nothing'
+
+// List literal
+list_literal       = '[' [ expression { ',' expression } ] ']'
+
+// Record literal
+record_literal     = 'record' '{' [ property { ',' property } ] '}'
+property           = identifier ':' expression
+```
+
+### 1.5 Operators
+
+```
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue/target/tmp && printf 'set r to record { x: 1 }\nsay r.x\n' > r.rb && ../../target/debug/rb run r.rb 2>&1 | head -3; ls ../..; cat ../../phases/INVARIANTS.md 2>/dev/null | head -30
+Error: AnalyzerError: Unknown variable 'record'
+  --> r.rb:1:10
+1 | set r to record { x: 1 }
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+phases
+src
+target
+test.redblue
+tests
+tooling
+wasm
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "pub enum Error" -A 30 src/error.rs | head -45; grep -n "pub fn span" -A 8 src/error.rs | head -20
+98:pub enum Error {
+99-    Lexer(String, Span),
+100-    Parser(String, Span),
+101-    Analyzer(String, Span),
+102-    Runtime(String, Span),
+103-    /// One of the host's own resource limits — the step budget, the call-depth
+104-    /// limit, or a loop's iteration cap.
+105-    ///
+106-    /// A variant rather than a `Runtime` whose message happens to read like one,
+107-    /// because the question `might fail` asks of a failure — *is this the host
+108-    /// stopping the program, or the program's own expression going wrong?* — has
+109-    /// to be answerable from the failure itself. Matching a message prefix made
+110-    /// the answer depend on the wording: rewording a limit message would silently
+111-    /// turn every guard around a runaway program into one that swallows it, and
+112-    /// any failure a program produced that began the same way would be reported as
+113-    /// a resource error and escape the guard written for it. It renders as a
+114-    /// `RuntimeError` and reads exactly as one — a limit is a runtime failure — but
+115-    /// nothing has to agree on how it is spelled for it to be told apart.
+116-    Limit(String, Span),
+117-    Io(String),
+118-}
+119-
+120-impl Error {
+121-    /// The source position of this failure, or `None` for failures that have
+122-    /// no position at all (`Io`) and for failures reported as `unknown`.
+123-    pub fn span(&self) -> Option<&Span> {
+124-        let span = match self {
+125-            Error::Lexer(_, span)
+126-            | Error::Parser(_, span)
+127-            | Error::Analyzer(_, span)
+128-            | Error::Runtime(_, span)
+123:    pub fn span(&self) -> Option<&Span> {
+124-        let span = match self {
+125-            Error::Lexer(_, span)
+126-            | Error::Parser(_, span)
+127-            | Error::Analyzer(_, span)
+128-            | Error::Runtime(_, span)
+129-            | Error::Limit(_, span) => span,
+130-            Error::Io(_) => return None,
+131-        };
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '1,60p' tests/parser_hardening_test.rs
+use redblue::lexer::Lexer;
+use redblue::parser::{parse, Parser, MAX_BLOCK_DEPTH, MAX_NESTING_DEPTH};
+use redblue::Error;
+
+fn lex_and_parse(source: &str) -> Result<redblue::parser::Program, Error> {
+    let tokens = Lexer::tokenize(source)?;
+    parse(tokens)
+}
+
+fn parser_error(source: &str) -> Error {
+    lex_and_parse(source).expect_err("source should fail to parse")
+}
+
+/// Builds `set x to ` followed by `open` repeated `depth` times, `1`, and
+/// `close` repeated `depth` times.
+fn nested(open: &str, close: &str, depth: usize) -> String {
+    format!(
+        "set x to {}{}{}\n",
+        open.repeat(depth),
+        "1",
+        close.repeat(depth)
+    )
+}
+
+fn assert_spanned_parser_error(error: &Error) {
+    match error {
+        Error::Parser(message, span) => {
+            assert!(
+                span.is_known(),
+                "parser error must carry a span, got {span:?} for {message:?}"
+            );
+            assert!(!message.is_empty(), "parser error must carry a message");
+        }
+        other => panic!("expected a Parser error, got {other:?}"),
+    }
+}
+
+// --- empty / degenerate input ------------------------------------------------
+
+#[test]
+fn edge_empty_file_parses_to_empty_program() {
+    let program = lex_and_parse("").expect("an empty file is valid Redblue");
+    assert!(
+        program.statements.is_empty(),
+        "empty file should produce no statements, got {}",
+        program.statements.len()
+    );
+}
+
+#[test]
+fn edge_whitespace_only_and_comment_only_are_empty_programs() {
+    for source in [
+        "   ",
+        "\n\n\n",
+        "\t \t",
+        " \r\n \r\n",
+        "// only a comment\n",
+    ] {
+        let program =
+            lex_and_parse(source).unwrap_or_else(|e| panic!("{source:?} should parse: {e}"));
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue/target/tmp && cat > bare1.rb <<'EOF'
+set x to 1
+say x
+EOF
+cat > bare2.rb <<'EOF'
+constant C to 1
+say C
+EOF
+cat > bare3.rb <<'EOF'
+to f(x)
+    give back x * 2
+end
+say f(3)
+EOF
+cat > bare4.rb <<'EOF'
+object P
+    has x
+end
+set P.x to 7
+say P.x
+EOF
+for f in bare1 bare2 bare3 bare4; do printf '=== %s\n' $f; ../../target/debug/rb run $f.rb 2>&1 | head -3; done
+=== bare1
+1
+=== bare2
+1
+=== bare3
+6
+=== bare4
+7
+[0m
+[0m← [0mWrite tests/type_annotation_test.rs
+Wrote file successfully.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "pub fn kind\|pub enum TokenKind" -A 3 src/lexer.rs | head -20; grep -n "Identifier" src/lexer.rs | head -5
+74:pub enum TokenKind {
+75-    // Literals
+76-    Number(f64),
+77-    Text(String),
+81:    // Identifiers
+82:    Identifier(String),
+514:            // Identifiers and keywords
+519:                    None => Token::new(TokenKind::Identifier(ident), line, column),
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "impl Token" -A 25 src/lexer.rs | head -40
+173:impl Token {
+174-    pub fn new(kind: TokenKind, line: usize, column: usize) -> Self {
+175-        Self {
+176-            kind,
+177-            line,
+178-            column,
+179-            word: None,
+180-        }
+181-    }
+182-
+183-    /// A token the lexer read from a word in the [`KEYWORDS`] table.
+184-    pub fn keyword(word: &'static str, kind: TokenKind, line: usize, column: usize) -> Self {
+185-        Self {
+186-            kind,
+187-            line,
+188-            column,
+189-            word: Some(word),
+190-        }
+191-    }
+192-
+193-    /// The same token at another position, keeping the word it was lexed from.
+194-    ///
+195-    /// Re-spanning a token must not cost it the word: a token that moved is
+196-    /// still the word the writer typed, and a diagnostic about it is still
+197-    /// about them.
+198-    pub fn at(&self, line: usize, column: usize) -> Self {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "pub fn kind" -B2 -A4 src/lexer.rs
+(no output)
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '150,175p' src/lexer.rs; sed -n '205,240p' src/lexer.rs
+// Special
+    Newline,
+    Eof,
+}
+
+#[derive(Debug, Clone)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub line: usize,
+    pub column: usize,
+    /// The word in the [`KEYWORDS`] table this token was lexed from, or `None`
+    /// for a token that came from anywhere else.
+    ///
+    /// A kind on its own does not say which word the writer typed: `give` and
+    /// `back` are both [`TokenKind::GiveBack`], `might` and `fail` both
+    /// [`TokenKind::MightFail`], and `mod` and `%` both [`TokenKind::Mod`]. A
+    /// diagnostic that named the kind would name `give` for a line that says
+    /// `back`. The lexer is the only place that still knows, so it records the
+    /// word here and a rejection names what was written.
+    pub word: Option<&'static str>,
+}
+
+impl Token {
+    pub fn new(kind: TokenKind, line: usize, column: usize) -> Self {
+        Self {
+    }
+
+    /// The source position this token was lexed from.
+    pub fn span(&self) -> Span {
+        Span::new(self.line, self.column)
+    }
+}
+
+pub struct Lexer {
+    source: Vec<char>,
+    pos: usize,
+    line: usize,
+    column: usize,
+}
+
+impl Lexer {
+    pub fn new(source: &str) -> Self {
+        Self {
+            source: source.chars().collect(),
+            pos: 0,
+            line: 1,
+            column: 1,
+        }
+    }
+
+    fn current(&self) -> Option<char> {
+        self.source.get(self.pos).copied()
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.source.get(self.pos + 1).copied()
+    }
+
+    fn advance(&mut self) -> Option<char> {
+        let c = self.source.get(self.pos).copied();
+        self.pos += 1;
+[0m
+[0m← [0mEdit tests/type_annotation_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+@@ -72,28 +72,17 @@
+         )
+     })
+ }
+ 
+-/// The printed lines of a program that runs, for the bare forms.
+-fn output(source: &str) -> Vec<String> {
+-    let tokens = Lexer::tokenize(source).expect("the bare form should lex");
+-    let ast = redblue::parser::parse(tokens).expect("the bare form should parse");
+-    redblue::analyzer::analyze(&ast).expect("the bare form should analyze");
++/// Runs a program through the whole pipeline and returns what it printed.
++fn run(source: &str) -> Vec<String> {
++    let tokens = Lexer::tokenize(source).expect("the program should lex");
++    let ast = redblue::parser::parse(tokens).expect("the program should parse");
++    redblue::analyzer::analyze(&ast).expect("the program should analyze");
+     let (mut vm, result) = redblue::run_isolated(&ast);
+-    result.expect("the bare form should run").pipe_output(&mut vm)
++    result.expect("the program should run").pipe(&mut vm)
+ }
+ 
+-trait PipeOutput {
+-    fn pipe_output(self, vm: &mut redblue::interpreter::Vm) -> Vec<String>;
+-}
+-
+-impl PipeOutput for Result<(), Error> {
+-    fn pipe_output(self, vm: &mut redblue::interpreter::Vm) -> Vec<String> {
+-        let _ = vm;
+-        vec![]
+-    }
+-}
+-
+ // ---------------------------------------------------------------------------
+ // The five productions, and the state each is in
+ // ---------------------------------------------------------------------------
+ 
+
+[0m
+[0m← [0mEdit tests/type_annotation_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+@@ -78,9 +78,10 @@
+     let tokens = Lexer::tokenize(source).expect("the program should lex");
+     let ast = redblue::parser::parse(tokens).expect("the program should parse");
+     redblue::analyzer::analyze(&ast).expect("the program should analyze");
+     let (mut vm, result) = redblue::run_isolated(&ast);
+-    result.expect("the program should run").pipe(&mut vm)
++    result.expect("the program should run");
++    vm.take_output()
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // The five productions, and the state each is in
+
+[0m
+[0m← [0mEdit tests/type_annotation_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+@@ -660,10 +660,5 @@
+     section
+         .lines()
+         .find(|line| line.starts_with('#'))
+         .unwrap_or("<no heading>")
+-}
+-
+-#[allow(dead_code)]
+-fn unused_output_helper(source: &str) -> Vec<String> {
+-    output(source)
+ }
+\ No newline at end of file
+
+[0m
+Now remove the dead helper and fix the token-kind access.
+[0m← [0mEdit tests/type_annotation_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+@@ -327,19 +327,22 @@
+         );
+     }
+ 
+     // Being ordinary identifiers is not only a rejection: each one is a name a
+-    // program may bind, and a program that binds them still runs.
+-    for word in ["needs", "gives", "list", "record", "number", "text"] {
+-        let source = format!("set {} to 1\nsay {}\n", word, word);
+-        let tokens = Lexer::tokenize(&source).unwrap_or_else(|e| panic!("`{}` should lex: {}", word, e));
++    // program may bind, and a program that binds them still runs and prints.
++    for (word, printed) in [
++        ("needs", "1"),
++        ("gives", "2"),
++        ("list", "3"),
++        ("record", "4"),
++        ("number", "5"),
++        ("text", "6"),
++    ] {
++        let source = format!("set {} to {}\nsay {}\n", word, printed, word);
+         assert_eq!(
+-            tokens
+-                .iter()
+-                .filter(|token| matches!(token.kind(), redblue::lexer::TokenKind::Identifier(_)))
+-                .count(),
+-            3,
+-            "`{}` should lex as three identifiers and be usable as a name",
++            run(&source),
++            vec![printed.to_string()],
++            "`{}` is not a keyword, so binding and reading it must work as a name",
+             word
+         );
+     }
+ }
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -i 's|^    let mut governed: Vec<usize> = marked_block(&lines, grammar_line("type_expression  = primitive_type"));|    let mut governed: Vec<usize> =\n        marked_block(\&lines, grammar_line("type_expression  = primitive_type")),|' tests/type_annotation_test.rs && cargo test --test type_annotation_test 2>&1 | tail -40
+[1m[94m--> [0mtests/type_annotation_test.rs:453:80
+    [1m[94m|[0m
+[1m[94m453[0m [1m[94m|[0m         marked_block(&lines, grammar_line("type_expression  = primitive_type")),
+    [1m[94m|[0m                                                                                [1m[91m^[0m [1m[91mexpected one of `.`, `;`, `?`, `else`, or an operator[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 2 arguments but 1 argument was supplied[0m
+   [1m[94m--> [0mtests/type_annotation_test.rs:385:19
+    [1m[94m|[0m
+[1m[94m385[0m [1m[94m|[0m     let section = section_containing("## 2. Type System");
+    [1m[94m|[0m                   [1m[91m^^^^^^^^^^^^^^^^^^[0m[1m[94m---------------------[0m [1m[94margument #2 of type `&str` is missing[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: function defined here
+   [1m[94m--> [0mtests/type_annotation_test.rs:655:4
+    [1m[94m|[0m
+[1m[94m655[0m [1m[94m|[0m fn section_containing(document: &str, heading: &str) -> String {
+    [1m[94m|[0m    [1m[92m^^^^^^^^^^^^^^^^^^[0m                 [1m[94m-------------[0m
+[1m[96mhelp[0m: provide the argument
+    [1m[94m|[0m
+[1m[94m385[0m [1m[94m| [0m    let section = section_containing("## 2. Type System"[92m, /* &str */[0m);
+    [1m[94m|[0m                                                         [92m++++++++++++[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 2 arguments but 1 argument was supplied[0m
+   [1m[94m--> [0mtests/type_annotation_test.rs:513:23
+    [1m[94m|[0m
+[1m[94m513[0m [1m[94m|[0m         let section = section_containing(heading);
+    [1m[94m|[0m                       [1m[91m^^^^^^^^^^^^^^^^^^[0m[1m[94m---------[0m [1m[94margument #2 of type `&str` is missing[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: function defined here
+   [1m[94m--> [0mtests/type_annotation_test.rs:655:4
+    [1m[94m|[0m
+[1m[94m655[0m [1m[94m|[0m fn section_containing(document: &str, heading: &str) -> String {
+    [1m[94m|[0m    [1m[92m^^^^^^^^^^^^^^^^^^[0m                 [1m[94m-------------[0m
+[1m[96mhelp[0m: provide the argument
+    [1m[94m|[0m
+[1m[94m513[0m [1m[94m| [0m        let section = section_containing(heading[92m, /* &str */[0m);
+    [1m[94m|[0m                                                 [92m++++++++++++[0m
+
+[1mFor more information about this error, try `rustc --explain E0061`.[0m
+[1m[91merror[0m: could not compile `redblue` (test "type_annotation_test") due to 3 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -i 's|section_containing("## 2. Type System")|section_containing(GRAMMAR, "## 2. Type System")|; s|section_containing(heading)|section_containing(SPEC, heading)|' tests/type_annotation_test.rs && cargo test --test type_annotation_test 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: expected one of `.`, `;`, `?`, `else`, or an operator, found `,`[0m
+   [1m[94m--> [0mtests/type_annotation_test.rs:453:80
+    [1m[94m|[0m
+[1m[94m453[0m [1m[94m|[0m         marked_block(&lines, grammar_line("type_expression  = primitive_type")),
+    [1m[94m|[0m                                                                                [1m[91m^[0m [1m[91mexpected one of `.`, `;`, `?`, `else`, or an operator[0m
+
+[1m[91merror[0m: could not compile `redblue` (test "type_annotation_test") due to 1 previous error
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m→ [0mRead tests/type_annotation_test.rs[90m [offset=445, limit=20][0m
+[0m
+[0m← [0mEdit tests/type_annotation_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs
+@@ -448,10 +448,10 @@
+ // The productions this phase owns: §2.1's block and the five annotation
+ // productions. Nothing else in the grammar is in scope — a word in §5 that
+ // the parser does not read is a different phase's finding, and naming it
+ // here would turn this phase into a documentation sweep.
+-let mut governed: Vec<usize> =
+-    marked_block(&lines, grammar_line("type_expression  = primitive_type")),
++let types = grammar_line("type_expression  = primitive_type");
++let mut governed: Vec<usize> = marked_block(&lines, types);
+ for host in HOSTS {
+     governed.extend(marked_block(&lines, grammar_line(host.anchor)));
+ }
+ governed.sort_unstable();
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test type_annotation_test 2>&1 | tail -50
+3: type_annotation_test::every_annotated_production_carries_a_not_implemented_note::{closure#0}
+   4: <type_annotation_test::every_annotated_production_carries_a_not_implemented_note::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- the_type_expression_block_carries_a_not_implemented_note stdout ----
+
+thread 'the_type_expression_block_carries_a_not_implemented_note' (6834) panicked at tests/type_annotation_test.rs:376:5:
+docs/GRAMMAR.md §2.1 spells a whole static type system with no Not-implemented note. Add one at the top of the block, as §4.8 does.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: type_annotation_test::the_type_expression_block_carries_a_not_implemented_note
+   3: type_annotation_test::the_type_expression_block_carries_a_not_implemented_note::{closure#0}
+   4: <type_annotation_test::the_type_expression_block_carries_a_not_implemented_note::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- spec_complex_types_and_explicit_types_say_they_are_not_implemented stdout ----
+
+thread 'spec_complex_types_and_explicit_types_say_they_are_not_implemented' (6831) panicked at tests/type_annotation_test.rs:514:9:
+SPEC.md `### Complex Types` shows type syntax the parser cannot read with no Not-implemented note
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: type_annotation_test::spec_complex_types_and_explicit_types_say_they_are_not_implemented
+   3: type_annotation_test::spec_complex_types_and_explicit_types_say_they_are_not_implemented::{closure#0}
+   4: <type_annotation_test::spec_complex_types_and_explicit_types_say_they_are_not_implemented::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword stdout ----
+
+thread 'every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword' (6829) panicked at tests/type_annotation_test.rs:472:5:
+docs/GRAMMAR.md spells 11 word(s) as keywords in a production that carries no Not-implemented note: 'number' on line 149, 'text' on line 149, 'list of' on line 150, 'record of' on line 151, 'function' on line 154, 'function' on line 155, 'of' on line 156, 'needs' on line 295, 'gives' on line 296, 'of' on line 301, 'default' on line 311. Either reserve the word in §1.3 and give the parser a rule for it, or mark the production Not implemented.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: type_annotation_test::every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword
+   3: type_annotation_test::every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword::{closure#0}
+   4: <type_annotation_test::every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    every_annotated_production_carries_a_not_implemented_note
+    every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword
+    spec_complex_types_and_explicit_types_say_they_are_not_implemented
+    the_type_expression_block_carries_a_not_implemented_note
+
+test result: FAILED. 5 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[91merror[0m: test failed, to rerun pass `--test type_annotation_test`
+[0m
+[0m→ [0mRead docs/GRAMMAR.md[90m [offset=130, limit=32][0m
+[0m
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -135,9 +135,27 @@
+ ## 2. Type System
+ 
+ ### 2.1 Type Expressions
+ 
++Not implemented. Redblue has no static types, no type expressions and no type
++annotations: every production in this section is kept here as the shape a future
++implementation has to match, and nothing below parses today. `number`, `text`,
++`list of`, `record of`, `function` and the type names a program would spell are
++ordinary identifiers, not reserved words — `set number to 1` is a program, and
++`set numbers to list of number` is a refusal naming the three names it could not
++resolve.
++
++The five productions that read a `type_expression` back — §4.1's annotated
++`declaration`, §4.5's `function_decl` and `parameter`, §4.6's `property_decl` —
++carry the same note. Each is pinned by `tests/type_annotation_test.rs`, which
++runs every annotated form in the language and requires the parser to refuse it;
++the moment one of them is implemented that test goes red and the note has to come
++off in the same change.
++
+ ```
++// NOT IMPLEMENTED. Nothing below parses today: `type_expression` is written down
++// as the shape a future implementation has to match, and §4.1, §4.5 and §4.6 all
++// carry this same note on the productions that read a type expression back.
+ type_expression  = primitive_type
+                  | list_type
+                  | record_type
+                  | object_type
+
+[0m
+[0m→ [0mRead tests/type_annotation_test.rs[90m [limit=70, offset=190][0m
+[0m✗ [0mEdit tests/type_annotation_test.rs failed
+[91m[1mError: [0mCould not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+[0m→ [0mRead tests/type_annotation_test.rs[90m [limit=45, offset=168][0m
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '155,168p' tests/type_annotation_test.rs
+];
+
+/// The lines of `docs/GRAMMAR.md`.
+fn grammar_lines() -> Vec<&'static str> {
+    GRAMMAR.lines().collect()
+}
+
+/// Whether the grammar line at `index` carries a **Not implemented** note in the
+/// shape §4.3 established: a run of `//` comments immediately above it, or —
+/// for a note that covers a whole fenced block, the way §2.1's does — a run of
+/// `//` comments immediately above the block's first line.
+fn note_governs(lines: &[&str], index: usize) -> bool {
+    let comment_run = |mut at: usize| -> Option<String> {
+        // Step back off the production's own line.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import io
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+start=s.index("/// Whether the grammar line at `index` carries a **Not implemented** note in the")
+end=s.index("/// The index of the first grammar line containing `anchor`.")
+new='''/// Whether the grammar line at `index` carries a **Not implemented** note in the
+/// shape §4.3 established: a run of `//` comments immediately above it. A note
+/// at the top of a fenced block — §2.1's, which covers all eight of its
+/// productions — is found this way too, because the production it marks is the
+/// line below the run.
+fn note_governs(lines: &[&str], index: usize) -> bool {
+    // Step back off the production's own line.
+    let mut at = match index.checked_sub(1) {
+        Some(at) => at,
+        None => return false,
+    };
+    while lines[at].trim().is_empty() {
+        at = match at.checked_sub(1) {
+            Some(at) => at,
+            None => return false,
+        };
+    }
+    // Collect the run of `//` lines ending at `at`, if that is what is there.
+    // Anything else means this line has no note of its own.
+    if !lines[at].trim_start().starts_with("//") {
+        return false;
+    }
+    let mut note = String::new();
+    loop {
+        if !lines[at].trim_start().starts_with("//") {
+            break;
+        }
+        note.insert_str(0, lines[at]);
+        if at == 0 {
+            break;
+        }
+        at -= 1;
+    }
+    note.to_lowercase().contains("not implemented")
+}
+
+'''
+s=s[:start]+new+s[end:]
+open(p,'w').write(s)
+PY
+sed -n '155,200p' tests/type_annotation_test.rs
+];
+
+/// The lines of `docs/GRAMMAR.md`.
+fn grammar_lines() -> Vec<&'static str> {
+    GRAMMAR.lines().collect()
+}
+
+/// Whether the grammar line at `index` carries a **Not implemented** note in the
+/// shape §4.3 established: a run of `//` comments immediately above it. A note
+/// at the top of a fenced block — §2.1's, which covers all eight of its
+/// productions — is found this way too, because the production it marks is the
+/// line below the run.
+fn note_governs(lines: &[&str], index: usize) -> bool {
+    // Step back off the production's own line.
+    let mut at = match index.checked_sub(1) {
+        Some(at) => at,
+        None => return false,
+    };
+    while lines[at].trim().is_empty() {
+        at = match at.checked_sub(1) {
+            Some(at) => at,
+            None => return false,
+        };
+    }
+    // Collect the run of `//` lines ending at `at`, if that is what is there.
+    // Anything else means this line has no note of its own.
+    if !lines[at].trim_start().starts_with("//") {
+        return false;
+    }
+    let mut note = String::new();
+    loop {
+        if !lines[at].trim_start().starts_with("//") {
+            break;
+        }
+        note.insert_str(0, lines[at]);
+        if at == 0 {
+            break;
+        }
+        at -= 1;
+    }
+    note.to_lowercase().contains("not implemented")
+}
+
+/// The index of the first grammar line containing `anchor`.
+fn grammar_line(anchor: &str) -> usize {
+    grammar_lines()
+[0m
+Now replace `marked_block` with an explicit region helper.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+start=s.index("/// The block of grammar lines a note at `index` governs")
+end=s.index("#[test]\nfn every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword")
+new='''/// The lines a note at `index` governs: the note's own run, the production, and
+/// its continuation lines — the ones that do not start a new production, which
+/// in this grammar is every line up to the blank line that ends it.
+///
+/// `whole_block` is §2.1's case, where one note at the top of the fenced block
+/// covers all eight of the productions below it. It is not inferred from the
+/// shape, because §4.1's note sits in exactly the same place and covers one
+/// production: saying that the multiple-assignment `declaration` — which parses —
+/// is Not implemented would be a second lie in the document this phase exists to
+/// remove.
+fn marked_region(lines: &[&str], index: usize, whole_block: bool) -> Vec<usize> {
+    if whole_block {
+        // The fence above the note, and the fence that closes it.
+        let mut start = index;
+        while start > 0 && !lines[start].trim_start().starts_with("//") {
+            start -= 1;
+        }
+        let mut end = start;
+        while end < lines.len() && lines[end].trim() != "```" {
+            end += 1;
+        }
+        return (start..end).collect();
+    }
+
+    let mut start = index;
+    while start > 0 && lines[start - 1].trim_start().starts_with("//") {
+        start -= 1;
+    }
+    let mut end = index;
+    while end < lines.len() && !lines[end].trim().is_empty() {
+        end += 1;
+    }
+    (start..end).collect()
+}
+
+'''
+s=s[:start]+new+s[end:]
+
+old_body='''    let types = grammar_line("type_expression  = primitive_type");
+    let mut governed: Vec<usize> = marked_block(&lines, types);
+    for host in HOSTS {
+        governed.extend(marked_block(&lines, grammar_line(host.anchor)));
+    }
+    governed.sort_unstable();
+    governed.dedup();
+
+    let mut unmarked: Vec<String> = Vec::new();
+    for &index in &governed {
+        for literal in literals(&lines[index]) {
+            if reserved.contains(&literal) {
+                continue;
+            }
+            if !note_governs(&lines, index) {
+                unmarked.push(format!("'{}' on line {}", literal, index + 1));
+            }
+        }
+    }
+'''
+new_body='''    let types = grammar_line("type_expression  = primitive_type");
+    let mut governed: Vec<usize> = marked_region(&lines, types, true);
+    for host in HOSTS {
+        let index = grammar_line(host.anchor);
+        governed.extend(marked_region(&lines, index, false));
+    }
+    governed.sort_unstable();
+    governed.dedup();
+
+    // Every one of those regions has to be marked, or the scan below is
+    // vacuous: a region nobody marked is not evidence, it is silence.
+    let unmarked_productions: Vec<String> = HOSTS
+        .iter()
+        .filter(|host| !note_governs(&lines, grammar_line(host.anchor)))
+        .map(|host| host.name.to_string())
+        .collect();
+    assert!(
+        unmarked_productions.is_empty(),
+        "the keyword scan below only covers marked productions, so an unmarked one is not \
+         checked at all: {}. Mark the production first.",
+        unmarked_productions.join(", ")
+    );
+
+    let mut unmarked: Vec<String> = Vec::new();
+    for &index in &governed {
+        for literal in literals(&lines[index]) {
+            if !reserved.contains(&literal) {
+                unmarked.push(format!("'{}' on line {}", literal, index + 1));
+            }
+        }
+    }
+'''
+assert old_body in s
+s=s.replace(old_body,new_body)
+open(p,'w').write(s)
+PY
+cargo test --test type_annotation_test 2>&1 | grep -E "^(test |error|warning: unused|failures:)" | head -30
+test edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts ... ok
+test every_annotated_production_carries_a_not_implemented_note ... FAILED
+test every_type_annotation_the_grammar_promises_is_refused ... ok
+test edge_the_bare_form_of_every_annotated_declaration_still_runs ... ok
+test the_rejection_of_an_annotation_names_what_it_wanted ... ok
+test spec_complex_types_and_explicit_types_say_they_are_not_implemented ... FAILED
+test every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword ... FAILED
+test the_type_expression_block_carries_a_not_implemented_note ... FAILED
+test edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names ... ok
+failures:
+failures:
+test result: FAILED. 5 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "^// Variable declaration\|^// Multiple assignment\|^// Constant declaration\|^declaration\|^function_decl\|^parameter\|^property_decl" docs/GRAMMAR.md
+211:// Variable declaration
+212:declaration      = 'set' identifier [ ':' type_expression ] 'to' expression
+214:// Multiple assignment
+215:declaration      = 'set' identifier { ',' identifier } 'to' expression { ',' expression }
+217:// Constant declaration
+218:declaration      = 'constant' identifier [ ':' type_expression ] 'to' expression
+312:function_decl    = 'to' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+318:parameter        = identifier [ ':' type_expression ]
+329:property_decl    = 'has' identifier [ ':' type_expression ] [ 'default' expression ]
+[0m
+Now the §4.1, §4.5, §4.6 notes in GRAMMAR.md.
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -207,15 +207,21 @@
+ 
+ ### 4.1 Declaration Statements
+ 
+ ```
+-// Variable declaration
++// Variable declaration — NOT IMPLEMENTED in the annotated form: the
++// `':' type_expression` bracket is a §2.1 type expression and the parser does
++// not read one, so `set x : number to 1` is a parser error and `set x to 1` is
++// the whole of what parses today. The multiple-assignment form below, which
++// carries no annotation, does parse.
+ declaration      = 'set' identifier [ ':' type_expression ] 'to' expression
+ 
+ // Multiple assignment
+ declaration      = 'set' identifier { ',' identifier } 'to' expression { ',' expression }
+ 
+-// Constant declaration
++// Constant declaration — NOT IMPLEMENTED in the annotated form, for the reason
++// the `set` declaration above gives: `constant C : number to 1` is a parser
++// error, and `constant C to 1` is the whole of what parses today.
+ declaration      = 'constant' identifier [ ':' type_expression ] 'to' expression
+ ```
+ 
+ A `constant` binds a name of the whole program, so it may be declared once
+
+[0m
+[0m→ [0mRead docs/GRAMMAR.md[90m [limit=22, offset=315][0m
+[0m
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -314,14 +314,22 @@
+ 
+ ### 4.5 Function Declaration
+ 
+ ```
++// NOT IMPLEMENTED in the annotated forms. `needs` and `gives` are not reserved
++// words: they are ordinary identifiers, so `to f(a) needs number` parses as two
++// expressions in a row and is refused by the analyzer with `Unknown variable
++// 'needs'`. A bare `to f(a)` is the whole of what parses today. The parameter
++// list below carries the same note on the parameters themselves.
+ function_decl    = 'to' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+                    [ 'needs' type_expression { ',' type_expression } ]
+                    [ 'gives' type_expression ]
+                    { statement }
+                    'end'
+ 
++// NOT IMPLEMENTED in both forms. Neither `to f(x : number)` nor `to f(x of
++// number)` parses: the first is a parser error at the colon, the second at the
++// word `of`. `to f(x)` is the whole of what parses today.
+ parameter        = identifier [ ':' type_expression ]
+                  | identifier 'of' type_expression
+ ```
+ 
+
+[0m
+[0m← [0mEdit docs/GRAMMAR.md
+Index: /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
++++ /home/runner/work/rbops/rbops/redblue/docs/GRAMMAR.md
+@@ -339,8 +339,12 @@
+ object_decl      = 'object' identifier [ 'extends' identifier ]
+                     { property_decl | method_decl }
+                     'end'
+ 
++// NOT IMPLEMENTED in the annotated form: `has x : number` and `has x default 1`
++// are both parser errors, and `has x` is the whole of what parses today. A
++// property is given its value by writing to the declaration — see SPEC.md,
++// "Lookup order and shadowing".
+ property_decl    = 'has' identifier [ ':' type_expression ] [ 'default' expression ]
+ 
+ method_decl      = 'to' identifier [ '(' [ parameter { ',' parameter } ] ')' ]
+                     { statement }
+
+[0m
+Now SPEC.md.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '176,215p' SPEC.md
+### Primitive Types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `number` | Integers and decimals | `42`, `3.14`, `-10` |
+| `text` | Unicode strings | `"Hello"` |
+| `yes/no` | Boolean values | `yes`, `no` |
+| `nothing` | Null/void | `nothing` |
+
+### Complex Types
+
+```redblue
+// List of a type
+set numbers to list of number
+set names to list of text
+
+// Record type
+set Point to record { x: number, y: number }
+
+// Object type
+set Person to object
+```
+
+### Type Inference
+
+Redblue infers types automatically:
+
+```redblue
+set x to 10        // x is number
+set name to "Hi"   // name is text
+```
+
+### Explicit Types
+
+```redblue
+set x to 10 as number
+set name to "Hi" as text
+```
+
+---
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue/target/tmp && printf 'set x to 10 as number\n' > a.rb && ../../target/debug/rb run a.rb 2>&1 | head -4; printf 'set Person to object\n' > b.rb && ../../target/debug/rb run b.rb 2>&1 | head -4
+Error: ParserError: Unexpected token 'as'
+  --> a.rb:1:13
+1 | set x to 10 as number
+  |             ^
+Error: ParserError: Unexpected token 'object'
+  --> b.rb:1:15
+1 | set Person to object
+  |               ^
+[0m
+[0m← [0mEdit SPEC.md
+Index: /home/runner/work/rbops/rbops/redblue/SPEC.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/SPEC.md
++++ /home/runner/work/rbops/rbops/redblue/SPEC.md
+@@ -181,10 +181,38 @@
+ | `text` | Unicode strings | `"Hello"` |
+ | `yes/no` | Boolean values | `yes`, `no` |
+ | `nothing` | Null/void | `nothing` |
+ 
++These four name the kinds a *value* can have, which is what the table above
++documents. None of them is a type a program can write down: Redblue has no type
++system, no type expressions and no type annotations, and none of the words in the
++left-hand column is reserved — `set number to 1` is an ordinary program that
++binds an ordinary name. See "Complex Types" below.
++
+ ### Complex Types
+ 
++Not implemented. Nothing in this section parses. `list of`, `record of`,
++`function` and the type names after them are ordinary identifiers, not reserved
++words, so each line below is a program the front end refuses rather than a
++declaration:
++
++- `set numbers to list of number` — `AnalyzerError: Unknown variable 'list'`,
++  then the same for `of` and `number`, because the parser reads three
++  identifiers in a row;
++- `set Point to record { x: number, y: number }` — `AnalyzerError: Unknown
++  variable 'record'`. The record literal Redblue does have is spelled `{ x:
++  1 }`, with the braces and no leading word; see "Records";
++- `set Person to object` — `ParserError: Unexpected token 'object'`.
++
++The grammar that would have to be implemented to make them work is written down
++in `docs/GRAMMAR.md` §2, marked Not Implemented there in the same way as the
++async and pattern-matching productions. The annotation the grammar reads back —
++`set x : number to 1`, `constant C : number to 1`, `to f(x : number)`,
++`object P` / `has x : number`, `to f(a) needs number` — is refused too, and
++`tests/type_annotation_test.rs` runs every one of those forms and requires the
++rejection. A future phase that implements them has to take the note off in the
++same change; the test is what stops the promise from drifting back in.
++
+ ```redblue
+ // List of a type
+ set numbers to list of number
+ set names to list of text
+@@ -206,8 +234,14 @@
+ ```
+ 
+ ### Explicit Types
+ 
++Not implemented. Redblue has no type annotations at all, so there is no `as` form
++to write: `set x to 10 as number` is `ParserError: Unexpected token 'as'`,
++because `as` is reserved for `import ... as ...` and the expression reader has
++no rule for it here. The annotation the grammar does spell — `set x : number to
++1` — is not implemented either, for the reason "Complex Types" above gives.
++
+ ```redblue
+ set x to 10 as number
+ set name to "Hi" as text
+ ```
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test type_annotation_test 2>&1 | grep -E "^(test |error|failures:|  )" | head -40
+test every_annotated_production_carries_a_not_implemented_note ... ok
+test edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts ... ok
+test every_type_annotation_the_grammar_promises_is_refused ... ok
+test edge_the_bare_form_of_every_annotated_declaration_still_runs ... ok
+test the_rejection_of_an_annotation_names_what_it_wanted ... ok
+test edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names ... ok
+test every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword ... FAILED
+test the_type_expression_block_carries_a_not_implemented_note ... FAILED
+test spec_complex_types_and_explicit_types_say_they_are_not_implemented ... ok
+failures:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: type_annotation_test::every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword
+   3: type_annotation_test::every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword::{closure#0}
+   4: <type_annotation_test::every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: type_annotation_test::the_type_expression_block_carries_a_not_implemented_note
+   3: type_annotation_test::the_type_expression_block_carries_a_not_implemented_note::{closure#0}
+   4: <type_annotation_test::the_type_expression_block_carries_a_not_implemented_note::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+failures:
+    every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword
+    the_type_expression_block_carries_a_not_implemented_note
+test result: FAILED. 7 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test type_annotation_test 2>&1 | grep -A3 "panicked at tests/type_annotation_test.rs" | head -20
+thread 'every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword' (7504) panicked at tests/type_annotation_test.rs:475:5:
+docs/GRAMMAR.md spells 12 word(s) as keywords in a production that carries no Not-implemented note: 'number' on line 167, 'text' on line 167, 'list of' on line 168, 'record of' on line 169, 'function' on line 172, 'function' on line 173, 'of' on line 174, 'needs' on line 321, 'needs' on line 324, 'gives' on line 325, 'of' on line 333, 'default' on line 347. Either reserve the word in §1.3 and give the parser a rule for it, or mark the production Not implemented.
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+--
+thread 'the_type_expression_block_carries_a_not_implemented_note' (7516) panicked at tests/type_annotation_test.rs:372:5:
+docs/GRAMMAR.md §2 carries no Not-implemented note outside its code block:
+## 2. Type System
+stack backtrace:
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+
+# 1. note_governs -> keep, but add note_text helper + chapter helper
+anchor = "/// The index of the first grammar line containing `anchor`."
+new_helpers = '''/// The note and the prose a reader sees about the production at `index`: the run
+/// of `//` comments immediately above it, plus the Markdown section it sits in.
+/// A word the grammar spells as a literal has to be named in one of the two —
+/// a note that says "Not implemented" without saying which words are affected
+/// leaves a reader thinking `needs` is a keyword.
+fn note_text(lines: &[&str], index: usize) -> String {
+    let mut text = String::new();
+    for line in &lines[section_bounds(lines, index)] {
+        text.push_str(line);
+        text.push('\\n');
+    }
+    if let Some(comment) = comment_run(lines, index) {
+        text.push_str(&comment);
+    }
+    text
+}
+
+/// The lines of the Markdown section `index` is in: from the heading above it to
+/// the next heading of any level.
+fn section_bounds(lines: &[&str], index: usize) -> std::ops::Range<usize> {
+    let start = (0..=index)
+        .rev()
+        .find(|at| lines[*at].starts_with('#'))
+        .unwrap_or(0);
+    let end = ((index + 1)..lines.len())
+        .find(|at| lines[*at].starts_with('#'))
+        .unwrap_or(lines.len());
+    start..end
+}
+
+/// The run of `//` comment lines immediately above `index`, or `None` when there
+/// is not one.
+fn comment_run(lines: &[&str], index: usize) -> Option<String> {
+    let mut at = index.checked_sub(1)?;
+    while lines[at].trim().is_empty() {
+        at = at.checked_sub(1)?;
+    }
+    if !lines[at].trim_start().starts_with("//") {
+        return None;
+    }
+    let mut note = String::new();
+    loop {
+        if !lines[at].trim_start().starts_with("//") {
+            break;
+        }
+        note.insert_str(0, lines[at]);
+        if at == 0 {
+            break;
+        }
+        at -= 1;
+    }
+    Some(note)
+}
+
+'''
+s = s.replace(anchor, new_helpers + anchor, 1)
+open(p,'w').write(s)
+PY
+echo done
+done
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+
+start=s.index("#[test]\nfn every_word_a_marked_production_spells_as_a_literal_is_not_a_hidden_keyword")
+end=s.index("/// The single-quoted literals on one grammar line")
+new='''#[test]
+fn every_word_a_marked_production_spells_as_a_literal_is_reserved_or_named_in_its_note() {
+    let lines = grammar_lines();
+    let reserved = grammar_keywords();
+
+    // The productions this phase owns: §2.1's block and the five annotation
+    // productions. Nothing else in the grammar is in scope — a word in §5 that
+    // the parser does not read is a different phase's finding, and sweeping the
+    // whole document here would turn this phase into a documentation rewrite.
+    let types = grammar_line("type_expression  = primitive_type");
+    let mut regions: Vec<(usize, bool)> = vec![(types, true)];
+    for host in HOSTS {
+        regions.push((grammar_line(host.anchor), false));
+    }
+
+    // Every region has to be marked, or the scan below proves nothing: an
+    // unmarked production is the finding, not an exemption from it.
+    let unmarked: Vec<&str> = regions
+        .iter()
+        .filter(|(index, _)| !note_governs(&lines, *index))
+        .map(|_| "one of the type productions")
+        .collect();
+    assert!(
+        unmarked.is_empty(),
+        "the scan below only covers marked productions, and {} of them carry no note",
+        unmarked.len()
+    );
+
+    // The claim: a word the grammar spells as a literal is either a reserved
+    // keyword — §1.3's rule, that a word is listed only while the parser has a
+    // rule that reads it — or it is named by the note that marks its production,
+    // so a reader meets the word and the sentence that says it is not a keyword.
+    let mut unnamed: Vec<String> = Vec::new();
+    for (index, whole_block) in regions {
+        let note = note_text(&lines, index);
+        for at in marked_region(&lines, index, whole_block) {
+            for word in literals(&lines[at]) {
+                if reserved.contains(&word) || contains_word(&note, &word) {
+                    continue;
+                }
+                unnamed.push(format!("'{}' on line {}", word, at + 1));
+            }
+        }
+    }
+
+    assert!(
+        unnamed.is_empty(),
+        "docs/GRAMMAR.md spells {} word(s) as keywords in a production that carries no \\
+         Not-implemented note: {}. Either reserve the word in §1.3 and give the parser a rule \\
+         for it, or name it in the note above its production — a reader who meets `needs` in \\
+         the grammar has to meet the sentence that says it is not a keyword.",
+        unnamed.len(),
+        unnamed.join(", ")
+    );
+
+    // The three words this finding named. `needs` and `gives` are in neither
+    // §1.3 nor a marked production's note as a *keyword*, and `default` is not
+    // reserved either: they are ordinary identifiers, which is exactly what the
+    // notes say. If a future phase gives the parser a rule for one, the notes
+    // and this test have to change together.
+    for word in ["needs", "gives", "default", "list", "record", "function"] {
+        assert!(
+            !Lexer::keywords().contains(&word),
+            "`{}` is reserved by the lexer; if the parser now reads it, drop the Not-implemented \\
+             note it is listed under with the same change",
+            word
+        );
+    }
+}
+
+'''
+s=s[:start]+new+s[end:]
+
+# literals() now yields words
+old_lits='''/// The single-quoted literals on one grammar line: `'set'`, `':'`, and so on.
+/// Single characters are left out — `'{'` and `'e'` are notation, not words a
+/// writer types.
+fn literals(line: &str) -> Vec<String> {
+    line.split('\\'')
+        .skip(1)
+        .step_by(2)
+        .filter(|literal| literal.len() > 1 && literal.chars().all(|c| c.is_ascii_lowercase() || c == ' '))
+        .map(|literal| literal.to_string())
+        .collect()
+}'''
+new_lits='''/// The words a grammar line spells as a single-quoted literal: `'set'`, `'needs'`,
+/// `'list of'` as `list` and `of`. Punctuation is left out — `'{'`, `':'` and
+/// `','` are notation rather than words a writer types, and a one-letter literal
+/// cannot be a keyword in any case.
+fn literals(line: &str) -> Vec<String> {
+    line.split('\\'')
+        .skip(1)
+        .step_by(2)
+        .flat_map(|literal| literal.split([' ', '/']))
+        .filter(|word| word.len() > 1 && word.chars().all(|c| c.is_ascii_lowercase()))
+        .map(|word| word.to_string())
+        .collect()
+}
+
+/// Whether `text` names `word` as a whole word, which is what "the note names
+/// this word" has to mean: a note about `of` is not satisfied by the word
+/// `record of` in a production three lines away, and `needs` is not satisfied
+/// by `needy`.
+fn contains_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|piece| piece == word)
+}'''
+assert old_lits in s
+s=s.replace(old_lits,new_lits)
+open(p,'w').write(s)
+PY
+cargo test --test type_annotation_test 2>&1 | grep -E "^test |panicked at tests|^error" | head -20
+test every_annotated_production_carries_a_not_implemented_note ... ok
+test edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts ... ok
+test every_type_annotation_the_grammar_promises_is_refused ... ok
+test every_word_a_marked_production_spells_as_a_literal_is_reserved_or_named_in_its_note ... ok
+test the_rejection_of_an_annotation_names_what_it_wanted ... ok
+test edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names ... ok
+test edge_the_bare_form_of_every_annotated_declaration_still_runs ... ok
+test spec_complex_types_and_explicit_types_say_they_are_not_implemented ... ok
+test the_type_expression_block_carries_a_not_implemented_note ... FAILED
+thread 'the_type_expression_block_carries_a_not_implemented_note' (7674) panicked at tests/type_annotation_test.rs:426:5:
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+old='''    // The section heading itself is what a reader lands on when they search for
+    // "types", so the note has to be reachable from the section too — not only
+    // from inside the block.
+    let section = section_containing(GRAMMAR, "## 2. Type System");
+    assert!(
+        section.to_lowercase().contains("not implemented"),
+        "docs/GRAMMAR.md §2 carries no Not-implemented note outside its code block:\\n{}",
+        heading_of(&section)
+    );'''
+new='''    // The section heading itself is what a reader lands on when they search for
+    // "types", so the note has to be reachable from the chapter and not only
+    // from inside the code block — where §4.3 puts `when`'s.
+    let chapter = chapter_containing(GRAMMAR, "## 2. Type System");
+    assert!(
+        chapter.to_lowercase().contains("not implemented"),
+        "docs/GRAMMAR.md §2 carries no Not-implemented note outside its code block:\\n{}",
+        heading_of(&chapter)
+    );'''
+assert old in s
+s=s.replace(old,new)
+
+old2='''/// The heading line of a section, for a message that has to say where it looked.'''
+new2='''/// The whole chapter of a Markdown document that starts at `heading`: the
+/// heading line to the next heading at the same level or above it. A reader who
+/// searches for "type" lands on `## 2. Type System`, not on `### 2.1`.
+fn chapter_containing(document: &str, heading: &str) -> String {
+    let level = heading.chars().take_while(|c| *c == '#').count();
+    let body = document
+        .split(heading)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the document must keep a `{}` section", heading));
+
+    let mut out = String::from(heading);
+    let mut fence = false;
+    for line in body.lines() {
+        let closes = line.trim_start().starts_with("```");
+        if line.starts_with('#') && !fence {
+            if line.chars().take_while(|c| *c == '#').count() <= level {
+                break;
+            }
+        }
+        if closes {
+            fence = !fence;
+        }
+        out.push('\\n');
+        out.push_str(line);
+    }
+    out
+}
+
+/// The heading line of a section, for a message that has to say where it looked.'''
+assert old2 in s
+s=s.replace(old2,new2)
+open(p,'w').write(s)
+PY
+cargo test --test type_annotation_test 2>&1 | grep -E "^test |panicked at tests|^error|^warning" | head -20
+test every_annotated_production_carries_a_not_implemented_note ... ok
+test edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts ... ok
+test every_type_annotation_the_grammar_promises_is_refused ... ok
+test edge_the_bare_form_of_every_annotated_declaration_still_runs ... ok
+test every_word_a_marked_production_spells_as_a_literal_is_reserved_or_named_in_its_note ... ok
+test the_rejection_of_an_annotation_names_what_it_wanted ... ok
+test the_type_expression_block_carries_a_not_implemented_note ... ok
+test edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names ... ok
+test spec_complex_types_and_explicit_types_say_they_are_not_implemented ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cp docs/GRAMMAR.md target/tmp/GRAMMAR.bak && python3 - <<'PY'
+p='docs/GRAMMAR.md'
+s=open(p).read()
+s=s.replace('''// NOT IMPLEMENTED. Nothing below parses today: `type_expression` is written down
+// as the shape a future implementation has to match, and §4.1, §4.5 and §4.6 all
+// carry this same note on the productions that read a type expression back.
+''','')
+s=s.replace('''// NOT IMPLEMENTED in the annotated forms. `needs` and `gives` are not reserved''','''// A note. `needs` and `gives` are not reserved''')
+open(p,'w').write(s)
+PY
+cargo test --test type_annotation_test 2>&1 | grep -E "^test " ; cp target/tmp/GRAMMAR.bak docs/GRAMMAR.md && echo restored
+test edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts ... ok
+test every_type_annotation_the_grammar_promises_is_refused ... ok
+test edge_the_bare_form_of_every_annotated_declaration_still_runs ... ok
+test every_annotated_production_carries_a_not_implemented_note ... FAILED
+test every_word_a_marked_production_spells_as_a_literal_is_reserved_or_named_in_its_note ... FAILED
+test the_rejection_of_an_annotation_names_what_it_wanted ... ok
+test the_type_expression_block_carries_a_not_implemented_note ... FAILED
+test edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names ... ok
+test spec_complex_types_and_explicit_types_say_they_are_not_implemented ... ok
+test result: FAILED. 6 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+restored
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo test --test doc_blocks_test 2>&1 | grep -E "^test |panicked at tests|^  " | head -30
+test edge_a_block_with_no_closing_fence_is_still_extracted ... ok
+test edge_a_fence_that_is_not_tagged_redblue_is_ignored ... ok
+test edge_a_document_that_does_not_exist_is_an_error_rather_than_a_panic ... ok
+test edge_an_empty_block_is_extracted ... ok
+test every_documentation_block_is_classified_exactly_once ... FAILED
+test edge_a_known_fail_recording_that_is_wrong_is_rejected ... FAILED
+test running_every_block_agrees_with_the_bucket_it_is_in ... FAILED
+thread 'every_documentation_block_is_classified_exactly_once' (8059) panicked at tests/doc_blocks_test.rs:517:5:
+  SPEC.md:1000
+  SPEC.md:1058
+  SPEC.md:1145
+  SPEC.md:1160
+  SPEC.md:1195
+  SPEC.md:1231
+  SPEC.md:1264
+  SPEC.md:1335
+  SPEC.md:1398
+  SPEC.md:1410
+  SPEC.md:203
+  SPEC.md:235
+  SPEC.md:246
+  SPEC.md:354
+  SPEC.md:466
+  SPEC.md:496
+  SPEC.md:602
+  SPEC.md:647
+  SPEC.md:659
+  SPEC.md:687
+  SPEC.md:710
+  SPEC.md:789
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import subprocess,re
+def blocks(text):
+    lines=text.split('\n')
+    out=[]
+    fence=False
+    for i,l in enumerate(lines,1):
+        t=l.strip()
+        if t.startswith('```'):
+            if not fence:
+                info=t[3:].split()
+                if info and info[0]=='redblue':
+                    out.append(i)
+            fence = not fence
+    return out
+for doc in ['SPEC.md','docs/GRAMMAR.md','README.md','PHILOSOPHY.md','HANDOUT.md']:
+    old=subprocess.run(['git','show','HEAD:'+doc],capture_output=True,text=True).stdout
+    new=open(doc).read()
+    o=blocks(old); n=blocks(new)
+    print(doc, len(o), len(n), 'SAME' if len(o)==len(n) else 'DIFFERENT')
+PY
+SPEC.md 72 72 SAME
+docs/GRAMMAR.md 9 9 SAME
+README.md 7 7 SAME
+PHILOSOPHY.md 9 9 SAME
+HANDOUT.md 8 8 SAME
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import subprocess,re
+def blocks(text):
+    lines=text.split('\n')
+    out=[]; fence=False
+    for i,l in enumerate(lines,1):
+        t=l.strip()
+        if t.startswith('```'):
+            if not fence:
+                info=t[3:].split()
+                if info and info[0]=='redblue': out.append(i)
+            fence = not fence
+    return out
+mapping={}
+for doc in ['SPEC.md','docs/GRAMMAR.md']:
+    old=subprocess.run(['git','show','HEAD:'+doc],capture_output=True,text=True).stdout
+    o=blocks(old); n=blocks(open(doc).read())
+    assert len(o)==len(n)
+    for a,b in zip(o,n):
+        if a!=b: mapping[(doc,a)]=b
+for f in ['tests/doc_blocks_runs.txt','tests/doc_blocks_fragments.txt','tests/doc_blocks_known_fail.txt']:
+    out=[]
+    for line in open(f).read().split('\n'):
+        m=re.match(r'^((?:docs/)?[A-Za-z0-9_.]+\.md):(\d+)(\t.*)?$',line)
+        if m:
+            key=(m.group(1),int(m.group(2)))
+            if key in mapping:
+                line=f"{key[0]}:{mapping[key]}{m.group(3) or ''}"
+        out.append(line)
+    open(f,'w').write('\n'.join(out))
+print("rewrote", len(mapping), "line numbers")
+PY
+cargo test --test doc_blocks_test 2>&1 | grep -E "^test |panicked at tests" | head -10
+rewrote 75 line numbers
+test edge_a_block_with_no_closing_fence_is_still_extracted ... ok
+test edge_a_fence_that_is_not_tagged_redblue_is_ignored ... ok
+test edge_an_empty_block_is_extracted ... ok
+test edge_a_document_that_does_not_exist_is_an_error_rather_than_a_panic ... ok
+test every_documentation_block_is_classified_exactly_once ... ok
+test edge_a_known_fail_recording_that_is_wrong_is_rejected ... ok
+test running_every_block_agrees_with_the_bucket_it_is_in ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "type\|not Redblue syntax\|as number" tests/doc_blocks_fragments.txt
+40:SPEC.md:215	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+41:SPEC.md:244	excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+59:SPEC.md:673	excerpt - a type-annotated signature; `a as number` and `as number` are not forms the parser accepts
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/doc_blocks_fragments.txt'
+s=open(p).read()
+s=s.replace("SPEC.md:215\texcerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords",
+            "SPEC.md:215\texcerpt - a type-declaration catalogue under a Not-implemented note: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords. The three refusals are named one at a time in tests/type_annotation_test.rs")
+s=s.replace('SPEC.md:244\texcerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it',
+            'SPEC.md:244\texcerpt - an "Explicit Types" illustration under a Not-implemented note; `as number` is not a form the parser accepts, and the block above it says the same thing without it')
+open(p,'w').write(s)
+PY
+grep -n "SPEC.md:215\|SPEC.md:244" tests/doc_blocks_fragments.txt
+40:SPEC.md:215	excerpt - a type-declaration catalogue under a Not-implemented note: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords. The three refusals are named one at a time in tests/type_annotation_test.rs
+41:SPEC.md:244	excerpt - an "Explicit Types" illustration under a Not-implemented note; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+[0m
+Now run the full gates.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check 2>&1 | head -40
+Diff in /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs:295:
+ #[test]
+ fn the_rejection_of_an_annotation_names_what_it_wanted() {
+     for (source, message, (line, column)) in [
+-        ("set x : number to 1\n", "Expected 'to' but got Colon", (1, 7)),
+-        ("constant C : number to 1\n", "Expected 'to' but got Colon", (1, 12)),
+         (
++            "set x : number to 1\n",
++            "Expected 'to' but got Colon",
++            (1, 7),
++        ),
++        (
++            "constant C : number to 1\n",
++            "Expected 'to' but got Colon",
++            (1, 12),
++        ),
++        (
+             "object P\n    has x : number\nend\n",
+             "Unexpected token Colon",
+             (2, 11),
+Diff in /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs:344:
+ fn edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names() {
+     for (source, named) in [
+         ("to f(a)\n    needs number\n    give back a\nend\n", "needs"),
+-        (
+-            "to f(a)\n    gives number\n    give back a\nend\n",
+-            "gives",
+-        ),
++        ("to f(a)\n    gives number\n    give back a\nend\n", "gives"),
+         ("set numbers to list of number\n", "list"),
+     ] {
+         let error = expect_refusal(source, &format!("`{}`", source.trim()));
+Diff in /home/runner/work/rbops/rbops/redblue/tests/type_annotation_test.rs:596:
+ 
+     // The form itself may not appear in a section that does not say so, anywhere
+     // in either document — the promise is what a reader copies out of it.
+-    for (name, document) in [
+-        ("SPEC.md", SPEC),
+-        ("docs/GRAMMAR.md", GRAMMAR),
+-    ] {
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all && cargo fmt --all -- --check && echo "FMT CLEAN" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -30
+FMT CLEAN
+[1m[94m530[0m [1m[94m|[0m             for word in literals(&lines[at]) {
+    [1m[94m|[0m                                  [1m[91m^^^^^^^^^^[0m [1m[91mhelp: change this to: `lines[at]`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mhelp[0m: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrow
+    [1m[94m= [0m[1mnote[0m: `-D clippy::needless-borrow` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(clippy::needless_borrow)]`
+
+[1m[91merror[0m[1m: this `if` statement can be collapsed[0m
+   [1m[94m--> [0mtests/type_annotation_test.rs:752:9
+    [1m[94m|[0m
+[1m[94m752[0m [1m[94m|[0m [1m[91m/[0m         if line.starts_with('#') && !fence {
+[1m[94m753[0m [1m[94m|[0m [1m[91m|[0m             if line.chars().take_while(|c| *c == '#').count() <= level {
+[1m[94m754[0m [1m[94m|[0m [1m[91m|[0m                 break;
+[1m[94m755[0m [1m[94m|[0m [1m[91m|[0m             }
+[1m[94m756[0m [1m[94m|[0m [1m[91m|[0m         }
+    [1m[94m|[0m [1m[91m|_________^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mhelp[0m: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_if
+    [1m[94m= [0m[1mnote[0m: `-D clippy::collapsible-if` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+[1m[96mhelp[0m: collapse nested if block
+    [1m[94m|[0m
+[1m[94m752[0m [92m~ [0m        if line.starts_with('#') && !fence
+[1m[94m753[0m [92m~ [0m            [92m&&[0m line.chars().take_while(|c| *c == '#').count() <= level {
+[1m[94m754[0m [1m[94m|[0m                 break;
+[1m[94m755[0m [92m~ [0m            }
+    [1m[94m|[0m
+
+[1m[91merror[0m: could not compile `redblue` (test "type_annotation_test") due to 2 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+s=s.replace("for word in literals(&lines[at]) {","for word in literals(lines[at]) {")
+s=s.replace("""        if line.starts_with('#') && !fence {
+            if line.chars().take_while(|c| *c == '#').count() <= level {
+                break;
+            }
+        }""","""        if line.starts_with('#')
+            && !fence
+            && line.chars().take_while(|c| *c == '#').count() <= level
+        {
+            break;
+        }""")
+open(p,'w').write(s)
+PY
+cargo clippy --all-targets -- -D warnings 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 4.69s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && cargo fmt --all -- --check && echo "FMT CLEAN" && cargo test --all-targets 2>&1 | grep -E "^(test result|error|failures:|---- )" | head -60
+FMT CLEAN
+
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 900000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && nohup cargo test --all-targets > target/tmp/cargo-test.log 2>&1 &
+echo started $!
+started 18890
+
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 120000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sleep 100; tail -5 target/tmp/cargo-test.log; grep -cE "^test result" target/tmp/cargo-test.log
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically has been running for over 60 seconds
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+3
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls phases/ | tail -8; echo ---; ls phases/phase-113 2>/dev/null; echo ---; ls phases/phase-112 2>/dev/null
+phase-081
+phase-083
+phase-085
+phase-086
+phase-087
+phase-089
+phase-092
+phase-093
+---
+---
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && ls phases/phase-093/; echo ---; head -60 phases/phase-093/REPORT.md
+REPORT.md
+---
+# Phase 093 — Cache target/ between CI runs
+
+> Applied by hand. Changes `.github/workflows/`; the rbops bot token has NO
+> `workflows` permission (`.github/workflows/rbops.yml:10`) so an agent cannot
+> land this. The intended lock.
+
+## Status: DONE. One thing landed; the rest was dead code and is abandoned.
+
+## What landed
+
+`actions/cache` on every job, keyed on the Cargo.lock hash, with `restore-keys`
+falling back to the lockfile alone. A second push on the same lockfile restores
+instead of recompiling cold.
+
+Not separately measured. Caching was folded into the same commit as the
+sharding (092), so its effect cannot be isolated from the sharding's in that one
+run — and the sharding's own effect turned out to be 17 seconds. Claiming a
+caching win from that run would be inventing a number.
+
+## What was proposed and rejected: the trigger split
+
+This phase originally also asked to run the corpus only on `pull_request` and on
+push to `main`, not on every branch push.
+
+**That premise was wrong.** `gh pr list` returns zero pull requests in both
+`authorss81/rbops` and `authorss81/redblue`. Every change — the bot's phase
+commits and human commits alike — goes straight to `main`. So:
+
+- the `pull_request:` trigger in this workflow has never fired once
+- the "branch push with no PR" case does not exist
+- trigger logic to skip the slow tier would serve zero runs
+
+It is dead code rather than backlog, which is why this phase is closed rather
+than left partial. A phase that looks open-ended eventually gets "finished" by
+someone adding trigger logic for a pattern that never occurs.
+
+## Delivery model: direct-to-main
+
+For a bot-driven pipeline the machine gate plus the read-only reviewer is the
+review model. A PR would add merge latency and a new failure mode without adding
+a reviewer. If PRs are introduced later, the trigger split becomes meaningful
+and should be designed then against real traffic.
+
+## Gates
+| Gate | Result |
+|---|---|
+| CI run `38362122114` | pass — 8/8 jobs green, 8m8s |
+| Full suite on both triggers | unchanged, and now known to be sufficient: there are no other triggers in use |
+| `cargo fmt --check` in CI | **added in a follow-up commit.** The tree was always fmt-clean; my earlier claim that it was not was wrong - see the correction below | — the tree is not fmt-clean, so it would turn every build red |
+
+## Invariants touched
+
+None. One file changed: `.github/workflows/ci.yml`. No test, language or public
+type was touched.
+
+## Correction: this report wrongly said the tree was not fmt-clean
+
+An earlier version of this file claimed `cargo fmt --check` was deliberately left
+out of CI because "the tree is not fmt-clean, so adding it would turn every build
+red." **That was false.**
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && tail -20 target/tmp/cargo-test.log; grep -cE "^test result" target/tmp/cargo-test.log
+test edge_malformed_source_is_reported_rather_than_compiled ... ok
+test edge_nothing_heads_an_expression_on_both_engines ... ok
+test edge_a_comparison_after_a_worded_index_is_the_same_program_on_both_engines ... ok
+test edge_stage3_is_byte_identical_on_a_sample_of_every_family ... ok
+test edge_stage3_is_byte_identical_on_the_awkward_shapes ... ok
+test edge_a_while_loop_nested_in_another_patches_its_own_jump ... ok
+test edge_stage3_reports_a_failure_rather_than_writing_a_file ... ok
+test edge_the_bytecode_vm_hands_arguments_to_the_program_it_runs ... ok
+test edge_the_bytecode_vm_reports_a_bad_invocation_as_a_failure ... ok
+test edge_the_self_compilation_still_obeys_the_step_budget ... ok
+test edge_stage3_refuses_every_malformed_corpus_program ... ok
+test edge_source_shapes_are_byte_identical ... ok
+test edge_the_two_engines_run_a_branching_program_the_same ... ok
+test stage2_is_byte_identical_for_each_statement_kind ... ok
+test edge_stage3_is_byte_identical_on_every_corpus_program has been running for over 60 seconds
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically has been running for over 60 seconds
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+3
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff --stat && git status --short
+SPEC.md                         | 34 ++++++++++++++++++++
+ docs/GRAMMAR.md                 | 42 +++++++++++++++++++++++--
+ tests/doc_blocks_fragments.txt  | 60 +++++++++++++++++------------------
+ tests/doc_blocks_known_fail.txt | 12 +++----
+ tests/doc_blocks_runs.txt       | 70 ++++++++++++++++++++---------------------
+ 5 files changed, 144 insertions(+), 74 deletions(-)
+ M SPEC.md
+ M docs/GRAMMAR.md
+ M tests/doc_blocks_fragments.txt
+ M tests/doc_blocks_known_fail.txt
+ M tests/doc_blocks_runs.txt
+?? tests/type_annotation_test.rs
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git diff --numstat SPEC.md docs/GRAMMAR.md && rm -f target/tmp/GRAMMAR.bak target/tmp/*.rb && git diff -- tests/doc_blocks_runs.txt | head -20
+34	0	SPEC.md
+39	3	docs/GRAMMAR.md
+diff --git a/tests/doc_blocks_runs.txt b/tests/doc_blocks_runs.txt
+index a686e8c..6f9e297 100644
+--- a/tests/doc_blocks_runs.txt
++++ b/tests/doc_blocks_runs.txt
+@@ -33,47 +33,47 @@ SPEC.md:40
+ SPEC.md:58
+ SPEC.md:132
+ SPEC.md:160
+-SPEC.md:203
+-SPEC.md:235
+-SPEC.md:246
+-SPEC.md:354
+-SPEC.md:466
+-SPEC.md:496
+-SPEC.md:602
+-SPEC.md:647
+-SPEC.md:659
+-SPEC.md:687
+-SPEC.md:710
++SPEC.md:231
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && for f in tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt tests/doc_blocks_known_fail.txt; do echo "== $f"; diff <(git show HEAD:$f | cut -f2- | sort) <(cut -f2- $f | sort) && echo "  reasons unchanged"; done
+== tests/doc_blocks_runs.txt
+47d46
+< SPEC.md:1000
+49,54c48,54
+< SPEC.md:1058
+< SPEC.md:1145
+< SPEC.md:1160
+< SPEC.md:1195
+< SPEC.md:1231
+< SPEC.md:1264
+---
+> SPEC.md:1068
+> SPEC.md:1092
+> SPEC.md:1179
+> SPEC.md:1194
+> SPEC.md:1229
+> SPEC.md:1265
+> SPEC.md:1298
+56d55
+< SPEC.md:1335
+58,59c57,59
+< SPEC.md:1398
+< SPEC.md:1410
+---
+> SPEC.md:1403
+> SPEC.md:1432
+> SPEC.md:1444
+61,64c61,64
+< SPEC.md:203
+< SPEC.md:235
+< SPEC.md:246
+< SPEC.md:354
+---
+> SPEC.md:231
+> SPEC.md:269
+> SPEC.md:280
+> SPEC.md:388
+66,67c66,67
+< SPEC.md:466
+< SPEC.md:496
+---
+> SPEC.md:500
+> SPEC.md:530
+69,73c69,71
+< SPEC.md:602
+< SPEC.md:647
+< SPEC.md:659
+< SPEC.md:687
+< SPEC.md:710
+---
+> SPEC.md:636
+> SPEC.md:681
+> SPEC.md:693
+75,78c73,75
+< SPEC.md:789
+< SPEC.md:806
+< SPEC.md:820
+< SPEC.md:828
+---
+> SPEC.md:744
+> SPEC.md:755
+> SPEC.md:823
+80,89c77,89
+< SPEC.md:893
+< SPEC.md:919
+< SPEC.md:962
+< docs/GRAMMAR.md:558
+< docs/GRAMMAR.md:605
+< docs/GRAMMAR.md:610
+< docs/GRAMMAR.md:626
+< docs/GRAMMAR.md:633
+< docs/GRAMMAR.md:642
+< docs/GRAMMAR.md:657
+---
+> SPEC.md:854
+> SPEC.md:862
+> SPEC.md:874
+> SPEC.md:927
+> SPEC.md:953
+> SPEC.md:996
+> docs/GRAMMAR.md:594
+> docs/GRAMMAR.md:641
+> docs/GRAMMAR.md:646
+> docs/GRAMMAR.md:662
+> docs/GRAMMAR.md:669
+> docs/GRAMMAR.md:678
+> docs/GRAMMAR.md:693
+== tests/doc_blocks_fragments.txt
+72,73c72,73
+< excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+< excerpt - an "Explicit Types" illustration; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+---
+> excerpt - a type-declaration catalogue under a Not-implemented note: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords. The three refusals are named one at a time in tests/type_annotation_test.rs
+> excerpt - an "Explicit Types" illustration under a Not-implemented note; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+== tests/doc_blocks_known_fail.txt
+  reasons unchanged
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sleep 110; grep -E "^test result|^error|FAILED" target/tmp/cargo-test.log | head -20; echo "---"; tail -3 target/tmp/cargo-test.log
+test result: ok. 266 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+---
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "fn " tests/type_annotation_test.rs | grep "^[0-9]*:fn" | sed 's/(.*//'
+52:fn refused
+65:fn expect_refusal
+77:fn run
+158:fn grammar_lines
+167:fn note_governs
+203:fn note_text
+217:fn section_bounds
+230:fn comment_run
+253:fn grammar_line
+265:fn every_type_annotation_the_grammar_promises_is_refused
+296:fn the_rejection_of_an_annotation_names_what_it_wanted
+352:fn edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names
+400:fn every_annotated_production_carries_a_not_implemented_note
+417:fn the_type_expression_block_carries_a_not_implemented_note
+443:fn grammar_keywords
+469:fn marked_region
+495:fn every_word_a_marked_production_spells_as_a_literal_is_reserved_or_named_in_its_note
+568:fn literals
+582:fn contains_word
+592:fn spec_complex_types_and_explicit_types_say_they_are_not_implemented
+633:fn edge_the_bare_form_of_every_annotated_declaration_still_runs
+668:fn edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts
+707:fn sections_of
+723:fn sections_containing
+731:fn section_containing
+741:fn chapter_containing
+768:fn heading_of
+[0m
+Let me write the report and findings while the bootstrap tests finish.
+[0m$ [0mmkdir -p /home/runner/work/rbops/rbops/redblue/phases/phase-113 && echo ok
+ok
+[0m
+[0m← [0mWrite phases/phase-113/FINDINGS.md
+Wrote file successfully.
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && sed -n '660,680p' SPEC.md; echo ===; sed -n '95,125p' docs/GRAMMAR.md
+```redblue
+to create_user(name, email, age)
+    // parameters
+end
+
+// With default values
+to greet(name, greeting default "Hello")
+    say "{greeting}, {name}!"
+end
+```
+
+### Type Annotations
+
+```redblue
+to add(a as number, b as number) as number
+    give back a + b
+end
+```
+
+### First-Class Functions
+
+===
+// List literal
+list_literal       = '[' [ expression { ',' expression } ] ']'
+
+// Record literal
+record_literal     = 'record' '{' [ property { ',' property } ] '}'
+property           = identifier ':' expression
+```
+
+### 1.5 Operators
+
+```
+// Arithmetic
+add_op       = '+'
+sub_op       = '-'
+mul_op       = '*'
+div_op       = '/'
+mod_op       = 'mod'
+
+// Comparison
+eq_op        = 'is equal to' | '=='
+neq_op       = 'is not' | 'isnt' | '!='
+lt_op        = 'is less than' | '<'
+lte_op       = 'is less than or equal to' | '<='
+gt_op        = 'is greater than' | '>'
+gte_op       = 'is greater than or equal to' | '>='
+
+// Logical
+and_op       = 'and' | '&&'
+or_op        = 'or' | '||'
+not_op       = 'not' | '!'
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "^### Type Annotations" -A 12 SPEC.md; echo ===; grep -n "record_literal\|^neq_op" docs/GRAMMAR.md
+671:### Type Annotations
+672-
+673-```redblue
+674-to add(a as number, b as number) as number
+675-    give back a + b
+676-end
+677-```
+678-
+679-### First-Class Functions
+680-
+681-```redblue
+682-set double to to (x) give back x * 2
+683-
+===
+99:record_literal     = 'record' '{' [ property { ',' property } ] '}'
+115:neq_op       = 'is not' | 'isnt' | '!='
+444:                 | record_literal
+[0m
+[0m← [0mEdit SPEC.md
+Index: /home/runner/work/rbops/rbops/redblue/SPEC.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/SPEC.md
++++ /home/runner/work/rbops/rbops/redblue/SPEC.md
+@@ -669,8 +669,16 @@
+ ```
+ 
+ ### Type Annotations
+ 
++Not implemented. There are no type annotations in Redblue, and the two spellings
++the grammar has ever offered are both refused: `to add(a as number, b as number)
++as number` is a parser error at the first `as`, because `as` is reserved for
++`import ... as ...` and the parameter reader has no rule for it, and the
++`identifier ':' type_expression` parameter of `docs/GRAMMAR.md` §4.5 — written
++`to add(a : number)` — is a parser error at the colon. A parameter is written
++`to add(a, b)`, and nothing checks what it is given. See "Complex Types" above.
++
+ ```redblue
+ to add(a as number, b as number) as number
+     give back a + b
+ end
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+old='''    for heading in ["### Complex Types", "### Explicit Types"] {'''
+new='''    for heading in [
+        "### Complex Types",
+        "### Explicit Types",
+        "### Type Annotations",
+    ] {'''
+assert old in s
+s=s.replace(old,new)
+old2='''        for promise in [
+            "set numbers to list of number",
+            "record { x: number",
+            "set x : number",
+            "needs number",
+        ] {'''
+new2='''        for promise in [
+            "set numbers to list of number",
+            "record { x: number",
+            "set x : number",
+            "needs number",
+            "a as number",
+            "as number",
+        ] {'''
+assert old2 in s
+s=s.replace(old2,new2)
+open(p,'w').write(s)
+PY
+cargo test --test type_annotation_test 2>&1 | grep -E "^test |panicked at tests" | head -20
+test every_annotated_production_carries_a_not_implemented_note ... ok
+test edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts ... ok
+test every_type_annotation_the_grammar_promises_is_refused ... ok
+test edge_the_bare_form_of_every_annotated_declaration_still_runs ... ok
+test the_rejection_of_an_annotation_names_what_it_wanted ... ok
+test the_type_expression_block_carries_a_not_implemented_note ... ok
+test every_word_a_marked_production_spells_as_a_literal_is_reserved_or_named_in_its_note ... ok
+test edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names ... ok
+test spec_complex_types_and_explicit_types_say_they_are_not_implemented ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue/target/tmp && printf 'to add(a as number)\n    give back a\nend\n' > c.rb && ../../target/debug/rb run c.rb 2>&1 | head -4
+Error: ParserError: Expected RightParen but got 'as'
+  --> c.rb:1:10
+1 | to add(a as number)
+  |          ^
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/type_annotation_test.rs'
+s=open(p).read()
+s=s.replace("fn spec_complex_types_and_explicit_types_say_they_are_not_implemented",
+            "fn every_spec_section_that_shows_type_syntax_says_it_is_not_implemented")
+old='''        (
+            "to f(x : number)\\n    give back x\\nend\\n",
+            "Expected RightParen but got Colon",
+            (1, 8),
+        ),
+    ] {'''
+new='''        (
+            "to f(x : number)\\n    give back x\\nend\\n",
+            "Expected RightParen but got Colon",
+            (1, 8),
+        ),
+        // The `as` spelling SPEC.md's "Type Annotations" shows. `as` is
+        // reserved — for `import ... as ...` — so the rejection has to name the
+        // word rather than a `TokenKind`, which is what the assertion below
+        // turns on.
+        (
+            "to add(a as number)\\n    give back a\\nend\\n",
+            "Expected RightParen but got 'as'",
+            (1, 10),
+        ),
+    ] {'''
+assert old in s
+s=s.replace(old,new)
+open(p,'w').write(s)
+PY
+cargo fmt --all && cargo test --test type_annotation_test 2>&1 | grep -E "^test |panicked at tests" | head -20
+test every_annotated_production_carries_a_not_implemented_note ... ok
+test edge_annotation_absent_present_malformed_and_doubled_on_all_five_hosts ... ok
+test edge_the_bare_form_of_every_annotated_declaration_still_runs ... ok
+test every_type_annotation_the_grammar_promises_is_refused ... ok
+test the_rejection_of_an_annotation_names_what_it_wanted ... ok
+test the_type_expression_block_carries_a_not_implemented_note ... ok
+test every_word_a_marked_production_spells_as_a_literal_is_reserved_or_named_in_its_note ... ok
+test edge_needs_gives_and_list_of_are_ordinary_identifiers_the_analyzer_names ... ok
+test every_spec_section_that_shows_type_syntax_says_it_is_not_implemented ... ok
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[0m
+Now renumber the buckets again for the new SPEC.md edit, and check the running suite.
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+import subprocess,re
+def blocks(text):
+    lines=text.split('\n'); out=[]; fence=False
+    for i,l in enumerate(lines,1):
+        t=l.strip()
+        if t.startswith('```'):
+            if not fence:
+                info=t[3:].split()
+                if info and info[0]=='redblue': out.append(i)
+            fence = not fence
+    return out
+mapping={}
+for doc in ['SPEC.md','docs/GRAMMAR.md']:
+    old=subprocess.run(['git','show','HEAD:'+doc],capture_output=True,text=True).stdout
+    o=blocks(old); n=blocks(open(doc).read())
+    assert len(o)==len(n), (doc,len(o),len(n))
+    for a,b in zip(o,n):
+        if a!=b: mapping[(doc,a)]=b
+for f in ['tests/doc_blocks_runs.txt','tests/doc_blocks_fragments.txt','tests/doc_blocks_known_fail.txt']:
+    out=[]
+    for line in open(f).read().split('\n'):
+        m=re.match(r'^((?:docs/)?[A-Za-z0-9_.]+\.md):(\d+)(\t.*)?$',line)
+        if m:
+            key=(m.group(1),int(m.group(2)))
+            if key in mapping: line=f"{key[0]}:{mapping[key]}{m.group(3) or ''}"
+        out.append(line)
+    open(f,'w').write('\n'.join(out))
+print("remapped", len(mapping))
+PY
+cargo test --test doc_blocks_test 2>&1 | grep -E "^test result|FAILED"
+remapped 75
+test every_documentation_block_is_classified_exactly_once ... FAILED
+test edge_a_known_fail_recording_that_is_wrong_is_rejected ... FAILED
+test running_every_block_agrees_with_the_bucket_it_is_in ... FAILED
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && git checkout -- tests/doc_blocks_runs.txt tests/doc_blocks_fragments.txt tests/doc_blocks_known_fail.txt && python3 - <<'PY'
+import subprocess,re
+def blocks(text):
+    lines=text.split('\n'); out=[]; fence=False
+    for i,l in enumerate(lines,1):
+        t=l.strip()
+        if t.startswith('```'):
+            if not fence:
+                info=t[3:].split()
+                if info and info[0]=='redblue': out.append(i)
+            fence = not fence
+    return out
+mapping={}
+for doc in ['SPEC.md','docs/GRAMMAR.md']:
+    old=subprocess.run(['git','show','HEAD:'+doc],capture_output=True,text=True).stdout
+    o=blocks(old); n=blocks(open(doc).read())
+    assert len(o)==len(n), (doc,len(o),len(n))
+    for a,b in zip(o,n):
+        if a!=b: mapping[(doc,a)]=b
+for f in ['tests/doc_blocks_runs.txt','tests/doc_blocks_fragments.txt','tests/doc_blocks_known_fail.txt']:
+    out=[]
+    for line in open(f).read().split('\n'):
+        m=re.match(r'^((?:docs/)?[A-Za-z0-9_.]+\.md):(\d+)(\t.*)?$',line)
+        if m:
+            key=(m.group(1),int(m.group(2)))
+            if key in mapping: line=f"{key[0]}:{mapping[key]}{m.group(3) or ''}"
+        out.append(line)
+    open(f,'w').write('\n'.join(out))
+print("remapped", len(mapping))
+PY
+python3 - <<'PY'
+p='tests/doc_blocks_fragments.txt'
+s=open(p).read()
+s=s.replace("SPEC.md:215\texcerpt - a type-declaration catalogue:","SPEC.md:215\texcerpt - a type-declaration catalogue under a Not-implemented note:")
+s=s.replace('SPEC.md:244\texcerpt - an "Explicit Types" illustration;','SPEC.md:244\texcerpt - an "Explicit Types" illustration under a Not-implemented note;')
+open(p,'w').write(s)
+PY
+grep -n "type-declaration catalogue\|Explicit Types" tests/doc_blocks_fragments.txt; grep -n "Type Annotations" tests/doc_blocks_fragments.txt
+remapped 75
+40:SPEC.md:215	excerpt - a type-declaration catalogue under a Not-implemented note: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+41:SPEC.md:244	excerpt - an "Explicit Types" illustration under a Not-implemented note; `as number` is not a form the parser accepts, and the block above it says the same thing without it
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -n "SPEC.md:67[0-9]\|SPEC.md:68[0-9]" tests/doc_blocks_fragments.txt
+59:SPEC.md:681	excerpt - a type-annotated signature; `a as number` and `as number` are not forms the parser accepts
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'PY'
+p='tests/doc_blocks_fragments.txt'
+s=open(p).read()
+s=s.replace("SPEC.md:681\texcerpt - a type-annotated signature; `a as number` and `as number` are not forms the parser accepts",
+            "SPEC.md:681\texcerpt - a type-annotated signature under a Not-implemented note; `a as number` and `as number` are not forms the parser accepts, and the refusal is pinned in tests/type_annotation_test.rs")
+open(p,'w').write(s)
+PY
+cargo test --test doc_blocks_test 2>&1 | grep -E "^test result|FAILED|panicked"
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && grep -E "^test result|FAILED|^error" target/tmp/cargo-test.log | head -20; echo "---"; tail -3 target/tmp/cargo-test.log
+test result: ok. 266 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+---
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+[0m
