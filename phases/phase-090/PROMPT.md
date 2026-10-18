@@ -8,7 +8,6 @@
 | Risk | `low` |
 | Depends on | _none_ |
 | Timeout | 90 min |
-
 ## The failure-assertion rule does not apply here
 
 This phase declares `failure_assert: not_applicable`, so the gate does NOT
