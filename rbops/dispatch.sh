@@ -1093,7 +1093,11 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       printf ' allow(clippy:: suppression. Do not delete a test.\n'
       printf 'Then re-run the four gates yourself.\n\n'
       printf '## Reviewer output\n\n'
-      cat "$LOG_DIR/$phase.review.$round.log"
+      if grep -qE '^FINDINGS:' "$LOG_DIR/$phase.review.$round.log" 2>/dev/null; then
+        sed -n '/^FINDINGS:/,$p' "$LOG_DIR/$phase.review.$round.log" | emit_capped 60000 "reviewer findings"
+      elif [ -f "$LOG_DIR/$phase.review.$round.log" ]; then
+        tail -c 60000 "$LOG_DIR/$phase.review.$round.log"
+      fi
     } > "$fctx"
     run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.fix.$round.log" "$fctx" \
         --dir "$PROJECT_DIR" --agent build --title "rbops-fix-${phase}-${round}"
