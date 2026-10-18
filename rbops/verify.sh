@@ -469,7 +469,7 @@ else
   # call beside a spelled-out error label: a test cannot buy this by naming a
   # label in prose, because the label must be quoted inside the matched line.
   FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
-    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|expect_refusal|assert_stdout_contains|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
   if [ "$FAILASSERT" -ge 1 ]; then
     ok "failure-asserting test present: $FAILASSERT"
   else
