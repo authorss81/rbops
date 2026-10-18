@@ -230,6 +230,7 @@ cmd_select() {
   # 1. resume a deferral — unless it has already yielded priority
   p="$( "$JQ" -r '.phases[].id' "$PHASES" 2>/dev/null | tr -d '\r' | sort -t- -k2 -n \
        | while read -r id; do
+           is_manual "$id" && continue
            has "$id" .deferred || continue
            [ "$(read_n "$id" .deferred_attempts)" -lt "$yield_at" ] || continue
            echo "$id"; break
@@ -241,6 +242,7 @@ cmd_select() {
         has "$id" .done     && continue
         has "$id" .blocked  && continue
         has "$id" .starved  && continue
+        is_manual "$id" && continue
         # Yielded: deferred too many times in a row without progress. Skip for
         # now so other ready work proceeds; step 3 below still picks it when
         # nothing else can run.
@@ -394,6 +396,20 @@ checkpoint_loop() {
       git reset --mixed HEAD >/dev/null 2>&1 || true
     ' || true
   done
+}
+
+# A phase with "manual": true cannot be landed by an agent: it needs an
+# edit under rbops/, and AGENTS.md hard rule 1 forbids an agent to make
+# one. Such a phase is applied by a human and marked .done. Without this
+# check the pipeline dispatches it anyway, the agent works in the redblue
+# checkout where there is no rbops/ directory to edit, must_touch can never
+# be satisfied, and the phase defers forever.
+#
+# Phase-111 spun on exactly this: 4 attempts, zero work, every one doomed
+# before it started. Dispatch had no notion of `manual` at all - the flag
+# was only ever read by humans reading the manifest.
+is_manual() {
+  [ "$("$JQ" -r --arg p "$1" '.phases[]|select(.id==$p)|.manual // false' "$PHASES" 2>/dev/null)" = "true" ]
 }
 
 start_checkpoint_loop() {
@@ -990,7 +1006,17 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     has_sev="$(grep -coE '\[(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\]|\*\*?(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL|MAJOR):' "$rlog" 2>/dev/null)"; has_sev="${has_sev:-0}"
     has_clean="$(grep -ciE 'FINDINGS: *none|REVIEW VERDICT: *CLEAN' "$rlog" 2>/dev/null)"; has_clean="${has_clean:-0}"
     has_verdict="$(grep -ciE '^[[:space:]]*REVIEW VERDICT: *(CLEAN|FINDINGS)' "$rlog" 2>/dev/null)"; has_verdict="${has_verdict:-0}"
-    blocking="$(grep -coE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL):' "$rlog" 2>/dev/null)"; blocking="${blocking:-0}"
+    # MAJOR blocks, exactly as BLOCKER and CRITICAL do. AGENTS.md section 5 says
+    # BLOCKER and MAJOR findings "are then fixed by a fresh implementer run, and
+    # the full gate is run again", and section 5's reviewer contract says a phase
+    # with open BLOCKER/MAJOR findings is not .done. This regex counted only
+    # BLOCKER and CRITICAL, so a review whose only finding was tagged [MAJOR]
+    # fell through to the `has_sev` branch below and shipped.
+    #
+    # That is not hypothetical: logs/phase-080.review.3.log ends with a [MAJOR] at
+    # src/parser.rs:1813 and `REVIEW VERDICT: FINDINGS 1`, and `touch
+    # phases/phase-080/.done` ran in the same minute.
+    blocking="$(grep -coE '\[(BLOCKER|CRITICAL|MAJOR)\]|\*\*?(BLOCKER|CRITICAL|MAJOR)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL|MAJOR):' "$rlog" 2>/dev/null)"; blocking="${blocking:-0}"
 
     if [ "$blocking" -gt 0 ]; then
       if [ "$round" -ge "$verify_round" ]; then
@@ -1003,7 +1029,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       log "review round $round: explicit CLEAN verdict - shipping"
       break
     elif [ "$has_sev" -gt 0 ]; then
-      log "review round $round: findings present, none blocking - shipping"
+      log "review round $round: findings present, none blocking (MINOR/STYLE only) - shipping"
       break
     elif [ "$has_verdict" -gt 0 ]; then
       log "review round $round: verdict line present but no findings and no CLEAN - shipping"
