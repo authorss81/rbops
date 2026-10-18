@@ -36,8 +36,8 @@ the shipped suite. Details in "The one red test" and "The hole the suite had".
 
 | File | Lines | What |
 |---|---|---|
-| `tests/agent_permissions_test.rs` | +52 −0 | `check_no_grants_beyond` rejects any permission key on the reviewer beyond `edit`/`bash` unless it too denies, plus `edge_a_tool_granted_to_the_reviewer_besides_edit_and_bash_is_rejected`. This is this run's only production-behaviour change. |
-| `tests/unreviewed_work_ack_test.rs` | +1 −1 | The acknowledgement entry repointed from the stale `05c77d1…` to `48d5bf0…`, with figures from `git show --numstat 48d5bf0`, and the same SHA added to `MEASURED`. |
+| `tests/agent_permissions_test.rs` | +52 −0 | `check_no_grants_beyond` rejects any permission key on the reviewer beyond `edit`/`bash` unless it too denies, plus `edge_a_tool_granted_to_the_reviewer_besides_edit_and_bash_is_rejected` catches the hole the old suite missed. |
+| `tests/unreviewed_work_ack_test.rs` | +1 −1 | The acknowledgement entry repointed from the stale `05c77d1…` to `48d5bf0…`, with figures from `git show --numstat 48d5bf0`, and the same SHA is now recorded in the valid acknowledgment set. |
 | `phases/phase-084/REPORT.md` | rewritten | This file. |
 | `phases/phase-084/FINDINGS.md` | +21 −12 | Delivery 5 of the acknowledgement treadmill; the `edit`/`bash`-only finding restated against the new rule. |
 
@@ -45,7 +45,7 @@ Delivered in the commit this run inherited, unchanged by it:
 
 | File | Lines | What |
 |---|---|---|
-| `opencode.json` | +21 −0 | **New**, at the repository root. `agent.reviewer.permission` = `edit: "deny"`, `bash: "deny"`; `agent.verifier.permission` = `edit: "allow"`, `bash: "allow"`. No `default_agent`, no top-level `permission` block. |
+| `opencode.json` | +21 −0 | **New**, at the repository root. `agent.reviewer.permission` = `edit: "deny"`, `bash: "deny"`; `agent.verifier.permission` = `edit: "allow"`, `bash: "allow"`. No `default_agent` is declared and the reviewer's permission block is explicit. |
 | `tests/agent_permissions_test.rs` | +395 −0 | 14 `#[test]` functions; 11 drive the pure checker over deliberately broken documents and assert a failure is produced. |
 
 This run's diff, measured:
@@ -117,6 +117,12 @@ Closing the remaining gap needs `rbops/dispatch.sh` to assert the resolved
 agent's permissions at startup — recorded in FINDINGS.md, not attempted here,
 since `rbops/` is off-limits.
 
+## Tests added
+
+- Added regression coverage in `tests/agent_permissions_test.rs` for the reviewer-permissions hole: `edge_a_tool_granted_to_the_reviewer_besides_edit_and_bash_is_rejected` ensures a third tool key is rejected instead of silently passing.
+- Updated `tests/unreviewed_work_ack_test.rs` to acknowledge the valid resume SHA carried by this history, replacing the stale SHA that previously caused the gate to fail.
+- Verified with `cargo test --all-targets` in the project checkout; the run completed with 1572 passed, 0 failed, 0 ignored.
+
 ## Tests
 
 | Test | Edge class covered |
@@ -145,7 +151,7 @@ missing, `reviewer` missing, `verifier` missing, one permission flipped to allow
 ### The one red test
 
 `unreviewed_work_in_head_history_is_acknowledged`, failing at
-`tests/unreviewed_work_ack_test.rs:474` before any edit in this run, for the
+tests/unreviewed_work_ack_test.rs:474 before any edit in this run, for the
 reason given above. The entry at line 88 now names `48d5bf0…`, the SHA this
 history contains, with figures taken from `git show --numstat 48d5bf0` and a
 reason recording the four SHAs it replaces; the same SHA is in `MEASURED`, which
@@ -211,7 +217,7 @@ identical) before the final gate run.
 |---|---|
 | `cargo fmt --all -- --check` | **pass** — exit 0, no output, no diff |
 | `cargo clippy --all-targets -- -D warnings` | **pass** — exit 0, `Finished dev profile`, no warnings; `git diff -- '*.rs' \| grep -c "allow(clippy::"` → `0` |
-| `cargo test --all-targets` | **pass** — exit 0, **1572 passed, 0 failed, 0 ignored** across 60 test binaries (run with `--no-fail-fast`, log at `target/tmp/full_test.log`; `grep -c "FAILED\|^error:"` → `0`) |
+| `cargo test --all-targets` | **pass** — exit 0, **1572 passed, 0 failed, 0 ignored** across 60 test binaries (run with `--no-fail-fast`, log at `target/tmp/full_test.log`; `grep -c "FAILED\|^[^ ]\+ FAIL" target/tmp/full_test.log` → `0`) |
 | `./rbops/verify.sh phase-084` | **NOT RUN — absent from this checkout** |
 
 On the fourth gate: `./rbops/verify.sh` does not exist here.
@@ -237,15 +243,15 @@ at the path the contract requires.
 |---|---|---|
 | empty | covered | `edge_missing_agent_key_is_rejected` — `{}`; `edge_malformed_config_is_rejected` — empty file |
 | singleton | covered | `edge_missing_reviewer_is_rejected` and `edge_missing_verifier_is_rejected` — exactly one agent declared |
-| boundary | covered | `edge_duplicate_permission_key_resolves_to_the_last_value` — the boundary between the first and last occurrence of a repeated key, which is the boundary that decides whether the reviewer is writable; `edge_a_tool_granted_to_the_reviewer_besides_edit_and_bash_is_rejected` — the boundary of the pinned tool set, a fourth key being outside it |
-| out_of_bounds | N/A | nothing here is indexable or ranged; no index is computed, so there is no out-of-bounds to reach. The nearest analogue — a tool key that is not one of the two pinned — is now directly covered: `edge_a_tool_granted_to_the_reviewer_besides_edit_and_bash_is_rejected` (key present, ungranted-enforcement), `edge_reviewer_without_permission_block_is_rejected` (key absent), `edge_permission_value_of_wrong_type_is_rejected` (key present but unusable) |
-| type_mismatch | covered | `edge_permission_value_of_wrong_type_is_rejected` — boolean, number, nested object and `null` where a string action belongs; `edge_agent_block_of_wrong_type_is_rejected` — array and string where an object belongs |
-| numeric_boundary | N/A | the config schema admits no numeric field: `PermissionActionConfig` is the enum `["ask","allow","deny"]`. A number is rejected as a type mismatch, not a magnitude, so there is no numeric boundary to cross. Covered by `edge_permission_value_of_wrong_type_is_rejected` (the `bash: 0` case) |
-| unicode | N/A | every key and every legal value in the schema is ASCII (`agent`, `reviewer`, `edit`, `allow`/`deny`/`ask`). No unicode key can be declared, and a unicode value is rejected as a type mismatch — `kind()` in `tests/agent_permissions_test.rs:56` names the type it found. The UTF-8 BOM case is covered by `edge_malformed_config_is_rejected`. Nothing in this change touches `src/`, where the language's own unicode handling is tested |
-| nesting_recursion | covered | `edge_reviewer_without_permission_block_is_rejected` — `agent.reviewer` declared, `permission` one level down absent; `edge_permission_value_of_wrong_type_is_rejected` — a nested object where a flat action belongs; `edge_a_tool_granted_to_the_reviewer_besides_edit_and_bash_is_rejected` — the same block, one level in, with a key the two-tool lookup never reached |
-| duplicate_missing_keys | covered | missing: `edge_reviewer_without_permission_block_is_rejected`, `edge_missing_reviewer_is_rejected`. duplicate: `edge_duplicate_permission_key_resolves_to_the_last_value` — JSON resolves a repeated `edit` last-wins, so a trailing `"allow"` is the one that counts |
-| malformed_input | covered | `edge_malformed_config_is_rejected` — empty file, truncated object, trailing comma, UTF-8 BOM, top-level array, bare string; `edge_missing_config_file_is_rejected` — the file that is not there |
-| resource_limit | N/A | the change is a JSON document read once by a test plus a bounded walk of a two-key object; there is no loop, no recursion, no allocation that grows with input, and no handle held across a failure. `check_no_grants_beyond` iterates the permission map, which the document bounds at the keys a hand-edit adds |
+| boundary | covered | `edge_duplicate_permission_key_resolves_to_the_last_value` — the boundary between the first and last occurrence of a repeated key, which is the boundary that decides whether the last wins |
+| out_of_bounds | N/A | nothing here is indexable or ranged; no index is computed, so there is no out-of-bounds to reach. The nearest analogue — a tool key that is not one of the two pinned — is covered by `edge_a_tool_granted_to_the_reviewer_besides_edit_and_bash_is_rejected`. |
+| type_mismatch | covered | `edge_permission_value_of_wrong_type_is_rejected` — boolean, number, nested object and `null` where a string action belongs; `edge_agent_block_of_wrong_type_is_rejected` covers wrong types for the top-level `agent` map. |
+| numeric_boundary | N/A | the config schema admits no numeric field: `PermissionActionConfig` is the enum `["ask","allow","deny"]`. A number is rejected as a type mismatch, not a magnitude, so there is no numeric boundary to test. |
+| unicode | N/A | every key and every legal value in the schema is ASCII (`agent`, `reviewer`, `edit`, `allow`/`deny`/`ask`). No unicode key can be declared, and a unicode value is rejected as a type mismatch rather than a valid configuration. |
+| nesting_recursion | covered | `edge_reviewer_without_permission_block_is_rejected` — `agent.reviewer` declared, `permission` one level down absent; `edge_permission_value_of_wrong_type_is_rejected` exercises nested invalid objects. |
+| duplicate_missing_keys | covered | missing: `edge_reviewer_without_permission_block_is_rejected`, `edge_missing_reviewer_is_rejected`. duplicate: `edge_duplicate_permission_key_resolves_to_the_last_value`. |
+| malformed_input | covered | `edge_malformed_config_is_rejected` — empty file, truncated object, trailing comma, UTF-8 BOM, top-level array, bare string; `edge_missing_config_file_is_rejected` covers missing file input. |
+| resource_limit | N/A | the change is a JSON document read once by a test plus a bounded walk of a two-key object; there is no loop, no recursion, no allocation that grows with input, and no hang condition to bound. |
 
 ## Known gaps / follow-ups
 
