@@ -473,8 +473,7 @@ cmd_run() {
       log "resumed from previous attempt (rbops-recovery/$phase, squashed onto main)"
       touch "$(marker "$phase" .recovered)"
       resumed=1
-    elif in_project git rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 \
-         || grep -qE '^(<<<<<<<|=======$|>>>>>>>)' "$PROJECT_DIR"/src/*.rs 2>/dev/null; then
+    elif [ -n "$(in_project git diff --name-only --diff-filter=U 2>/dev/null)" ]; then
       # Conflicted. Hand the resolution to the agent rather than throwing the
       # work away: phase-019's recovery held a 5629-line bytecode VM, and
       # starting clean would mean re-deriving all of it. The gate still decides
@@ -499,6 +498,7 @@ cmd_run() {
     if in_project git merge --squash --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1; then
       in_project git commit -q -m "resume $phase: adopt WIP checkpoint" >/dev/null 2>&1 || true
       touch "$(marker "$phase" .checkpoint)"
+      resumed=1
     else
       in_project git merge --abort 2>/dev/null || true
       in_project git reset -q --hard HEAD 2>/dev/null || true
