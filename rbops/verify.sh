@@ -49,7 +49,72 @@ FAIL=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
-bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
+# Every failure passes through here, so this is the one place a remedy can be
+# attached to a check that does not know how to fix itself.
+#
+# Phase-092, 088 and 113 all failed the same two checks and burned three
+# attempts each. The message said the rule and not the remedy, and a rule an
+# agent cannot act on is not a gate - it is a wall. The retry note is supposed to
+# close that gap, but a note is written by a human who has to notice, and three
+# of these ran before anyone did.
+#
+# remedy_for prints the first line of advice for a message, keyed on a substring
+# of it. It is a lookup rather than a per-check argument so that adding a check
+# means adding a remedy rather than remembering to thread one through, and so
+# the text lives in exactly one place and cannot drift from what it explains.
+#
+# When nothing matches, nothing is printed: a wrong remedy would send an agent
+# chasing a problem it does not have, which is worse than the bare verdict it
+# replaces.
+remedy_for() {
+  case "$1" in
+    *"failure is produced"*)
+      printf '          A suite of entirely passing tests does NOT satisfy this.\n'
+      printf '          The check wants a test whose SUBJECT is a failure - a bad input\n'
+      printf '          producing a clean error rather than a panic or a wrong value.\n'
+      printf '          Rust:    let r = run_source(bad); assert!(r.is_err());\n'
+      printf '          or:      #[should_panic] fn edge_...() { /* ... */ }\n'
+      printf '          Redblue: try ... catch error ... end, asserting it was caught.\n'
+      ;;
+    *"REPORT.md missing"*)
+      printf '          Writing REPORT.md is the whole fix; the code may already be right.\n'
+      printf '          It needs sections: What changed / Tests added / Gates /\n'
+      printf '          Known gaps, with real evidence rows. Report counts you observed.\n'
+      ;;
+    *"edge"*"test"*|*"no test named"*)
+      printf '          At least one test must be named edge_* (fn edge_foo, or test "edge_foo").\n'
+      printf '          The happy path alone is not a test.\n'
+      ;;
+    *"quota"*)
+      printf '          AGENTS.md 3.3: at least 3 new #[test] (or 2 Redblue test blocks).\n'
+      printf '          The count floor catches "no verification at all"; see it there.\n'
+      ;;
+    *"must_touch"*|*"no implementation change"*)
+      printf '          must_touch names the areas the change must land in. At least one\n'
+      printf '          changed file must fall under one of them, or this check fails on\n'
+      printf '          exactly that. Editing only tests, or only docs, does not satisfy it.\n'
+      ;;
+    *"documentation block"*|*"bucket"*)
+      printf '          A ```redblue block moved or was added, so tests/doc_blocks_runs.txt\n'
+      printf '          still points at the old line. Update the registry entry to the new\n'
+      printf '          line of the opening fence, or classify the block in\n'
+      printf '          doc_blocks_fragments.txt / doc_blocks_known_fail.txt.\n'
+      ;;
+    *"README"*)
+      printf '          README names a corpus count that has drifted. Count corpus/*.rb and\n'
+      printf '          update the number in the same commit that adds or removes a program.\n'
+      ;;
+    *"clippy"*|*"fmt"*)
+      printf '          Fix the reported diagnostic and re-run; do not widen the lint bound\n'
+      printf '          and do not reformat files outside this phase.\n'
+      ;;
+  esac
+}
+
+bad()  {
+  printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1))
+  remedy_for "$*"
+}
 
 # =============================================================================
 # RBOPS_PREFLIGHT=1 — the cheap half of the gate.
