@@ -1,0 +1,2370 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · space-bunny-free
+[0m
+I'll start by examining the actual state of the repository and the committed work for phase-060.
+[0m$ [0mgit log --oneline -15 && echo "---STATUS---" && git status --short
+659724d 060: verify the export/TAB work, fix two red gates, add three edge tests
+b5461ae resume phase-060: adopt preserved work
+222aa83 tests: replace invalid placeholder causing compile failure
+3d85942 ci: add minimal #[should_panic] test to satisfy rbops preflight (phase-090)
+c95062e ack: resume phase-088: add resume commit to ACKNOWLEDGED
+971d9bb 082: rustfmt the new test so the fmt gate passes
+6bdc628 082 follow-up: the two wrong names are now pinned by a test
+21460a3 082: fix the two HANDOUT examples that never worked
+72461c9 README: the corpus count pin failed because a corpus program was added
+2948f23 Document the memory model, and pin every claim in it
+e008f0b rbops: phase-089 (2026-10-16T20:52:46Z)
+bf9ffc3 resume phase-089: adopt WIP checkpoint
+ad19910 rbops: phase-087 (2026-10-16T15:31:00Z)
+96beaa9 resume phase-087: adopt WIP checkpoint
+6c11270 rbops: phase-059 (2026-10-16T11:40:18Z)
+---STATUS---
+[0m
+[0m$ [0mgit diff --stat 222aa83..HEAD && echo "===COMMITTED 659724d===" && git show --stat 659724d
+phases/phase-060/FINDINGS.md      | 117 ++++++++
+ phases/phase-060/REPORT.md        | 260 ++++++++++++++++++
+ src/repl/commands.rs              | 187 ++++++++++++-
+ src/repl/completer.rs             | 448 +++++++++++++++++++++++++++++-
+ src/repl/editor.rs                |  74 +++++
+ src/repl/mod.rs                   |  85 +++++-
+ src/repl/style.rs                 | 106 ++++++++
+ src/repl/transcript.rs            | 560 ++++++++++++++++++++++++++++++++++++++
+ tests/memory_model_test.rs        |  30 +-
+ tests/repl_test.rs                | 419 ++++++++++++++++++++++++++++
+ tests/unreviewed_work_ack_test.rs | 149 +++++++++-
+ 11 files changed, 2409 insertions(+), 26 deletions(-)
+===COMMITTED 659724d===
+commit 659724d1f81d826149d30dc42f21b1410aa26da4
+Author: rbops-bot <rbops-bot@users.noreply.github.com>
+Date:   Sun Oct 18 10:50:35 2026 +0000
+
+    060: verify the export/TAB work, fix two red gates, add three edge tests
+    
+    The phase's src/ work was already committed in b5461ae. This commit does
+    not re-derive it: it runs the four gates first, as the resume instructions
+    require, and fixes what they report.
+    
+    Gates that were red on main before this run, both in tests/ and both
+    compile errors under -D warnings rather than failing assertions:
+    
+      - tests/unreviewed_work_ack_test.rs held an `assert!(true)` placeholder
+        that clippy rejects (assertions_on_constants) and rustfmt rejects. It is
+        now three tests that read tests/checkpoint_ancestry_ack.txt with no git:
+        the list is non-empty, every entry has a non-empty sha and a non-empty
+        reason, no sha is listed twice, and wip_merges_on_main is pinned.
+      - tests/memory_model_test.rs held Arc<Node> where Node wraps a RefCell,
+        so Arc<Node> is neither Send nor Sync and clippy's arc_with_non_send_sync
+        refuses the test target. The helper holds Rc<Node> now; the strong-count
+        and weak-count assertions are the same numbers from the same counter.
+        No #[allow] was added.
+    
+    Three edge tests added to tests/repl_test.rs, closing rows the definition of
+    done leaves open:
+    
+      - edge_a_session_of_unicode_exports_and_reads_back_unchanged: an emoji
+        outside the BMP, e+U+0301, Arabic and CJK survive the export verbatim
+        and read back as the strings that were typed.
+      - edge_export_to_the_same_path_twice_replaces_the_document: a second
+        export replaces the first. Watched red against a mutated export_session
+        that opened the file with .append(true).
+      - edge_a_session_that_ran_a_crlf_file_exports_and_reads_back: a program
+        written with CRLF is one block, and no carriage return reaches the
+        document.
+    
+    Gates on this tree: cargo fmt --all -- --check exit 0;
+    cargo clippy --all-targets -- -D warnings exit 0; cargo test --all-targets
+    1825 passed / 0 failed / 0 ignored across 67 binaries; cargo test --doc 2
+    passed; all 9 examples/ and modules/ programs run clean.
+    
+    ./rbops/verify.sh is not in this checkout (no rbops/ directory), so gate
+    four was neither run nor claimed. Recorded as F1; the two pre-existing red
+    gates as F4, in phases/phase-060/FINDINGS.md.
+
+ phases/phase-060/FINDINGS.md      |  36 +++-
+ phases/phase-060/REPORT.md        | 393 +++++++++++++++++++-------------------
+ tests/memory_model_test.rs        |  30 +--
+ tests/repl_test.rs                | 168 ++++++++++++++++
+ tests/unreviewed_work_ack_test.rs | 149 ++++++++++++++-
+ 5 files changed, 556 insertions(+), 220 deletions(-)
+[0m
+[0m→ [0mRead src/repl/transcript.rs
+[0m
+[0m$ [0mgit diff 222aa83..HEAD -- src/repl/mod.rs
+diff --git a/src/repl/mod.rs b/src/repl/mod.rs
+index 0c74eac..086de25 100644
+--- a/src/repl/mod.rs
++++ b/src/repl/mod.rs
+@@ -8,6 +8,7 @@ pub mod history;
+ pub mod introspect;
+ pub mod measure;
+ pub mod style;
++pub mod transcript;
+ 
+ use std::cell::RefCell;
+ use std::collections::{HashMap, HashSet, VecDeque};
+@@ -20,6 +21,7 @@ pub use completer::ReplCompleter;
+ pub use editor::{Line, LineSource, SessionNames};
+ pub use history::ReplHistory;
+ pub use introspect::Definition;
++pub use transcript::Transcript;
+ 
+ use crate::analyzer;
+ use crate::debugger::{lock, DebugAction, DebugSession, SharedDebugSession, StepMode};
+@@ -27,7 +29,7 @@ use crate::error::Error;
+ use crate::interpreter::Vm;
+ use crate::lexer::{Lexer, TokenKind};
+ use crate::parser::{open_block_depth, Expr, Parser, Program, Stmt};
+-use crate::repl::style::{Paint, Style};
++use crate::repl::style::{strip_escapes, Paint, Style};
+ use crate::stdlib;
+ use crate::value::{FunctionBody, Value};
+ 
+@@ -501,6 +503,21 @@ pub struct Repl {
+     /// typed, and neither knew the other's half: `:inspect x` printed the value
+     /// and its kind and nothing about the line three prompts ago that made it.
+     definitions: HashMap<String, Definition>,
++    /// Every line this session ran and everything it said, which is what
++    /// `.export` writes and what the terminal is not.
++    ///
++    /// The history is not this and cannot be: it holds every line *typed*,
++    /// commands included, and holds no output at all. Sharing a session meant
++    /// copy-pasting scrollback — prompts, colour and banner included — because
++    /// this was the only record there was.
++    transcript: Transcript,
++    /// What the line just run said, before it is printed.
++    ///
++    /// Held between the VM printing it and the session recording it, because the
++    /// VM prints `say` output itself ([`Vm::run`]) and the session needs the same
++    /// lines as text. Cleared at the start of every line, so a line that failed to
++    /// parse — and so never reached the VM — cannot inherit the last one's output.
++    last_output: Vec<String>,
+ }
+ 
+ impl Repl {
+@@ -517,6 +534,8 @@ impl Repl {
+             style: Style::detect(),
+             prompt_format: DEFAULT_PROMPT.to_string(),
+             definitions: HashMap::new(),
++            transcript: Transcript::new(),
++            last_output: Vec::new(),
+         }
+     }
+ 
+@@ -829,6 +848,10 @@ impl Repl {
+                 self.restore_session(&path);
+                 true
+             }
++            ReplCommand::Export(path) => {
++                self.export_session(path.as_deref());
++                true
++            }
+             ReplCommand::Reset => {
+                 self.reset_session();
+                 true
+@@ -995,6 +1018,9 @@ impl Repl {
+         self.definitions.clear();
+         self.multiline_buffer.clear();
+         self.in_multiline = false;
++        // The transcript with them: an export of a session that had forgotten the
++        // lines it ran would claim a session that no longer exists ran them.
++        self.transcript.clear();
+         println!("REPL state reset.");
+     }
+ 
+@@ -1086,7 +1112,14 @@ impl Repl {
+     /// the user typed has no line of its own but has a place in the history, and
+     /// a file's line *is* its line.
+     fn execute_code_from(&mut self, file: &str, line_offset: usize, code: &str) {
++        // A line that fails to parse never reaches the VM, so the output of the
++        // line before it has to be out of the way before the next line starts.
++        self.last_output.clear();
+         let result = self.run_code(code);
++        // What the program said, whatever path it left by. Taken before the
++        // `= value` line is added, so the transcript records the program's own
++        // output and the session's echo of it separately, as it prints them.
++        let mut output = std::mem::take(&mut self.last_output);
+ 
+         match result {
+             Ok(value) => {
+@@ -1095,12 +1128,22 @@ impl Repl {
+                     let line = format!("= {}", value);
+                     println!("{}", self.style.paint(Paint::Result, &line));
+                     self.variables.insert("_".to_string(), value);
++                    output.push(line);
+                 }
+             }
+             Err(e) => {
+-                println!("Error: {}", render_error(&self.style, code, file, &e));
++                let rendered = format!("Error: {}", render_error(&self.style, code, file, &e));
++                println!("{}", rendered);
++                output.push(rendered);
+             }
+         }
++        // Recorded as plain text: what the session painted for a reader is not
++        // what a document should carry, so the escape sequences are taken off
++        // here rather than at the far end of the export.
++        self.transcript.record(
++            code.to_string(),
++            output.iter().map(|line| strip_escapes(line)).collect(),
++        );
+     }
+ 
+     /// Notes where `code` bound each name, for `.type` and `.which`.
+@@ -1264,8 +1307,16 @@ impl Repl {
+         self.arm_debugger(source);
+         self.vm.take_output();
+         let result = self.vm.run(program);
++        // What the program said, kept for the transcript `.export` writes. On the
++        // error path these are the lines the program printed before it failed,
++        // which are printed here rather than by [`Vm::run`] — the VM gives up
++        // before its print loop — and on the success path `Vm::run` has already
++        // printed them and left the buffer, so this is the same lines read once
++        // more. Drained either way: an export that re-printed them would be the
++        // bug this is here to prevent, one line later.
++        self.last_output = self.vm.take_output();
+         if result.is_err() {
+-            for line in self.vm.take_output() {
++            for line in &self.last_output {
+                 println!("{}", line);
+             }
+         }
+@@ -1427,6 +1478,34 @@ impl Repl {
+         }
+     }
+ 
++    /// Writes the session as Markdown — to `path`, or to stdout when given
++    /// nothing — and says where it went.
++    ///
++    /// The other half of `:save`, and a different document. `:save` writes the
++    /// lines the session *typed*, one per line, so a session can be restored; this
++    /// writes what the session *ran* and what it said, so a reader who was not at
++    /// the terminal can read it. Neither is the other: a transcript of inputs and
++    /// no outputs is a log, and the scrollback it replaces carried the prompts and
++    /// the colour codes as well.
++    ///
++    /// The destination is part of what the command means, so the message names it
++    /// and a failure names the path that failed — "No such file or directory"
++    /// alone does not say which of the paths in the command was at fault.
++    fn export_session(&self, path: Option<&str>) {
++        let document = self.transcript.markdown();
++        match path {
++            None => println!("{}", document.trim_end()),
++            Some(path) => match std::fs::write(path, &document) {
++                Ok(()) => println!(
++                    "Exported {} exchange(s) to '{}'.",
++                    self.transcript.len(),
++                    path
++                ),
++                Err(e) => println!("Could not export session to '{}': {}", path, e),
++            },
++        }
++    }
++
+     /// Reads a history file written by [`Repl::save_session`] back into this
+     /// session, and re-runs what it holds.
+     ///
+[0m
+[0m$ [0mgrep -n "run_program\|last_output\|execute_code_from\|fn run_code" src/repl/mod.rs
+470:/// [`Repl::execute_code_from`], so `.type` and `.time` do not answer a
+520:    last_output: Vec<String>,
+538:            last_output: Vec::new(),
+1095:        self.execute_code_from(introspect::SESSION_FILE, offset, code);
+1114:    fn execute_code_from(&mut self, file: &str, line_offset: usize, code: &str) {
+1117:        self.last_output.clear();
+1122:        let mut output = std::mem::take(&mut self.last_output);
+1254:    fn run_code(&mut self, code: &str) -> Result<Value, crate::error::Error> {
+1258:        self.run_program(&program, code)
+1302:    fn run_program(
+1317:        self.last_output = self.vm.take_output();
+1319:            for line in &self.last_output {
+1464:        self.execute_code_from(path, 0, &source);
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=1060, limit=120][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=130, offset=1420][0m
+[0m
+[0m$ [0mgit diff 222aa83..HEAD -- src/repl/commands.rs src/repl/style.rs src/repl/editor.rs
+diff --git a/src/repl/commands.rs b/src/repl/commands.rs
+index 312ae44..2daf179 100644
+--- a/src/repl/commands.rs
++++ b/src/repl/commands.rs
+@@ -20,6 +20,13 @@ pub enum ReplCommand {
+     /// The other half of `:save`, which had no half: a saved file could not be
+     /// loaded by any REPL path, so the round trip existed only in unit tests.
+     Restore(String),
++    /// Writes the session — every line it ran, what each line said, and what
++    /// failed — as Markdown, to `path` or to stdout when given nothing.
++    ///
++    /// `Option` for the same reason [`ReplCommand::Prompt`] is: `.export` with no
++    /// path is not a command missing its argument, it is a command writing to the
++    /// terminal, which is the one destination that needs no name.
++    Export(Option<String>),
+     Reset,
+     Run(String),
+     Debug,
+@@ -136,6 +143,15 @@ pub const ALT_SIGIL: char = '.';
+ /// the commands inside them, so a typo loaded a file or ended the session.
+ pub const SIGILS: [char; 2] = [':', ALT_SIGIL];
+ 
++/// The placeholder every command whose argument is a file path declares.
++///
++/// It is the whole of what says a command takes a path: `:load`, `:save`,
++/// `:restore`, `:run` and `.export` declare it, `:break <line>` and `:inspect
++/// <name>` declare theirs, and [`ReplCommand::takes_a_file_path`] — which is what
++/// decides where TAB offers a path — asks the table rather than keeping a second
++/// list of five words to fall out of date.
++const FILE_USAGE: &str = "<filename>";
++
+ /// Every command, in the order `:help` lists them.
+ static COMMAND_TABLE: &[CommandSpec] = &[
+     CommandSpec {
+@@ -189,7 +205,7 @@ static COMMAND_TABLE: &[CommandSpec] = &[
+     CommandSpec {
+         names: &["load", "l"],
+         description: "Load and run a file",
+-        usage: Some("<filename>"),
++        usage: Some(FILE_USAGE),
+         optional_argument: false,
+         verbatim_argument: false,
+         build: |argument| ReplCommand::Load(argument.unwrap_or_default()),
+@@ -197,7 +213,7 @@ static COMMAND_TABLE: &[CommandSpec] = &[
+     CommandSpec {
+         names: &["save", "s"],
+         description: "Save current session",
+-        usage: Some("<filename>"),
++        usage: Some(FILE_USAGE),
+         optional_argument: false,
+         verbatim_argument: false,
+         build: |argument| ReplCommand::Save(argument.unwrap_or_default()),
+@@ -205,7 +221,7 @@ static COMMAND_TABLE: &[CommandSpec] = &[
+     CommandSpec {
+         names: &["restore", "r"],
+         description: "Restore a saved session",
+-        usage: Some("<filename>"),
++        usage: Some(FILE_USAGE),
+         optional_argument: false,
+         verbatim_argument: false,
+         build: |argument| ReplCommand::Restore(argument.unwrap_or_default()),
+@@ -218,10 +234,18 @@ static COMMAND_TABLE: &[CommandSpec] = &[
+         verbatim_argument: false,
+         build: |_| ReplCommand::Reset,
+     },
++    CommandSpec {
++        names: &["export"],
++        description: "Write the session as Markdown; no filename writes it here",
++        usage: Some(FILE_USAGE),
++        optional_argument: true,
++        verbatim_argument: false,
++        build: |argument| ReplCommand::Export(argument),
++    },
+     CommandSpec {
+         names: &["run"],
+         description: "Run a Redblue file",
+-        usage: Some("<filename>"),
++        usage: Some(FILE_USAGE),
+         optional_argument: false,
+         verbatim_argument: false,
+         build: |argument| ReplCommand::Run(argument.unwrap_or_default()),
+@@ -525,6 +549,27 @@ impl ReplCommand {
+         }
+     }
+ 
++    /// A path with one matching pair of quotes around it, and without them.
++    ///
++    /// TAB quotes a filename that holds a space — see
++    /// [`super::completer::complete_path_in`] — so this is the other half of that:
++    /// without it the completer offers `"my file.rb"`, accepting it puts those quotes
++    /// in the command, and the command then tries to open a file whose name really
++    /// does start and end with a `"` character.
++    ///
++    /// Only a *matching* pair, only around the whole argument, and only for the
++    /// commands whose argument is a path. `:prompt "rb> "` is display text and its
++    /// quotes are part of it, which is the whole reason this is not in
++    /// [`ReplCommand::argument`].
++    fn unquote_path(path: &str) -> String {
++        let quoted = path.len() >= 2 && path.starts_with('"') && path.ends_with('"');
++        if quoted {
++            path[1..path.len() - 1].to_string()
++        } else {
++            path.to_string()
++        }
++    }
++
+     pub fn parse(input: &str) -> Self {
+         let input = input.trim_start();
+ 
+@@ -540,7 +585,14 @@ impl ReplCommand {
+                 } else {
+                     input.trim_end()
+                 }) {
+-                    Some(value) => (spec.build)(Some(value)),
++                    Some(value) => {
++                        let value = if spec.usage == Some(FILE_USAGE) {
++                            Self::unquote_path(&value)
++                        } else {
++                            value
++                        };
++                        (spec.build)(Some(value))
++                    }
+                     // An argument the command does not insist on is the command's
+                     // own business, not a missing-argument report: `:prompt` reads
+                     // "no format given" as "put the default back".
+@@ -555,6 +607,26 @@ impl ReplCommand {
+         }
+     }
+ 
++    /// Whether the argument this command carries is a file path.
++    ///
++    /// Asked by the completer before it offers the filesystem: TAB completes a
++    /// path in the argument of a command that takes one, and nowhere else, so
++    /// `say "` is not answered with a directory listing.
++    ///
++    /// Read out of the table by its `<filename>` placeholder rather than kept as a
++    /// list here, for the reason the whole table exists: a second copy of the
++    /// answer is a second answer.
++    ///
++    /// A sigil is required, and by the same first step [`ReplCommand::parse`]
++    /// takes: `load x` with no sigil is not a command at all, it is Redblue source
++    /// calling a function called `load`, and offering it a filesystem would be
++    /// offering paths to a line that cannot take one.
++    pub fn takes_a_file_path(input: &str) -> bool {
++        let input = input.trim_start();
++        input.starts_with(SIGILS)
++            && spec_for(input).is_some_and(|spec| spec.usage == Some(FILE_USAGE))
++    }
++
+     /// Whether `input` names a command whose argument keeps the whitespace at its
+     /// end.
+     ///
+@@ -591,7 +663,8 @@ impl ReplCommand {
+             | ReplCommand::Bytecode(value)
+             | ReplCommand::Asm(value)
+             | ReplCommand::Break(value)
+-            | ReplCommand::Delete(value) => Some(value.as_str()),
++            | ReplCommand::Delete(value)
++            | ReplCommand::Export(Some(value)) => Some(value.as_str()),
+             ReplCommand::Prompt(Some(value)) => Some(value.as_str()),
+             _ => None,
+         }
+@@ -634,10 +707,24 @@ mod tests {
+             (":f", "Functions", ""),
+             (":load some.rb", "Load", "some.rb"),
+             (":l some.rb", "Load", "some.rb"),
++            // A quoted path is the form TAB offers for a name holding a space, so
++            // it is the form the command has to open. `:prompt "rb> "` is not a
++            // path and keeps its quotes: they are part of what a prompt is.
++            (":load \"my file.rb\"", "Load", "my file.rb"),
++            (":prompt \"rb> \"", "Prompt", "\"rb> \""),
+             (":save out.txt", "Save", "out.txt"),
+             (":s out.txt", "Save", "out.txt"),
+             (":restore out.txt", "Restore", "out.txt"),
+             (":r out.txt", "Restore", "out.txt"),
++            // `.export` is the one command that takes a path and may be given
++            // none: with no argument it writes the session to the terminal, which
++            // is a thing a user asks for rather than a command typed
++            // incompletely. Both shapes are here, and the variant tells them
++            // apart — `Export(None)` is the document on stdout and
++            // `Export(Some(..))` is one written to a file.
++            (":export", "Export", ""),
++            (":export   ", "Export", ""),
++            (":export session.md", "Export", "session.md"),
+             (":reset", "Reset", ""),
+             (":run prog.rb", "Run", "prog.rb"),
+             (":debug", "Debug", ""),
+@@ -697,6 +784,9 @@ mod tests {
+                 // to the empty argument below, `Prompt(Some(..))` is one that was
+                 // given a format and carries it verbatim.
+                 ReplCommand::Prompt(Some(value)) => value.as_str(),
++                // `.export` with a path carries it the same way; with none it
++                // carries nothing, which is the empty argument above.
++                ReplCommand::Export(Some(value)) => value.as_str(),
+                 _ => "",
+             };
+             assert_eq!(
+@@ -1146,4 +1236,89 @@ mod tests {
+             seen.push(name);
+         }
+     }
++    /// `.export` is a command, and it is the one whose argument may be left out.
++    ///
++    /// There was no way to write a session down at all: `.export` was reported as
++    /// the unknown word `export`, so sharing a session meant copy-pasting terminal
++    /// scrollback — prompts, colour and banner included — which is not a thing
++    /// that can be pasted into an issue and read.
++    ///
++    /// Both shapes matter and the variant is what tells them apart: `.export` with
++    /// a path writes a file, `.export` with none writes to the terminal. A command
++    /// that reported the second as a missing argument would push every user to a
++    /// temporary file for the one case that needs none.
++    #[test]
++    fn edge_export_is_a_command_whose_path_may_be_left_out() {
++        assert_eq!(
++            ReplCommand::parse(".export session.md"),
++            ReplCommand::Export(Some("session.md".to_string())),
++            "`.export` with a path is a document written to that path"
++        );
++        assert_eq!(
++            ReplCommand::parse(":export"),
++            ReplCommand::Export(None),
++            "and with no path it is a document written to the terminal, which is \
++             why the argument may be left out"
++        );
++        assert_eq!(
++            ReplCommand::parse(".export   "),
++            ReplCommand::Export(None),
++            "whitespace after the command word is not a path"
++        );
++        assert!(
++            ReplCommand::names().contains(&":export".to_string()),
++            "and it is offered by the completer, which offers the parser's table"
++        );
++    }
++
++    /// The commands whose argument is a path, and only those.
++    ///
++    /// This is the gate on where TAB offers the filesystem. It is read out of the
++    /// table by its filename placeholder, so a sixth command that takes a path
++    /// says so by declaring the same thing — and a command that takes something
++    /// else cannot be completed as though it took a path.
++    #[test]
++    fn edge_only_the_commands_that_take_a_path_take_a_path() {
++        let taking: Vec<String> = ReplCommand::bare_names()
++            .into_iter()
++            .filter(|name| ReplCommand::takes_a_file_path(&format!(":{name}")))
++            .collect();
++
++        assert_eq!(
++            taking,
++            vec![
++                "export".to_string(),
++                "l".to_string(),
++                "load".to_string(),
++                "r".to_string(),
++                "restore".to_string(),
++                "run".to_string(),
++                "s".to_string(),
++                "save".to_string(),
++            ],
++            "the five commands that take a filename, aliases included, and \
++             nothing else: a command taking a line number or an expression is not \
++             one whose argument can be completed as a path"
++        );
++
++        for (command, takes) in [
++            (":load x", true),
++            (".save x", true),
++            (":run x", true),
++            (":restore x", true),
++            (":export x", true),
++            (":break 3", false),
++            (":inspect x", false),
++            (":ast 1 + 1", false),
++            (":prompt rb> ", false),
++            ("say \"x", false),
++            ("", false),
++        ] {
++            assert_eq!(
++                ReplCommand::takes_a_file_path(command),
++                takes,
++                "{command:?} is or is not a command whose argument is a path"
++            );
++        }
++    }
+ }
+diff --git a/src/repl/editor.rs b/src/repl/editor.rs
+index b57aebf..a8fa877 100644
+--- a/src/repl/editor.rs
++++ b/src/repl/editor.rs
+@@ -232,6 +232,12 @@ impl Completer for SessionCompleter {
+         let Some((start, word)) = Self::word_at(line, pos) else {
+             return Ok((0, Vec::new()));
+         };
++        // A filename first, where the line is the argument of a command that
++        // takes one: the vocabulary has no business answering `:load sr`, and
++        // this is the only place the filesystem is read at all.
++        if let Some((path_start, candidates)) = self.completer.complete_path(line, pos) {
++            return Ok((path_start, candidates));
++        }
+         Ok((
+             start,
+             self.completer.complete_with(word, &self.names.borrow()),
+@@ -869,4 +875,72 @@ mod tests {
+             "a class added without a theme colour would be a class nobody can draw"
+         );
+     }
++
++    /// TAB in the argument of a command that takes a path offers paths, not the
++    /// language's vocabulary.
++    ///
++    /// `:load` and its three siblings are the only arguments that are filenames, and
++    /// this is the only place TAB offers one. Before this the completer read the word
++    /// under the cursor and matched it against keywords, builtins, commands and the
++    /// session's names — so `:load sr` was completed against `:save` and `say` and
++    /// `skip`, and every filename in the argument had to be typed whole and blind.
++    #[test]
++    fn edge_tab_after_a_command_that_takes_a_path_offers_paths() {
++        let source = editor(live_names(&[]), None);
++
++        // The three prefixes of the DoD: nothing typed, one letter, and one that
++        // narrows. All three are answered from the directory this checkout has,
++        // which is why the assertion is `contains` rather than an exact list: the
++        // point is that a *directory* is in the answer at all.
++        for line in [":load ", ":load s", ":load sr"] {
++            let offered = source.complete(line, line.len());
++            assert!(
++                offered.contains(&"src/".to_string()),
++                "{line:?} offers the directory this checkout has, offered \
++                 {offered:?} instead"
++            );
++        }
++        assert!(
++            source
++                .complete(":load ", 6)
++                .contains(&"Cargo.toml".to_string()),
++            "and an empty fragment offers the files as well as the directories, \
++             which is what the whole of the directory means"
++        );
++        assert!(
++            source.complete(":load sr", 8).len() < 20,
++            "narrowing to `sr` narrows the answer rather than re-offering the \
++             whole vocabulary: {:?}",
++            source.complete(":load sr", 8)
++        );
++
++        let offered = source.complete(":load s", 7);
++        assert!(
++            offered.contains(&"src/".to_string()),
++            "a directory is offered with the separator that means it is one: {offered:?}"
++        );
++        assert!(
++            !offered.contains(&"say".to_string()) && !offered.contains(&":save".to_string()),
++            "and the language's vocabulary is not offered in a filename argument, \
++         which is what it used to offer: {offered:?}"
++        );
++    }
++
++    /// The gate the other side of: a path is offered in a command that takes one and
++    /// nowhere else. `say "a` is a string, and a reader typing a word into one is not
++    /// asking for a directory listing — the failure mode of a completer that offered
++    /// paths everywhere.
++    #[test]
++    fn edge_tab_outside_a_file_argument_offers_no_path() {
++        let source = editor(live_names(&[]), None);
++
++        for line in ["say \"a", "set x to \"s", "sr", "say \"src/"] {
++            assert_eq!(
++                source.complete(line, line.len()),
++                Vec::<String>::new(),
++                "{line:?} is not the argument of a command that takes a path, so \
++             nothing is offered for it"
++            );
++        }
++    }
+ }
+diff --git a/src/repl/style.rs b/src/repl/style.rs
+index 3a11453..f30efe2 100644
+--- a/src/repl/style.rs
++++ b/src/repl/style.rs
+@@ -237,6 +237,37 @@ impl Style {
+     }
+ }
+ 
++/// The text `text` says, with every escape sequence taken off it.
++///
++/// What a document is made of. An export, a test and a `--color=never` pipe all
++/// want the same thing — the text a reader reads — and each of them reaching into
++/// the middle of an escape sequence is three places to get it wrong.
++///
++/// A sequence is `ESC [` followed by parameters and closed by a final byte in
++/// `@`…`~`, which covers everything [`Style::paint`] writes and everything else
++/// a terminal understands. An escape byte that opens nothing is dropped as well:
++/// it is a control character, not text, and a document that carried one would
++/// carry something no reader of the document can see.
++pub fn strip_escapes(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut chars = text.chars();
++    while let Some(c) = chars.next() {
++        if c != '\u{1b}' {
++            out.push(c);
++            continue;
++        }
++        if chars.as_str().starts_with('[') {
++            chars.next();
++            for parameter in chars.by_ref() {
++                if ('\u{40}'..='\u{7e}').contains(&parameter) {
++                    break;
++                }
++            }
++        }
++    }
++    out
++}
++
+ /// The detection order, isolated so it can be tested directly.
+ fn resolve_enabled() -> bool {
+     if let Ok(mode) = std::env::var("REDBLUE_COLOR") {
+@@ -266,3 +297,78 @@ impl Default for Style {
+         Self::detect()
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{strip_escapes, Paint, Style};
++
++    /// The paint a style writes, and the text it says underneath it.
++    fn painted(role: Paint, text: &str) -> String {
++        Style::forced(true).paint(role, text)
++    }
++
++    /// Every role this crate can paint is round-tripped: stripping what
++    /// [`Style::paint`] added gives back the text that was painted, byte for byte.
++    #[test]
++    fn stripping_a_painted_string_gives_the_text_back() {
++        for role in [
++            Paint::Prompt,
++            Paint::Heading,
++            Paint::Result,
++            Paint::Error,
++            Paint::Dim,
++            Paint::BrandRed,
++            Paint::BrandBlue,
++            Paint::BrandMid,
++            Paint::Keyword,
++            Paint::Str,
++            Paint::Number,
++            Paint::Comment,
++            Paint::Builtin,
++            Paint::Operator,
++        ] {
++            assert_eq!(
++                strip_escapes(&painted(role, "hello")),
++                "hello",
++                "{role:?} is paint around the text, and the stripper takes it off"
++            );
++        }
++    }
++
++    /// Text with no escape in it comes back as itself, and a disabled style paints
++    /// nothing — so a plain session and a coloured one cannot export differently
++    /// because of what this function did.
++    #[test]
++    fn edge_stripping_a_plain_string_changes_nothing() {
++        let plain = "say \"hi\" = 1\n  indented\tand tabbed";
++        assert_eq!(strip_escapes(plain), plain);
++        assert_eq!(strip_escapes(""), "");
++        assert_eq!(Style::forced(false).paint(Paint::Result, "x"), "x");
++    }
++
++    /// An escape byte is a control character, not text. A document is read in a
++    /// text editor, a diff and a code review, and a stray `ESC` in one is
++    /// invisible in all three — so it is dropped, and only the text around it is
++    /// kept. The parameter form ends at its final byte, so `[2J` is one sequence
++    /// rather than a `[` and an orphan `J`.
++    #[test]
++    fn edge_an_escape_that_is_not_a_paint_sequence_leaves_only_text() {
++        assert_eq!(
++            strip_escapes("before\u{1b}after"),
++            "beforeafter",
++            "an escape that opens nothing is a control character, and dropping it \
++             keeps the text on both sides of it"
++        );
++        assert_eq!(
++            strip_escapes("\u{1b}[2J\u{1b}[H"),
++            "",
++            "a clear-screen and a cursor-home are terminal control, not text a \
++             document should carry"
++        );
++        assert_eq!(
++            strip_escapes("```redblue"),
++            "```redblue",
++            "and the backticks of a fence are text, so they stay"
++        );
++    }
++}
+[0m
+[0m$ [0mgit diff 222aa83..HEAD -- src/repl/completer.rs | head -320
+diff --git a/src/repl/completer.rs b/src/repl/completer.rs
+index c8136bb..9ad2015 100644
+--- a/src/repl/completer.rs
++++ b/src/repl/completer.rs
+@@ -1,5 +1,27 @@
++use std::path::{Path, PathBuf};
++
+ use super::commands;
+ 
++/// The separator offered after a directory, so it is visibly a directory and the
++/// next TAB walks into it.
++///
++/// `/` rather than [`std::path::MAIN_SEPARATOR`]: this is the text that goes into
++/// a command line, and `:load src/main.rs` reads the same on every platform.
++/// Both separators are *accepted* when one is being completed (see
++/// [`split_fragment`]), so offering this one on Windows is cosmetic rather than
++/// wrong.
++const DIRECTORY_SEPARATOR: &str = "/";
++
++/// How many entries one directory offers before the list is cut short.
++///
++/// A completion list is read by eye, and a directory of ten thousand entries is
++/// not a list any reader can use: it is the answer to "did I mean this
++/// directory?", not a catalogue. The list simply stops at this many, which reads
++/// as "type more to see less" — an entry saying how many were left out would be
++/// one more thing in a column of filenames, and accepting it would type a name
++/// that is not there.
++pub const MAX_PATH_CANDIDATES: usize = 200;
++
+ /// The module names a program can write as a receiver of a dotted call, read
+ /// from the one table the analyzer reads them from.
+ ///
+@@ -192,9 +214,162 @@ impl Default for ReplCompleter {
+     }
+ }
+ 
++/// Where the cursor is, when it is in the path argument of a command that takes
++/// one: the offset that argument starts at, and the fragment typed so far.
++///
++/// `None` for everything else — and that is the property this exists for. A
++/// completer that offered paths anywhere would answer `say "` with a directory
++/// listing, so the question is asked of the *command* first and answered by
++/// [`commands::ReplCommand::takes_a_file_path`], which is the parser's own table
++/// rather than a list of the four commands that happen to take a path today.
++///
++/// A cursor the caller put inside a character is `None` rather than a panic:
++/// `line.get(..pos)` is what says so.
++pub fn path_argument(line: &str, pos: usize) -> Option<(usize, &str)> {
++    let head = line.get(..pos)?;
++    let command_end = head.find(char::is_whitespace)?;
++    if !commands::ReplCommand::takes_a_file_path(&head[..command_end]) {
++        return None;
++    }
++    let rest = &head[command_end..];
++    let start = command_end + rest.len() - rest.trim_start().len();
++    Some((start, &head[start..]))
++}
++
++/// The directory part of `fragment` and the name being typed in it, as the user
++/// wrote them.
++///
++/// Both halves are text rather than a [`Path`], because the completion is offered
++/// back to be typed: `:load ./sr` is completed to `./src/lib.rs`, not to the
++/// normalised `src/lib.rs` the filesystem would answer to. Both `/` and the
++/// platform's own separator end the directory, so a path typed on either is
++/// walked into.
++fn split_fragment(fragment: &str) -> (&str, &str) {
++    let separator = |c: char| c == '/' || (std::path::is_separator(c) && c != '/');
++    match fragment.rfind(separator) {
++        Some(at) => fragment.split_at(at + 1),
++        None => ("", fragment),
++    }
++}
++
++/// Completes `fragment` against what is in `dir`, offering directories with a
++/// trailing separator.
++///
++/// `dir` is named rather than read from the process, so a caller can complete
++/// against a directory it chose and a test can complete against a scratch one
++/// instead of whatever the checkout happens to hold.
++///
++/// Three things about the answer, each of them a decision rather than an
++/// accident:
++///
++/// - **Directories are offered with `/` after them.** A completion that reads
++///   `src` and `src.rs` as two answers leaves the reader to guess which is a
++///   directory; a trailing separator says so, and lets the next TAB walk in.
++/// - **A name with a space in it is quoted.** The argument is everything after
++///   the command word, so an unquoted `my file.rb` would reach the command as
++///   two arguments — one path and one stray word.
++/// - **Dot-entries are not offered.** A directory listing a user did not ask for
++///   is noise, and `.git` in it is noise twice over; a hidden file is still
++///   reachable by typing its name.
++///
++/// A directory that cannot be read — missing, unreadable, not a directory, a
++/// name that is not valid UTF-8 on this platform — offers nothing rather than
++/// failing: a TAB that reports nothing is better than a TAB that prints.
++pub fn complete_path_in(dir: &Path, fragment: &str) -> Vec<String> {
++    let (directory, name) = split_fragment(fragment);
++    let listing = dir.join(directory);
++    let prefix = name.to_lowercase();
++    let Ok(entries) = std::fs::read_dir(&listing) else {
++        return Vec::new();
++    };
++
++    let mut candidates: Vec<String> = Vec::new();
++    for entry in entries.flatten() {
++        let Some(entry_name) = entry.file_name().to_str().map(str::to_string) else {
++            continue;
++        };
++        if entry_name.starts_with('.') || !entry_name.to_lowercase().starts_with(&prefix) {
++            continue;
++        }
++        let candidate = format!(
++            "{directory}{}{}",
++            quote_if_spaced(&entry_name),
++            if is_directory(&entry.path()) {
++                DIRECTORY_SEPARATOR
++            } else {
++                ""
++            }
++        );
++        candidates.push(candidate);
++    }
++
++    // Sorted before it is cut short, because a filesystem does not hand entries
++    // back in an order this can promise: a list that depended on readdir would be
++    // a different list on a different day, and a test could not pin it. That is
++    // also why the directory is read whole and the *list* is capped — a list
++    // sorted from a partial reading is a list of whichever entries the filesystem
++    // returned first, which is not a promise anyone can keep.
++    candidates.sort_by_key(|candidate| sort_key(candidate));
++    candidates.truncate(MAX_PATH_CANDIDATES);
++    candidates
++}
++
++/// The case-insensitive order a reader expects of a file list, with the exact
++/// spelling as the tiebreak so two names differing only in case have one order.
++fn sort_key(candidate: &str) -> (String, String) {
++    (candidate.to_lowercase(), candidate.to_string())
++}
++
++/// `name` wrapped in quotes when it holds whitespace, and left alone when it does
++/// not — a quoted name nobody needed quoted is noise in the line being typed.
++fn quote_if_spaced(name: &str) -> String {
++    if name.contains(char::is_whitespace) {
++        format!("\"{name}\"")
++    } else {
++        name.to_string()
++    }
++}
++
++/// Whether `path` is a directory, following a symlink to one.
++///
++/// `metadata` rather than `file_type`, which reports the link itself: a symlink
++/// into a directory is a thing you can walk into, and offering it without the
++/// separator would send the next TAB to the parent instead. A path whose type
++/// cannot be read is offered as a file, which is the reading that does least.
++fn is_directory(path: &Path) -> bool {
++    std::fs::metadata(path)
++        .map(|metadata| metadata.is_dir())
++        .unwrap_or(false)
++}
++
++impl ReplCompleter {
++    /// What TAB offers when the cursor is in the path argument of a command that
++    /// takes one, and `None` when it is anywhere else.
++    ///
++    /// The completion rather than the candidates alone, because the offset is half
++    /// of the answer: rustyline replaces from there, so a candidate that did not
++    /// come with the place it starts would replace the command word too.
++    pub fn complete_path(&self, line: &str, pos: usize) -> Option<(usize, Vec<String>)> {
++        let (start, fragment) = path_argument(line, pos)?;
++        Some((start, complete_path_in(&current_dir(), fragment)))
++    }
++}
++
++/// The directory a session completes paths against.
++///
++/// A function so that the answer is one place: the process's working directory,
++/// which is where a user typing `:load ` means "here".
++fn current_dir() -> PathBuf {
++    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
++}
++
+ #[cfg(test)]
+ mod tests {
+-    use super::ReplCompleter;
++    use std::fs;
++    use std::path::{Path, PathBuf};
++    use std::sync::atomic::{AtomicUsize, Ordering};
++
++    use super::{complete_path_in, path_argument, ReplCompleter, MAX_PATH_CANDIDATES};
+     use crate::repl::commands::{self, ReplCommand};
+ 
+     /// The names a session would offer: a variable it bound, a function it
+@@ -503,4 +678,275 @@ mod tests {
+             "the original spelling of the name is what is offered"
+         );
+     }
++    /// A scratch directory for the path tests, named so no other test in this
++    /// binary can be looking at it, and emptied before use so what a test finds
++    /// does not depend on what ran before it.
++    fn scratch_dir(name: &str) -> PathBuf {
++        static COUNTER: AtomicUsize = AtomicUsize::new(0);
++        let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
++        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
++            .join("target/tmp/repl-completer")
++            .join(format!("{name}-{serial}"));
++        if dir.exists() {
++            fs::remove_dir_all(&dir).expect("a leftover scratch directory should be removable");
++        }
++        fs::create_dir_all(&dir).expect("scratch directory should be creatable");
++        dir
++    }
++
++    /// A file in `dir`, written empty so it exists to be listed.
++    fn file_in(dir: &Path, name: &str) -> PathBuf {
++        let path = dir.join(name);
++        fs::write(&path, "").expect("the scratch file should be writable");
++        path
++    }
++
++    fn dir_in(dir: &Path, name: &str) -> PathBuf {
++        let path = dir.join(name);
++        fs::create_dir_all(&path).expect("the scratch directory should be creatable");
++        path
++    }
++
++    /// The finding, both halves of it: the file commands complete paths, and
++    /// every other word completes vocabulary.
++    ///
++    /// `:load sr` is the case that matters. It used to be completed against the
++    /// command table and the keyword table — `:save`, `say`, `skip`, `split` —
++    /// so the one place a user has to name a file on disk was the one place with
++    /// no knowledge of the disk.
++    #[test]
++    fn a_file_command_completes_the_paths_it_could_load() {
++        let dir = scratch_dir("load");
++        dir_in(&dir, "src");
++        file_in(&dir, "notes.txt");
++
++        assert_eq!(
++            complete_path_in(&dir, "sr"),
++            vec!["src/".to_string()],
++            "a directory is offered with the separator that says it is one"
++        );
++        assert_eq!(
++            complete_path_in(&dir, "no"),
++            vec!["notes.txt".to_string()],
++            "a file is offered whole"
++        );
++        assert_eq!(
++            complete_path_in(&dir, "src/"),
++            Vec::<String>::new(),
++            "a directory with nothing in it offers nothing of its contents"
++        );
++        assert_eq!(
++            complete_path_in(&dir, "src/n"),
++            Vec::<String>::new(),
++            "and a path walked into is completed against what is really there"
++        );
++        assert_eq!(
++            complete_path_in(&dir, "zzz"),
++            Vec::<String>::new(),
++            "a prefix nothing starts with completes to nothing, as everywhere else"
++        );
++    }
++
++    /// An empty fragment offers the directory the user is in, and the cursor's
++    /// offset is the whole argument — so `:load ` followed by TAB replaces the
++    /// empty argument and leaves the command word alone.
++    #[test]
++    fn an_empty_fragment_offers_the_directory_and_replaces_only_the_argument() {
++        let dir = scratch_dir("empty-fragment");
++        file_in(&dir, "a.rb");
++        file_in(&dir, "b.md");
++
++        assert_eq!(
++            complete_path_in(&dir, ""),
++            vec!["a.rb".to_string(), "b.md".to_string()],
++            "an empty fragment is every entry, in order"
++        );
++
++        assert_eq!(
++            path_argument(":load ", 6),
++            Some((6, "")),
++            "the argument starts after the command word and its space"
++        );
++        assert_eq!(
++            path_argument(":load src/li", 12),
++            Some((6, "src/li")),
++            "and the fragment is everything from there to the cursor, so the \\
++             completion replaces the path and not the command"
++        );
++        assert_eq!(
++            path_argument(".save out.txt", 13),
++            Some((6, "out.txt")),
++            "the second sigil is the same command and completes the same way"
++        );
++    }
++
++    /// A name with a space in it is offered quoted, so that accepting it does not
++    /// hand the command two arguments.
++    ///
++    /// `ReplCommand::argument` is everything after the command word, so an
++    /// unquoted `my file.rb` reaches `:load` as `my file.rb` — which happens to
++    /// be the whole of it — but a quoted one reaches it *with* the quotes, and
++    /// neither is a path that opens. Quoting is the form that says which one is
++    /// the name.
++    #[test]
++    fn edge_a_filename_with_a_space_in_it_is_offered_quoted() {
++        let dir = scratch_dir("spaced");
++        file_in(&dir, "my file.rb");
++        file_in(&dir, "plain.rb");
++
++        let offered = complete_path_in(&dir, "my");
++
++        assert_eq!(
++            offered,
+[0m
+[0m$ [0mgit diff 222aa83..HEAD -- src/repl/completer.rs | tail -180
++            "and the fragment is everything from there to the cursor, so the \\
++             completion replaces the path and not the command"
++        );
++        assert_eq!(
++            path_argument(".save out.txt", 13),
++            Some((6, "out.txt")),
++            "the second sigil is the same command and completes the same way"
++        );
++    }
++
++    /// A name with a space in it is offered quoted, so that accepting it does not
++    /// hand the command two arguments.
++    ///
++    /// `ReplCommand::argument` is everything after the command word, so an
++    /// unquoted `my file.rb` reaches `:load` as `my file.rb` — which happens to
++    /// be the whole of it — but a quoted one reaches it *with* the quotes, and
++    /// neither is a path that opens. Quoting is the form that says which one is
++    /// the name.
++    #[test]
++    fn edge_a_filename_with_a_space_in_it_is_offered_quoted() {
++        let dir = scratch_dir("spaced");
++        file_in(&dir, "my file.rb");
++        file_in(&dir, "plain.rb");
++
++        let offered = complete_path_in(&dir, "my");
++
++        assert_eq!(
++            offered,
++            vec!["\"my file.rb\"".to_string()],
++            "quoted, because an unquoted name with a space in it is two words"
++        );
++        assert_eq!(
++            complete_path_in(&dir, "pl"),
++            vec!["plain.rb".to_string()],
++            "and a name nobody needed quoting is not given any"
++        );
++    }
++
++    /// The three shapes of nothing, all of which a TAB can meet and none of which
++    /// may be an error: a directory with nothing in it, a prefix nothing starts
++    /// with, and a path into a directory that is not there.
++    #[test]
++    fn edge_nothing_to_offer_is_no_candidates_rather_than_a_failure() {
++        let empty = scratch_dir("empty");
++
++        assert!(
++            complete_path_in(&empty, "").is_empty(),
++            "an empty directory has nothing to offer, which is not a failure"
++        );
++        assert!(
++            complete_path_in(&empty, "anything").is_empty(),
++            "and nothing there starts with the prefix either"
++        );
++        assert!(
++            complete_path_in(&empty.join("no-such-directory"), "x").is_empty(),
++            "a directory that cannot be read offers nothing rather than panicking"
++        );
++        assert!(
++            complete_path_in(&file_in(&empty, "a-file"), "x").is_empty(),
++            "and a path that is a file rather than a directory is the same answer"
++        );
++        assert_eq!(
++            path_argument(":load ", 1000),
++            None,
++            "a cursor past the end of the line is not a position to complete at"
++        );
++        assert_eq!(
++            path_argument(":loa\u{1F600}", 4),
++            None,
++            "and a cursor inside a character is not one either"
++        );
++    }
++
++    /// A dot-entry is not offered, which is what keeps `.git` and `.env` out of a
++    /// listing — and it is a decision rather than an accident, so it is pinned:
++    /// the hidden file is still reachable by typing it.
++    #[test]
++    fn edge_a_dot_entry_is_not_offered() {
++        let dir = scratch_dir("hidden");
++        file_in(&dir, ".hidden");
++        file_in(&dir, "shown.rb");
++
++        assert_eq!(
++            complete_path_in(&dir, ""),
++            vec!["shown.rb".to_string()],
++            "a dot-entry is a thing the user did not mean to name"
++        );
++        assert_eq!(
++            complete_path_in(&dir, ".hid"),
++            Vec::<String>::new(),
++            "and it is not reachable by prefixing it either"
++        );
++        assert!(
++            dir.join(".hidden").exists(),
++            "which is only about what is offered: the file is still there to be \\
++             typed, and nothing here touched it"
++        );
++    }
++
++    /// A long list is cut short, and it is cut in an order the filesystem does not
++    /// choose — a second run over the same directory answers the same way.
++    #[test]
++    fn edge_a_long_listing_is_capped_and_the_order_does_not_depend_on_the_disk() {
++        let dir = scratch_dir("capped");
++        for index in 0..MAX_PATH_CANDIDATES + 10 {
++            file_in(&dir, &format!("{index:04}.rb"));
++        }
++
++        let offered = complete_path_in(&dir, "");
++
++        assert_eq!(
++            offered.len(),
++            MAX_PATH_CANDIDATES,
++            "a list longer than a reader can use is cut short"
++        );
++        assert_eq!(
++            offered,
++            complete_path_in(&dir, ""),
++            "and the same directory answers the same way twice: the list is \\
++             sorted before it is cut, because readdir does not promise an order"
++        );
++        assert_eq!(
++            offered.first().map(String::as_str),
++            Some("0000.rb"),
++            "so the cut is the first of the sorted list, not whichever entries the \\
++             filesystem happened to return first"
++        );
++    }
++
++    /// A symlink to a directory is walked into, because it is a thing you can walk
++    /// into — and offering it as a file would send the next TAB to its parent.
++    #[test]
++    fn a_symlink_to_a_directory_is_offered_as_a_directory() {
++        let dir = scratch_dir("symlink");
++        dir_in(&dir, "real");
++        #[cfg(unix)]
++        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).expect("a symlink");
++
++        let offered = complete_path_in(&dir, "l");
++
++        #[cfg(unix)]
++        assert_eq!(
++            offered,
++            vec!["link/".to_string()],
++            "the link is followed, so it is offered with the separator"
++        );
++        #[cfg(not(unix))]
++        assert!(
++            offered.is_empty(),
++            "no symlink was made, so nothing is offered"
++        );
++    }
++
++    /// The filesystem is read for a path argument and nowhere else, at every
++    /// position in the line.
++    #[test]
++    fn a_path_is_offered_only_in_the_argument_of_a_command_that_takes_one() {
++        for (line, pos, expected) in [
++            (":load s", 7, Some(6)),
++            (".save sr", 7, Some(6)),
++            (":run s", 6, Some(5)),
++            (":restore s", 10, Some(9)),
++            (":l s", 4, Some(3)),
++            (":load", 5, None),
++            (":loadx s", 8, None),
++            ("::load s", 8, None),
++            ("load s", 6, None),
++            ("say s", 5, None),
++            ("say \"s", 6, None),
++            ("", 0, None),
++        ] {
++            assert_eq!(
++                path_argument(line, pos).map(|(start, _)| start),
++                expected,
++                "{line:?} at {pos} is {} a path argument",
++                if expected.is_some() { "in" } else { "not in" }
++            );
++        }
++    }
+ }
+[0m
+[0m→ [0mRead tests/repl_test.rs[90m [limit=200][0m
+[0m
+[0m$ [0mgrep -n "^fn \|^#\[test\]\|^async fn " tests/repl_test.rs | sed -n '1,200p'
+76:fn session(input: &str) -> Session {
+88:fn session_with_env(input: &str, env: &[(&str, &str)]) -> Session {
+145:fn read_all(pipe: &mut impl Read) -> String {
+152:fn scratch_dir() -> PathBuf {
+158:fn scratch_file(name: &str, source: &str) -> PathBuf {
+166:fn scratch_path(name: &str, extension: &str) -> PathBuf {
+180:#[test]
+181:fn repl_runs_commands_and_quits() {
+194:#[test]
+195:fn repl_shows_the_result_of_an_expression_under_vars() {
+203:#[test]
+204:fn repl_runs_a_multiline_block() {
+212:#[test]
+213:fn repl_reports_an_uncaught_error_and_stays_alive() {
+227:#[test]
+228:fn a_failure_at_the_prompt_shows_the_line_that_failed() {
+237:#[test]
+238:fn repl_runs_a_program_that_catches_its_own_error() {
+259:#[test]
+260:fn edge_first_line_syntax_error_keeps_the_repl_alive() {
+275:#[test]
+276:fn edge_unterminated_block_then_eof_terminates_saying_what_it_never_ran() {
+290:#[test]
+291:fn repl_runs_a_block_the_last_word_heuristic_missed() {
+339:#[test]
+340:fn edge_a_to_declaration_is_read_as_a_block_and_callable_afterwards() {
+350:#[test]
+351:fn edge_a_stray_end_does_not_swallow_the_rest_of_the_session() {
+362:#[test]
+363:fn repl_load_runs_the_file_rather_than_only_measuring_it() {
+375:#[test]
+376:fn edge_a_command_argument_with_a_space_in_it_is_not_truncated() {
+393:#[test]
+394:fn edge_a_quoted_path_with_a_space_in_it_is_the_file_it_names() {
+410:#[test]
+411:fn edge_vars_lists_the_session_bindings() {
+419:#[test]
+420:fn edge_load_of_a_missing_path_reports_the_failure() {
+438:#[test]
+439:fn edge_command_missing_its_argument_is_reported_not_guessed() {
+450:#[test]
+451:fn edge_unknown_command_is_named_and_the_session_survives() {
+463:#[test]
+464:fn repl_carries_a_binding_from_one_line_to_the_next() {
+477:#[test]
+478:fn edge_vars_lists_the_names_the_session_bound_not_only_the_last_result() {
+491:#[test]
+492:fn edge_funcs_names_the_function_the_session_declared() {
+504:#[test]
+505:fn edge_inspect_reports_a_value_the_session_bound() {
+518:#[test]
+519:fn edge_inspect_reports_the_redblue_type_of_what_it_found() {
+536:#[test]
+537:fn edge_an_imported_modules_members_are_not_listed_as_session_names() {
+551:#[test]
+552:fn edge_reset_after_an_unfinished_block_returns_the_session_to_a_prompt() {
+563:#[test]
+564:fn edge_a_doubled_sigil_is_a_mistyped_command_and_not_the_command() {
+577:#[test]
+578:fn edge_help_says_the_second_sigil_reaches_the_same_commands() {
+587:#[test]
+588:fn edge_a_command_argument_with_consecutive_spaces_is_not_collapsed() {
+605:#[test]
+606:fn edge_save_then_restore_brings_the_session_back_in_a_second_session() {
+647:#[test]
+648:fn edge_restore_of_a_missing_path_reports_the_failure() {
+669:#[test]
+670:fn edge_a_piped_block_that_never_closes_does_not_grow_without_limit() {
+692:#[test]
+693:fn edge_the_report_of_an_unclosed_block_counts_the_lines_it_did_not_echo() {
+715:#[test]
+716:fn edge_a_line_says_its_line_once_however_many_lines_follow() {
+740:#[test]
+741:fn edge_help_and_examples_promise_only_what_the_session_can_run() {
+754:#[test]
+755:fn edge_help_names_every_alias_the_repl_accepts() {
+784:#[test]
+785:fn edge_command_missing_its_argument_is_reported_for_restore_too() {
+799:#[test]
+800:fn edge_the_banner_names_the_crate_version_and_not_a_stale_one() {
+817:#[test]
+818:fn a_block_is_read_at_a_prompt_that_numbers_its_continuations() {
+851:#[test]
+852:fn edge_a_piped_prompt_command_leaves_the_newline_out_of_the_prompt() {
+866:#[test]
+867:fn edge_a_prompt_format_that_closes_a_brace_it_never_opens_is_refused() {
+885:#[test]
+886:fn edge_bang_bang_repeats_the_last_line_with_its_output() {
+900:#[test]
+901:fn edge_bang_bang_at_the_start_of_a_session_says_there_is_nothing_to_repeat() {
+912:#[test]
+913:fn a_prompt_command_replaces_the_prompt_and_refuses_an_unknown_placeholder() {
+927:#[test]
+928:fn edge_bang_bang_after_a_failed_line_repeats_the_failure() {
+945:#[test]
+946:fn edge_bang_bang_still_repeats_after_a_reset() {
+963:#[test]
+964:fn edge_bang_bang_twice_repeats_the_same_line_twice() {
+982:#[test]
+983:fn edge_repeating_the_last_line_of_a_block_is_a_clean_error_not_a_dead_session() {
+1001:#[test]
+1002:fn edge_a_piped_session_prompts_plainly_until_colour_is_asked_for() {
+1025:#[test]
+1026:fn edge_type_of_a_statement_prints_nothing_and_binds_nothing() {
+1046:#[test]
+1047:fn edge_type_cannot_delete_a_file() {
+1074:#[test]
+1075:fn edge_type_of_a_call_does_not_change_the_session_it_runs_against() {
+1104:#[test]
+1105:fn edge_type_cannot_delete_a_file_through_a_function_the_session_declared() {
+1138:#[test]
+1139:fn edge_type_cannot_move_the_random_stream_or_read_the_clock() {
+1179:#[test]
+1180:fn edge_type_cannot_print_through_a_function_the_session_called() {
+1201:#[test]
+1202:fn edge_which_names_every_module_one_import_binds_and_a_reset_forgets_their_lines() {
+1225:#[test]
+1226:fn bytecode_shows_the_instruction_listing_the_session_compiles_to() {
+1241:#[test]
+1242:fn edge_bytecode_with_no_argument_is_told_what_it_wanted() {
+1254:#[test]
+1255:fn bytecode_reports_a_compile_error_instead_of_listing_nothing() {
+1268:#[test]
+1269:fn asm_at_the_prompt_agrees_with_rb_dis_on_the_same_source() {
+1345:fn plain(text: &str) -> String {
+1368:fn exported_document(stdout: &str) -> String {
+1386:fn fenced_blocks(document: &str) -> Vec<(String, String)> {
+1411:#[test]
+1412:fn edge_export_writes_a_two_line_session_as_two_fenced_markdown_blocks() {
+1472:#[test]
+1473:fn edge_a_session_exported_to_a_file_runs_again_from_the_fences_read_back() {
+1520:#[test]
+1521:fn edge_export_to_a_path_that_cannot_be_written_names_the_path() {
+1542:#[test]
+1543:fn edge_export_of_a_session_that_has_run_nothing_says_so() {
+1569:#[test]
+1570:fn edge_a_session_of_unicode_exports_and_reads_back_unchanged() {
+1646:#[test]
+1647:fn edge_export_to_the_same_path_twice_replaces_the_document() {
+1694:#[test]
+1695:fn edge_a_session_that_ran_a_crlf_file_exports_and_reads_back() {
+[0m
+[0m→ [0mRead tests/repl_test.rs[90m [offset=1330, limit=400][0m
+[0m
+[0m$ [0mgrep -n "fn word_at" -A 40 src/repl/editor.rs
+210:    fn word_at(line: &str, pos: usize) -> Option<(usize, &str)> {
+211-        let head = line.get(..pos)?;
+212-        let start = head
+213-            .char_indices()
+214-            .rev()
+215-            .find(|(_, ch)| ch.is_whitespace())
+216-            .map_or(0, |(offset, ch)| offset + ch.len_utf8());
+217-        Some((start, &head[start..]))
+218-    }
+219-}
+220-
+221-impl Completer for SessionCompleter {
+222-    type Candidate = String;
+223-
+224-    fn complete(
+225-        &self,
+226-        line: &str,
+227-        pos: usize,
+228-        _ctx: &Context<'_>,
+229-    ) -> Result<(usize, Vec<String>), ReadlineError> {
+230-        // A cursor the caller put inside a character is not an answer this
+231-        // completer can give, and slicing at it would panic.
+232-        let Some((start, word)) = Self::word_at(line, pos) else {
+233-            return Ok((0, Vec::new()));
+234-        };
+235-        // A filename first, where the line is the argument of a command that
+236-        // takes one: the vocabulary has no business answering `:load sr`, and
+237-        // this is the only place the filesystem is read at all.
+238-        if let Some((path_start, candidates)) = self.completer.complete_path(line, pos) {
+239-            return Ok((path_start, candidates));
+240-        }
+241-        Ok((
+242-            start,
+243-            self.completer.complete_with(word, &self.names.borrow()),
+244-        ))
+245-    }
+246-}
+247-
+248-// The line editor is generic over a "helper", which is completion plus the three
+249-// hooks around it. Redblue has no inline hints and no per-line validation to
+250-// offer, so those two are the defaults rather than a second place to keep
+[0m
+[0m$ [0mgrep -n "fn take_output\|fn run\b\|output_buffer\|fn push_output\|output:" src/interpreter.rs | head -40
+279:    output: Vec<String>,
+619:            output: Vec::new(),
+948:    pub fn take_output(&mut self) -> Vec<String> {
+1329:    pub fn run(&mut self, program: &Program) -> Result<Value> {
+[0m
+[0m$ [0msed -n '1320,1400p' src/interpreter.rs; echo "=== take_output ==="; sed -n '935,975p' src/interpreter.rs
+self.declared_modules
+            .insert(name.to_string(), DeclaredModule { members });
+        self.module_aliases
+            .entry(name.to_string())
+            .or_insert_with(|| name.to_string());
+        Ok(Value::Nothing)
+    }
+
+    pub fn run(&mut self, program: &Program) -> Result<Value> {
+        let result = self.run_statements(program)?;
+
+        // Print collected output. Through the one boundary a program writes
+        // through, so the WebAssembly playground can collect what the native
+        // binary would have printed.
+        for line in &self.output {
+            crate::wasm::emit(&format!("{}\n", line));
+        }
+
+        Ok(result)
+    }
+
+    /// Runs `program` and answers with what it returned, printing nothing.
+    ///
+    /// [`Vm::run`] prints what the program *said*, which is right for a program
+    /// and wrong for a question about a value: `.type f()` is not asking to hear
+    /// what `f` prints, and a REPL that printed it would answer a question with
+    /// output the user did not type. The lines are still buffered — nothing is
+    /// lost, and a caller that wants them reads them with [`Vm::take_output`] —
+    /// so this is about what reaches the terminal and not about the VM keeping
+    /// a record.
+    ///
+    /// `print` and `console.log` do not go through this buffer: they write at
+    /// the point they are reached, so a question has to keep them out of the
+    /// program it evaluates rather than rely on there being nothing to print.
+    pub fn run_quietly(&mut self, program: &Program) -> Result<Value> {
+        self.run_statements(program)
+    }
+
+    /// The statements, without the printing [`Vm::run`] does afterwards.
+    ///
+    /// Split out so the two entry points cannot disagree about what a program
+    /// *does* — a failure returns here in both, before any output is emitted,
+    /// exactly as it did when [`Vm::run`] returned straight from the loop.
+    fn run_statements(&mut self, program: &Program) -> Result<Value> {
+        let mut result = Value::Nothing;
+
+        for statement in &program.statements {
+            result = self.execute_statement(statement)?;
+        }
+
+        Ok(result)
+    }
+
+    fn push_scope(&mut self) {
+        self.locals.push(CapturedScope::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.locals.pop();
+    }
+
+    /// Builds the function value for a declaration, closing over every local
+    /// scope that is live where the declaration is executed.
+    ///
+    /// The capture is a copy taken at declaration time, so a variable the
+    /// function reads is the value it had where the function was written, and
+    /// a variable it assigns is assigned only for that one call. Globals are
+    /// not captured and are read live, which is what a declaration that
+    /// changes a global — a counter, a registry — is written to do.
+    fn make_function(&self, name: &str, params: &[String], body: &[Stmt]) -> Value {
+        let captured: Captured = self.locals.clone();
+        Value::Function(FunctionValue {
+            name: name.to_string(),
+            params: params.to_vec(),
+            body: FunctionBody::Statements(Arc::new(body.to_vec())),
+            captured: Arc::new(captured),
+        })
+    }
+
+    fn get_var(&self, name: &str) -> Option<Value> {
+=== take_output ===
+    /// instead of only a rendered message.
+    pub fn take_expectation_failure(
+        &mut self,
+    ) -> Option<crate::testing::assertions::TestAssertionError> {
+        self.expectation_failure.take()
+    }
+
+    /// Takes the lines `say` produced, for a caller that wants them rather than
+    /// the printing.
+    ///
+    /// The printing happens in [`Vm::run`], so this is only useful afterwards.
+    /// It exists so that a caller comparing this VM with the bytecode VM can see
+    /// what each printed without capturing a process's stdout.
+    pub fn take_output(&mut self) -> Vec<String> {
+        self.output_bytes = 0;
+        self.output_full = false;
+        std::mem::take(&mut self.output)
+    }
+
+    /// Charges `bytes` to the buffered `say` output, failing once one program's
+    /// lines would need more than [`crate::wasm::MAX_OUTPUT_BYTES`].
+    ///
+    /// The same bound [`crate::wasm::emit`] enforces, charged here rather than
+    /// there, and on the same `Error::Limit` channel — so the limit is the
+    /// interpreter's own, a Redblue program can `catch` it, and the two engines
+    /// stop at the same number because they read the same constant.
+    ///
+    /// One byte per line is the newline [`Vm::run`] appends on the way out, so
+    /// what is charged is what the boundary will eventually be handed. The
+    /// charge sticks: see [`Vm::output_full`].
+    fn charge_output(&mut self, line: &str) -> Result<()> {
+        let limit = crate::wasm::MAX_OUTPUT_BYTES;
+        let needed = line.len().saturating_add(1);
+        if self.output_full || self.output_bytes.saturating_add(needed) > limit {
+            self.output_full = true;
+            return Err(Error::Limit(
+                format!(
+                    "Output past the limit of {limit} bytes: this program said more than the \
+                     interpreter will hold"
+                ),
+                self.span(),
+[0m
+[0m$ [0mgrep -rn "MAX_OUTPUT_BYTES" src/ | head -10; echo ---; grep -rn "pub const MAX_OUTPUT_BYTES" -A3 src/wasm.rs
+src/interpreter.rs:955:    /// lines would need more than [`crate::wasm::MAX_OUTPUT_BYTES`].
+src/interpreter.rs:966:        let limit = crate::wasm::MAX_OUTPUT_BYTES;
+src/wasm.rs:33:/// Set when a run tried to [`emit`] past [`MAX_OUTPUT_BYTES`]. A run that
+src/wasm.rs:52:pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+src/wasm.rs:85:        if buffer.len().saturating_add(text.len()) > MAX_OUTPUT_BYTES {
+src/wasm.rs:194:                "Output past the limit of {MAX_OUTPUT_BYTES} bytes: this program printed more \
+src/wasm.rs:352:    /// truncated — [`emit`] refuses to collect past [`MAX_OUTPUT_BYTES`] and
+src/wasm.rs:412:    /// [`MAX_OUTPUT_BYTES`] — the same way `fstat` answers a size query. Any
+src/wasm.rs:441:    HOST_OUTPUT.get_or_init(|| HostBuffer::new(MAX_OUTPUT_BYTES))
+src/wasm.rs:456:/// The size is [`MAX_OUTPUT_BYTES`] for a reason rather than by accident: a host
+---
+52:pub const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+53-
+54-/// The most rendered error text one run may leave for a host. An error carries a
+55-/// source line and a caret under it, so this is generous for anything a person
+[0m
+[0m$ [0mgrep -n "FILE_USAGE" src/repl/commands.rs | cat -A | head -20
+153:const FILE_USAGE: &str = "<filename>";$
+208:        usage: Some(FILE_USAGE),$
+216:        usage: Some(FILE_USAGE),$
+224:        usage: Some(FILE_USAGE),$
+240:        usage: Some(FILE_USAGE),$
+248:        usage: Some(FILE_USAGE),$
+589:                        let value = if spec.usage == Some(FILE_USAGE) {$
+627:            && spec_for(input).is_some_and(|spec| spec.usage == Some(FILE_USAGE))$
+[0m
+[0m$ [0msed -n '153p' src/repl/commands.rs | hexdump -C | head -5
+00000000  63 6f 6e 73 74 20 46 49  4c 45 5f 55 53 41 47 45  |const FILE_USAGE|
+00000010  3a 20 26 73 74 72 20 3d  20 22 3c 66 69 6c 65 6e  |: &str = "<filen|
+00000020  61 6d 65 3e 22 3b 0a                              |ame>";.|
+00000027
+[0m
+[0m→ [0mRead src/repl/commands.rs[90m [limit=130, offset=540][0m
+[0m→ [0mRead tests/repl_test.rs[90m [limit=60, offset=374][0m
+[0m
+[0m$ [0mgit log --oneline -1 -- tests/repl_test.rs && git show 222aa83:tests/repl_test.rs | grep -n "edge_a_quoted_path_with_a_space_in_it_is_the_file_it_names"
+659724d 060: verify the export/TAB work, fix two red gates, add three edge tests
+[0m
+[0m$ [0mgit show 222aa83:src/repl/commands.rs | grep -n "unquote\|trim_matches\|starts_with('\"')" | head; echo "--- repl_test at b5461ae ---"; git show b5461ae:tests/repl_test.rs | grep -c "" ; git show b5461ae:tests/repl_test.rs | grep -n "quoted_path"
+--- repl_test at b5461ae ---
+1557
+394:fn edge_a_quoted_path_with_a_space_in_it_is_the_file_it_names() {
+[0m
+[0m$ [0mcargo build 2>&1 | tail -5
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.08s
+[0m
+[0m$ [0mcargo fmt --all -- --check 2>&1 | tail -20; echo "FMT EXIT: $?"
+FMT EXIT: 0
+[0m
+[0m$ [0mprintf 'say "one"\nsay "two"\n.export\n:quit\n' | ./target/debug/rb 2>&1 | cat -A | head -30
+M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^H    M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H$
+                       M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H    M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H    M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H   $
+                       M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^H    M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H $
+                       M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H    M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H    M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^H   $
+                       M-bM-^VM-^H M-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H  M-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^HM-bM-^VM-^H$
+$
+Welcome to Redblue v0.2.0 - tree-walking interpreter$
+Type ':help' for commands, ':quit' to exit$
+TAB completes, Up arrow walks back through history, !! repeats the last line$
+$
+>>> one$
+>>> two$
+>>> # Redblue session$
+$
+```redblue$
+say "one"$
+```$
+one$
+$
+```redblue$
+say "two"$
+```$
+two$
+>>> Goodbye!$
+[0m
+[0m$ [0mprintf 'say "```redblue"\nsay "x"\n.export\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/# Redblue/,$p' | cat -A
+>>> # Redblue session$
+$
+````redblue$
+say "```redblue"$
+````$
+```redblue$
+$
+```redblue$
+say "x"$
+```$
+x$
+>>> Goodbye!$
+[0m
+[0m$ [0mgrep -rn "read_markdown\|FENCE_LANGUAGE\|Transcript::" src/ tests/ --include=*.rs | grep -v "transcript.rs" | head -20
+src/repl/mod.rs:537:            transcript: Transcript::new(),
+[0m
+[0m$ [0mgrep -rn '1b}\]' src/ | head; echo "--- any ESC sequences written ---"; grep -rno '\\u{1b}\[[^"]*' src/ | head -20
+--- any ESC sequences written ---
+src/repl/transcript.rs:311:\u{1b}[32m` in
+src/repl/transcript.rs:318:\u{1b}[32mone\u{1b}[0m
+src/repl/transcript.rs:322:\u{1b}[31mError: ParserError: Expected expression\u{1b}[0m
+src/repl/style.rs:236:\u{1b}[{}m{}\u{1b}[0m
+src/repl/style.rs:363:\u{1b}[2J\u{1b}[H
+src/repl/mod.rs:4413:\u{1b}[0m
+src/repl/highlight.rs:286:\u{1b}[0m
+[0m
+[0m$ [0mprintf ':help\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/Commands:/,$p' | head -40
+>>> Redblue REPL Commands:
+
+  :quit, :exit, :q                 Exit the REPL
+  :help, :h, :?                    Show this help
+  :clear, :cls                     Clear the screen
+  :history, :hist                  Show command history
+  :vars, :variables, :v            Show all variables
+  :functions, :funcs, :f           Show defined functions
+  :load, :l <filename>             Load and run a file
+  :save, :s <filename>             Save current session
+  :restore, :r <filename>          Restore a saved session
+  :reset                           Reset REPL state
+  :export <filename>               Write the session as Markdown; no filename writes it here
+  :run <filename>                  Run a Redblue file
+  :debug                           Debug mode
+  :break, :b <line>                Stop at a line, or clear the breakpoint there
+  :breaks, :bps                    List the lines breakpoints are set on
+  :delete, :d <line>               Remove the breakpoint on a line
+  :step, :st                       Step into the next call
+  :next, :n                        Step over the next call
+  :continue, :c                    Run on to the next breakpoint
+  :frame, :fr                      Show the frame the program last stopped in
+  :inspect, :i <variable>          Inspect a variable
+  :type <expression>               Value, kind and source span of an expression
+  :doc <module>                    List what a module exposes
+  :which <name>                    Say where a name is bound
+  :sighelp <name>                  Show the shape of a call
+  :time <expression> [n times]     Time an expression over N runs, in wall time
+  :bench <expression> [n times]    Report min/median/max/mean over N runs, in wall time
+  :ast <expression>                Print AST for expression
+  :tokens <expression>             Print tokens for expression
+  :bytecode <expression>           List the instructions an expression compiles to
+  :asm <expression>                Show the annotated disassembly of an expression
+  :example, :examples              Show example code
+  :prompt <format>                 Set the prompt from {engine}, {version}, {history}; none restores it
+
+  Every command also answers to '.' in place of ':' — .quit is :quit.
+
+Quick Reference:
+  // Variable
+[0m
+[0m$ [0mprintf ':help\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/:load, :l/p' | hexdump -C | head -4; echo "=== old source ==="; git show 222aa83:src/repl/commands.rs | sed -n '190,192p' | hexdump -C | head -8
+00000000  20 20 3a 6c 6f 61 64 2c  20 3a 6c 20 3c 66 69 6c  |  :load, :l <fil|
+00000010  65 6e 61 6d 65 3e 20 20  20 20 20 20 20 20 20 20  |ename>          |
+00000020  20 20 20 4c 6f 61 64 20  61 6e 64 20 72 75 6e 20  |   Load and run |
+00000030  61 20 66 69 6c 65 0a                              |a file.|
+=== old source ===
+00000000  20 20 20 20 20 20 20 20  6e 61 6d 65 73 3a 20 26  |        names: &|
+00000010  5b 22 6c 6f 61 64 22 2c  20 22 6c 22 5d 2c 0a 20  |["load", "l"],. |
+00000020  20 20 20 20 20 20 20 64  65 73 63 72 69 70 74 69  |       descripti|
+00000030  6f 6e 3a 20 22 4c 6f 61  64 20 61 6e 64 20 72 75  |on: "Load and ru|
+00000040  6e 20 61 20 66 69 6c 65  22 2c 0a 20 20 20 20 20  |n a file",.     |
+00000050  20 20 20 75 73 61 67 65  3a 20 53 6f 6d 65 28 22  |   usage: Some("|
+00000060  3c 66 69 6c 65 6e 61 6d  65 3e 22 29 2c 0a        |<filename>"),.|
+0000006e
+[0m
+[0m$ [0mmkdir -p /tmp/opencode/ctest && rm -rf "/tmp/opencode/ctest/my dir" && mkdir -p "/tmp/opencode/ctest/my dir" && touch "/tmp/opencode/ctest/my dir/inner.rb" && ls -la /tmp/opencode/ctest
+total 12
+drwxr-xr-x 3 runner runner 4096 Oct 18 11:07 .
+drwxr-xr-x 3 runner runner 4096 Oct 18 11:07 ..
+drwxr-xr-x 2 runner runner 4096 Oct 18 11:07 my dir
+[0m
+[0m$ [0mgrep -rn "read_markdown" --include=*.rs --include=*.rb --include=*.md . 2>/dev/null | grep -v "^./target" | head -20
+./phases/phase-060/REPORT.md:58:| `src/repl/transcript.rs` | +560 (new) | The document. `Exchange` (what was typed, what it said) and `Transcript` (the exchanges, bounded at `LIMIT` = 500, oldest dropped). `markdown()` writes the `redblue` fence and the text after it and strips escapes on the way out; `read_markdown()` is its other half. `fence_width`/`fence_language` widen a fence around an input that prints one. 13 tests. |
+./phases/phase-060/REPORT.md:200:| nesting / recursion | `transcript::a_block_is_one_exchange_holding_every_line_it_was_typed_on` (a three-line block is one exchange and reads back as one), `completer::an_empty_fragment_…` (`:load src/li` — a directory inside the fragment is walked, not offered as a name), `completer::a_symlink_to_a_directory_is_offered_as_a_directory` (a link is followed, so nesting is reachable). No recursion limit is needed: `complete_path_in` recurses per TAB, not per keystroke, and `markdown`/`read_markdown` are single passes over a bounded document |
+./src/repl/transcript.rs:14://! - **It reads back.** [`Transcript::read_markdown`] is the other half of
+./src/repl/transcript.rs:20:/// Not decoration: a reader — or [`Transcript::read_markdown`] — tells an input
+./src/repl/transcript.rs:154:    pub fn read_markdown(document: &str) -> Vec<String> {
+./src/repl/transcript.rs:304:            Transcript::read_markdown(&transcript.markdown()),
+./src/repl/transcript.rs:356:            Transcript::read_markdown(&document),
+./src/repl/transcript.rs:376:            Transcript::read_markdown(&document).is_empty(),
+./src/repl/transcript.rs:451:            Transcript::read_markdown(&document),
+./src/repl/transcript.rs:524:            Transcript::read_markdown(document),
+./src/repl/transcript.rs:540:            Transcript::read_markdown("# A session\n\n```redblue\nsay \"one\"\n").is_empty(),
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -20
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.11s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tail -40
+test edge_an_empty_acknowledgement_list_is_not_agreement ... ok
+test edge_an_entry_without_a_reason_is_rejected ... ok
+test unreviewed_work_ack ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[1m[92m     Running[0m tests/wasm_test.rs (target/debug/deps/wasm_test-3427ea39ca145971)
+
+running 28 tests
+test a_malformed_program_is_reported_and_is_not_output ... ok
+test edge_a_run_that_cannot_be_given_its_stack_is_refused_rather_than_run_unprotected ... ok
+test edge_abi_refuses_a_negative_length ... ok
+test edge_a_failure_keeps_the_output_written_before_it ... ok
+test a_runtime_failure_is_reported_rather_than_panicking ... ok
+test edge_abi_rejects_bytes_that_are_not_utf8 ... ok
+test bytes_write_and_files_read_agree_on_where_the_bytes_went ... ok
+test edge_an_allocation_is_released_by_its_own_address_and_only_once ... ok
+test edge_an_allocation_past_the_source_limit_is_refused_before_anything_is_allocated ... ok
+test edge_bytes_that_are_not_text_say_the_same_thing_in_both_builds ... ok
+test edge_an_allocation_stays_put_however_many_programs_follow_it ... ok
+test edge_empty_and_whitespace_only_programs_produce_no_output ... ok
+test edge_print_is_immediate_and_say_flushes_at_the_end ... ok
+test edge_reading_a_file_that_was_never_written_is_a_catchable_error ... ok
+test edge_recursion_beyond_the_call_depth_is_a_clean_error_not_an_abort ... ok
+test edge_the_in_memory_filesystem_answers_for_directories_too ... ok
+test edge_an_error_too_long_for_its_buffer_is_truncated_and_says_so ... ok
+test edge_say_output_is_bounded_while_it_is_still_buffered ... ok
+test edge_the_platform_builtins_still_answer_natively ... ok
+test edge_unicode_survives_the_boundary_intact ... ok
+test the_in_memory_filesystem_behaves_like_the_one_it_replaces ... ok
+test edge_output_past_the_playground_limit_is_reported_not_truncated ... ok
+test wasm_example_corpus_is_exactly_the_deterministic_examples ... ok
+test wasm_module_reports_its_version_and_keywords ... ok
+test files_reads_back_what_it_wrote_in_a_temp_dir ... ok
+test wasm_run_reproduces_the_native_output_of_every_example ... ok
+test edge_the_output_is_copied_out_under_the_lock_rather_than_read_through_a_pointer ... ok
+test wasm_abi_round_trips_source_and_output ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.48s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^test result|error|FAILED|failures" | sort | uniq -c | head -20
+1 Failed to read 'typed-catch-missing-file.txt': No such file or directory (os error 2)
+      2 caught error
+     33 error
+      1 error ✓ 🎉 café
+      1 outer took it: error
+      1 outer untyped handler: error
+      1 test a_guarded_call_that_raises_inside_a_try_still_lets_the_catch_see_later_failures ... ok
+      1 test a_missing_end_is_reported_as_an_error ... ok
+      1 test a_program_that_fails_still_reports_its_own_error_under_the_debugger ... ok
+      1 test a_wellformed_program_reports_no_errors ... ok
+      1 test a_word_form_applied_to_the_wrong_type_is_a_clean_runtime_error ... ok
+      1 test an_index_that_is_not_a_whole_number_is_a_runtime_error ... ok
+      1 test brand_roles_are_distinct_from_error_and_prompt ... ok
+      1 test break_outside_a_loop_is_a_clean_runtime_error ... ok
+      1 test bytecode_reports_a_compile_error_instead_of_listing_nothing ... ok
+      1 test catch_error_name_binds_the_message ... ok
+      1 test catch_error_name_runs_and_compiles_through_the_cli ... ok
+      1 test constant_syntax_errors_are_reported ... ok
+      1 test depth_error_is_catchable_by_try_catch ... ok
+      1 test diagnostics_surface_a_spanned_analyzer_error ... ok
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^test result:" | awk '{p+=$4; f+=$6; i+=$8} END {print "passed:",p," failed:",f," ignored:",i}'
+passed: 1825  failed: 0  ignored: 0
+[0m
+[0m$ [0mgit diff 222aa83..HEAD -- tests/unreviewed_work_ack_test.rs tests/memory_model_test.rs
+diff --git a/tests/memory_model_test.rs b/tests/memory_model_test.rs
+index 3b4181b..3b1ddf0 100644
+--- a/tests/memory_model_test.rs
++++ b/tests/memory_model_test.rs
+@@ -4,22 +4,26 @@
+ //! particular is the kind of statement a future change to reference handling
+ //! would falsify, and nothing else would notice.
+ //!
+-//! Everything here uses `Arc::strong_count` rather than a global drop counter,
++//! Everything here uses strong counts (`Rc::strong_count` for the node helper,
++//! `Arc::strong_count` elsewhere) rather than a global drop counter,
+ //! deliberately: cargo runs tests on parallel threads, so a shared atomic is a
+ //! flake waiting to happen. Strong counts are per-value and thread-safe.
+ 
+ use redblue::Value;
+ use std::cell::RefCell;
++use std::rc::Rc;
+ use std::sync::Arc;
+ 
+ /// A node that can point at another node — the shape a Redblue list-of-lists
+-/// would take if the language had reference types.
++/// would take if the language had reference types. It is held by `Rc`, not
++/// `Arc`: nothing here crosses a thread, and a reference-counted handle to a
++/// `RefCell` is not `Send`.
+ struct Node {
+-    peer: RefCell<Option<Arc<Node>>>,
++    peer: RefCell<Option<Rc<Node>>>,
+ }
+ 
+-fn node() -> Arc<Node> {
+-    Arc::new(Node {
++fn node() -> Rc<Node> {
++    Rc::new(Node {
+         peer: RefCell::new(None),
+     })
+ }
+@@ -48,11 +52,11 @@ fn a_reference_cycle_never_reaches_zero() {
+     // Exactly the shape MEMORY.md says leaks.
+     let a = node();
+     let b = node();
+-    *a.peer.borrow_mut() = Some(Arc::clone(&b));
+-    *b.peer.borrow_mut() = Some(Arc::clone(&a));
++    *a.peer.borrow_mut() = Some(Rc::clone(&b));
++    *b.peer.borrow_mut() = Some(Rc::clone(&a));
+ 
+-    assert_eq!(Arc::strong_count(&a), 2, "held by the test and by b");
+-    assert_eq!(Arc::strong_count(&b), 2);
++    assert_eq!(Rc::strong_count(&a), 2, "held by the test and by b");
++    assert_eq!(Rc::strong_count(&b), 2);
+ 
+     drop(a);
+     drop(b);
+@@ -72,11 +76,11 @@ fn a_weak_handle_is_what_would_be_required_and_redblue_has_none() {
+     // Demonstrates the standard remedy exists in Rust and is absent here.
+     let a = node();
+     let b = node();
+-    *a.peer.borrow_mut() = Some(Arc::clone(&b));
+-    *b.peer.borrow_mut() = Some(Arc::clone(&a));
++    *a.peer.borrow_mut() = Some(Rc::clone(&b));
++    *b.peer.borrow_mut() = Some(Rc::clone(&a));
+ 
+-    let weak_a = Arc::downgrade(&a);
+-    let weak_b = Arc::downgrade(&b);
++    let weak_a = Rc::downgrade(&a);
++    let weak_b = Rc::downgrade(&b);
+     drop(a);
+     drop(b);
+ 
+diff --git a/tests/unreviewed_work_ack_test.rs b/tests/unreviewed_work_ack_test.rs
+index 50017d0..a91de86 100644
+--- a/tests/unreviewed_work_ack_test.rs
++++ b/tests/unreviewed_work_ack_test.rs
+@@ -1,7 +1,150 @@
+-// Minimal replacement for an invalid placeholder that introduced a syntax error
+-// TODO: replace with real assertions that exercise the intended behavior.
++//! The acknowledgement list is data, not a comment.
++//!
++//! This file replaced a placeholder that asserted `assert!(true, ...)`, which
++//! `cargo clippy -- -D warnings` rejects outright — an un-compilable test is a
++//! red gate, not a placeholder. It is kept, and given the smallest assertion
++//! that can actually fail.
++//!
++//! # Why it is separate from the audit
++//!
++//! `tests/checkpoint_ancestry_test.rs` is the audit: it reads `main`'s history
++//! with `git` and refuses to measure a truncated one. That audit needs a
++//! repository, so it says nothing in a checkout that has none. This file reads
++//! `tests/checkpoint_ancestry_ack.txt` with no `git` at all, so an emptied,
++//! truncated or half-written acknowledgement list fails even when there is no
++//! history to compare it against — which is exactly the state the audit would
++//! otherwise launder into a clean pass (it reports "zero checkpoints
++//! acknowledged" and, with no history, "zero checkpoints").
++//!
++//! Nothing here is weakened or skipped: every assertion can fail.
++
++use std::collections::HashSet;
++use std::path::PathBuf;
++
++/// The checked-in acknowledgement list, read from the repository root rather
++/// than the working directory so the test does not depend on where cargo was
++/// invoked from.
++const ACK_FILE: &str = "tests/checkpoint_ancestry_ack.txt";
++
++fn ack_path() -> PathBuf {
++    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(ACK_FILE)
++}
++
++/// One `sha|reason` line, or a directive. Anything else is malformed.
++fn is_entry(line: &str) -> bool {
++    line.contains('|')
++}
+ 
+ #[test]
+ fn unreviewed_work_ack() {
+-    assert!(true, "placeholder test should be replaced with real assertions");
++    let text = std::fs::read_to_string(ack_path())
++        .unwrap_or_else(|e| panic!("{ACK_FILE} must be readable: {e}"));
++
++    let entries: Vec<(&str, &str)> = text
++        .lines()
++        .map(str::trim)
++        .filter(|l| !l.is_empty() && !l.starts_with('#') && is_entry(l))
++        .map(|l| {
++            let (sha, reason) = l
++                .split_once('|')
++                .unwrap_or_else(|| panic!("{ACK_FILE}: an entry has no `|`: {l:?}"));
++            (sha.trim(), reason.trim())
++        })
++        .collect();
++
++    assert!(
++        !entries.is_empty(),
++        "{ACK_FILE} acknowledges nothing, so every tolerated checkpoint commit reads as \
++         unreviewed and unaccounted for"
++    );
++
++    let mut seen = HashSet::new();
++    for (sha, reason) in &entries {
++        assert!(
++            !sha.is_empty(),
++            "{ACK_FILE} has an entry with no sha; the file is data or it is a comment"
++        );
++        assert!(
++            !reason.is_empty(),
++            "{ACK_FILE} lists {sha} without saying why it is tolerated: recording a sha is \
++             not the same as acknowledging one"
++        );
++        assert!(
++            seen.insert(*sha),
++            "{ACK_FILE} lists {sha} twice, so which reason applies is ambiguous"
++        );
++    }
++
++    let pinned = text
++        .lines()
++        .find(|l| l.trim_start().starts_with("wip_merges_on_main="))
++        .unwrap_or_else(|| {
++            panic!(
++                "{ACK_FILE} pins no `wip_merges_on_main=` directive, so the audit has nothing to \
++                 compare the measured merge count against"
++            )
++        });
++    let count = pinned
++        .trim()
++        .trim_start_matches("wip_merges_on_main=")
++        .trim();
++    assert!(
++        count.parse::<usize>().is_ok(),
++        "{ACK_FILE} pins wip_merges_on_main={count:?}, which is not a number"
++    );
++}
++
++/// The empty file is the failure this list is most able to cause silently.
++///
++/// An empty acknowledgement list parses, matches nothing, and reports a clean
++/// history — so its emptiness must be caught before it is read as agreement.
++#[test]
++fn edge_an_empty_acknowledgement_list_is_not_agreement() {
++    for body in [
++        "",
++        "\n\n",
++        "# nothing recorded yet\n",
++        "wip_merges_on_main=0\n",
++    ] {
++        let entries: Vec<&str> = body
++            .lines()
++            .map(str::trim)
++            .filter(|l| !l.is_empty() && !l.starts_with('#') && is_entry(l))
++            .collect();
++        assert!(
++            entries.is_empty(),
++            "premise: {body:?} lists no commit, so an audit reading it acknowledges nothing"
++        );
++    }
++
++    let text = std::fs::read_to_string(ack_path()).expect(ACK_FILE);
++    assert!(
++        text.lines().any(is_entry),
++        "{ACK_FILE} must hold at least one `<sha>|<reason>` line"
++    );
++}
++
++/// A line that is neither an entry nor a directive is a corruption, not a note.
++#[test]
++fn edge_an_entry_without_a_reason_is_rejected() {
++    for bad in ["7fdea15|\n", "7fdea15|   \n", "|\ntolerated\n"] {
++        let line = bad.trim_end_matches('\n');
++        let (sha, reason) = line
++            .split_once('|')
++            .unwrap_or_else(|| panic!("premise: {bad:?} should split"));
++        assert!(
++            sha.trim().is_empty() || reason.trim().is_empty(),
++            "premise: {bad:?} is an entry with no usable half"
++        );
++    }
++
++    // The checked-in file is the other half of the claim: no half-empty entry.
++    let text = std::fs::read_to_string(ack_path()).expect(ACK_FILE);
++    for line in text.lines().filter(|l| is_entry(l.trim())) {
++        let (sha, reason) = line.trim().split_once('|').expect("split");
++        assert!(
++            !sha.trim().is_empty() && !reason.trim().is_empty(),
++            "{ACK_FILE} has a half-empty entry: {line:?}"
++        );
++    }
+ }
+[0m
+[0m$ [0mls MEMORY.md 2>/dev/null && grep -n -i "arc\b\|thread\|send\|sync" MEMORY.md | head -20
+MEMORY.md
+13:    List(Shared<Vec<Value>>),      // Shared<T> = std::sync::Arc<T>
+26:pub type Shared<T> = std::sync::Arc<T>;
+29:An `Arc` is freed when its **last reference** goes away. That is the whole
+43:/// Behind an `Arc` because reading any variable clones the value bound to
+52:`Value::List` wrapping its contents in an `Arc` means the *outer* container is
+69:Because an `Arc` frees only when the **last** reference drops, two values that
+155:| Is there a garbage collector? | No. `Arc` frees on last reference. |
+[0m
+[0m$ [0mprintf 'say "one"\n!!\n.export\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/# Redblue/,$p'
+>>> # Redblue session
+
+```redblue
+say "one"
+```
+one
+
+```redblue
+say "one"
+```
+one
+>>> Goodbye!
+[0m
+[0m$ [0mprintf 'set x to 1\nrepeat 2 times\n  say "in block"\nend\nsay x\n.export\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/# Redblue/,$p'
+>>> # Redblue session
+
+```redblue
+set x to 1
+```
+
+```redblue
+repeat 2 times
+say "in block"
+end
+```
+in block
+in block
+
+```redblue
+say x
+```
+1
+>>> Goodbye!
+[0m
+[0m$ [0mcat > /tmp/opencode/failmid.rb <<'EOF'
+say "before"
+set q to 1 / 0
+EOF
+printf ':load /tmp/opencode/failmid.rb\n.export\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/Loaded/,$p'
+>>> Loaded 28 bytes from '/tmp/opencode/failmid.rb'.
+before
+Error: RuntimeError: Division by zero
+  --> /tmp/opencode/failmid.rb:2:1
+2 | set q to 1 / 0
+  | ^
+>>> # Redblue session
+
+```redblue
+say "before"
+set q to 1 / 0
+```
+before
+Error: RuntimeError: Division by zero
+  --> /tmp/opencode/failmid.rb:2:1
+2 | set q to 1 / 0
+  | ^
+>>> Goodbye!
+[0m
+[0m→ [0mRead phases/phase-060/FINDINGS.md
+[0m
+[0m$ [0mls target/debug/*.rlib target/debug/deps/libredblue*.rlib 2>/dev/null | head
+target/debug/deps/libredblue.rlib
+target/debug/libredblue.rlib
+[0m
+[0m$ [0mmkdir -p /tmp/opencode/probe && cat > /tmp/opencode/probe/probe.rs <<'EOF'
+use redblue::repl::transcript::Transcript;
+
+fn main() {
+    let mut t = Transcript::new();
+    t.record("say \"```redblue\"".to_string(), vec!["```redblue".to_string()]);
+    t.record("say \"x\"".to_string(), vec!["x".to_string()]);
+    let doc = t.markdown();
+    println!("=== DOCUMENT ===\n{}\n=== END ===", doc);
+    let back = Transcript::read_markdown(&doc);
+    println!("read back ({} blocks):", back.len());
+    for b in &back { println!("  {:?}", b); }
+
+    // quoted directory walk-in, via the real completer entry point
+    let quoted = redblue::repl::completer::complete_path_in(std::path::Path::new("/tmp/opencode/ctest"), "\"my dir\"/in");
+    println!("quoted dir walk-in -> {:?}", quoted);
+    let unquoted = redblue::repl::completer::complete_path_in(std::path::Path::new("/tmp/opencode/ctest"), "my dir/in");
+    println!("unquoted dir walk-in -> {:?}", unquoted);
+}
+EOF
+rustc --edition 2021 -L target/debug/deps --extern redblue=target/debug/libredblue.rlib -o /tmp/opencode/probe/probe /tmp/opencode/probe/probe.rs 2>&1 | tail -20 && /tmp/opencode/probe/probe
+=== DOCUMENT ===
+# Redblue session
+
+````redblue
+say "```redblue"
+````
+```redblue
+
+```redblue
+say "x"
+```
+x
+
+
+=== END ===
+read back (2 blocks):
+  "say \"```redblue\""
+  "```redblue\nsay \"x\""
+quoted dir walk-in -> []
+unquoted dir walk-in -> ["my dir/inner.rb"]
+[0m
+[0m$ [0mprintf 'say ""\nsay "a\\nb"\n.export\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/# Redblue/,$p' | cat -A
+>>> # Redblue session$
+$
+```redblue$
+say ""$
+```$
+$
+```redblue$
+say "a\nb"$
+```$
+a$
+b$
+>>> Goodbye!$
+[0m
+[0m$ [0mcd /tmp/opencode && printf 'set a to 1\n:save /tmp/opencode/sess.txt\n:quit\n' | /home/runner/work/rbops/rbops/redblue/target/debug/rb 2>&1 | tail -3; echo "=== saved ==="; cat /tmp/opencode/sess.txt
+>>> >>> Session saved to '/tmp/opencode/sess.txt' (2 line(s)).
+>>> Goodbye!
+=== saved ===
+set a to 1
+:save /tmp/opencode/sess.txt
+[0m
+[0m$ [0mcd /tmp/opencode && printf ':restore /tmp/opencode/sess.txt\n.export\n:quit\n' | /home/runner/work/rbops/rbops/redblue/target/debug/rb 2>&1 | sed -n '/# Redblue/,$p'
+>>> # Redblue session
+
+```redblue
+set a to 1
+```
+>>> Goodbye!
+[0m
+[0m$ [0mcd /tmp/opencode && printf 'say "before-restore"\n:restore /tmp/opencode/sess.txt\n.export\n:quit\n' | /home/runner/work/rbops/rbops/redblue/target/debug/rb 2>&1 | sed -n '/# Redblue/,$p'
+>>> # Redblue session
+
+```redblue
+say "before-restore"
+```
+before-restore
+
+```redblue
+set a to 1
+```
+>>> Goodbye!
+[0m
+[0m$ [0mgrep -n "MULTILINE\|BLOCK_REPORT_LINES\|const .*LIMIT" src/repl/mod.rs | head -20
+39:const HISTORY_LIMIT: usize = 1000;
+59:const BLOCK_REPORT_LINES: usize = 20;
+1067:    /// At most [`BLOCK_REPORT_LINES`] lines are echoed. The buffer is bounded now,
+1082:        for line in lines.iter().take(BLOCK_REPORT_LINES) {
+1085:        if lines.len() > BLOCK_REPORT_LINES {
+1088:                lines.len() - BLOCK_REPORT_LINES
+3275:        let body = super::BLOCK_REPORT_LINES + 5;
+[0m
+[0m$ [0mgrep -n "edge_a_piped_block_that_never_closes_does_not_grow_without_limit" -A 24 tests/repl_test.rs
+670:fn edge_a_piped_block_that_never_closes_does_not_grow_without_limit() {
+671-    let mut input = String::from("repeat 3 times\n");
+672-    for index in 0..600 {
+673-        input.push_str(&format!("    say \"LINE {}\"\n", index));
+674-    }
+675-    input.push_str("say \"AFTER THE BLOCK\"\n:quit\n");
+676-
+677-    let s = session(&input);
+678-
+679-    s.assert_exited_ok()
+680-        .assert_stdout_contains("a session holds at most")
+681-        .assert_stdout_contains("AFTER THE BLOCK")
+682-        .assert_stdout_contains("Goodbye!");
+683-    assert!(
+684-        s.stdout.len() < 64 * 1024,
+685-        "the abandoned block was not echoed back in full: {} bytes",
+686-        s.stdout.len()
+687-    );
+688-}
+689-
+690-/// The report of an unclosed block quotes the lines back so the user can see what
+691-/// never ran, and counts what it did not quote rather than printing it all.
+692-#[test]
+693-fn edge_the_report_of_an_unclosed_block_counts_the_lines_it_did_not_echo() {
+694-    let mut input = String::from("repeat 3 times\n");
+[0m
+[0m$ [0mprintf 'say "one"\n:reset\n.export\n:quit\n' | ./target/debug/rb 2>&1 | sed -n '/# Redblue/,$p'
+>>> # Redblue session
+
+_Nothing has been run in this session yet._
+>>> Goodbye!
+[0m
+[0m$ [0mgrep -n "fn spec_for" -A 25 src/repl/commands.rs
+443:fn spec_for(input: &str) -> Option<&'static CommandSpec> {
+444-    let command = command_word(input);
+445-    COMMAND_TABLE
+446-        .iter()
+447-        .find(|spec| spec.names.contains(&command))
+448-}
+449-
+450-impl ReplCommand {
+451-    /// Every command word the table accepts, without a sigil, sorted.
+452-    ///
+453-    /// The word itself rather than a spelling of it: which sigil the user types
+454-    /// is theirs, and [`SIGILS`] are all accepted, so the completer matches what
+455-    /// they typed against this and puts their sigil back.
+456-    ///
+457-    /// Not deduplicated: a word the table holds twice is a word two commands
+458-    /// answer to, and [`bare_names`] reporting it twice is what lets a test say
+459-    /// so. The completer's own `dedup` hides it from a user either way.
+460-    pub fn bare_names() -> Vec<String> {
+461-        let mut names: Vec<String> = COMMAND_TABLE
+462-            .iter()
+463-            .flat_map(|spec| spec.names.iter())
+464-            .map(|name| (*name).to_string())
+465-            .collect();
+466-        names.sort();
+467-        names
+468-    }
+[0m
+[0m$ [0mgrep -n "read_markdown\|read back\|round trip\|fences read back" phases/phase-060/REPORT.md | head -30
+58:| `src/repl/transcript.rs` | +560 (new) | The document. `Exchange` (what was typed, what it said) and `Transcript` (the exchanges, bounded at `LIMIT` = 500, oldest dropped). `markdown()` writes the `redblue` fence and the text after it and strips escapes on the way out; `read_markdown()` is its other half. `fence_width`/`fence_language` widen a fence around an input that prints one. 13 tests. |
+112:| `transcript::a_session_read_back_from_its_own_markdown_is_the_session` | round trip, unit half — write then read, no terminal |
+113:| `repl_test::edge_a_session_exported_to_a_file_runs_again_from_the_fences_read_back` | the DoD's round trip end to end: export → file → fences read back → a fresh session says `one` and `two` once each |
+117:| `transcript::edge_an_unclosed_fence_at_the_end_of_a_document_reads_as_nothing` | malformed — a truncated export does not read back as half a line of Redblue |
+118:| `transcript::edge_a_session_that_has_run_nothing_says_so` | empty — a heading and a sentence, no fence, nothing to read back |
+143:| **`repl_test::edge_a_session_of_unicode_exports_and_reads_back_unchanged`** | **added this run** — unicode: an emoji outside the BMP, `e`+U+0301 (two characters, not `é`), Arabic, CJK; the input and its output survive verbatim and read back as themselves |
+200:| nesting / recursion | `transcript::a_block_is_one_exchange_holding_every_line_it_was_typed_on` (a three-line block is one exchange and reads back as one), `completer::an_empty_fragment_…` (`:load src/li` — a directory inside the fragment is walked, not offered as a name), `completer::a_symlink_to_a_directory_is_offered_as_a_directory` (a link is followed, so nesting is reachable). No recursion limit is needed: `complete_path_in` recurses per TAB, not per keystroke, and `markdown`/`read_markdown` are single passes over a bounded document |
+[0m
+[0m$ [0mls phases/phase-060/ && ls phases/ | tail -5
+FINDINGS.md
+REPORT.md
+phase-086
+phase-087
+phase-089
+phase-092
+phase-093
+[0m
+[0m$ [0mgrep -n "self.history = restored" src/repl/mod.rs; grep -n "self.transcript.clear()" src/repl/mod.rs; echo "--- completer ---"; grep -n "fn quote_if_spaced\|fn split_fragment\|let candidate = format!\|fn complete_path_in\|let listing = dir.join" src/repl/completer.rs; echo "--- editor test ---"; grep -n "fn edge_tab_after_a_command_that_takes_a_path_offers_paths" src/repl/editor.rs; echo "--- mem ---"; sed -n '5,12p' tests/memory_model_test.rs
+1538:        self.history = restored;
+1023:        self.transcript.clear();
+--- completer ---
+247:fn split_fragment(fragment: &str) -> (&str, &str) {
+278:pub fn complete_path_in(dir: &Path, fragment: &str) -> Vec<String> {
+280:    let listing = dir.join(directory);
+294:        let candidate = format!(
+325:fn quote_if_spaced(name: &str) -> String {
+--- editor test ---
+888:    fn edge_tab_after_a_command_that_takes_a_path_offers_paths() {
+--- mem ---
+//! would falsify, and nothing else would notice.
+//!
+//! Everything here uses strong counts (`Rc::strong_count` for the node helper,
+//! `Arc::strong_count` elsewhere) rather than a global drop counter,
+//! deliberately: cargo runs tests on parallel threads, so a shared atomic is a
+//! flake waiting to happen. Strong counts are per-value and thread-safe.
+
+use redblue::Value;
+[0m
+[0m→ [0mRead src/repl/completer.rs[90m [limit=40, offset=276][0m
+[0m→ [0mRead src/repl/editor.rs[90m [limit=30, offset=878][0m
+I verified the gates myself (`cargo fmt --check` 0, `clippy --all-targets -D warnings` 0, `cargo test --all-targets` 1825 passed / 0 failed / 0 ignored — the counts match the report). I also linked the crate outside the repo and drove the new code directly to confirm the two behavioural claims below.
+
+FINDINGS:
+1. [MAJOR] src/repl/transcript.rs:125 — `fence_width` is computed from `exchange.input` only, and the output is then written bare at src/repl/transcript.rs:135-140 with no fence of its own. An **output** line that begins with ` ```redblue ` therefore reads back as the opening of a new input block. Reproduced against this tree: recording `say "```redblue"` (output ` ```redblue `) and `say "x"` yields a document whose `read_markdown` returns `["say \"```redblue\"", "```redblue\nsay \"x\""]` — the second block is not valid Redblue source, so the round trip is broken. This falsifies the module's own headline claim ("**It reads back.** `Transcript::read_markdown` is the other half of `Transcript::markdown`", transcript.rs:14-16) and the DoD's round trip. The only test on this path, `edge_a_line_that_prints_a_fence_is_written_inside_a_longer_one` (transcript.rs:345), records the fence in the *input*, so it never exercises the failing side. Fix: widen from `input` **and** `output` (`fence_width` over both, or fence the output section with a matching-width fence), plus a test recording `say "```redblue"`.
+2. [MAJOR] src/repl/mod.rs:1538 — `:restore` replaces `self.history` but never clears `self.transcript`. The doc immediately above states the reason it replaces the history: "restoring it into a session that had since typed more lines would give back two sessions at once" (mod.rs:1518-1520). The transcript, added by this same phase, does exactly that. Verified: `say "before-restore"` → `:restore sess.txt` (holding `set a to 1`) → `.export` writes **both** sessions into one document, so the export claims one session ran two disjoint sets of lines. `:reset` was wired to clear it (mod.rs:1023); `:restore` was not, and neither is tested. Fix: `self.transcript.clear();` beside `self.history = restored;` and a `tests/repl_test.rs` case pinning `:restore` then `.export` yields only the restored session.
+3. [MAJOR] src/repl/transcript.rs:154 — `Transcript::read_markdown` is public and has **no caller anywhere in the repo**: `grep -rn read_markdown` over `src/`, `tests/`, `examples/` returns only its own unit tests and prose. The end-to-end test the report calls "the DoD's round trip end to end" (REPORT.md:113, tests/repl_test.rs:1473) reads the file back with a test-local `fenced_blocks` (tests/repl_test.rs:1486) rather than the shipped reader — and the two are not equivalent: `fenced_blocks` closes a block on *any* line starting with ` ``` ` and takes the language via `trim_start_matches('`')`, while `read_markdown` requires an exact fence match (`transcript.rs:173`). For `say "```"` the helper reports two blocks, the shipped reader one. So the feature's stated second half is shipped, uncalled, untested outside its own module, and the test that claims to cover it proves something else. Fix: either wire a `:replay <file.md>` / `:open <file.md>` command that actually reads an exported document back (which would also catch finding 1), or drop `read_markdown` and stop calling the document "readable back" in the module docs and the report.
+4. [MAJOR] src/repl/completer.rs:294 — a directory whose name holds a space is offered as `"my dir"/` (`quote_if_spaced` at :325), but `split_fragment` (:247) splits the next TAB's fragment at the trailing `/` and keeps the quotes, so `dir.join(directory)` at src/repl/completer.rs:280 opens a path literally named `"my dir/`. Confirmed against this tree: `complete_path_in(dir, "\"my dir\"/in")` returns `[]` while `complete_path_in(dir, "my dir/in")` returns `["my dir/inner.rb"]`. This directly falsifies the doc at completer.rs:262-264 ("a trailing separator says so, and lets the next TAB walk in"), and `edge_a_filename_with_a_space_in_it_is_offered_quoted` (completer.rs:~845) only pins the *file* case, never the directory case. Fix: unquote (or split the quotes) around the directory component in `complete_path_in` before `dir.join`, and add the `"my dir"/in` row.
+5. [MINOR] src/repl/transcript.rs:136 — `"".lines()` yields nothing, so an exchange whose only output is an empty line is rendered exactly like an exchange that said nothing. Verified: `say ""` followed by `say "x"` exports as two blocks with a bare blank line between, byte-identical to what `set x to 1` followed by `say "x"` produces (see the exact-document assertion at transcript.rs:467-473). A document cannot distinguish "printed a blank line" from "printed nothing". Fix: record output emptiness by index rather than by whether the rendered line count is zero, or write a sentinel for an empty output vector.
+6. [MINOR] src/repl/transcript.rs:72 — `LIMIT` bounds the number of exchanges, not their size, so the "the transcript is bounded, and says how many it holds" claim at transcript.rs:33-37 is only half true. `say` output is capped at 4 MiB per run (src/wasm.rs:52, charged in `Vm::charge_output`) and `execute_code_from` records the *entire* `:load`ed file source as one exchange (src/repl/mod.rs:1464), so the reachable ceiling is 500 × 4 MiB ≈ 2 GiB retained, which `markdown()` then copies in full at mod.rs:1495 before `fs::write` hands it over. Fix: also bound total bytes in `record`, dropping oldest exchanges on the byte budget as well as the count.
+7. [MINOR] src/repl/editor.rs:898 — `edge_tab_after_a_command_that_takes_a_path_offers_paths` asserts on the contents of the checkout (`src/`, `Cargo.toml`) reached through `current_dir()` (completer.rs:~355), the only completion test that does. Its sibling in completer.rs deliberately takes `dir` as a parameter "so a test can complete against a scratch one instead of whatever the checkout happens to hold" (completer.rs:268-271), and that discipline is abandoned here. Fix: point the assertion at a scratch dir by exercising `complete_path_in`, and leave `complete_path`/`current_dir` covered by a test that only asserts the offset it returns.
+8. [MINOR] src/repl/mod.rs:1023 — `self.transcript.clear()` on `:reset` is the one piece of wiring in this feature with no end-to-end test; the only test, `edge_a_cleared_transcript_exports_an_empty_session` (transcript.rs:419), builds a `Transcript` directly and so cannot fail if the call at mod.rs:1023 is deleted. I verified the behaviour works by hand (`say "one"` → `:reset` → `.export` prints the EMPTY document), so this is a coverage gap, not a defect. Fix: add the `:reset` → `.export` case to tests/repl_test.rs alongside the empty-session test at :1543.
+9. [STYLE] tests/memory_model_test.rs:9 — the header still reads "Strong counts are per-value and thread-safe" directly under a line that now says the node helper uses `Rc::strong_count`. `Rc::strong_count` is neither; the sentence was true when the helper was `Arc` and is now a false claim left behind by the fix.
+10. [STYLE] src/repl/editor.rs:882 — "`:load` and its three siblings are the only arguments that are filenames" is stale in the same commit that made it four (`.export` joined `:load`/`:save`/`:restore`/`:run` via `FILE_USAGE` at commands.rs:153).
+
+REVIEW VERDICT: FINDINGS 10
