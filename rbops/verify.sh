@@ -477,13 +477,19 @@ else
   fi
 fi
 
-if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
-  ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
+TEST_POLICY_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .test_policy // "required"' "$PHASES" 2>/dev/null)" || TEST_POLICY_MODE="required"
+[ -n "$TEST_POLICY_MODE" ] || TEST_POLICY_MODE="required"
+if [ "$TEST_POLICY_MODE" = "not_applicable" ]; then
+  warn "test quota and edge_* rule NOT APPLICABLE to this phase (test_policy: not_applicable) — the reviewer still judges documentation and substance"
 else
-  bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
+  if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
+    ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
+  else
+    bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
+  fi
+  [ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
+    || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
 fi
-[ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
-  || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
 
 # Same precision rule as the construct scan above: the token must begin the
 # line. A test fixture that embeds `#[ignore]` as data is not a skipped test.
