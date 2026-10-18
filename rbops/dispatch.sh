@@ -283,6 +283,11 @@ cmd_select() {
         has "$id" .done     && continue
         has "$id" .blocked  && continue
         has "$id" .starved  && continue
+        # Manual phases are excluded here too, not just in steps 1 and 2. The
+        # yield reorders, it does not re-enable work an agent cannot do: falling
+        # back to a manual phase would hand it to an agent that has no business
+        # touching this repo, which is the waste this guard exists to prevent.
+        is_manual "$id" && continue
         local unmet=0 dep
         for dep in $( "$JQ" -r --arg p "$id" '.phases[]|select(.id==$p)|.depends_on[]?' "$PHASES" | tr -d '\r'); do
           has "$dep" .done || unmet=1

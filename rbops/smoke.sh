@@ -460,6 +460,35 @@ case "$out" in
   *"nothing else can proceed"*) ok "the fallback path says why it runs a yielded phase" ;;
   *) no "no fallback notice in selection output" ;;
 esac
+# The fallback must not hand a MANUAL phase to an agent, even when it is the only
+# thing left. Manual phases are ones an agent cannot do (they need a human on the
+# product repo), so dispatching one wastes a model call on work the model is not
+# allowed to attempt. Steps 1 and 2 already skip them; this covers step 3, which
+# previously did not - so the guard held only while ordinary work remained, which
+# is precisely when it is least tested and most visible.
+build_fixture >/dev/null
+jq '.phases |= map(if .id == "phase-001" then .manual = true else . end)' \
+  "$RBOPS_ROOT/rbops/phases.json" > "$PIPE/rbops/phases.json.tmp" \
+  && mv "$PIPE/rbops/phases.json.tmp" "$PIPE/rbops/phases.json"
+mkdir -p "$PIPE/phases/phase-001"
+touch "$PIPE/phases/phase-001/.deferred"
+printf '3' > "$PIPE/phases/phase-001/.deferred_attempts"
+for id in $(seq -f "phase-%03g" 2 "${last_phase:-41}"); do
+  mkdir -p "$PIPE/phases/$id"
+  touch "$PIPE/phases/$id/.blocked"
+done
+out="$(D select)"
+sel="$(printf '%s' "$out" | tail -1)"
+case "$sel" in
+  phase-001) no "the fallback dispatched a MANUAL phase to an agent" ;;
+  *) ok "the fallback skips a manual phase ($sel)" ;;
+esac
+# Leave a clean fixture behind. This subtest blocks every phase except a manual
+# one, which is exactly the state that makes the NEXT subtest ("resume did not
+# restore selection") find nothing to select and fail - it was reading as a real
+# regression. Each subtest owns its own starting state; sharing one across a
+# deliberately destructive check is how a passing suite starts lying.
+build_fixture >/dev/null
 D stop >/dev/null 2>&1
 out="$(D select)"
 case "$out" in *"pipeline halted"*) ok ".stop halts selection" ;; *) no ".stop did not halt" ;; esac
