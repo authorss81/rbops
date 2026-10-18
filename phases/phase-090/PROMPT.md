@@ -9,6 +9,14 @@
 | Depends on | _none_ |
 | Timeout | 90 min |
 
+## The failure-assertion rule does not apply here
+
+This phase declares `failure_assert: not_applicable`, so the gate does NOT
+require a test asserting that a failure is produced. Your subsystem reports
+problems as diagnostics or emits documents, so there is no `Result::Err` to
+assert on. Every other test rule still applies in full.
+
+
 ## Evidence — verified finding
 
 ```
