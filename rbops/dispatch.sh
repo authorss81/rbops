@@ -539,10 +539,25 @@ cmd_run() {
     if [ "$pf_rc" -eq 3 ]; then
       log "$phase PREFLIGHT FAILED — the diff it inherits is refused by the gate already"
       printf '%s\n' "$pf_out" | grep -E 'FAIL' | sed 's/^/          /' | sed -n '1,8p'
-      in_project git reset -q --hard "$base" 2>/dev/null || true
-      log "$phase: discarding partial un-preflighted recovery work — starting clean from main"
-      resumed=0
-      rm -f "$(marker "$phase" .recovered)" "$(marker "$phase" .conflict)"
+      # Refuse to spend an attempt on a tree the gate has already rejected. The
+      # marker is .deferred (retryable, no attempt burned), not .blocked: the fix
+      # may be a gate fix or a manifest fix, and either lands as a new commit that
+      # should re-open this phase rather than exhaust it.
+      #
+      # It MUST still be counted. A bare `touch .deferred` with no counter is an
+      # infinite loop, and that is not hypothetical: phase-053 spun for ~12 hours
+      # and ~120 identical CI runs because every tick re-adopted the same recovery
+      # branch, preflight refused the same inherited diff, and nothing anywhere
+      # tracked that it had already refused it. `.deferred_attempts` was never
+      # created, so MAX_DEFERRALS could not fire and the phase deferred forever
+      # without ever blocking or ever dispatching a model.
+      #
+      # Routed through defer_phase so this shares ONE counter and ONE bound with
+      # every other deferral reason. A phase that the gate refuses to read is
+      # stuck for a reason no number of retries can fix, and .blocked is how a
+      # human finds out.
+      defer_phase "$phase" "preflight refuses the inherited diff; the gate or the manifest must be fixed before this can run"
+      return $?
     fi
     [ "$pf_rc" -eq 0 ] || log "$phase preflight inconclusive (rc=$pf_rc) — continuing to the agent"
   fi
