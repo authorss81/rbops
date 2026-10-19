@@ -12,7 +12,7 @@ whether to promote them to phases.
 
 Recorded identically by phases 057, 058 and 059, so this is the third phase to
 hit it and not a one-off. What was run here instead: `cargo fmt --all -- --check`,
-`cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` (1872
+`cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` (1825
 passed, 0 failed), `cargo test --doc` (2 passed), and every file in `examples/`
 and `modules/` through `rb run` by hand (9 of 9 exit 0).
 
@@ -36,7 +36,7 @@ there is a short list of those in the tree, all verified on this tree:
 - `import MathUtils` names a *module*, not a path, and the parser rejects a
   quoted one: `printf 'import "modules/MathUtils"\n' > t.rb && rb run t.rb`
   answers `ParserError: Expected module name`. The module then resolves through
-  `module_search_paths` (`src/interpreter.rs:517`) — `modules/<name>.rb`,
+  `module_search_paths` (`src/interpreter.rs:516`) — `modules/<name>.rb`,
   `./modules/<name>`, `<name>` — so what a user types is a *name*, and the names
   that resolve are the `.rb` files in `modules/` (2 in this checkout:
   `MathUtils.rb`, `SuiteKit.rb`). TAB could offer those; it cannot do it today,
@@ -56,7 +56,7 @@ second predicate over expressions and over the module table would reuse it.
 ## F3 — An exported block has no indentation, because the line that ran had none
 
 The read loop trims each line before running it: `let input = line.trim();` at
-`src/repl/mod.rs:679`, and `execute_line(&expanded)` is handed that trimmed
+`src/repl/mod.rs:667`, and `execute_line(&expanded)` is handed that trimmed
 text. So a block typed with indentation
 
 ```
@@ -66,7 +66,7 @@ end
 ```
 
 is recorded — in the transcript *and* in the history, which takes `line.trim_start()`
-at `:688` — as
+at `:676` — as
 
 ```
 repeat 2 times
@@ -118,9 +118,9 @@ pipeline that fixed the gates before dispatching a phase would not have to choos
 
 ## F5 — `:run` is not in the export, and `:load` is
 
-`src/repl/mod.rs:1584` — `load_file(&mut self, …)` calls `execute_code_from`, which
+`src/repl/mod.rs:1452` — `load_file(&mut self, …)` calls `execute_code_from`, which
 records the exchange, so `:load notes.rb` appears in `.export` with what it said.
-`src/repl/mod.rs:1816` — `run_file(&self, …)` does not: it builds a VM of its own,
+`src/repl/mod.rs:1578` — `run_file(&self, …)` does not: it builds a VM of its own,
 runs the file in it, prints, and drops the bindings. There is nowhere for the
 transcript to go, because the method holds `&self` and `Transcript::record` needs
 `&mut self`.
@@ -160,148 +160,3 @@ matching, and keep the quotes in the replacement.
 It was not done here because the phase's diff was already a fix to the round trip,
 and a second behaviour change in the same file is how a bug-fix phase turns into a
 refactor.
-
-## F7 — The formatter rewrites words, not only layout — and `rb format` never writes
-
-Found while implementing format-on-enter, both verified on this tree:
-
-```
-$ printf 'import files, network as net\n' > i.rb && rb format i.rb
-import files, network to net
-```
-
-The formatter normalises `import … as x` to `… to x`. Both spellings parse
-(`src/parser.rs:654` accepts `TokenKind::As | TokenKind::To`), so the rewrite is
-meaning-preserving — but it is a *word* change, and it is the reason
-`Repl::format_on_enter` refuses any rewrite whose token stream differs
-(`src/repl/mod.rs`). `Repl::same_tokens` is the guard, and this phase added it
-along with format-on-enter; `repl::tests::format_on_enter::
-edge_an_import_the_formatter_would_rewrite_is_returned_byte_identical` is what
-fails if it goes. (Note that `as` and `to` are *different* kinds — `TokenKind::As`
-and `TokenKind::To` — so this particular rewrite is caught by the kind
-comparison. The `word` comparison beside it is carried by the pairs that share
-one kind: `give`/`back`, `might`/`fail`, `mod`/`%`.)
-
-It is also a documentation question: `docs/GRAMMAR.md` should say which spelling
-the formatter emits, because a `.rb` file that comes back from `.format` is not
-the file that went in.
-
-**Needed:** a docs line, not code. The parser and formatter agree; only the spec
-is silent.
-
-## F8 — `rb format <file>` still prints and does not write
-
-This phase added `:format`, which writes. `rb format <file>` (src/lib.rs:248) was
-left exactly as it was: it prints the formatted source to stdout and leaves the
-file alone. That is the correct Unix behaviour for a filter and the wrong
-behaviour for the one command whose name is the file's name, but changing it
-would be a breaking CLI change and this phase owns the REPL.
-
-**Needed:** a decision — `rb format -w <file>` beside the existing form, or a
-documented note that `rb format` is a filter and `:format` is the one that
-writes. Recorded rather than changed: a CLI break smuggled into a REPL phase is
-the kind of diff a reviewer has to unpick.
-
-## F9 — Two TAB tests read the real checkout, and one bound is only true today
-
-`src/repl/editor.rs` — `edge_tab_after_a_command_that_takes_a_path_offers_paths`
-completes `:load `, `:load s` and `:load sr` against
-`completer::current_dir()`, which is `std::env::current_dir()`. It asserts
-`Cargo.toml` is offered and that `src/` is offered for `sr`, and that
-`complete(":load sr", 8).len() < 20`. All three are statements about *this
-checkout*, not about the completer:
-
-- they hold because `cargo test` runs integration tests with the package root as
-  the working directory, and would not hold from any other one;
-- the `< 20` bound is a claim about how many entries in a repository root start
-  with `sr`. Nothing enforces it. A checkout with 20 such files turns the test
-  red for a reason that has nothing to do with the code.
-
-`a_file_command_completes_the_paths_it_could_load`
-(`src/repl/completer.rs:714`) does the same claim properly: it builds a scratch
-directory and asserts against what it put there. The editor test does not, because
-`ReplCompleter::complete_path` takes its directory from the process and the test
-cannot hand it one.
-
-**Needed:** give the editor's completer the same seam `complete_path_in` already
-has — a directory parameter, or a cwd override for the test — so the two levels
-test the same thing against a directory they own. It is a test-only change and a
-one-parameter signature; it is not in this phase because this phase's diff is a
-behaviour fix and re-shaping a test seam under it would make the diff harder to
-read than the fix it contains.
-
-## F10 — Nothing reads an exported document back
-
-Recorded by the phase-060 round-1 review. `Transcript::read_markdown`
-(`src/repl/transcript.rs`) is the reading half of the export's round trip and has
-no caller under `src/` at all: the only callers in the tree are this module's own
-tests and `tests/repl_test.rs`, which reaches it as
-`redblue::repl::Transcript::read_markdown`.
-
-```
-$ grep -rn 'read_markdown' src/ --include='*.rs' | grep -v 'transcript.rs'
-(no output)
-```
-
-`.export` (`src/repl/mod.rs`, `export_session`) writes a document and stops. `:load`
-and `:restore` replay a `:save` *history* file, which is one line per input with
-no outputs and no fences — a different format, not a subset of this one. So the
-property this phase spent its diff on, "a document this writer wrote reads back as
-the session that wrote it", is asserted against a reader that no user can reach:
-the round trip is pinned, but nothing in the product performs it.
-
-The obvious consumer is a command that runs an exported document back into a
-session, and it is not small — it needs a second history load, a decision about
-whether `:load` should accept a Markdown document at all or whether that wants its
-own name, and the escaping rules that a hand-edited document brings with it. That
-is a phase, not a line in this one.
-
-**Needed:** a phase that adds a reader command (or extends `:load`) and makes
-`read_markdown`'s rules the contract between `.export` and it. Until then the
-honest statement is the one now in the module doc and in the report: the writer is
-the part a session reaches, and the reader is what this file's two halves are
-written against.
-
-## F11 — `.format` replaces a symlink with a regular file
-
-`Repl::write_source_atomically` (`src/repl/mod.rs`) renames its temporary over
-`path`, and a rename replaces the *name*, not what the name points at. So
-
-```
-$ ln -s ../src/thing.rb thing.rb && .format thing.rb
-```
-
-leaves a regular file where the link was and the target untouched behind it.
-The permission fix in this run makes the mode of the *target* the mode of the new
-file, which is the best available answer for a link — but the link itself is
-still gone, and a `0755` symlink to a checked-in script comes back as a copy.
-
-**Needed:** a decision, then code. Either resolve the link and write through to
-the target (`fs::canonicalize`, and report the target's path in the message,
-because that is the path that changed), or refuse a symlinked target and name it
-as one. Refusing is the smaller change and the safer default; writing through is
-what a user who linked the file meant.
-
-## F12 — Should `.format` refuse a read-only file?
-
-Not decided here, deliberately. `tests/repl_test.rs`'s
-`edge_format_of_a_file_that_cannot_be_written_names_the_path_and_leaves_it_alone`
-states the position as a decision: "a `0444` file on its own is not in the way,
-because a rename asks the directory and not the file, which is the same answer
-every editor that saves atomically gives". So `.format` of a read-only file in a
-writable directory rewrites it, and — before this run — also handed it back
-`0644`, which quietly undid the permission the user set. The mode is fixed; the
-write is not:
-
-```
-$ chmod 444 notes.rb && printf '.format notes.rb\n' | rb
->>> Formatted 'notes.rb'.
-```
-
-**Needed:** the decision the test already argues for, made explicitly. If
-`.format` is to stay a filter-and-write that follows the editor convention, the
-test's comment should say so once and F12 closes. If a file marked read-only is
-meant to be off limits, `format_file` must check `Permissions::readonly()` before
-the write and report it with the same shape as every other `.format` failure —
-which is also what makes the message "It is unchanged" true for a case where the
-session never even tried.
