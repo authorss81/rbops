@@ -40,9 +40,9 @@ PROJECT_DIR="${RBOPS_PROJECT_DIR:-.}"
 JQ="${JQ:-jq}"
 
 # Model chains, ranked. Overridable, comma-separated, first entry is primary.
-IMPL_MODELS="${RBOPS_IMPL_MODELS:-opencode/big-pickle,openrouter/thinkingmachines/inkling:free,opencode/nemotron-3-ultra-free,openrouter/poolside/laguna-s-2.1:free}"
-REVIEW_MODELS="${RBOPS_REVIEW_MODELS:-openrouter/thinkingmachines/inkling:free,opencode/nemotron-3-ultra-free}"
-AUDIT_MODELS="${RBOPS_AUDIT_MODELS:-opencode/big-pickle,opencode/nemotron-3-ultra-free}"
+IMPL_MODELS="${RBOPS_IMPL_MODELS:-opencode/minimax-m3.1-flash-free,opencode/nemotron-3-ultra-free,opencode/nemotron-3.5-super-vl-free,opencode/longcat-2.5-preview-free,opencode/beam-free}"
+REVIEW_MODELS="${RBOPS_REVIEW_MODELS:-opencode/nemotron-3-ultra-free,opencode/longcat-2.5-preview-free,opencode/nemotron-3.5-super-vl-free,opencode/minimax-m3.1-flash-free}"
+AUDIT_MODELS="${RBOPS_AUDIT_MODELS:-opencode/longcat-2.5-preview-free,opencode/nemotron-3-ultra-free,opencode/minimax-m3.1-flash-free,opencode/nemotron-3.5-super-vl-free}"
 
 MAX_ATTEMPTS="${RBOPS_MAX_ATTEMPTS:-3}"
 MAX_DEFERRALS="${RBOPS_MAX_DEFERRALS:-5}"
