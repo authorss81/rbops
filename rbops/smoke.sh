@@ -2312,8 +2312,8 @@ case "$out" in
   *"PREFLIGHT NOTHING TO JUDGE"*) ok "a tree with nothing to judge is neither pass nor fail" ;;
   *) no "preflight demands work that does not exist yet"; printf '%s\n' "$out" | grep -E 'PREFLIGHT|no changed|FAIL' | head -4 | sed 's/^/      /' ;;
 esac
-# (c) The whole point: an inherited diff the gate would reject is caught BEFORE
-# the agent runs, without consuming an attempt.
+# (c) The whole point: an inherited diff with gaps is diagnosed BEFORE
+# the agent runs, and its gaps are passed to the agent while keeping 100% of the work.
 build_fixture >/dev/null; use_stubs
 cat > "$PROJ/tests/preflight_probe.rs" <<'EOR'
 #[test]
@@ -2329,18 +2329,20 @@ EOR
   && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
 a_before="$(cat "$PIPE/phases/phase-001/.attempts" 2>/dev/null || echo none)"
 out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"; rc=$?
-[ "$rc" = "42" ] && ok "a refused inherited diff defers (exit 42) instead of dispatching" \
-  || no "preflight did not stop the run: got $rc"
 case "$out" in
-  *"PREFLIGHT FAILED"*) ok "the refusal names preflight as the reason" ;;
+  *"PREFLIGHT"*) ok "preflight checked the inherited diff" ;;
   *) no "no preflight line in the output"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /' ;;
 esac
-marker phase-001 .deferred && ok ".deferred written (retryable)" || no ".deferred missing"
-marker phase-001 .blocked && no "blocked — a detector bug is not the agent's fault" \
-  || ok "not blocked — a fix must not exhaust the phase's attempts"
-a_after="$(cat "$PIPE/phases/phase-001/.attempts" 2>/dev/null || echo none)"
-[ "$a_before" = "$a_after" ] && ok "no attempt consumed ($a_before → $a_after)" \
-  || no "an attempt was burned on a preflight failure: $a_before → $a_after"
+if [ -f "$PROJ/tests/preflight_probe.rs" ]; then
+  ok "preserved work kept in tree (not thrown away)"
+else
+  no "preserved work was dropped"
+fi
+if grep -q "PREFLIGHT GAPS" "$PIPE/logs/phase-001.ctx" 2>/dev/null; then
+  ok "preflight gaps passed into the agent context"
+else
+  no "preflight gaps missing from context"
+fi
 # (d) A good inherited diff must NOT be stopped: preflight that refuses
 # everything is as useless as one that refuses nothing. This one has to clear
 # EVERY diff-based check — quota, edge_*, a failure assertion, the size floor —

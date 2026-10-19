@@ -537,29 +537,13 @@ cmd_run() {
     pf_out="$(RBOPS_PREFLIGHT=1 RBOPS_PROJECT_DIR="$PROJECT_DIR" RBOPS_PHASES="$PHASES" \
                     RBOPS_BASE_REF="$base" "$VERIFY" "$phase" 2>&1)" || pf_rc=$?
     if [ "$pf_rc" -eq 3 ]; then
-      log "$phase PREFLIGHT FAILED — the diff it inherits is refused by the gate already"
+      log "$phase PREFLIGHT INCOMPLETE — inherited diff does not yet pass gate; passing gaps to agent"
       printf '%s\n' "$pf_out" | grep -E 'FAIL' | sed 's/^/          /' | sed -n '1,8p'
-      # Refuse to spend an attempt on a tree the gate has already rejected. The
-      # marker is .deferred (retryable, no attempt burned), not .blocked: the fix
-      # may be a gate fix or a manifest fix, and either lands as a new commit that
-      # should re-open this phase rather than exhaust it.
-      #
-      # It MUST still be counted. A bare `touch .deferred` with no counter is an
-      # infinite loop, and that is not hypothetical: phase-053 spun for ~12 hours
-      # and ~120 identical CI runs because every tick re-adopted the same recovery
-      # branch, preflight refused the same inherited diff, and nothing anywhere
-      # tracked that it had already refused it. `.deferred_attempts` was never
-      # created, so MAX_DEFERRALS could not fire and the phase deferred forever
-      # without ever blocking or ever dispatching a model.
-      #
-      # Routed through defer_phase so this shares ONE counter and ONE bound with
-      # every other deferral reason. A phase that the gate refuses to read is
-      # stuck for a reason no number of retries can fix, and .blocked is how a
-      # human finds out.
-      defer_phase "$phase" "preflight refuses the inherited diff; the gate or the manifest must be fixed before this can run"
-      return $?
+    elif [ "$pf_rc" -eq 0 ]; then
+      log "$phase preflight clean (rc=0)"
+    else
+      log "$phase preflight inconclusive (rc=$pf_rc) — continuing to the agent"
     fi
-    [ "$pf_rc" -eq 0 ] || log "$phase preflight inconclusive (rc=$pf_rc) — continuing to the agent"
   fi
 
   # --- STALE FINDING -------------------------------------------------------
@@ -656,6 +640,17 @@ TPL
 A previous attempt was interrupted and its partial work is already in the tree.
 DO NOT restart. Inspect what exists, continue from it, finish the phase.
 TPL
+    if [ "$resumed" -eq 1 ] && [ -n "$pf_out" ] && printf '%s\n' "$pf_out" | grep -q 'FAIL'; then
+      cat <<TPL
+
+---
+## PREFLIGHT GAPS — fix these first
+Preflight checked the inherited work against the gate and found:
+$(printf '%s\n' "$pf_out" | grep -E 'FAIL' | sed 's/^/  - /')
+
+Add what is missing (tests, failure assertions, report) so the gate passes at the end.
+TPL
+    fi
     # Tell the agent what it inherited and, crucially, why the previous attempt
     # failed — otherwise it repeats the same failure. The prior REPORT.md names
     # the failing checks; the gate output below is quoted from the last run.
