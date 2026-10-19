@@ -619,10 +619,14 @@ inspect it, do not audit it, and do not spend a single tool call on it.
 You have one job, described below. Work in this order and do not deviate:
 
 1. Reproduce the finding. Smallest command that shows it. Then STOP and note it.
-2. Write ONE failing test that demonstrates it. Run it. Watch it fail.
-3. Make the smallest change that turns that test green.
-4. Add the remaining edge-case tests required below.
-5. Run the four gates. Fix what they report.
+2. Write ONE failing test that demonstrates it. Run ONLY your targeted test: `cargo test <test_name>` (fast). Do NOT run `cargo test --all-targets` during iteration — the full suite runs 67 binaries, takes 15 minutes, and will burn your time budget. Watch your test fail.
+3. Make the smallest change that turns that test green. Re-run `cargo test <test_name>`.
+4. Add the remaining edge-case tests required below. Test each with `cargo test <test_name>`.
+5. Only now run the four gates (full suite at the end):
+   - cargo fmt --all -- --check
+   - cargo clippy --all-targets -- -D warnings
+   - cargo test --all-targets
+   - ../rbops/verify.sh "$phase"
 6. Write REPORT.md.
 
 Budget: reproduce in 2 minutes, first test by 5, first edit by 10. If you
