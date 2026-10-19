@@ -593,7 +593,7 @@ cmd_run() {
     # run 3 listed directories for five minutes, read AGENTS.md, started
     # auditing the pipeline, and never wrote a line of code. Scope and a time
     # box up front are worth more than a longer brief.
-    cat <<TPL
+    cat <<'TPL' | sed "s/__PHASE__/$phase/g"
 # DO THIS, NOW. No orientation phase.
 
 Your working directory is the project checkout. It is the ONLY place you may
@@ -610,7 +610,7 @@ You have one job, described below. Work in this order and do not deviate:
    - cargo fmt --all -- --check
    - cargo clippy --all-targets -- -D warnings
    - cargo test --all-targets
-   - ../rbops/verify.sh "$phase"
+   - ../rbops/verify.sh "__PHASE__"
 6. Write REPORT.md.
 
 Budget: reproduce in 2 minutes, first test by 5, first edit by 10. If you

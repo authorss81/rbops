@@ -143,7 +143,7 @@ halt survives a runner being replaced.
 
 ### Models
 
-Order is deliberate: `opencode/space-bunny-free` leads, then
+Order is deliberate: `opencode/minimax-m3.1-flash-free` leads, then
 `muse-spark-1.3-contributor-free`. The strongest coder on the free tier goes
 first because a dead model advances the chain **without consuming a phase
 attempt**, so an unavailable or revoked entry costs about two seconds rather
@@ -156,7 +156,7 @@ To see what your key can actually reach:
 OPENCODE_API_KEY=... opencode models
 ```
 
-If `space-bunny-free` is not listed for your key it will simply be skipped and
+If `minimax-m3.1-flash-free` is not listed for your key it will simply be skipped and
 the chain moves to muse-spark. To change the order, edit `RBOPS_IMPL_MODELS`
 (and the reviewer/audit chains) in `.github/workflows/rbops.yml`, plus
 `.models` in `rbops/phases.json` and the agent models in `opencode.json`.
