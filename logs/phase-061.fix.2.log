@@ -1,0 +1,3503 @@
+[0m
+> build · space-bunny-free
+[0m
+I'll start by reading the reviewer findings and the current state of the code and report.
+[0m→ [0mRead phases/phase-061/REPORT.md
+[0m
+[0m$ [0mgit status --short && git log --oneline -5
+A phases/phase-061/REPORT.md
+ M src/repl/editor.rs
+ M src/repl/mod.rs
+ M tests/unreviewed_work_ack_test.rs
+0e84349 resume phase-061: adopt preserved work
+9bd1e59 rbops: phase-060 (2026-10-19T09:50:00Z)
+f96edca tests: restore history-audit test suite and repair memory-model clippy warning
+d948c63 fmt: rustfmt tests/unreviewed_work_ack_test.rs to fix CI
+222aa83 tests: replace invalid placeholder causing compile failure
+[0m
+[0m$ [0mgit diff HEAD -- src/repl/mod.rs | head -400
+diff --git a/src/repl/mod.rs b/src/repl/mod.rs
+index 18b3f72..398c56a 100644
+--- a/src/repl/mod.rs
++++ b/src/repl/mod.rs
+@@ -13,7 +13,7 @@ pub mod transcript;
+ use std::cell::RefCell;
+ use std::collections::{HashMap, HashSet, VecDeque};
+ use std::io::{self, Write};
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::rc::Rc;
+ use std::time::{Duration, Instant};
+ 
+@@ -59,6 +59,14 @@ const MAX_BLOCK_BYTES: usize = 64 * 1024;
+ /// the thing that floods a terminal.
+ const BLOCK_REPORT_LINES: usize = 20;
+ 
++/// How many names a `.edit` will try for its own directory under the temporary
++/// one, before it reports that it could not have one.
++///
++/// One is the number that would be right if nobody else were sharing the
++/// directory. This is the number that is right if somebody is: a name that is
++/// taken is somebody else's or an earlier edit's, and the next one is not.
++const SCRATCH_DIR_ATTEMPTS: usize = 64;
++
+ /// The prompt a program stopped by the debugger waits at.
+ ///
+ /// Distinct from `>>> ` and `..  2 ` because it is asked by a running program
+@@ -472,12 +480,20 @@ fn tutorial_lines(style: &Style) -> Vec<String> {
+ /// was not in a tour said nothing at all, which reads as a command that does
+ /// nothing rather than a command with nothing to say.
+ fn hint_lines(step: Option<usize>, style: &Style) -> Vec<String> {
+-    match step.and_then(|index| TUTORIAL.get(index)) {
+-        Some(step) => vec![format!(
+-            "Hint for step {} of {}: {}",
+-            step_index(step) + 1,
+-            TUTORIAL.len(),
+-            step.hint
++    // The index is the number the message needs and the borrow is the step it is
++    // about, so both come out of the one lookup. Recovering the index from the
++    // step afterwards would be a search that can fail — and whose failure has to
++    // be answered with something, which is how a step that is not in the table
++    // ends up announced as step one.
++    match step.and_then(|index| TUTORIAL.get(index).map(|listed| (index, listed))) {
++        Some((index, step)) => vec![style.paint(
++            Paint::Heading,
++            &format!(
++                "Hint for step {} of {}: {}",
++                index + 1,
++                TUTORIAL.len(),
++                step.hint
++            ),
+         )],
+         None => vec![style.paint(
+             Paint::Heading,
+@@ -487,18 +503,6 @@ fn hint_lines(step: Option<usize>, style: &Style) -> Vec<String> {
+     }
+ }
+ 
+-/// Where a step sits in [`TUTORIAL`], for a message that has to name it.
+-///
+-/// A step is searched for rather than carried around: the tour is one table, and
+-/// a second copy of "which step is this" is a second answer to a question the
+-/// table already gives.
+-fn step_index(step: &TutorialStep) -> usize {
+-    TUTORIAL
+-        .iter()
+-        .position(|listed| std::ptr::eq(listed, step))
+-        .unwrap_or(0)
+-}
+-
+ /// Why a session's read loop stopped.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum SessionEnd {
+@@ -646,6 +650,13 @@ pub struct Repl {
+     /// tour has to say so, and an index cannot tell "on step one" from "not in
+     /// the tour".
+     tutorial_step: Option<usize>,
++    /// What this session has run since it entered that step, so a step whose
++    /// snippet is several programs can still be recognised as it is typed.
++    ///
++    /// `set name to "World"` and `say name` are each a whole program, and a
++    /// session runs each as it is typed — so neither of them is step one of the
++    /// tour, and the two of them together are.
++    tutorial_typed: Vec<String>,
+ }
+ 
+ impl Repl {
+@@ -665,6 +676,7 @@ impl Repl {
+             transcript: Transcript::new(),
+             last_output: Vec::new(),
+             tutorial_step: None,
++            tutorial_typed: Vec::new(),
+         }
+     }
+ 
+@@ -1129,7 +1141,10 @@ impl Repl {
+ 
+         let code = std::mem::take(&mut self.multiline_buffer).join("\n");
+         self.in_multiline = false;
+-        self.execute_code(&code);
++        // A failure was reported in full by the run itself, with the line that
++        // failed and a caret under it; a line the user typed has nothing to add
++        // to that and nowhere else to put it.
++        let _ = self.execute_code(&code);
+     }
+ 
+     /// Forgets everything the session has done: its bindings, its last result,
+@@ -1231,9 +1246,14 @@ impl Repl {
+         }
+     }
+ 
+-    fn execute_code(&mut self, code: &str) {
++    /// Runs `code` as the session's own line, and what it answered.
++    ///
++    /// The `Err` carries the failure already reported in full — with its `-->`,
++    /// its offending line and its caret — so a caller that needs to know whether
++    /// the run worked has it without a second rendering of the same error.
++    fn execute_code(&mut self, code: &str) -> Result<Value, String> {
+         let offset = self.current_line_number().saturating_sub(1);
+-        self.execute_code_from(introspect::SESSION_FILE, offset, code);
++        self.execute_code_from(introspect::SESSION_FILE, offset, code)
+     }
+ 
+     /// The number `:history` prints beside the line being run, which is the line
+@@ -1247,12 +1267,17 @@ impl Repl {
+     }
+ 
+     /// Runs `code` as the program at `file`, whose first line is `line_offset`
+-    /// plus one.
++    /// plus one, and hands back what it answered or what it failed with.
+     ///
+     /// The offset is what makes one definition format serve two callers: a line
+     /// the user typed has no line of its own but has a place in the history, and
+     /// a file's line *is* its line.
+-    fn execute_code_from(&mut self, file: &str, line_offset: usize, code: &str) {
++    fn execute_code_from(
++        &mut self,
++        file: &str,
++        line_offset: usize,
++        code: &str,
++    ) -> Result<Value, String> {
+         // A line that fails to parse never reaches the VM, so the output of the
+         // line before it has to be out of the way before the next line starts.
+         self.last_output.clear();
+@@ -1262,21 +1287,28 @@ impl Repl {
+         // output and the session's echo of it separately, as it prints them.
+         let mut output = std::mem::take(&mut self.last_output);
+ 
+-        match result {
++        let outcome = match result {
+             Ok(value) => {
+                 self.record_definitions(file, line_offset, code);
+                 if !matches!(value, Value::Nothing) {
+                     let line = format!("= {}", value);
+                     println!("{}", self.style.paint(Paint::Result, &line));
+-                    self.variables.insert("_".to_string(), value);
++                    self.variables.insert("_".to_string(), value.clone());
+                     output.push(line);
+                 }
++                Ok(value)
+             }
+             Err(e) => {
+                 let rendered = format!("Error: {}", render_error(&self.style, code, file, &e));
+-                println!("{}", rendered);
+-                output.push(rendered);
++                println!("{rendered}");
++                output.push(rendered.clone());
++                Err(rendered)
+             }
++        };
++        // A step of the tour is taken by running it, so this is where the tour
++        // moves — and only here, where the run is known to have worked.
++        if outcome.is_ok() {
++            self.advance_tutorial_step(code);
+         }
+         // Recorded as plain text: what the session painted for a reader is not
+         // what a document should carry, so the escape sequences are taken off
+@@ -1285,6 +1317,46 @@ impl Repl {
+             code.to_string(),
+             output.iter().map(|line| strip_escapes(line)).collect(),
+         );
++        outcome
++    }
++
++    /// Moves a session in a tour on to the step after the one it just ran.
++    ///
++    /// A step is taken by running its snippet and by nothing else, and a snippet
++    /// arrives one run at a time rather than in one piece: `set name to "World"`
++    /// is a whole program and so is `say name`, so a reader who types step one
++    /// exactly as printed runs two programs and neither of them is the step. What
++    /// has been run since the step began is therefore accumulated, and the step is
++    /// taken when the accumulation *is* the snippet: a prefix of it means the
++    /// reader is part-way through and is still on this step, and anything else
++    /// means this was something of their own, so the next attempt at the snippet
++    /// starts from the beginning.
++    ///
++    /// Only runs that worked get here — the caller asks after a successful one —
++    /// so a step the reader typed with a typo in it is a step they have not taken,
++    /// and its hint is the one they get.
++    ///
++    /// The last step leaves no step behind it, so a finished tour is over rather
++    /// than parked on its final hint.
++    fn advance_tutorial_step(&mut self, code: &str) {
++        let Some(index) = self.tutorial_step else {
++            return;
++        };
++        let Some(step) = TUTORIAL.get(index) else {
++            self.tutorial_step = None;
++            return;
++        };
++
++        let snippet = step.snippet.trim();
++        self.tutorial_typed.push(code.trim().to_string());
++        let typed = self.tutorial_typed.join("\n");
++
++        if typed == snippet {
++            self.tutorial_step = index.checked_add(1).filter(|next| *next < TUTORIAL.len());
++            self.tutorial_typed.clear();
++        } else if !snippet.starts_with(&typed) {
++            self.tutorial_typed.clear();
++        }
+     }
+ 
+     /// Notes where `code` bound each name, for `.type` and `.which`.
+@@ -1601,8 +1673,10 @@ impl Repl {
+ 
+         println!("Loaded {} bytes from '{}'.", source.len(), path);
+         // The path, not `<session>`: a name this file binds is reported by
+-        // `.which` as `path:line`, which is a place the user can open.
+-        self.execute_code_from(path, 0, &source);
++        // `.which` as `path:line`, which is a place the user can open. A file
++        // that failed to run has said so already, in the same rendered error a
++        // typed line would have produced.
++        let _ = self.execute_code_from(path, 0, &source);
+     }
+ 
+     /// Writes the session's history to `path`, one entry per line, in the
+@@ -2325,11 +2399,15 @@ impl Repl {
+ 
+     /// Prints [`TUTORIAL`], the guided tour a newcomer is walked through, and
+     /// leaves the session on its first step so `.hint` has a step to answer for.
++    ///
++    /// From the first step again, wherever the reader had got to: a tour is a
++    /// list of six things to try, and asking for it is asking for the list.
+     fn show_tutorial(&mut self) {
+         for line in tutorial_lines(&self.style) {
+             println!("{line}");
+         }
+         self.tutorial_step = Some(0);
++        self.tutorial_typed.clear();
+     }
+ 
+     /// Prints the hint for the step the session is on, or says how to start one.
+@@ -2375,34 +2453,164 @@ impl Repl {
+         let mut command = std::process::Command::new(program);
+         command.args(parts);
+ 
+-        let scratch = scratch_dir.join(format!("redblue-edit-{}.rb", std::process::id()));
+-        std::fs::create_dir_all(scratch_dir).map_err(|error| {
+-            format!("could not make a scratch file in {scratch_dir:?}: {error}")
++        let scratch_dir = self.private_scratch_dir(scratch_dir)?;
++        let scratch = scratch_dir.join("redblue-edit.rb");
++        self.write_scratch_file(&scratch)?;
++
++        // Past this line the scratch file exists and holds the session's own
++        // buffer, so every path out of here takes the directory with it: an edit
++        // that failed three times in a row must not leave three copies of what
++        // the reader was writing in the temp directory.
++        let outcome = (|| {
++            let status = command
++                .arg(&scratch)
++                .status()
++                .map_err(|error| format!("could not run `{program}`: {error}"))?;
++            if !status.success() {
++                return Err(format!(
++                    "`{program}` exited with {status}; nothing was read back from it"
++                ));
++            }
++
++            let edited = std::fs::read_to_string(&scratch).map_err(|error| {
++                format!(
++                    "could not read back what `{program}` saved to {}: {error}",
++                    scratch.display()
++                )
++            })?;
++            if edited.trim().is_empty() {
++                return Err(
++                    "the editor left the file empty, so there is nothing to run".to_string()
++                );
++            }
++            Ok(edited)
++        })();
++        // The directory goes as well as the file, and whether that succeeds is
++        // not something to report over an edit that already failed: the buffer
++        // the user was writing is in the session, and this is the temp
++        // directory, which the operating system reclaims anyway.
++        let _ = std::fs::remove_dir_all(&scratch_dir);
++        outcome
++    }
++
++    /// A directory under `parent` that only this user can reach, and the one the
++    /// editor is opened over.
++    ///
++    /// `/tmp` is a world-writable directory that every local user shares, so a
++    /// file written straight into it as `redblue-edit-<pid>.rb` is a name another
++    /// user can predict — the process id is a small number — and pre-create as a
++    /// symlink. `std::fs::write` follows such a link and truncates what it points
++    /// at, so the buffer would have been written through it into a file the
++    /// reader can write, and that path handed to `$EDITOR`.
++    ///
++    /// The name is therefore refused if it already exists rather than reused:
++    /// `create_dir` does not `create_dir_all`, so a directory planted under that
++    /// name with someone else's permissions is a failure instead of a place this
++    /// session writes into. Serial after serial, until one of them is free.
++    /// Nothing inside is readable by anyone else, so nothing inside can be
++    /// planted by anyone else either.
++    fn private_scratch_dir(&self, parent: &Path) -> Result<PathBuf, String> {
++        std::fs::create_dir_all(parent).map_err(|error| {
++            format!("could not make a scratch directory in {parent:?}: {error}")
+         })?;
+-        std::fs::write(&scratch, self.multiline_buffer.join("\n"))
+-            .map_err(|error| format!("could not write {}: {error}", scratch.display()))?;
+-
+-        let status = command
+-            .arg(&scratch)
+-            .status()
+-            .map_err(|error| format!("could not run `{program}`: {error}"))?;
+-        if !status.success() {
+-            return Err(format!(
+-                "`{program}` exited with {status}; nothing was read back from it"
+-            ));
++        for serial in 0..SCRATCH_DIR_ATTEMPTS {
++            let dir = parent.join(format!("redblue-edit-{}-{serial}", std::process::id()));
++            match std::fs::create_dir(&dir) {
++                Ok(()) => {
++                    Self::lock_down_dir(&dir)?;
++                    return Ok(dir);
++                }
++                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
++                Err(error) => {
++                    return Err(format!(
++                        "could not make {} for an edit: {error}",
++                        dir.display()
++                    ))
++                }
++            }
+         }
++        Err(format!(
++            "could not make a directory of its own for an edit under {parent:?}: \
++             every name from redblue-edit-{}-0 to redblue-edit-{}-{} was taken",
++            std::process::id(),
++            std::process::id(),
++            SCRATCH_DIR_ATTEMPTS - 1
++        ))
++    }
+ 
+-        let edited = std::fs::read_to_string(&scratch).map_err(|error| {
+-            format!(
+-                "could not read back what `{program}` saved to {}: {error}",
+-                scratch.display()
+-            )
+-        })?;
+-        let _ = std::fs::remove_file(&scratch);
+-        if edited.trim().is_empty() {
+-            return Err("the editor left the file empty, so there is nothing to run".to_string());
++    /// Takes away everyone else's access to `dir`, whatever the umask left of it.
++    ///
++    /// `create_dir` asks the kernel for `0o777 & ~umask`, so a directory made in a
++    /// shared `/tmp` is normally `0755` — listable by every local user for as
++    /// long as the editor is open. The file inside it is `0600` regardless, so
++    /// what is private is the buffer; the directory is closed as well so that
++    /// what a reader is working on is not announced by a name they did not choose.
++    #[cfg(unix)]
++    fn lock_down_dir(dir: &Path) -> Result<(), String> {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
++            .map_err(|error| format!("could not make {} private: {error}", dir.display()))
++    }
++
++    #[cfg(not(unix))]
++    fn lock_down_dir(_dir: &Path) -> Result<(), String> {
++        // No mode to set here. What the file inside it was created with is still
++        // this platform's own answer to who may read it.
++        Ok(())
++    }
++
++    /// Writes the session's block to `path`, for an editor to open.
++    ///
++    /// `create_new` rather than `write`: the file is created by this call or not
++    /// at all, so a symlink sitting at that path is a failure rather than
++    /// something the buffer is written through. And `0o600` rather than whatever
++    /// the umask leaves behind — the block is the reader's own, and for as long
++    /// as the editor is open it does not need to be readable by anyone else.
++    fn write_scratch_file(&self, path: &Path) -> Result<(), String> {
++        let mut options = std::fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::OpenOptionsExt;
+[0m
+[0m$ [0mgit diff HEAD --stat && echo "---" && git diff HEAD --numstat
+phases/phase-061/REPORT.md        | 230 +++++++++++++
+ src/repl/editor.rs                |  44 ++-
+ src/repl/mod.rs                   | 709 ++++++++++++++++++++++++++++++++------
+ tests/unreviewed_work_ack_test.rs |   1 +
+ 4 files changed, 870 insertions(+), 114 deletions(-)
+---
+230	0	phases/phase-061/REPORT.md
+39	5	src/repl/editor.rs
+600	109	src/repl/mod.rs
+1	0	tests/unreviewed_work_ack_test.rs
+[0m
+[0m$ [0mgit diff HEAD -- src/repl/mod.rs | sed -n '400,900p'
++            use std::os::unix::fs::OpenOptionsExt;
++            options.mode(0o600);
++        }
++        let mut file = options
++            .open(path)
++            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
++        std::io::Write::write_all(&mut file, self.multiline_buffer.join("\n").as_bytes())
++            .map_err(|error| format!("could not write {}: {error}", path.display()))
++    }
++
++    /// `.edit` over the block this session is holding, with the editor and the
++    /// directory given rather than read from the process.
++    ///
++    /// This is the entry point the command uses and the one a test drives, so
++    /// what is asserted afterwards — the buffer that survived a failed edit, the
++    /// block that came back and ran — is asserted about the session's own state
++    /// and not about a scratch file's leftovers.
++    fn edit_with(&mut self, editor: Option<&str>, scratch_dir: &Path) -> Result<(), String> {
++        let edited = self.edit_in(editor, scratch_dir)?;
++        self.multiline_buffer.clear();
++        self.in_multiline = false;
++        match self.execute_code(&edited) {
++            Ok(_) => Ok(()),
++            Err(_) => {
++                // The editor's block is the only copy of it there is, and the
++                // buffer was cleared before the run on purpose — a block that ran
++                // must not be left to be run again by the next line typed. A
++                // block that did not run is the other case: clearing it first
++                // threw away a typo at the end of a long program with no way back
++                // into it, and `.edit` is the only route into the session for
++                // anything longer than a line.
++                self.multiline_buffer = edited.lines().map(str::to_string).collect();
++                self.in_multiline = Self::needs_continuation(&edited);
++                Err(
++                    "nothing was run: the block the editor saved is back in the \
++                     buffer — `.edit` to try again, or keep typing"
++                        .to_string(),
++                )
++            }
+         }
+-        Ok(edited)
+     }
+ 
+     /// Opens `$EDITOR` over the block this session is holding, runs what comes
+@@ -2410,18 +2618,11 @@ impl Repl {
+     fn edit_buffer(&mut self) {
+         let editor = Self::editor_program();
+         let scratch = std::env::temp_dir();
+-        match self.edit_in(editor.as_deref(), &scratch) {
+-            Ok(edited) => {
+-                self.multiline_buffer.clear();
+-                self.in_multiline = false;
+-                self.execute_code(&edited);
+-            }
+-            Err(message) => {
+-                println!(
+-                    "{}",
+-                    self.style.paint(Paint::Error, &format!("Error: {message}"))
+-                );
+-            }
++        if let Err(message) = self.edit_with(editor.as_deref(), &scratch) {
++            println!(
++                "{}",
++                self.style.paint(Paint::Error, &format!("Error: {message}"))
++            );
+         }
+     }
+ 
+@@ -2776,7 +2977,8 @@ mod tests {
+     #[test]
+     fn complete_offers_the_names_the_session_has_bound() {
+         let mut repl = Repl::new();
+-        repl.execute_code("set total to 3");
++        repl.execute_code("set total to 3")
++            .expect("a `set` of a number is a line that runs");
+ 
+         let matches = repl.complete("to");
+         assert!(
+@@ -2804,7 +3006,8 @@ mod tests {
+     #[test]
+     fn edge_completion_after_reset_forgets_the_sessions_names() {
+         let mut repl = Repl::new();
+-        repl.execute_code("set counter to 3");
++        repl.execute_code("set counter to 3")
++            .expect("a `set` of a number is a line that runs");
+         assert!(repl.complete("count").contains(&"counter".to_string()));
+ 
+         repl.handle_command(":reset");
+@@ -5866,6 +6069,7 @@ mod tests {
+         use super::{feed, Repl};
+         use crate::repl::style::{Paint, Style};
+         use crate::repl::{hint_lines, tutorial_lines, TUTORIAL};
++        use crate::value::Value;
+ 
+         /// A scratch directory under the checkout, unique per test so two running
+         /// in parallel cannot collide.
+@@ -5897,6 +6101,33 @@ mod tests {
+             path.to_string_lossy().to_string()
+         }
+ 
++        /// That an edit left nothing of the reader's block in `dir`, whatever
++        /// shape the edit left by.
++        ///
++        /// The whole directory rather than one file name, because the file lives
++        /// in a directory of the session's own and the directory is the thing
++        /// that has to go: a name that is left behind is a name the next edit,
++        /// or the next session, finds.
++        fn assert_no_scratch_left(dir: &Path) {
++            let left: Vec<String> = fs::read_dir(dir)
++                .unwrap_or_else(|error| {
++                    panic!("{} should still be readable: {error}", dir.display())
++                })
++                .map(|entry| {
++                    entry
++                        .expect("a scratch entry should be readable")
++                        .file_name()
++                })
++                .map(|name| name.to_string_lossy().into_owned())
++                .filter(|name| name != "fake-editor.sh")
++                .collect();
++            assert!(
++                left.is_empty(),
++                "no copy of the block is left in {}: {left:?}",
++                dir.display()
++            );
++        }
++
+         /// The tour is a numbered set of steps, and its last step is the way to
+         /// the catalogue. This is the finding: `:example` existed, so a newcomer
+         /// got a wall of code and no way in.
+@@ -6032,8 +6263,17 @@ mod tests {
+             );
+         }
+ 
+-        /// `.hint` in the tour answers about the step the session is on, and
+-        /// `:tutorial` is what puts it there.
++        /// `.hint` in the tour answers about the step the session is on, `:tutorial` is
++        /// what puts it there, and running that step's snippet is what moves it on.
++        ///
++        /// The second half is the half that was missing: the step was set once and
++        /// nothing ever read it again, so `:hint` answered "step 1 of 6" for a
++        /// reader who had already done step 1 — and the other five steps' hints
++        /// could not be reached at all.
++        ///
++        /// Fed a line at a time, as a reader types it: `set name to "World"` is
++        /// a whole program and so is `say name`, so neither run on its own is the
++        /// step and only the two of them together are.
+         #[test]
+         fn a_hint_in_the_tour_names_the_step_it_is_for() {
+             let mut repl = Repl::new();
+@@ -6053,10 +6293,124 @@ mod tests {
+                 "and with colour off it is plain text: {:?}",
+                 hint[0]
+             );
++
++            feed(&mut repl, &["set name to \"World\""]);
++            assert_eq!(
++                repl.tutorial_step,
++                Some(0),
++                "half a step is still on the step it belongs to"
++            );
++
++            feed(&mut repl, &["say name"]);
++            assert_eq!(
++                repl.tutorial_step,
++                Some(1),
++                "and doing step one leaves the reader on step two"
++            );
++            let hint = hint_lines(repl.tutorial_step, &Style::forced(false));
++            assert!(
++                hint[0].contains("2") && hint[0].contains(TUTORIAL[1].hint),
++                "so the hint now answers about step two: {:?}",
++                hint[0]
++            );
++        }
++
++        /// Every step of the tour can be walked, in order, by typing it — the
++        /// whole point of a step being its own snippet.
++        ///
++        /// Line by line, so the accumulation that recognises a snippet of several
++        /// programs is exercised on a step that is one (`repeat 3 times`, its
++        /// body, its `end`) as well as on one that is several.
++        #[test]
++        fn edge_every_step_of_the_tour_can_be_walked_by_typing_it() {
++            let mut repl = Repl::new();
++            feed(&mut repl, &[":tutorial"]);
++
++            for (index, step) in TUTORIAL.iter().enumerate() {
++                assert_eq!(
++                    repl.tutorial_step,
++                    Some(index),
++                    "the reader is on step {} before typing it: {:?}",
++                    index + 1,
++                    step.title
++                );
++                let lines: Vec<&str> = step.snippet.lines().collect();
++                feed(&mut repl, &lines);
++            }
++
++            assert_eq!(
++                repl.tutorial_step, None,
++                "and a tour walked to its end is over"
++            );
++        }
++
++        /// The tour ends where it says it ends: the last step's hint is the last
++        /// thing a reader is on, and once it has been taken there is no step left
++        /// to be on — which is what `:hint` then says.
++        #[test]
++        fn edge_the_last_step_taken_is_the_end_of_the_tour() {
++            let mut repl = Repl::new();
++            feed(&mut repl, &[":tutorial"]);
++            repl.tutorial_step = Some(TUTORIAL.len() - 1);
++
++            let lines: Vec<&str> = TUTORIAL[TUTORIAL.len() - 1].snippet.lines().collect();
++            feed(&mut repl, &lines);
++
++            assert_eq!(
++                repl.tutorial_step, None,
++                "a finished tour is over, not parked on its last hint"
++            );
++            let hint = hint_lines(repl.tutorial_step, &Style::forced(false));
++            assert!(
++                hint[0].contains(":examples"),
++                "and the answer a reader then gets points at the catalogue the \
++                 last step names: {:?}",
++                hint[0]
++            );
++        }
++
++        /// Only running the step moves the tour. Code that is not the step's own
++        /// snippet is a reader trying something of their own, and a step they
++        /// have not taken yet is a step they still need the hint for.
++        #[test]
++        fn edge_only_the_step_its_own_snippet_moves_the_tour_on() {
++            let mut repl = Repl::new();
++            feed(&mut repl, &[":tutorial"]);
++
++            feed(&mut repl, &["set something_else to 1"]);
++            assert_eq!(
++                repl.tutorial_step,
++                Some(0),
++                "and leaves the reader on the step they were on"
++            );
++
++            feed(&mut repl, &["set name to \"World\""]);
++            assert_eq!(
++                repl.tutorial_step,
++                Some(0),
++                "and so does a snippet begun and then given up on"
++            );
++            feed(&mut repl, &["say \"something else\""]);
++            assert_eq!(
++                repl.tutorial_step,
++                Some(0),
++                "even after the reader strays: the tour does not skip a step"
++            );
++
++            feed(&mut repl, &["set name to \"World\"", "say nosuchvariable"]);
++            assert_eq!(
++                repl.tutorial_step,
++                Some(0),
++                "and a step that failed to run is a step that has not been taken"
++            );
+         }
+ 
+         /// The round trip: the block the session is holding goes out to the
+         /// editor, and what the editor wrote comes back as a program that ran.
++        ///
++        /// Driven through [`Repl::edit_with`], the entry point the command uses,
++        /// so what is asserted is the session's own state afterwards and not what
++        /// a scratch file happens to hold.
+         #[cfg(unix)]
+         #[test]
+         fn edit_runs_what_the_editor_left_behind() {
+@@ -6067,28 +6421,80 @@ mod tests {
+ 
+             assert!(repl.in_multiline, "the block is open before the edit");
+ 
+-            let edited = repl
+-                .edit_in(Some(&editor), &dir)
++            repl.edit_with(Some(&editor), &dir)
+                 .expect("an editor that saves the file is an editor that worked");
+ 
+-            assert_eq!(
+-                edited, "set edited to 42\n",
+-                "what came back is what the editor wrote"
+-            );
+-            assert!(
+-                !dir.join(format!("redblue-edit-{}.rb", std::process::id()))
+-                    .exists(),
+-                "and the scratch file is not left behind"
+-            );
+-
+-            repl.multiline_buffer.clear();
+-            repl.in_multiline = false;
+-            repl.execute_code(&edited);
+             assert!(
+                 repl.vm.user_names().contains(&"edited".to_string()),
+                 "what the editor wrote is a program the session ran: {:?}",
+                 repl.vm.user_names()
+             );
++            assert!(
++                repl.multiline_buffer.is_empty() && !repl.in_multiline,
++                "and a block that ran is not left to be run again by the next line"
++            );
++            assert_no_scratch_left(&dir);
++        }
++
++        /// What the reader was writing is theirs: while the editor is open, the
++        /// file it was handed is readable by its owner and nobody else, and it
++        /// sits in a directory of its own rather than in a world-writable one
++        /// where a name this session would pick could be planted beforehand.
++        #[cfg(unix)]
++        #[test]
++        fn edge_the_scratch_file_is_readable_by_its_owner_and_nobody_else() {
++            let dir = scratch_dir("edit-private-scratch");
++            // The editor reports back what it was given: the modes of the file it
++            // opened and of the directory it is in, as a program that runs.
++            let editor = script_editor(
++                &dir,
++                "printf 'set file_mode to %s\\nset dir_mode to %s\\n' \
++                 \"$(stat -c '%a' \"$1\")\" \"$(stat -c '%a' \"$(dirname \"$1\")\")\" > \"$1\"",
++            );
++            let mut repl = Repl::new();
++            feed(&mut repl, &["repeat 2 times"]);
++
++            repl.edit_with(Some(&editor), &dir)
++                .expect("an editor that only reports the modes still edits");
++
++            assert_eq!(
++                repl.lookup("file_mode"),
++                Some(&Value::Number(600.0)),
++                "the file holding the block is not readable by anyone else"
++            );
++            assert_eq!(
++                repl.lookup("dir_mode"),
++                Some(&Value::Number(700.0)),
++                "and it is not in a directory another user can list"
++            );
++            assert_no_scratch_left(&dir);
++        }
++
++        /// The scratch file is created, and never opened at a name somebody else
++        /// could have got there first: a symlink at that path has to be a refusal,
++        /// not a buffer written through it.
++        #[cfg(unix)]
++        #[test]
++        fn edge_a_scratch_path_already_taken_is_refused_rather_than_followed() {
++            let dir = scratch_dir("edit-symlink-scratch");
++            let planted = dir.join("redblue-edit-0");
++            fs::create_dir(&planted).expect("the planted directory should be creatable");
++
++            let mut repl = Repl::new();
++            feed(&mut repl, &["repeat 2 times"]);
++            let missing = dir.join("no-such-editor").to_string_lossy().into_owned();
++
++            // The name is taken, so the session takes the next one rather than
++            // writing into a directory it did not make.
++            repl.edit_in(Some(&missing), &dir)
++                .expect_err("an editor that is not there cannot edit anything");
++            assert_eq!(
++                fs::read_dir(&planted)
++                    .expect("the planted directory should still be readable")
++                    .count(),
++                0,
++                "and nothing of the session's was written into it"
++            );
+         }
+ 
+         /// No editor named is a clean error that says which variable to set, and
+@@ -6100,7 +6506,7 @@ mod tests {
+             feed(&mut repl, &["repeat 2 times", "    say \"hi\""]);
+ 
+             let error = repl
+-                .edit_in(None, &dir)
++                .edit_with(None, &dir)
+                 .expect_err("no editor named is not an edit");
+ 
+             assert!(
+@@ -6120,6 +6526,10 @@ mod tests {
+ 
+         /// An editor that cannot be run, one that fails, and one that empties the
+         /// file are three different failures and none of them runs anything.
++        ///
++        /// Driven through [`Repl::edit_with`] rather than through the file round
++        /// trip beneath it: the buffer is this session's own state, so a claim
++        /// about it means nothing over a `&self` that cannot have touched it.
+         #[test]
+         fn edge_an_editor_that_cannot_be_used_is_reported_rather_than_run() {
+             let dir = scratch_dir("edit-bad-editor");
+@@ -6128,7 +6538,7 @@ mod tests {
+             feed(&mut repl, &["repeat 2 times"]);
+ 
+             let error = repl
+-                .edit_in(Some(&dir.join("no-such-editor").to_string_lossy()), &dir)
++                .edit_with(Some(&dir.join("no-such-editor").to_string_lossy()), &dir)
+                 .expect_err("a program that is not there cannot edit anything");
+             assert!(
+                 error.contains("no-such-editor"),
+@@ -6144,7 +6554,7 @@ mod tests {
+             {
+                 let failing = script_editor(&dir, "exit 3");
+                 let error = repl
+-                    .edit_in(Some(&failing), &dir)
++                    .edit_with(Some(&failing), &dir)
+                     .expect_err("an editor that exits badly has not saved anything");
+                 assert!(
+                     error.contains("exited"),
+@@ -6153,7 +6563,7 @@ mod tests {
+ 
+                 let emptying = script_editor(&dir, ": > \"$1\"");
+                 let error = repl
+-                    .edit_in(Some(&emptying), &dir)
++                    .edit_with(Some(&emptying), &dir)
+                     .expect_err("an empty file is not a program");
+                 assert!(
+                     error.contains("nothing to run"),
+@@ -6167,6 +6577,79 @@ mod tests {
+             }
+         }
+ 
++        /// A block the editor wrote that does not run is the only copy of itself
++        /// there is, and clearing the buffer before the run threw it away with no
++        /// way back into it.
++        ///
++        /// `.edit` is the only route into the session for anything longer than a
++        /// line, so a typo at the end of a program the reader had just written was
++        /// a program lost. It comes back into the buffer here, and the buffer is
++        /// the state a test can hold.
++        #[cfg(unix)]
++        #[test]
++        fn edge_an_edit_that_does_not_run_gives_the_block_back() {
++            let dir = scratch_dir("edit-broken-program");
++            let editor = script_editor(&dir, "printf 'set kept to 1\\nrepeat 2 times\\n' > \"$1\"");
++            let mut repl = Repl::new();
++            feed(&mut repl, &["repeat 2 times"]);
++
++            let error = repl
++                .edit_with(Some(&editor), &dir)
++                .expect_err("a block that never balances is not a program");
++
++            assert!(
++                error.contains("buffer"),
++                "and the message says where the block went: {error}"
++            );
++            assert_eq!(
++                repl.multiline_buffer,
++                vec!["set kept to 1".to_string(), "repeat 2 times".to_string()],
++                "the block the editor saved is back in the buffer, in full"
++            );
++            assert!(
++                repl.in_multiline,
++                "and it is still an open block, so `end` finishes it rather than \
++                 than being appended to something else"
++            );
++
++            // Which is the point of putting it back: the block is editable again.
++            feed(&mut repl, &["end"]);
++            assert!(
++                repl.vm.user_names().contains(&"kept".to_string()),
++                "and finishing it by hand is a program the session runs: {:?}",
++                repl.vm.user_names()
++            );
++        }
++
++        /// The scratch file is the session's own buffer, written out so an editor
++        /// has something to open — and the edit paths that failed left it there.
++        ///
++        /// The success path removed it and nothing else did, so an editor that
++        /// could not be run, or that exited badly, or whose save could not be
++        /// read back, each left a copy of what the reader was writing in the
++        /// temp directory. Three failed edits is three copies.
++        #[cfg(unix)]
++        #[test]
++        fn edge_a_failed_edit_leaves_no_copy_of_the_buffer_behind() {
++            let dir = scratch_dir("edit-no-scratch-left");
++            let mut repl = Repl::new();
++            feed(&mut repl, &["repeat 2 times"]);
++
++            let missing = dir.join("no-such-editor").to_string_lossy().into_owned();
++            assert!(
++                repl.edit_with(Some(&missing), &dir).is_err(),
++                "an editor that is not there cannot edit anything"
++            );
++            assert_no_scratch_left(&dir);
++
++            let failing = script_editor(&dir, "exit 3");
++            assert!(
++                repl.edit_with(Some(&failing), &dir).is_err(),
++                "an editor that exits badly has saved nothing"
++            );
++            assert_no_scratch_left(&dir);
++        }
++
+         /// The commands are commands: they parse, they are completable, and
+         /// `:help` names them.
+         ///
+@@ -6209,30 +6692,38 @@ mod tests {
+ 
+         /// A hint is painted whole, so the reader can tell it from the source and
+[0m
+[0m$ [0mgit diff HEAD -- src/repl/editor.rs tests/unreviewed_work_ack_test.rs
+diff --git a/src/repl/editor.rs b/src/repl/editor.rs
+index 936b49f..2acd5ba 100644
+--- a/src/repl/editor.rs
++++ b/src/repl/editor.rs
+@@ -851,7 +851,36 @@ mod tests {
+         assert_eq!(
+             source.signature_hint("say split(", 5),
+             None,
+-            "a cursor past the end of the line is not a position to hint at"
++            "a cursor inside the name is not a cursor after the bracket, whatever \
++             the line holds"
++        );
++        assert_eq!(
++            source.signature_hint("say split(", 999),
++            None,
++            "a cursor past the end of the line is refused by `line.get(..pos)` \
++             rather than panicking on a slice"
++        );
++        assert_eq!(
++            source.signature_hint("say split(", 11),
++            None,
++            "and the end of the line itself is not after the bracket either"
++        );
++        assert_eq!(
++            source.signature_hint("say é(", 5),
++            None,
++            "a cursor left inside a two-byte character is not a position to slice \
++             at, and the whole line is refused rather than half of it"
++        );
++        assert_eq!(
++            source.signature_hint("say é(", 7),
++            None,
++            "while a cursor at the end of that line is still not after a `(` that \
++             is the last thing in it"
++        );
++        assert_eq!(
++            source.signature_hint("say ", 4),
++            None,
++            "and a line that is not a call at all is not one either"
+         );
+     }
+ 
+@@ -885,12 +914,17 @@ mod tests {
+             "and the answer really is the filesystem's: {offered:?}"
+         );
+ 
++        // Sorted here as the answer is: the completer sorts what it offers, so
++        // comparing against the declaration order of `MODULES` would pass only
++        // while that unrelated table happened to be alphabetical.
++        let mut modules: Vec<String> = crate::stdlib::MODULES
++            .iter()
++            .map(|name| (*name).to_string())
++            .collect();
++        modules.sort();
+         assert_eq!(
+             source.complete(".", 1),
+-            crate::stdlib::MODULES
+-                .iter()
+-                .map(|name| (*name).to_string())
+-                .collect::<Vec<_>>(),
++            modules,
+             "a bare dot is the start of a dotted call, so it offers the receivers"
+         );
+     }
+diff --git a/tests/unreviewed_work_ack_test.rs b/tests/unreviewed_work_ack_test.rs
+index 9435951..4263628 100644
+--- a/tests/unreviewed_work_ack_test.rs
++++ b/tests/unreviewed_work_ack_test.rs
+@@ -95,6 +95,7 @@ const ACKNOWLEDGED: &[(&str, &str)] = &[
+     ("96beaa93fb2193239f4e8409189720002b3e94bc", "resume phase-087: adopt WIP checkpoint. Carries unreviewed code (+546/-104, 23 files, +30/-28 under src/ - `length` over text counts characters instead of UTF-8 bytes at src/runtime.rs, and the unreachable second `length` arm is deleted from src/stdlib.rs, along with the corpus and test expectations that recorded the byte count). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
+     ("bf9ffc3370e97436d193f146102e8c4d69d1fade", "resume phase-089: adopt WIP checkpoint. Carries unreviewed code (+1068/-15, 11 files, +381/-15 under src/ - the typed failure value and `catch error of <Type>`: src/failure.rs is new (`FailureKind`, the closed list, `value_of`), plus the `of <Type>` parse and `catch_kind` in src/parser.rs, the decline path and the bound failure record in both src/interpreter.rs and src/bytecode/vm.rs, the kind in the catch block's parameter list in src/bytecode/codegen.rs, and `catch error of <Kind> <name>` in src/formatter.rs). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
+     ("b48189aa679e0f4df60f5cd5d10a4894d77bc3f7", "resume phase-059: adopt preserved work. Carries unreviewed code (+1321/-85, 22 files, +897/-61 under src/ - REPL failures are now drawn through `Error::render` against the session buffer: `render_error`, `paint_diagnostic` and `is_caret_line` in src/repl/mod.rs, the cell-accurate drawing (`char_cells`, `display_width`, `render_single`, `render_range`) and its two bounds (`MAX_DRAWN_CELLS`, `MAX_DRAWN_LINES`) in src/error.rs, `Expr::Variable(String, Span)` in src/parser.rs and `name_position` in src/analyzer.rs so the caret lands on the name rather than the statement, plus 16 tests and this phase's REPORT.md and FINDINGS.md). Deliberately not rewritten; kept so HEAD's ancestry stays intact. The earlier phase-059 resume it replaces (8389c5a) is not an ancestor of HEAD, so it is not listed: `scan` reports an acknowledgement naming a commit HEAD does not contain as stale, and a stale entry is a failure."),
++    ("0e84349b84327cf76c6dcd4fb2a8d1e5ade4411c", "resume phase-061: adopt preserved work. Carries unreviewed code (+942/-5, 5 files, +937/-5 under src/ - the REPL discoverability work: member completion after a module dot (`complete_dotted`/`split_dotted` and the `ALT_DOT` bare-dot case in src/repl/completer.rs), the `$EDITOR` round trip for `.edit` (`editor_program`, `edit_in`, `edit_buffer` in src/repl/mod.rs), the guided tour `:tutorial` with `:hint` (`TUTORIAL`, `TutorialStep`, `tutorial_lines`, `hint_lines`, `step_index`, `show_tutorial`, `show_hint` in src/repl/mod.rs), the inline call-signature hint behind the `Hinter` hook (`signature_hint` in src/repl/editor.rs), `stdlib::module_members` and the three command rows in src/repl/commands.rs), plus 16 tests). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
+     ("c95062eb02a6e336f011a918daac7938f0efee6d", "ack: resume phase-088: add resume commit to ACKNOWLEDGED. Carries no production code: +1/-927 across 2 files, neither under src/ (phase-088's acknowledgement data and its bookkeeping). Acknowledged because the selector is a case-insensitive substring test on `resume phase-` and the subject merely *contains* the phrase; deliberately not rewritten."),
+     // --- `rbops: phase-NNN checkpoint` ---------------------------------------
+     // Already audited, with reasons, by tests/checkpoint_ancestry_test.rs against
+[0m
+[0m# [0mTodos
+[•] Read relevant code: exceeds_block_limits, edit_in, reset_session, private_scratch_dir
+[ ] Fix 4: cap edited block with exceeds_block_limits + tests both sides
+[ ] Fix 5: scope guard for scratch dir removal + write/lock failure test
+[ ] Fix 6: malformed_input — add whitespace-only editor test
+[ ] Fix 7: reset_session clears tutorial_step/tutorial_typed + test
+[ ] Fix 8+14: editor.rs signature_hint assertions and stat -c portability
+[ ] Fix 13: private_scratch_dir doc describes serial search
+[ ] Fix 1,2,3,9,10,11,12: REPORT.md rewrite
+[ ] Re-run four gates
+[0m
+[0m$ [0mrg -n "exceeds_block_limits|MAX_BLOCK_LINES|MAX_BLOCK_BYTES" src/repl/mod.rs | head -30
+50:const MAX_BLOCK_LINES: usize = 500;
+53:/// a block of a few very long lines gets nowhere near [`MAX_BLOCK_LINES`] and can
+55:const MAX_BLOCK_BYTES: usize = 64 * 1024;
+97:/// ([`MAX_BLOCK_LINES`], [`MAX_BLOCK_BYTES`]); this is the prompt's share of it.
+1133:        if Self::exceeds_block_limits(&self.multiline_buffer, buffered.len()) {
+1188:    fn exceeds_block_limits(lines: &[String], bytes: usize) -> bool {
+1189:        lines.len() > MAX_BLOCK_LINES || bytes > MAX_BLOCK_BYTES
+1212:            lines, bytes, MAX_BLOCK_LINES, MAX_BLOCK_BYTES
+3676:        feed_repeatedly(&mut repl, r#"    say "x""#, super::MAX_BLOCK_LINES + 10);
+3702:        let long = format!("say \"{}\"", "a".repeat(super::MAX_BLOCK_BYTES / 4));
+3708:            super::MAX_BLOCK_BYTES
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=1120, limit=90][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=180, offset=2415][0m
+[0m
+[0m$ [0mrg -n "fn signature_hint" -A 40 src/repl/editor.rs | head -80
+230:    fn signature_hint(&self, line: &str, pos: usize) -> Option<String> {
+231-        let head = line.get(..pos)?;
+232-        let opened = head.strip_suffix('(')?;
+233-        let name = opened
+234-            .rsplit(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.'))
+235-            .next()?;
+236-        if name.is_empty() {
+237-            return None;
+238-        }
+239-        // A member is spelled `json.parse` and stored as `json_parse`, which is
+240-        // the whole of the difference between finding the shape and not.
+241-        let qualified = name.replace('.', "_");
+242-        crate::stdlib::builtin_signature(&qualified).map(str::to_string)
+243-    }
+244-}
+245-
+246-impl Completer for SessionCompleter {
+247-    type Candidate = String;
+248-
+249-    fn complete(
+250-        &self,
+251-        line: &str,
+252-        pos: usize,
+253-        _ctx: &Context<'_>,
+254-    ) -> Result<(usize, Vec<String>), ReadlineError> {
+255-        // A cursor the caller put inside a character is not an answer this
+256-        // completer can give, and slicing at it would panic.
+257-        let Some((start, word)) = Self::word_at(line, pos) else {
+258-            return Ok((0, Vec::new()));
+259-        };
+260-        // A filename first, where the line is the argument of a command that
+261-        // takes one: the vocabulary has no business answering `:load sr`, and
+262-        // this is the only place the filesystem is read at all.
+263-        if let Some((path_start, candidates)) = self.completer.complete_path(line, pos) {
+264-            return Ok((path_start, candidates));
+265-        }
+266-        Ok((
+267-            start,
+268-            self.completer.complete_with(word, &self.names.borrow()),
+269-        ))
+270-    }
+--
+412:    pub fn signature_hint(&self, line: &str, pos: usize) -> Option<String> {
+413-        self.completer.signature_hint(line, pos)
+414-    }
+415-
+416-    /// The line as this editor would draw it while it is being typed.
+417-    ///
+418-    /// What the terminal asks for on every keystroke, reachable without one.
+419-    pub fn highlight<'l>(&self, line: &'l str) -> Cow<'l, str> {
+420-        Highlighter::highlight(&self.completer, line, line.len())
+421-    }
+422-
+423-    /// Records `line` as read, so Up and Down can walk back to it.
+424-    pub fn record(&mut self, line: &str) {
+425-        if line.trim().is_empty() {
+426-            return;
+427-        }
+428-        // `false` here is a line the editor declined to keep — a blank one, or a
+429-        // repeat of the last — which is the same answer a session gets today.
+430-        let _ = self.editor.add_history_entry(line.to_string());
+431-    }
+432-
+433-    /// How many lines this session can walk back through.
+434-    pub fn history_len(&self) -> usize {
+435-        self.editor.history().len()
+436-    }
+437-
+438-    /// Whether `line` is one this session can walk back through.
+439-    pub fn history_contains(&self, line: &str) -> bool {
+440-        LineSource::history(self).iter().any(|entry| entry == line)
+441-    }
+442-
+443-    /// Writes the lines read so far to `path`, adding to what is already there.
+444-    ///
+445-    /// The directory is created here rather than in [`EditSource::new`] so that
+446-    /// a first session — which has nothing to write until it ends — still
+447-    /// succeeds, and so that a session whose history cannot be written says so
+448-    /// at the moment it found out.
+449-    ///
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=40, offset=1192][0m
+[0m
+[0m$ [0mrg -n "exceeds_block_limits" -r '' --stats src/ tests/ | head; rg -n "^use |^pub struct |^struct |^impl |^const " src/repl/mod.rs | head -40
+src/repl/mod.rs:1133:        if Self::(&self.multiline_buffer, buffered.len()) {
+src/repl/mod.rs:1188:    fn (lines: &[String], bytes: usize) -> bool {
+
+2 matches
+2 matched lines
+1 files contained matches
+134 files searched
+152 bytes printed
+3966980 bytes searched
+0.001396 seconds spent searching
+13:use std::cell::RefCell;
+14:use std::collections::{HashMap, HashSet, VecDeque};
+15:use std::io::{self, Write};
+16:use std::path::{Path, PathBuf};
+17:use std::rc::Rc;
+18:use std::time::{Duration, Instant};
+27:use crate::analyzer;
+28:use crate::debugger::{lock, DebugAction, DebugSession, SharedDebugSession, StepMode};
+29:use crate::error::Error;
+30:use crate::interpreter::Vm;
+31:use crate::lexer::{Lexer, TokenKind};
+32:use crate::parser::{open_block_depth, Expr, Parser, Program, Stmt};
+33:use crate::repl::style::{strip_escapes, Paint, Style};
+34:use crate::stdlib;
+35:use crate::value::{FunctionBody, Value};
+40:const HISTORY_LIMIT: usize = 1000;
+50:const MAX_BLOCK_LINES: usize = 500;
+55:const MAX_BLOCK_BYTES: usize = 64 * 1024;
+60:const BLOCK_REPORT_LINES: usize = 20;
+68:const SCRATCH_DIR_ATTEMPTS: usize = 64;
+74:const DEBUG_PROMPT: &str = "(rb-debug) ";
+81:const DEFAULT_PROMPT: &str = ">>> ";
+88:const PROMPT_PLACEHOLDERS: [&str; 3] = ["{engine}", "{version}", "{history}"];
+100:const MAX_PROMPT_BYTES: usize = 1024;
+107:const REPEAT: &str = "!!";
+354:const QUICK_REFERENCE: &[(&str, &str)] = &[
+369:const EXAMPLES: &[(&str, &str)] = &[
+396:struct TutorialStep {
+411:const TUTORIAL: &[TutorialStep] = &[
+604:pub struct Repl {
+662:impl Repl {
+2647:impl Default for Repl {
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=60, offset=6075][0m
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -1129,9 +1129,9 @@
+ /// session.
+ fn execute_line(&mut self, input: &str) {
+     self.multiline_buffer.push(input.to_string());
+     let buffered = self.multiline_buffer.join("\n");
+-    if Self::exceeds_block_limits(&self.multiline_buffer, buffered.len()) {
++    if Self::exceeds_block_limits(self.multiline_buffer.len(), buffered.len()) {
+         self.report_buffered_block_too_large();
+         return;
+     }
+     if Self::needs_continuation(&buffered) {
+
+[0m
+Now the code fixes. Starting with the block cap on the `.edit` path (finding 4):
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -1184,10 +1184,13 @@
+ /// is still typing.
+ ///
+ /// Both limits, because either alone leaves a hole: a block of a thousand
+ /// blank lines is small in bytes, and one line of a megabyte is one line.
+-fn exceeds_block_limits(lines: &[String], bytes: usize) -> bool {
+-    lines.len() > MAX_BLOCK_LINES || bytes > MAX_BLOCK_BYTES
++///
++/// A count rather than the lines themselves, because `.edit` has a block too
++/// and holds it as the one string an editor wrote.
++fn exceeds_block_limits(lines: usize, bytes: usize) -> bool {
++    lines > MAX_BLOCK_LINES || bytes > MAX_BLOCK_BYTES
+ }
+ 
+ /// Gives up on a block that has outgrown what a session will hold, saying so
+ /// rather than buffering on.
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2474,29 +2474,62 @@
+                 "`{program}` exited with {status}; nothing was read back from it"
+             ));
+         }
+ 
+-        let edited = std::fs::read_to_string(&scratch).map_err(|error| {
+-            format!(
+-                "could not read back what `{program}` saved to {}: {error}",
+-                scratch.display()
+-            )
+-        })?;
++        let edited = self.read_edited_block(&scratch, program)?;
+         if edited.trim().is_empty() {
+             return Err(
+                 "the editor left the file empty, so there is nothing to run".to_string()
+             );
+         }
+         Ok(edited)
+     })();
+-    // The directory goes as well as the file, and whether that succeeds is
+-    // not something to report over an edit that already failed: the buffer
+-    // the user was writing is in the session, and this is the temp
+-    // directory, which the operating system reclaims anyway.
+-    let _ = std::fs::remove_dir_all(&scratch_dir);
+     outcome
+ }
+ 
++/// What `$EDITOR` saved, under the same limit a typed block is held to.
++///
++/// `.edit` is a second way into the session and the block a session holds was
++/// never a rule about the keyboard: a runaway editor — a macro that filled a
++/// buffer, a `>` where a `s` was meant — wrote a file that no typed block
++/// could have produced, and it was read whole and parsed.
++///
++/// The read is capped rather than the answer: `take` stops one byte past the
++/// limit, so a file of any size is a read of at most [`MAX_BLOCK_BYTES`] + 1
++/// bytes and the rest is never in memory. That byte over is what says "there
++/// was more than the limit", so a block exactly at it is still a block the
++/// session runs — the same boundary the typed path draws at `>`.
++fn read_edited_block(&self, path: &Path, program: &str) -> Result<String, String> {
++    use std::io::Read;
++
++    let unreadable =
++        |error: std::io::Error| -> String {
++            if error.kind() == std::io::ErrorKind::InvalidData {
++                format!("what `{program}` saved to {} is not text", path.display())
++            } else {
++                format!(
++                    "could not read back what `{program}` saved to {}: {error}",
++                    path.display()
++                )
++            }
++        };
++    let mut block = String::new();
++    std::fs::File::open(path)
++        .map_err(unreadable)?
++        .take(MAX_BLOCK_BYTES as u64 + 1)
++        .read_to_string(&mut block)
++        .map_err(unreadable)?;
++
++    if Self::exceeds_block_limits(block.lines().count(), block.len()) {
++        return Err(format!(
++            "the block `{program}` saved is past what a session holds for one \
++             block — at most {MAX_BLOCK_LINES} lines or {MAX_BLOCK_BYTES} bytes — \
++             so nothing was read back from it"
++        ));
++    }
++    Ok(block)
++}
++
+ /// A directory under `parent` that only this user can reach, and the one the
+ /// editor is opened over.
+ ///
+ /// `/tmp` is a world-writable directory that every local user shares, so a
+
+[0m
+Now the `.edit` read path:
+[0m→ [0mRead src/repl/mod.rs[90m [limit=80, offset=2444][0m
+Now the scope guard for the scratch directory (finding 5):
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2456,35 +2456,32 @@
+     let mut command = std::process::Command::new(program);
+     command.args(parts);
+ 
+     let scratch_dir = self.private_scratch_dir(scratch_dir)?;
+-    let scratch = scratch_dir.join("redblue-edit.rb");
++    let scratch = scratch_dir.path().join("redblue-edit.rb");
+     self.write_scratch_file(&scratch)?;
+ 
+-    // Past this line the scratch file exists and holds the session's own
+-    // buffer, so every path out of here takes the directory with it: an edit
+-    // that failed three times in a row must not leave three copies of what
+-    // the reader was writing in the temp directory.
+-    let outcome = (|| {
+-        let status = command
+-            .arg(&scratch)
+-            .status()
+-            .map_err(|error| format!("could not run `{program}`: {error}"))?;
+-        if !status.success() {
+-            return Err(format!(
+-                "`{program}` exited with {status}; nothing was read back from it"
+-            ));
+-        }
++    // From here the scratch file holds the session's own block, and
++    // `scratch_dir` goes out of scope on every way out of this function — a
++    // return, a `?`, a panic. An edit that failed three times in a row must
++    // not leave three copies of what the reader was writing in the temp
++    // directory, and a removal written at the end of each path is one of
++    // those paths getting it wrong.
++    command
++        .arg(&scratch)
++        .status()
++        .map_err(|error| format!("could not run `{program}`: {error}"))?;
++    if !command_status_success {
++        return Err(format!(
++            "`{program}` exited with {command_status}; nothing was read back from it"
++        ));
++    }
+ 
+-        let edited = self.read_edited_block(&scratch, program)?;
+-        if edited.trim().is_empty() {
+-            return Err(
+-                "the editor left the file empty, so there is nothing to run".to_string()
+-            );
+-        }
+-        Ok(edited)
+-    })();
+-    outcome
++    let edited = self.read_edited_block(&scratch, program)?;
++    if edited.trim().is_empty() {
++        return Err("the editor left the file empty, so there is nothing to run".to_string());
++    }
++    Ok(edited)
+ }
+ 
+ /// What `$EDITOR` saved, under the same limit a typed block is held to.
+ ///
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2465,13 +2465,13 @@
+ // return, a `?`, a panic. An edit that failed three times in a row must
+ // not leave three copies of what the reader was writing in the temp
+ // directory, and a removal written at the end of each path is one of
+ // those paths getting it wrong.
+-command
++let status = command
+     .arg(&scratch)
+     .status()
+     .map_err(|error| format!("could not run `{program}`: {error}"))?;
+-if !command_status_success {
++if !status.success() {
+     return Err(format!(
+         "`{program}` exited with {command_status}; nothing was read back from it"
+     ));
+ }
+
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=70, offset=2534][0m
+Now the `ScratchDir` guard type and `private_scratch_dir` (findings 5 and 13):
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2535,24 +2535,33 @@
+ /// symlink. `std::fs::write` follows such a link and truncates what it points
+ /// at, so the buffer would have been written through it into a file the
+ /// reader can write, and that path handed to `$EDITOR`.
+ ///
+-/// The name is therefore refused if it already exists rather than reused:
+-/// `create_dir` does not `create_dir_all`, so a directory planted under that
+-/// name with someone else's permissions is a failure instead of a place this
+-/// session writes into. Serial after serial, until one of them is free.
+-/// Nothing inside is readable by anyone else, so nothing inside can be
+-/// planted by anyone else either.
+-fn private_scratch_dir(&self, parent: &Path) -> Result<PathBuf, String> {
++/// A name that is taken is a name this session does not write into, and a
++/// name that is free is not reused either — it is taken, not borrowed.
++/// `create_dir` is `mkdir`, not `mkdir -p`, so a directory planted under a
++/// serial with someone else's permissions is reported as taken and the search
++/// moves on; and because it was never entered, nothing of the session's was
++/// ever written inside it. The search runs [`SCRATCH_DIR_ATTEMPTS`] serials
++/// before it reports that it could not have a directory of its own, and what
++/// it reports then is the whole range it tried, not a generic failure.
++///
++/// Nothing inside a directory it did make is reachable by anyone else, so
++/// nothing inside it can have been planted by anyone else either.
++fn private_scratch_dir(&self, parent: &Path) -> Result<ScratchDir, String> {
+     std::fs::create_dir_all(parent).map_err(|error| {
+         format!("could not make a scratch directory in {parent:?}: {error}")
+     })?;
+     for serial in 0..SCRATCH_DIR_ATTEMPTS {
+         let dir = parent.join(format!("redblue-edit-{}-{serial}", std::process::id()));
+         match std::fs::create_dir(&dir) {
+             Ok(()) => {
+-                Self::lock_down_dir(&dir)?;
+-                return Ok(dir);
++                // Owned from here, and before it is locked down: a
++                // `chmod` that failed is a failure this session made the
++                // directory for, so the directory goes with it.
++                let owned = ScratchDir::new(dir);
++                Self::lock_down_dir(owned.path())?;
++                return Ok(owned);
+             }
+             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+             Err(error) => {
+                 return Err(format!(
+
+[0m
+[0m$ [0mrg -n "^impl Default for Repl" -B 30 src/repl/mod.rs | head -45
+2659-    /// back, and keeps everything when the editor could not be opened at all.
+2660-    fn edit_buffer(&mut self) {
+2661-        let editor = Self::editor_program();
+2662-        let scratch = std::env::temp_dir();
+2663-        if let Err(message) = self.edit_with(editor.as_deref(), &scratch) {
+2664-            println!(
+2665-                "{}",
+2666-                self.style.paint(Paint::Error, &format!("Error: {message}"))
+2667-            );
+2668-        }
+2669-    }
+2670-
+2671-    /// Prints [`EXAMPLES`], which is the same list the tests at the bottom of
+2672-    /// this module run. Each one is code the session has run and the analyzer has
+2673-    /// accepted, so `:example` cannot advertise a feature that is not there — the
+2674-    /// old examples promised `say "Hello, {{name}}!"`, and `say` printed
+2675-    /// `Hello, {{name}}!`.
+2676-    fn show_examples(&self) {
+2677-        println!("Example Redblue Code:");
+2678-        println!();
+2679-        for (caption, source) in EXAMPLES {
+2680-            println!("  {}", caption);
+2681-            for line in source.lines() {
+2682-                println!("  {}", line);
+2683-            }
+2684-            println!();
+2685-        }
+2686-    }
+2687-}
+2688-
+2689:impl Default for Repl {
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2677,16 +2677,50 @@
+         println!("Example Redblue Code:");
+         println!();
+         for (caption, source) in EXAMPLES {
+             println!("  {}", caption);
+-            for line in source.lines() {
+-                println!("  {}", line);
++for line in source.lines() {
++                println!("    {}", line);
+             }
+             println!();
+         }
+     }
+ }
+ 
++/// A directory this session made for one `.edit`, and the thing that takes it
++/// away again.
++///
++/// The removal is in `drop`, not at the end of the edit, because an edit has
++/// more ways out than the one it succeeds by: the editor is not there, it exits
++/// badly, its save cannot be read back, the block it saved is past what a
++/// session holds. A removal written on each of those is a list to keep in step
++/// with the paths above it, and a list is exactly what grows a new path and
++/// forgets it. Owned rather than borrowed, so holding this is what makes the
++/// directory exist: nobody can reach the file inside without going through it.
++struct ScratchDir(PathBuf);
++
++impl ScratchDir {
++    /// Makes `path` a directory this session owns.
++    fn new(path: PathBuf) -> Self {
++        ScratchDir(path)
++    }
++
++    /// The directory the editor is opened over.
++    fn path(&self) -> &Path {
++        &self.0
++    }
++}
++
++impl Drop for ScratchDir {
++    fn drop(&mut self) {
++        // Whether this succeeds is not something to report over an edit that
++        // already failed: the block the user was writing is in the session, and
++        // this is the temporary directory, which the operating system reclaims
++        // anyway.
++        let _ = std::fs::remove_dir_all(&self.0);
++    }
++}
++
+ impl Default for Repl {
+     fn default() -> Self {
+         Self::new()
+     }
+
+[0m
+[0m$ [0mrg -n "for line in source.lines" -A 6 src/repl/mod.rs | cat -A | sed -n '1,12p' | sed 's/\$$//' | head -12
+1569:            for line in source.lines() {
+1570-                println!("  {}", line);
+1571-            }
+1572-        }
+1573-        println!();
+1574-    }
+1575-
+--
+2681:for line in source.lines() {
+2682-                println!("    {}", line);
+2683-            }
+2684-            println!();
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=20, offset=2676][0m
+[0m✗ [0mEdit src/repl/mod.rs failed
+[91m[1mError: [0mNo changes to apply: oldString and newString are identical.
+[0m✗ [0mEdit src/repl/mod.rs failed
+[91m[1mError: [0mNo changes to apply: oldString and newString are identical.
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2677,9 +2677,9 @@
+         println!("Example Redblue Code:");
+         println!();
+         for (caption, source) in EXAMPLES {
+             println!("  {}", caption);
+-for line in source.lines() {
++            for line in source.lines() {
+                 println!("    {}", line);
+             }
+             println!();
+         }
+
+[0m
+[0m$ [0mcargo build 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0425][0m[1m: cannot find value `command_status` in this scope[0m
+    [1m[94m--> [0msrc/repl/mod.rs:2475:43
+     [1m[94m|[0m
+[1m[94m2475[0m [1m[94m|[0m                 "`{program}` exited with {command_status}; nothing was read back from it"
+     [1m[94m|[0m                                           [1m[91m^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1mFor more information about this error, try `rustc --explain E0425`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib) due to 1 previous error
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=30, offset=2462][0m
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2471,9 +2471,9 @@
+     .status()
+     .map_err(|error| format!("could not run `{program}`: {error}"))?;
+ if !status.success() {
+     return Err(format!(
+-        "`{program}` exited with {command_status}; nothing was read back from it"
++        "`{program}` exited with {status}; nothing was read back from it"
+     ));
+ }
+ 
+ let edited = self.read_edited_block(&scratch, program)?;
+
+[0m
+[0m$ [0mcargo build 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 2.92s
+[0m
+Now finding 7 — `reset_session` must clear the tour state:
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -1167,14 +1167,24 @@
+ /// because it is a wrong answer rather than an absence.
+ ///
+ /// The history is left alone: it is the record of what was typed, and a reset
+ /// is not a new session in the sense that the earlier lines were never typed.
++///
++/// So is the tour, though, and that is the newer half of the same question. A
++/// step is taken by running its snippet and a snippet needs the bindings the
++/// step before it bound, so a session that has been reset mid-tour is a
++/// session holding a hint for a step of a program it no longer has: `set name
++/// to "World"`, `:reset`, and `:hint` answers as though `name` were about to
++/// be asked for. A reset forgets what it was, and where in the tour it was is
++/// part of what it was.
+ fn reset_session(&mut self) {
+     self.vm = Vm::new();
+     self.variables.clear();
+     self.definitions.clear();
+     self.multiline_buffer.clear();
+     self.in_multiline = false;
++    self.tutorial_step = None;
++    self.tutorial_typed.clear();
+     // The transcript with them: an export of a session that had forgotten the
+     // lines it ran would claim a session that no longer exists ran them.
+     self.transcript.clear();
+     println!("REPL state reset.");
+
+[0m
+[0m→ [0mRead src/repl/editor.rs[90m [limit=70, offset=826][0m
+Now the editor.rs test fixes (findings 8 and 14):
+[0m
+[0m← [0mEdit src/repl/editor.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/editor.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/editor.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/editor.rs
+@@ -862,21 +862,34 @@
+ );
+ assert_eq!(
+     source.signature_hint("say split(", 11),
+     None,
+-    "and the end of the line itself is not after the bracket either"
++    "one byte past the end of the line is still past it"
+ );
++let at_the_end = source.signature_hint("say split(", 10);
++assert!(
++    at_the_end.is_some(),
++    "the end of the line *is* after the bracket, which is the position the \
++     hint is wanted at: {at_the_end:?}"
++);
+ assert_eq!(
+     source.signature_hint("say é(", 5),
+     None,
+     "a cursor left inside a two-byte character is not a position to slice \
+      at, and the whole line is refused rather than half of it"
+ );
+ assert_eq!(
++    source.signature_hint("say é(", 6),
++    None,
++    "and a cursor immediately before the bracket is not after it either, \
++     whichever side of the wide character it sits on"
++);
++assert_eq!(
+     source.signature_hint("say é(", 7),
+     None,
+-    "while a cursor at the end of that line is still not after a `(` that \
+-     is the last thing in it"
++    "while a cursor at the end of that line *is* after the `(` — so what \
++     is refused there is the name: `é` is not a builtin, and a name the \
++     language does not have has no shape however wide the character is"
+ );
+ assert_eq!(
+     source.signature_hint("say ", 4),
+     None,
+
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=50, offset=6519][0m
+Now finding 14 — the GNU-only `stat -c` in a `#[cfg(unix)]` test:
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6525,9 +6525,15 @@
+ /// What the reader was writing is theirs: while the editor is open, the
+ /// file it was handed is readable by its owner and nobody else, and it
+ /// sits in a directory of its own rather than in a world-writable one
+ /// where a name this session would pick could be planted beforehand.
+-#[cfg(unix)]
++///
++/// Linux, not `cfg(unix)`: the editor reports the modes with
++/// `stat -c '%a'`, which is GNU. BSD and macOS spell that `-f '%Lp'`, so
++/// on those hosts the script would write two empty strings and the block
++/// would not be the program this asserts on. The property is pinned where
++/// the command that reads it back exists.
++#[cfg(target_os = "linux")]
+ #[test]
+ fn edge_the_scratch_file_is_readable_by_its_owner_and_nobody_else() {
+     let dir = scratch_dir("edit-private-scratch");
+     // The editor reports back what it was given: the modes of the file it
+
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=130, offset=6566][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=130, offset=6696][0m
+Now let me add the new tests:
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6741,8 +6741,169 @@
+     );
+     assert_no_scratch_left(&dir);
+ }
+ 
++/// The directory the editor was opened over is taken with it however the
++/// edit ended — including on the paths that end before the editor runs.
++///
++/// The removal was once written at the end of the successful path and at
++/// the end of the failing one, and the two paths between them — a lock
++/// that failed, a buffer that could not be written — returned before
++/// either, so they left the directory in the temp directory holding the
++/// block. The removal is now in `Drop`, which every path out of the edit
++/// goes through whatever its shape.
++///
++/// A real `chmod` or write failure cannot be forced without a second user
++/// or a full disk, so the guard is driven where it can be: an owned
++/// directory, given up on part-way through the work, is gone. The second
++/// half is a genuine I/O failure, reached end to end.
++#[test]
++fn edge_a_scratch_directory_is_taken_with_it_however_the_edit_ended() {
++    let dir = scratch_dir("edit-scratch-dir-guard");
++    let repl = Repl::new();
++
++    let owned = repl
++        .private_scratch_dir(&dir)
++        .expect("a free serial makes a directory of its own");
++    let block = owned.path().join("redblue-edit.rb");
++    repl.write_scratch_file(&block)
++        .expect("the block should be writable inside a directory of its own");
++    drop(owned);
++    assert!(
++        !block.exists(),
++        "giving the directory up part-way through is how `?` leaves it"
++    );
++    assert_no_scratch_left(&dir);
++
++    #[cfg(unix)]
++    {
++        // A real failure inside the edit: the editor saves a directory
++        // where the file was, so the read back cannot answer.
++        let repl = &mut Repl::new();
++        feed(repl, &["repeat 2 times"]);
++        let replacing = script_editor(&dir, "rm -f \"$1\" && mkdir \"$1\"");
++        let error = repl
++            .edit_with(Some(&replacing), &dir)
++            .expect_err("a directory where the save was is not a program");
++        assert!(
++            error.contains("could not read back"),
++            "and it is the read back that is reported: {error}"
++        );
++        assert_no_scratch_left(&dir);
++        assert_eq!(
++            repl.multiline_buffer,
++            vec!["repeat 2 times".to_string()],
++            "with the block the session was holding still in the buffer"
++        );
++    }
++}
++
++/// A block past what a session holds is a block the session refuses to
++/// read, at the line limit and at the byte limit, and a block exactly at
++/// either one is still a block it runs.
++///
++/// `.edit` is the other way into the session and the limit was not on
++/// the keyboard: whatever an editor wrote was read whole and parsed, so
++/// a runaway `>` could hand the session a block that no typed line could
++/// have made. Both sides of both limits, because a limit drawn one byte
++/// or one line too early is a limit that refuses a block it should run.
++#[cfg(unix)]
++#[test]
++fn edge_a_block_the_editor_saved_past_the_session_limit_is_refused() {
++    let dir = scratch_dir("edit-too-large");
++    let lines = |count: usize| -> String {
++        format!(
++            "i=0; while [ $i -lt {count} ]; do echo \"set v to $i\"; \
++             i=$((i+1)); done > \"$1\""
++        )
++    };
++    // `set big to "` and the closing quote and the newline, so a payload
++    // of this many bytes is a file of exactly the limit.
++    let overhead = "set big to \"".len() + 2;
++    let payload = |bytes: usize| -> String {
++        format!(
++            "printf 'set big to \"%s\"\\n' \
++             \"$(head -c {bytes} /dev/zero | tr '\\000' 'x')\" > \"$1\""
++        )
++    };
++
++    let mut repl = Repl::new();
++    feed(&mut repl, &["repeat 2 times"]);
++
++    let at_line_limit = script_editor(&dir, &lines(super::MAX_BLOCK_LINES));
++    repl.edit_with(Some(&at_line_limit), &dir)
++        .expect("a block exactly at the line limit is one the session holds");
++    assert_eq!(
++        repl.lookup("v"),
++        Some(&Value::Number((super::MAX_BLOCK_LINES - 1) as f64)),
++        "and it ran: the last of its lines was the one that set it"
++    );
++
++    let over_line_limit = script_editor(&dir, &lines(super::MAX_BLOCK_LINES + 1));
++    let error = repl
++        .edit_with(Some(&over_line_limit), &dir)
++        .expect_err("one line past the limit is past it");
++    assert!(
++        error.contains("nothing was read back from it"),
++        "and it says the block was not read rather than that it did not run: \
++         {error}"
++    );
++    assert_eq!(
++        repl.multiline_buffer,
++        vec!["repeat 2 times".to_string()],
++        "with the block the session was holding untouched"
++    );
++
++    let at_byte_limit = script_editor(&dir, &payload(super::MAX_BLOCK_BYTES - overhead));
++    repl.edit_with(Some(&at_byte_limit), &dir)
++        .expect("a block exactly at the byte limit is one the session holds");
++    assert!(
++        repl.lookup("big").is_some(),
++        "and it ran: the string it set is bound"
++    );
++
++    let over_byte_limit =
++        script_editor(&dir, &payload(super::MAX_BLOCK_BYTES - overhead + 1));
++    let error = repl
++        .edit_with(Some(&over_byte_limit), &dir)
++        .expect_err("one byte past the limit is past it");
++    assert!(
++        error.contains("nothing was read back from it"),
++        "and it is refused before it is read: {error}"
++    );
++    assert_eq!(
++        repl.multiline_buffer,
++        vec!["repeat 2 times".to_string()],
++        "with the block the session was holding untouched"
++    );
++    assert_no_scratch_left(&dir);
++}
++
++/// An `$EDITOR` that names nothing at all is a different mistake from one
++/// that names a program that is not there, and it is refused by name
++/// rather than spawned.
++///
++/// `editor_program` cannot hand this over — it filters the empty and the
++/// blank away before `.edit` sees them — so `edit_in` is driven directly
++/// with what `$EDITOR` can actually hold. Nothing is written either way:
++/// the name is refused before there is a directory to write it into.
++#[test]
++fn edge_an_editor_that_names_nothing_is_refused_rather_than_spawned() {
++    let dir = scratch_dir("edit-blank-editor");
++    let repl = Repl::new();
++
++    for blank in ["", "   ", "\t "] {
++        let error = repl
++            .edit_in(Some(blank), &dir)
++            .expect_err("a name with no program in it is not an editor");
++        assert!(
++            error.contains("is not a program that can be run"),
++            "and the message says the name is not a program: {error}"
++        );
++    }
++    assert_no_scratch_left(&dir);
++}
++
+ /// The commands are commands: they parse, they are completable, and
+ /// `:help` names them.
+ ///
+ /// `.edit` is checked by parsing rather than by dispatching, on purpose:
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6826,11 +6826,11 @@
+     )
+ };
+ 
+ let mut repl = Repl::new();
+-feed(&mut repl, &["repeat 2 times"]);
+ 
+ let at_line_limit = script_editor(&dir, &lines(super::MAX_BLOCK_LINES));
++feed(&mut repl, &["repeat 2 times"]);
+ repl.edit_with(Some(&at_line_limit), &dir)
+     .expect("a block exactly at the line limit is one the session holds");
+ assert_eq!(
+     repl.lookup("v"),
+@@ -6838,8 +6838,9 @@
+     "and it ran: the last of its lines was the one that set it"
+ );
+ 
+ let over_line_limit = script_editor(&dir, &lines(super::MAX_BLOCK_LINES + 1));
++feed(&mut repl, &["repeat 2 times"]);
+ let error = repl
+     .edit_with(Some(&over_line_limit), &dir)
+     .expect_err("one line past the limit is past it");
+ assert!(
+@@ -6853,8 +6854,9 @@
+     "with the block the session was holding untouched"
+ );
+ 
+ let at_byte_limit = script_editor(&dir, &payload(super::MAX_BLOCK_BYTES - overhead));
++feed(&mut repl, &["repeat 2 times"]);
+ repl.edit_with(Some(&at_byte_limit), &dir)
+     .expect("a block exactly at the byte limit is one the session holds");
+ assert!(
+     repl.lookup("big").is_some(),
+@@ -6862,8 +6864,9 @@
+ );
+ 
+ let over_byte_limit =
+     script_editor(&dir, &payload(super::MAX_BLOCK_BYTES - overhead + 1));
++feed(&mut repl, &["repeat 2 times"]);
+ let error = repl
+     .edit_with(Some(&over_byte_limit), &dir)
+     .expect_err("one byte past the limit is past it");
+ assert!(
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6777,10 +6777,10 @@
+ #[cfg(unix)]
+ {
+     // A real failure inside the edit: the editor saves a directory
+     // where the file was, so the read back cannot answer.
+-    let repl = &mut Repl::new();
+-    feed(repl, &["repeat 2 times"]);
++    let mut repl = Repl::new();
++    feed(&mut repl, &["repeat 2 times"]);
+     let replacing = script_editor(&dir, "rm -f \"$1\" && mkdir \"$1\"");
+     let error = repl
+         .edit_with(Some(&replacing), &dir)
+         .expect_err("a directory where the save was is not a program");
+
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=60, offset=6325][0m
+Now the reset/tour test (finding 7) and the serial-search test (finding 13):
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6490,8 +6490,60 @@
+         "and a step that failed to run is a step that has not been taken"
+     );
+ }
+ 
++/// A reset is a session that has forgotten what it was, and where in the tour
++/// it had got to is part of that.
++///
++/// A step is taken by running its snippet and a snippet needs the
++/// bindings the steps before it bound, so a session reset half-way
++/// through the tour with the tour still on the old step is a session
++/// answering `:hint` about a program it no longer holds. Half a step is
++/// the interesting half: the accumulation that recognises a step of two
++/// programs outlived the bindings it was accumulated from.
++#[test]
++fn edge_a_reset_forgets_the_tour_it_was_walked_through() {
++    let mut repl = Repl::new();
++    feed(&mut repl, &[":tutorial"]);
++    feed(&mut repl, &["set name to \"World\""]);
++
++    assert_eq!(repl.tutorial_step, Some(0), "mid-step, before the reset");
++    assert!(
++        !repl.tutorial_typed.is_empty(),
++        "with half of the step's snippet accumulated: {:?}",
++        repl.tutorial_typed
++    );
++
++    feed(&mut repl, &[":reset"]);
++
++    assert_eq!(
++        repl.tutorial_step, None,
++        "a reset session is not part-way through a tour"
++    );
++    assert!(
++        repl.tutorial_typed.is_empty(),
++        "and the half of the snippet it had is gone with it: {:?}",
++        repl.tutorial_typed
++    );
++    let hint = hint_lines(repl.tutorial_step, &Style::forced(false));
++    assert!(
++        hint[0].contains(":tutorial"),
++        "so the hint asks for a tour rather than answering about a step \
++         whose bindings are gone: {:?}",
++        hint[0]
++    );
++
++    // Which is what makes the next tour start clean rather than
++    // half-way through the one before it.
++    feed(&mut repl, &[":tutorial"]);
++    assert_eq!(repl.tutorial_step, Some(0), "and a new tour starts at step one");
++    assert!(
++        repl.tutorial_typed.is_empty(),
++        "with nothing of the last one still half-typed: {:?}",
++        repl.tutorial_typed
++    );
++}
++
+ /// The round trip: the block the session is holding goes out to the
+ /// editor, and what the editor wrote comes back as a program that ran.
+ ///
+ /// Driven through [`Repl::edit_with`], the entry point the command uses,
+
+[0m
+[0m$ [0mrg -n "fn feed\b" -A 20 src/repl/mod.rs | head -40
+2777:    fn feed(repl: &mut Repl, lines: &[&str]) {
+2778-        for line in lines {
+2779-            repl.history.push((*line).to_string());
+2780-            if repl.handle_command(line) {
+2781-                continue;
+2782-            }
+2783-            repl.execute_line(line);
+2784-        }
+2785-    }
+2786-
+2787-    /// Feeds `count` copies of `line` to a session, as a piped input would.
+2788-    fn feed_repeatedly(repl: &mut Repl, line: &str, count: usize) {
+2789-        for _ in 0..count {
+2790-            repl.history.push(line.to_string());
+2791-            repl.execute_line(line);
+2792-        }
+2793-    }
+2794-
+2795-    /// A line source that answers with what the test tells it to, so the read
+2796-    /// loop can be driven through the parts a terminal owns — an interrupt, end
+2797-    /// of input, a failed read — without one.
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6614,34 +6614,76 @@
+     assert_no_scratch_left(&dir);
+ }
+ 
+ /// The scratch file is created, and never opened at a name somebody else
+-/// could have got there first: a symlink at that path has to be a refusal,
+-/// not a buffer written through it.
++/// could have got there first: a name that is taken is a name the session
++/// does not write into.
++///
++/// The name the session would pick is `redblue-edit-<pid>-<serial>`, so
++/// that is the name planted here — planting the pid alone would test a
++/// path nothing ever opens.
+ #[cfg(unix)]
+ #[test]
+ fn edge_a_scratch_path_already_taken_is_refused_rather_than_followed() {
+     let dir = scratch_dir("edit-symlink-scratch");
+-    let planted = dir.join("redblue-edit-0");
++    let planted = dir.join(format!("redblue-edit-{}-0", std::process::id()));
+     fs::create_dir(&planted).expect("the planted directory should be creatable");
++    fs::write(planted.join("decoy.rb"), "set planted to 1\n")
++        .expect("the planted directory should be writable");
+ 
+     let mut repl = Repl::new();
+     feed(&mut repl, &["repeat 2 times"]);
+-    let missing = dir.join("no-such-editor").to_string_lossy().into_owned();
++    let editor = script_editor(&dir, "printf 'set edited to 1\\n' > \"$1\"");
+ 
+-    // The name is taken, so the session takes the next one rather than
++    // The name is taken, so the session takes the next serial rather than
+     // writing into a directory it did not make.
+-    repl.edit_in(Some(&missing), &dir)
+-        .expect_err("an editor that is not there cannot edit anything");
+-    assert_eq!(
+-        fs::read_dir(&planted)
+-            .expect("the planted directory should still be readable")
+-            .count(),
+-        0,
+-        "and nothing of the session's was written into it"
++    repl.edit_with(Some(&editor), &dir)
++        .expect("the next serial is a directory of its own, so the edit works");
++    assert!(
++        !repl.lookup("planted").is_some(),
++        "and nothing of the session's ran out of the planted directory"
+     );
++    assert!(
++        repl.vm.user_names().contains(&"edited".to_string()),
++        "while the editor's own block ran: {:?}",
++        repl.vm.user_names()
++    );
++    assert_no_scratch_left(&dir);
++    assert!(
++        planted.join("decoy.rb").exists(),
++        "and what the planter left is still there, untouched"
++    );
+ }
+ 
++/// A name is not reused, it is skipped — and when every name this session
++/// would try is taken, it says which range it tried rather than reporting
++/// a generic failure.
++///
++/// `/tmp` is shared, so "the name is free" is not a thing a session can
++/// assume; the honest answer is to search, and to report the search when
++/// it runs out. Sixty-four serials of `redblue-edit-<pid>-<serial>`.
++#[test]
++fn edge_every_scratch_name_taken_is_reported_as_the_range_it_tried() {
++    let dir = scratch_dir("edit-no-free-serial");
++    for serial in 0..super::SCRATCH_DIR_ATTEMPTS {
++        fs::create_dir(dir.join(format!("redblue-edit-{}-{serial}", std::process::id())))
++            .expect("a planted directory should be creatable");
++    }
++    let repl = Repl::new();
++
++    let error = repl
++        .private_scratch_dir(&dir)
++        .expect_err("no free name is not a directory of its own");
++
++    let last = super::SCRATCH_DIR_ATTEMPTS - 1;
++    assert!(
++        error.contains(&format!("redblue-edit-{}-0", std::process::id()))
++            && error.contains(&format!("redblue-edit-{}-{last}", std::process::id())),
++        "and the message names both ends of the search: {error}"
++    );
++    assert_no_scratch_left(&dir);
++}
++
+ /// No editor named is a clean error that says which variable to set, and
+ /// the block the session was holding survives it.
+ #[test]
+ fn edge_edit_without_an_editor_names_the_variable_and_keeps_the_buffer() {
+
+[0m
+Now the serial-search test (finding 13) and fixing the planted-name test:
+[0m$ [0mcargo build --tests 2>&1 | tail -40
+[1m[96mhelp[0m: if you import `MAX_BLOCK_BYTES`, refer to it directly
+     [1m[94m|[0m
+[1m[94m6951[0m [91m- [0m            let at_byte_limit = script_editor(&dir, &payload([91msuper::[0mMAX_BLOCK_BYTES - overhead));
+[1m[94m6951[0m [92m+ [0m            let at_byte_limit = script_editor(&dir, &payload(MAX_BLOCK_BYTES - overhead));
+     [1m[94m|[0m
+
+[1m[91merror[E0425][0m[1m: cannot find value `MAX_BLOCK_BYTES` in module `super`[0m
+    [1m[94m--> [0msrc/repl/mod.rs:6961:53
+     [1m[94m|[0m
+[1m[94m6961[0m [1m[94m|[0m                 script_editor(&dir, &payload(super::MAX_BLOCK_BYTES - overhead + 1));
+     [1m[94m|[0m                                                     [1m[91m^^^^^^^^^^^^^^^[0m [1m[91mnot found in `super`[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: consider importing this constant
+     [1m[94m|[0m
+[1m[94m6151[0m [92m+ [0m        [92muse crate::repl::MAX_BLOCK_BYTES;[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: if you import `MAX_BLOCK_BYTES`, refer to it directly
+     [1m[94m|[0m
+[1m[94m6961[0m [91m- [0m                script_editor(&dir, &payload([91msuper::[0mMAX_BLOCK_BYTES - overhead + 1));
+[1m[94m6961[0m [92m+ [0m                script_editor(&dir, &payload(MAX_BLOCK_BYTES - overhead + 1));
+     [1m[94m|[0m
+
+[1m[91merror[E0277][0m[1m: `ScratchDir` doesn't implement `Debug`[0m
+    [1m[94m--> [0msrc/repl/mod.rs:6675:18
+     [1m[94m|[0m
+[1m[94m6675[0m [1m[94m|[0m                 .expect_err("no free name is not a directory of its own");
+     [1m[94m|[0m                  [1m[91m^^^^^^^^^^[0m [1m[91mthe trait `Debug` is not implemented for `ScratchDir`[0m
+     [1m[94m|[0m
+[1m[92mnote[0m: required by a bound in `std::result::Result::<T, E>::expect_err`
+    [1m[94m--> [0m/rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/core/src/result.rs:1292:4
+[1m[96mhelp[0m: consider annotating `ScratchDir` with `#[derive(Debug)]`
+     [1m[94m|[0m
+[1m[94m2709[0m [92m+ #[derive(Debug)][0m
+[1m[94m2710[0m [1m[94m|[0m struct ScratchDir(PathBuf);
+     [1m[94m|[0m
+
+[1mSome errors have detailed explanations: E0277, E0425.[0m
+[1mFor more information about an error, try `rustc --explain E0277`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib test) due to 8 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m✗ [0mEdit src/repl/mod.rs failed
+[91m[1mError: [0mCould not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.
+[0m
+[0m$ [0mrg -n "struct ScratchDir" -B 2 src/repl/mod.rs
+2707-/// forgets it. Owned rather than borrowed, so holding this is what makes the
+2708-/// directory exist: nobody can reach the file inside without going through it.
+2709:struct ScratchDir(PathBuf);
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2705,8 +2705,9 @@
+ /// session holds. A removal written on each of those is a list to keep in step
+ /// with the paths above it, and a list is exactly what grows a new path and
+ /// forgets it. Owned rather than borrowed, so holding this is what makes the
+ /// directory exist: nobody can reach the file inside without going through it.
++#[derive(Debug)]
+ struct ScratchDir(PathBuf);
+ 
+ impl ScratchDir {
+     /// Makes `path` a directory this session owns.
+
+[0m
+[0m$ [0mrg -n "use crate::repl::\{hint_lines, tutorial_lines, TUTORIAL\};" src/repl/mod.rs
+6158:        use crate::repl::{hint_lines, tutorial_lines, TUTORIAL};
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6154,9 +6154,12 @@
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ use super::{feed, Repl};
+ use crate::repl::style::{Paint, Style};
+-use crate::repl::{hint_lines, tutorial_lines, TUTORIAL};
++use crate::repl::{
++    hint_lines, tutorial_lines, MAX_BLOCK_BYTES, MAX_BLOCK_LINES, SCRATCH_DIR_ATTEMPTS,
++    TUTORIAL,
++};
+ use crate::value::Value;
+ 
+ /// A scratch directory under the checkout, unique per test so two running
+ /// in parallel cannot collide.
+
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+p='src/repl/mod.rs'
+s=open(p).read()
+# replace super::MAX_BLOCK_BYTES / super::MAX_BLOCK_LINES / super::SCRATCH_DIR_ATTEMPTS within onboarding tests
+s=s.replace('super::MAX_BLOCK_BYTES','MAX_BLOCK_BYTES').replace('super::MAX_BLOCK_LINES','MAX_BLOCK_LINES').replace('super::SCRATCH_DIR_ATTEMPTS','SCRATCH_DIR_ATTEMPTS')
+open(p,'w').write(s)
+EOF
+cargo build --tests 2>&1 | tail -40
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0425][0m[1m: cannot find value `MAX_BLOCK_LINES` in this scope[0m
+    [1m[94m--> [0msrc/repl/mod.rs:3763:54
+     [1m[94m|[0m
+[1m[94m3763[0m [1m[94m|[0m         feed_repeatedly(&mut repl, r#"    say "x""#, MAX_BLOCK_LINES + 10);
+     [1m[94m|[0m                                                      [1m[91m^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: consider importing this constant
+     [1m[94m|[0m
+[1m[94m2742[0m [92m+ [0m    [92muse crate::repl::MAX_BLOCK_LINES;[0m
+     [1m[94m|[0m
+
+[1m[91merror[E0425][0m[1m: cannot find value `MAX_BLOCK_BYTES` in this scope[0m
+    [1m[94m--> [0msrc/repl/mod.rs:3789:53
+     [1m[94m|[0m
+[1m[94m3789[0m [1m[94m|[0m         let long = format!("say \"{}\"", "a".repeat(MAX_BLOCK_BYTES / 4));
+     [1m[94m|[0m                                                     [1m[91m^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: consider importing this constant
+     [1m[94m|[0m
+[1m[94m2742[0m [92m+ [0m    [92muse crate::repl::MAX_BLOCK_BYTES;[0m
+     [1m[94m|[0m
+
+[1m[91merror[E0425][0m[1m: cannot find value `MAX_BLOCK_BYTES` in this scope[0m
+    [1m[94m--> [0msrc/repl/mod.rs:3795:13
+     [1m[94m|[0m
+[1m[94m3795[0m [1m[94m|[0m             MAX_BLOCK_BYTES
+     [1m[94m|[0m             [1m[91m^^^^^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: consider importing this constant
+     [1m[94m|[0m
+[1m[94m2742[0m [92m+ [0m    [92muse crate::repl::MAX_BLOCK_BYTES;[0m
+     [1m[94m|[0m
+
+[1mFor more information about this error, try `rustc --explain E0425`.[0m
+[1m[91merror[0m: could not compile `redblue` (lib test) due to 3 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='src/repl/mod.rs'
+s=open(p).read()
+s=s.replace('feed_repeatedly(&mut repl, r#"    say "x""#, MAX_BLOCK_LINES + 10);','feed_repeatedly(&mut repl, r#"    say "x""#, super::MAX_BLOCK_LINES + 10);')
+s=s.replace('let long = format!("say \\"{}\\"", "a".repeat(MAX_BLOCK_BYTES / 4));','let long = format!("say \\"{}\\"", "a".repeat(super::MAX_BLOCK_BYTES / 4));')
+s=s.replace('''            MAX_BLOCK_BYTES''','''            super::MAX_BLOCK_BYTES''')
+open(p,'w').write(s)
+EOF
+cargo build --tests 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 14.13s
+[0m
+[0m$ [0mcargo test --lib repl:: 2>&1 | tail -40
+test repl::tests::edge_a_block_that_outgrows_the_buffer_is_dropped_not_kept ... ok
+test repl::tests::edge_every_block_form_asks_for_its_continuation_line ... ok
+test repl::tests::introspection::edge_a_deeply_nested_question_is_refused_rather_than_overflowing ... ok
+
+failures:
+
+---- repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed stdout ----
+
+thread 'repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed' (150602) panicked at src/repl/mod.rs:6214:13:
+no copy of the block is left in /home/runner/work/rbops/rbops/redblue/target/tmp/repl-onboarding/edit-symlink-scratch-3: ["redblue-edit-150356-0"]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: redblue::repl::tests::onboarding::assert_no_scratch_left
+   3: redblue::repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed
+   4: redblue::repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed::{closure#0}
+   5: <redblue::repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried stdout ----
+
+thread 'repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried' (150612) panicked at src/repl/mod.rs:6214:13:
+no copy of the block is left in /home/runner/work/rbops/rbops/redblue/target/tmp/repl-onboarding/edit-no-free-serial-8: ["redblue-edit-150356-4", "redblue-edit-150356-56", "redblue-edit-150356-5", "redblue-edit-150356-36", "redblue-edit-150356-50", "redblue-edit-150356-41", "redblue-edit-150356-61", "redblue-edit-150356-37", "redblue-edit-150356-9", "redblue-edit-150356-45", "redblue-edit-150356-40", "redblue-edit-150356-29", "redblue-edit-150356-19", "redblue-edit-150356-53", "redblue-edit-150356-13", "redblue-edit-150356-30", "redblue-edit-150356-35", "redblue-edit-150356-54", "redblue-edit-150356-51", "redblue-edit-150356-7", "redblue-edit-150356-46", "redblue-edit-150356-31", "redblue-edit-150356-39", "redblue-edit-150356-59", "redblue-edit-150356-3", "redblue-edit-150356-1", "redblue-edit-150356-22", "redblue-edit-150356-8", "redblue-edit-150356-60", "redblue-edit-150356-12", "redblue-edit-150356-17", "redblue-edit-150356-28", "redblue-edit-150356-62", "redblue-edit-150356-47", "redblue-edit-150356-16", "redblue-edit-150356-6", "redblue-edit-150356-43", "redblue-edit-150356-27", "redblue-edit-150356-21", "redblue-edit-150356-52", "redblue-edit-150356-33", "redblue-edit-150356-44", "redblue-edit-150356-34", "redblue-edit-150356-57", "redblue-edit-150356-23", "redblue-edit-150356-49", "redblue-edit-150356-26", "redblue-edit-150356-25", "redblue-edit-150356-38", "redblue-edit-150356-48", "redblue-edit-150356-11", "redblue-edit-150356-14", "redblue-edit-150356-0", "redblue-edit-150356-24", "redblue-edit-150356-2", "redblue-edit-150356-63", "redblue-edit-150356-18", "redblue-edit-150356-55", "redblue-edit-150356-58", "redblue-edit-150356-20", "redblue-edit-150356-10", "redblue-edit-150356-15", "redblue-edit-150356-42", "redblue-edit-150356-32"]
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: redblue::repl::tests::onboarding::assert_no_scratch_left
+   3: redblue::repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried
+   4: redblue::repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried::{closure#0}
+   5: <redblue::repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed
+    repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried
+
+test result: FAILED. 268 passed; 2 failed; 0 ignored; 0 measured; 53 filtered out; finished in 1.44s
+
+[1m[91merror[0m: test failed, to rerun pass `--lib`
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6190,17 +6190,14 @@
+                 .expect("the editor script is made executable");
+             path.to_string_lossy().to_string()
+         }
+ 
+-        /// That an edit left nothing of the reader's block in `dir`, whatever
+-        /// shape the edit left by.
+-        ///
+-        /// The whole directory rather than one file name, because the file lives
+-        /// in a directory of the session's own and the directory is the thing
+-        /// that has to go: a name that is left behind is a name the next edit,
+-        /// or the next session, finds.
+-        fn assert_no_scratch_left(dir: &Path) {
+-            let left: Vec<String> = fs::read_dir(dir)
++        /// What an edit left in `dir`, other than the editor script itself.
++///
++/// The editor script is the test's own and outlives every edit it drives, so it
++/// is not a thing an edit left behind.
++        fn left_behind(dir: &Path) -> Vec<String> {
++            fs::read_dir(dir)
+                 .unwrap_or_else(|error| {
+                     panic!("{} should still be readable: {error}", dir.display())
+                 })
+                 .map(|entry| {
+@@ -6209,9 +6206,20 @@
+                         .file_name()
+                 })
+                 .map(|name| name.to_string_lossy().into_owned())
+                 .filter(|name| name != "fake-editor.sh")
+-                .collect();
++                .collect()
++        }
++
++        /// That an edit left nothing of the reader's block in `dir`, whatever
++        /// shape the edit left by.
++        ///
++        /// The whole directory rather than one file name, because the file lives
++        /// in a directory of the session's own and the directory is the thing
++        /// that has to go: a name that is left behind is a name the next edit,
++        /// or the next session, finds.
++        fn assert_no_scratch_left(dir: &Path) {
++            let left = left_behind(dir);
+             assert!(
+                 left.is_empty(),
+                 "no copy of the block is left in {}: {left:?}",
+                 dir.display()
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6658,13 +6658,21 @@
+         repl.vm.user_names().contains(&"edited".to_string()),
+         "while the editor's own block ran: {:?}",
+         repl.vm.user_names()
+     );
+-    assert_no_scratch_left(&dir);
+-    assert!(
+-        planted.join("decoy.rb").exists(),
+-        "and what the planter left is still there, untouched"
++    assert_eq!(
++        left_behind(&dir),
++        vec![format!("redblue-edit-{}-0", std::process::id())],
++        "and the serial the session made is gone while the planted one is \
++         not its to remove"
+     );
++    assert_eq!(
++        fs::read_dir(&planted)
++            .expect("the planted directory should still be readable")
++            .count(),
++        1,
++        "with nothing of the session's written inside it"
++    );
+ }
+ 
+ /// A name is not reused, it is skipped — and when every name this session
+ /// would try is taken, it says which range it tried rather than reporting
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -6699,9 +6699,14 @@
+         error.contains(&format!("redblue-edit-{}-0", std::process::id()))
+             && error.contains(&format!("redblue-edit-{}-{last}", std::process::id())),
+         "and the message names both ends of the search: {error}"
+     );
+-    assert_no_scratch_left(&dir);
++    assert_eq!(
++        left_behind(&dir).len(),
++        SCRATCH_DIR_ATTEMPTS,
++        "and the directories it found taken are the ones the test planted: \
++         none of them was written into"
++    );
+ }
+ 
+ /// No editor named is a clean error that says which variable to set, and
+ /// the block the session was holding survives it.
+
+[0m
+[0m$ [0mcargo test --lib repl:: 2>&1 | tail -30
+test repl::transcript::tests::a_block_is_one_exchange_holding_every_line_it_was_typed_on ... ok
+test repl::transcript::tests::a_block_starting_with_a_blank_line_round_trips ... ok
+test repl::transcript::tests::a_document_written_by_hand_is_read_the_same_way ... ok
+test repl::transcript::tests::a_session_read_back_from_its_own_markdown_is_the_session ... ok
+test repl::transcript::tests::an_exchange_keeps_its_input_apart_from_its_output ... ok
+test repl::transcript::tests::an_exchange_that_said_nothing_writes_no_output_block ... ok
+test repl::transcript::tests::an_exported_session_is_markdown_with_one_redblue_block_per_line ... ok
+test repl::transcript::tests::edge_a_cleared_transcript_exports_an_empty_session ... ok
+test repl::transcript::tests::edge_a_line_that_prints_a_fence_is_written_inside_a_longer_one ... ok
+test repl::transcript::tests::edge_a_long_session_keeps_the_newest_exchanges_and_no_more ... ok
+test repl::transcript::tests::edge_a_session_that_has_run_nothing_says_so ... ok
+test repl::transcript::tests::edge_an_unclosed_fence_at_the_end_of_a_document_reads_as_nothing ... ok
+test repl::transcript::tests::edge_no_escape_sequence_can_reach_the_document ... ok
+test repl::transcript::tests::edge_the_fence_is_one_backtick_longer_than_the_longest_run_inside_it ... ok
+x
+x
+x
+x
+x
+x
+x
+x
+x
+x
+test repl::tests::edge_a_block_that_outgrows_the_buffer_is_dropped_not_kept ... ok
+test repl::tests::edge_every_block_form_asks_for_its_continuation_line ... ok
+test repl::tests::introspection::edge_a_deeply_nested_question_is_refused_rather_than_overflowing ... ok
+
+test result: ok. 270 passed; 0 failed; 0 ignored; 0 measured; 53 filtered out; finished in 1.58s
+[0m
+[0m$ [0mcargo test --lib onboarding 2>&1 | tail -25
+something else
+Hello, World!
+test repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried ... ok
+{a: 1}
+test repl::tests::onboarding::edge_every_step_of_the_tour_can_be_walked_by_typing_it ... ok
+{a: 1}
+test repl::tests::onboarding::edge_only_the_step_its_own_snippet_moves_the_tour_on ... ok
+test repl::tests::onboarding::edge_the_last_step_taken_is_the_end_of_the_tour ... ok
+test repl::tests::onboarding::edge_the_onboarding_commands_are_reachable_every_way ... ok
+test repl::tests::onboarding::edge_tutorial_with_colour_off_numbers_its_steps_and_emits_no_escapes ... ok
+World
+30
+Adult
+Hello!
+Hello!
+Hello!
+Hello, World!
+{a: 1}
+test repl::tests::onboarding::every_tutorial_snippet_is_a_program_the_session_runs ... ok
+test repl::tests::onboarding::edit_runs_what_the_editor_left_behind ... ok
+test repl::tests::onboarding::edge_the_scratch_file_is_readable_by_its_owner_and_nobody_else ... ok
+test repl::tests::onboarding::edge_a_block_the_editor_saved_past_the_session_limit_is_refused ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 301 filtered out; finished in 0.03s
+[0m
+[0m$ [0mcargo test --lib onboarding 2>&1 | rg "^test repl" | sort
+test repl::tests::onboarding::a_hint_in_the_tour_names_the_step_it_is_for ... ok
+test repl::tests::onboarding::a_hint_outside_the_tour_names_the_tour ... ok
+test repl::tests::onboarding::a_tutorial_is_a_numbered_tour_that_ends_at_examples ... ok
+test repl::tests::onboarding::edge_a_block_the_editor_saved_past_the_session_limit_is_refused ... ok
+test repl::tests::onboarding::edge_a_failed_edit_leaves_no_copy_of_the_buffer_behind ... ok
+test repl::tests::onboarding::edge_a_painted_hint_keeps_the_hint_readable ... ok
+test repl::tests::onboarding::edge_a_reset_forgets_the_tour_it_was_walked_through ... ok
+test repl::tests::onboarding::edge_a_scratch_directory_is_taken_with_it_however_the_edit_ended ... ok
+test repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed ... ok
+test repl::tests::onboarding::edge_an_edit_that_does_not_run_gives_the_block_back ... ok
+test repl::tests::onboarding::edge_an_editor_that_cannot_be_used_is_reported_rather_than_run ... ok
+test repl::tests::onboarding::edge_an_editor_that_names_nothing_is_refused_rather_than_spawned ... ok
+test repl::tests::onboarding::edge_edit_without_an_editor_names_the_variable_and_keeps_the_buffer ... ok
+test repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried ... ok
+test repl::tests::onboarding::edge_every_step_of_the_tour_can_be_walked_by_typing_it ... ok
+test repl::tests::onboarding::edge_only_the_step_its_own_snippet_moves_the_tour_on ... ok
+test repl::tests::onboarding::edge_the_last_step_taken_is_the_end_of_the_tour ... ok
+test repl::tests::onboarding::edge_the_onboarding_commands_are_reachable_every_way ... ok
+test repl::tests::onboarding::edge_the_scratch_file_is_readable_by_its_owner_and_nobody_else ... ok
+test repl::tests::onboarding::edge_tutorial_with_colour_off_numbers_its_steps_and_emits_no_escapes ... ok
+test repl::tests::onboarding::edit_runs_what_the_editor_left_behind ... ok
+test repl::tests::onboarding::every_tutorial_snippet_is_a_program_the_session_runs ... ok
+[0m
+[0m$ [0mcargo fmt --all && cargo clippy --all-targets -- -D warnings 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 4.92s
+[0m
+[0m$ [0mgit diff --stat && cargo fmt --all -- --check && echo "FMT CLEAN"
+phases/phase-061/REPORT.md        |  230 ++++++++
+ src/repl/editor.rs                |   57 +-
+ src/repl/mod.rs                   | 1068 +++++++++++++++++++++++++++++++++----
+ tests/unreviewed_work_ack_test.rs |    1 +
+ 4 files changed, 1251 insertions(+), 105 deletions(-)
+FMT CLEAN
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | rg -e "^test result" -e "^error" -e "FAILED" -e "panicked" | head -40
+(no output)
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 120000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | rg -e "^test result" -e "^error" -e "FAILED" -e "panicked" | head -40
+test result: ok. 323 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.60s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 348.57s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 447.16s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+error
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 72.82s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+error
+error
+error
+error
+error
+error
+error ✓ 🎉 café
+error
+error
+error
+error
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | rg -e "^test result:" -e "^failures:" -e "^error\[" -e "^error:" | head -40
+test result: ok. 323 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.59s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 348.09s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 441.44s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 73.95s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.35s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.25s
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.05s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | rg -e "^test result:" | awk '{p+=$4; f+=$6; i+=$8} END {print "passed:",p," failed:",f," ignored:",i}'
+passed: 1864  failed: 0  ignored: 0
+[0m
+[0m$ [0mls ../rbops/ && cat ../rbops/verify.sh | head -60
+agents
+baseline.json
+dispatch.sh
+gen-prompts.sh
+phases.json
+progress_watchdog.sh
+setup-deploy-key.ps1
+smoke.sh
+verify.sh
+#!/usr/bin/env bash
+# =============================================================================
+# rbops/verify.sh — the ONLY authority on whether phase work is real.
+#
+# Exit 0  = phase may be marked .done
+# Exit 1  = gate failed, phase must be retried
+#
+# Design rule: this script must be UNTRUSTWORTHY-PROOF against the agent.
+# The implementer agent cannot edit this file (see AGENTS.md hard rule 1) and
+# the token it runs under has no `workflows` scope, so a push that modifies
+# .github/ is rejected by GitHub itself. Two independent locks.
+# =============================================================================
+set -uo pipefail
+
+PHASE="${1:?usage: verify.sh <phase-id>}"
+
+# Resolve every path BEFORE changing directory, and normalise away any `..`.
+# The gate runs against the project checkout (redblue/) while the manifest,
+# baseline and report live in the pipeline repo. A relative path resolved after
+# `cd` silently points at a file that does not exist there, and the gate then
+# fails on its very first check having verified nothing.
+abspath() {
+  local p="$1"
+  if [ -e "$p" ]; then (cd "$(dirname "$p")" && printf '%s/%s\n' "$(pwd)" "$(basename "$p")")
+  else printf '%s\n' "$p"; fi
+}
+
+# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the gate can
+# be exercised against a fixture pipeline root, not only this checkout.
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PHASES="$(abspath "${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}")"
+BASELINE="$(abspath "${RBOPS_BASELINE:-$RBOPS_ROOT/rbops/baseline.json}")"
+PROJECT_DIR="$(abspath "${RBOPS_PROJECT_DIR:-.}")"
+REPORT="$RBOPS_ROOT/phases/$PHASE/REPORT.md"
+
+# Preconditions, checked before we touch the project.
+[ -f "$PHASES" ]                                    || { echo "FATAL: no manifest at $PHASES" >&2; exit 1; }
+[ -f "$BASELINE" ]                                  || { echo "FATAL: no baseline at $BASELINE" >&2; exit 1; }
+[ -d "$RBOPS_ROOT/phases/$PHASE" ]                  || { echo "FATAL: $RBOPS_ROOT/phases/$PHASE does not exist" >&2; exit 1; }
+cd "$PROJECT_DIR" || { echo "FATAL: cannot enter project dir $PROJECT_DIR" >&2; exit 1; }
+[ -f Cargo.toml ] || { echo "FATAL: no Cargo.toml in $PROJECT_DIR — is RBOPS_PROJECT_DIR correct?" >&2; exit 1; }
+
+# Honour $JQ so a native Linux jq can be substituted when testing outside CI.
+# A Windows jq.exe under WSL emits CRLF and breaks every id and count.
+JQ="${JQ:-jq}"
+BASE_REF="${RBOPS_BASE_REF:-HEAD}"
+
+FAIL=0
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+# Every failure passes through here, so this is the one place a remedy can be
+# attached to a check that does not know how to fix itself.
+#
+# Phase-092, 088 and 113 all failed the same two checks and burned three
+# attempts each. The message said the rule and not the remedy, and a rule an
+# agent cannot act on is not a gate - it is a wall. The retry note is supposed to
+# close that gap, but a note is written by a human who has to notice, and three
+# of these ran before anyone did.
+#
+[0m
+[0m$ [0m../rbops/verify.sh phase-061 2>&1 | tail -60
+[1m== manifest[0m
+  [32mPASS[0m phase phase-061 is declared in /home/runner/work/rbops/rbops/rbops/phases.json
+  [32mPASS[0m dep phase-060 done
+
+[1m== report[0m
+  [32mPASS[0m /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md exists
+  [32mPASS[0m section: What changed
+  [32mPASS[0m section: Tests added
+  [32mPASS[0m section: Gates
+  [32mPASS[0m section: Known gaps
+  [32mPASS[0m report has at least one real evidence row
+
+[1m== diff hygiene[0m
+  [32mPASS[0m forbidden-path scan done
+  [32mPASS[0m no gate-weakening constructs added
+  [32mPASS[0m no scratch files
+  [32mPASS[0m diff substance: +1251 -105 (min +5)
+  [32mPASS[0m implementation touched src/ (must_touch: src/)
+
+[1m== cargo fmt[0m
+  [32mPASS[0m cargo fmt --check
+
+[1m== cargo clippy[0m
+  [32mPASS[0m cargo clippy -D warnings
+
+[1m== cargo test[0m
+  [32mPASS[0m cargo test: 1864 passed, 0 failed
+
+[1m== doc tests[0m
+  [32mPASS[0m runs: examples/files.rb
+  [32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [32mPASS[0m failure-asserting test present: 8
+  [32mPASS[0m test quota met: 12 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 12
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [33mWARN[0m report claims 13 passing, actual run has 1864 — under-claimed, fix the number
+  [32mPASS[0m reported test count (13) does not exceed actual (1864)
+
+[32m╔══════════════════════════════════════╗[0m
+[32m║ VERIFY PASS — phase-061                ║[0m
+[32m╚══════════════════════════════════════╝[0m
+[0m
+[0m$ [0mrg -n "under-claimed|report honesty|actual run has" -B 20 ../rbops/verify.sh | head -60
+481-[ -n "$TEST_POLICY_MODE" ] || TEST_POLICY_MODE="required"
+482-if [ "$TEST_POLICY_MODE" = "not_applicable" ]; then
+483-  warn "test quota and edge_* rule NOT APPLICABLE to this phase (test_policy: not_applicable) — the reviewer still judges documentation and substance"
+484-else
+485-  if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
+486-    ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
+487-  else
+488-    bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
+489-  fi
+490-  [ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
+491-    || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
+492-fi
+493-
+494-# Same precision rule as the construct scan above: the token must begin the
+495-# line. A test fixture that embeds `#[ignore]` as data is not a skipped test.
+496-SKIPDELTA="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+497-  | grep -cE '^\+[[:space:]]*(#\[ignore|//[[:space:]]*skip\b)')"
+498-[ "$SKIPDELTA" -eq 0 ] && ok "no newly skipped tests" || bad "$SKIPDELTA newly skipped/ignored tests"
+499-
+500-# --- 6. self-consistency: does the report match reality? --------------------
+501:step "report honesty"
+502-if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
+503-  REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+504-  CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
+505-  if [ -n "${CLAIM:-}" ]; then
+506-    # Asymmetric by design. The threat model is FABRICATION: claiming green
+507-    # that was never earned. A claim ABOVE reality (+2 tolerance for reruns)
+508-    # fails the phase. A claim BELOW reality is sloppiness in prose, not a lie
+509-    # that ships bad code — the gate itself measured the real number, so warn
+510-    # and move on. This distinction once blocked a phase with 59 green tests
+511-    # over a "0 passing" typo.
+512-    if [ "$CLAIM" -gt $((REAL + 2)) ]; then
+513:      bad "report claims $CLAIM passing, actual run has $REAL — over-claiming is fabrication"
+514-    elif [ "$CLAIM" -lt $((REAL - 2)) ]; then
+515:      warn "report claims $CLAIM passing, actual run has $REAL — under-claimed, fix the number"
+[0m
+[0m$ [0mgit diff HEAD -U0 -- src/ tests/ | rg -n "^\+\s*fn (\w+)\(\)" -o -r '$1' | sed 's/^[0-9]*://' | sort | uniq -c
+1 edge_a_block_the_editor_saved_past_the_session_limit_is_refused
+      1 edge_a_failed_edit_leaves_no_copy_of_the_buffer_behind
+      1 edge_a_reset_forgets_the_tour_it_was_walked_through
+      1 edge_a_scratch_directory_is_taken_with_it_however_the_edit_ended
+      1 edge_a_scratch_path_already_taken_is_refused_rather_than_followed
+      1 edge_an_edit_that_does_not_run_gives_the_block_back
+      1 edge_an_editor_that_names_nothing_is_refused_rather_than_spawned
+      1 edge_every_scratch_name_taken_is_reported_as_the_range_it_tried
+      1 edge_every_step_of_the_tour_can_be_walked_by_typing_it
+      1 edge_only_the_step_its_own_snippet_moves_the_tour_on
+      1 edge_the_last_step_taken_is_the_end_of_the_tour
+      1 edge_the_scratch_file_is_readable_by_its_owner_and_nobody_else
+[0m
+[0m$ [0mgit show 0e84349 -U0 -- src/ | rg "^\+\s*fn (\w+)\(\)" -o -r '$1' | sort > /tmp/t0e.txt; wc -l < /tmp/t0e.txt; rg -c "^edge_" /tmp/t0e.txt; cat /tmp/t0e.txt
+17
+9
+a_hint_in_the_tour_names_the_step_it_is_for
+a_hint_outside_the_tour_names_the_tour
+a_tutorial_is_a_numbered_tour_that_ends_at_examples
+edge_a_bracket_after_something_that_is_not_callable_shows_nothing
+edge_a_module_that_is_not_one_offers_nothing_and_does_not_error
+edge_a_painted_hint_keeps_the_hint_readable
+edge_an_editor_that_cannot_be_used_is_reported_rather_than_run
+edge_edit_without_an_editor_names_the_variable_and_keeps_the_buffer
+edge_every_module_member_offered_is_bound_and_every_bound_one_is_offered
+edge_members_and_paths_do_not_fight_over_one_tab
+edge_the_onboarding_commands_are_reachable_every_way
+edge_tutorial_with_colour_off_numbers_its_steps_and_emits_no_escapes
+edit_runs_what_the_editor_left_behind
+editor_program
+every_tutorial_snippet_is_a_program_the_session_runs
+json_dot_offers_the_members_the_registry_holds
+typing_an_open_bracket_after_a_callable_surfaces_its_shape
+[0m
+[0m$ [0mgit diff HEAD --numstat -- src/ tests/; echo "--- summary of src/ only:"; git diff HEAD --numstat -- src/ | awk '{p+=$1; m+=$2} END {print "src +"p" -"m}'
+52	5	src/repl/editor.rs
+968	100	src/repl/mod.rs
+1	0	tests/unreviewed_work_ack_test.rs
+--- summary of src/ only:
+src +1020 -105
+[0m
+[0m$ [0mgit diff HEAD --stat -- src/ && git diff HEAD -U0 -- src/repl/mod.rs | rg "^@@" | head -60
+src/repl/editor.rs |   57 ++-
+ src/repl/mod.rs    | 1068 +++++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 1020 insertions(+), 105 deletions(-)
+@@ -16 +16 @@ use std::io::{self, Write};
+@@ -61,0 +62,8 @@ const BLOCK_REPORT_LINES: usize = 20;
+@@ -475,6 +483,14 @@ fn hint_lines(step: Option<usize>, style: &Style) -> Vec<String> {
+@@ -490,12 +505,0 @@ fn hint_lines(step: Option<usize>, style: &Style) -> Vec<String> {
+@@ -648,0 +653,7 @@ pub struct Repl {
+@@ -667,0 +679 @@ impl Repl {
+@@ -1121 +1133 @@ impl Repl {
+@@ -1132 +1144,4 @@ impl Repl {
+@@ -1155,0 +1171,8 @@ impl Repl {
+@@ -1161,0 +1185,2 @@ impl Repl {
+@@ -1173,2 +1198,5 @@ impl Repl {
+@@ -1234 +1262,6 @@ impl Repl {
+@@ -1236 +1269 @@ impl Repl {
+@@ -1250 +1283 @@ impl Repl {
+@@ -1255 +1288,6 @@ impl Repl {
+@@ -1265 +1303 @@ impl Repl {
+@@ -1271 +1309 @@ impl Repl {
+@@ -1273,0 +1312 @@ impl Repl {
+@@ -1277,2 +1316,3 @@ impl Repl {
+@@ -1279,0 +1320,5 @@ impl Repl {
+@@ -1287,0 +1333,40 @@ impl Repl {
+@@ -1604,2 +1689,4 @@ impl Repl {
+@@ -2327,0 +2415,3 @@ impl Repl {
+@@ -2332,0 +2423 @@ impl Repl {
+@@ -2378,6 +2469,3 @@ impl Repl {
+@@ -2384,0 +2473,6 @@ impl Repl {
+@@ -2395,7 +2489 @@ impl Repl {
+@@ -2407,0 +2496,171 @@ impl Repl {
+@@ -2413,12 +2672,5 @@ impl Repl {
+@@ -2439 +2691 @@ impl Repl {
+@@ -2445,0 +2698,35 @@ impl Repl {
+@@ -2779 +3066,2 @@ mod tests {
+@@ -2807 +3095,2 @@ mod tests {
+@@ -5868 +6157,5 @@ mod tests {
+@@ -5899,0 +6193,35 @@ mod tests {
+@@ -6035,2 +6363,11 @@ mod tests {
+@@ -6055,0 +6393,166 @@ mod tests {
+@@ -6059,0 +6563,4 @@ mod tests {
+@@ -6070,2 +6577 @@ mod tests {
+@@ -6074,3 +6580,4 @@ mod tests {
+@@ -6079,3 +6586,42 @@ mod tests {
+@@ -6082,0 +6629,18 @@ mod tests {
+@@ -6084,3 +6648,12 @@ mod tests {
+@@ -6089 +6662 @@ mod tests {
+@@ -6091,0 +6665,47 @@ mod tests {
+@@ -6103 +6723 @@ mod tests {
+@@ -6122,0 +6743,4 @@ mod tests {
+@@ -6131 +6755 @@ mod tests {
+@@ -6147 +6771 @@ mod tests {
+@@ -6156 +6780 @@ mod tests {
+@@ -6169,0 +6794,236 @@ mod tests {
+@@ -6211,0 +7072,5 @@ mod tests {
+@@ -6215 +7080 @@ mod tests {
+@@ -6217,19 +7082,22 @@ mod tests {
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=30, offset=483][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=45, offset=2625][0m
+[0m
+[0m$ [0mcargo build 2>&1 | tail -2 && printf ':tutorial\nset name to "World"\nsay name\n:hint\n:quit\n' | ./target/debug/rb 2>&1 | tail -12
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.08s
+     > end
+     > greet("World")
+
+  6. Where to go next
+     Type `json.` and press TAB: the REPL offers the members of a module. Type `(` after a name to see its shape. For more, `:examples`.
+     > set record to json.parse("{\"a\": 1}")
+     > say record
+
+  Stuck on a step? Type :hint for the step you are on.
+>>> >>> World
+>>> Hint for step 2 of 6: Type `set x to (10 + 5) * 2` and then `say x`. It answers 30.
+>>> Goodbye!
+[0m
+[0m$ [0mprintf ':tutorial\nset name to "World"\nsay name\n:reset\n:hint\n:quit\n' | ./target/debug/rb 2>&1 | tail -4; echo "=== edit round trip ==="; printf 'repeat 2 times\n    say "hi"\nend\n.edit\n:quit\n' > /tmp/opencode/edited.rb; EDITOR="cat /tmp/opencode/edited.rb >" ./target/debug/rb <<'EOF' 2>&1 | tail -6
+repeat 2 times
+    say "from the editor"
+end
+.edit
+:quit
+EOF
+ls /tmp | rg redblue-edit | head
+>>> >>> World
+>>> REPL state reset.
+>>> There is no tutorial step in progress — type :tutorial to start one, and :examples for a catalogue of what Redblue can do.
+>>> Goodbye!
+=== edit round trip ===
+end
+.edit
+:quit
+cat: '>': No such file or directory
+Error: `cat` exited with exit status: 1; nothing was read back from it
+>>> Goodbye!
+[0m
+[0m$ [0mprintf '#!/bin/sh\nprintf "set edited to 42\\nsay edited\\n" > "$1"\n' > /tmp/opencode/ed.sh && chmod +x /tmp/opencode/ed.sh && printf 'repeat 2 times\n    say "hi"\nend\n.edit\n:quit\n' | EDITOR=/tmp/opencode/ed.sh ./target/debug/rb 2>&1 | tail -5; echo "=== leftovers in /tmp:"; ls /tmp | rg -c redblue-edit || echo none
+>>> ..  2 ..  3 hi
+hi
+>>> 42
+>>> Goodbye!
+=== leftovers in /tmp:
+none
+[0m
+[0m$ [0mgit show 0e84349 --numstat --format="%h %s" | head -10; echo "---- src only:"; git show 0e84349 --numstat --format="" -- src/ | awk '{p+=$1; m+=$2} END {print "src +"p" -"m}'
+0e84349 resume phase-061: adopt preserved work
+
+41	0	src/repl/commands.rs
+127	0	src/repl/completer.rs
+137	5	src/repl/editor.rs
+623	0	src/repl/mod.rs
+14	0	src/stdlib.rs
+---- src only:
+src +942 -5
+[0m
+[0m$ [0mrg -n "fn unreviewed_work_in_head_history_is_acknowledged" -A 60 tests/unreviewed_work_ack_test.rs | head -80
+489:fn unreviewed_work_in_head_history_is_acknowledged() {
+490-    let (scan, log) = audit_head().expect("HEAD's history must be readable and acknowledged");
+491-    println!("{}", describe(&scan, ACKNOWLEDGED));
+492-
+493-    assert!(
+494-        scan.unreviewed.is_empty(),
+495-        "{} commit(s) in HEAD's history carry unreviewed work and are not on the \
+496-         acknowledgement list in this file: {}. Add each one with a reason saying what \
+497-         it carries and that it was deliberately not rewritten.",
+498-        scan.unreviewed.len(),
+499-        scan.unreviewed.join(" | ")
+500-    );
+501-
+502-    assert!(
+503-        scan.stale.is_empty(),
+504-        "{} entry/entries name a commit HEAD's history does not contain: {}. An entry \
+505-         pointing at nothing is how the list decays into a comment — a typo, an \
+506-         abbreviated sha, or a rewrite that AGENTS.md forbids would all parse and \
+507-         satisfy nothing.",
+508-        scan.stale.len(),
+509-        scan.stale.join(", ")
+510-    );
+511-
+512-    for (sha, subject) in MEASURED {
+513-        let sha: &str = sha;
+514-        assert!(
+515-            log.lines()
+516-                .any(|line| line.starts_with(&format!("{sha}\t"))),
+517-            "{sha} ({subject}) was measured on this history but `git log HEAD` does not \
+518-             report it; re-measure before trusting this file"
+519-        );
+520-        let entry = ACKNOWLEDGED
+521-            .iter()
+522-            .find(|entry| entry.0 == sha)
+523-            .unwrap_or_else(|| panic!("{sha} is in HEAD's history but is not acknowledged"));
+524-        assert!(
+525-            !entry.1.trim().is_empty(),
+526-            "{sha} is acknowledged without saying why"
+527-        );
+528-    }
+529-}
+530-
+531-/// Phase-078's eight commits are **ancestors** of HEAD, not absent.
+532-///
+533-/// Phase-083's evidence asserted the opposite and proposed superseding
+534-/// phase-078 on that basis. The assertion was measured on a shallow clone, where
+535-/// `git log` cannot see far enough back and `merge-base --is-ancestor` answers
+536-/// `false` for a commit it has not been given. On a complete history all eight
+537-/// are ancestors, so phase-078's finding stands and this file extends it rather
+538-/// than replacing it. Asserting the truth here is what stops the stale claim
+539-/// from being re-derived a third time.
+540-#[test]
+541-fn edge_phase_078_commits_are_ancestors_of_head_not_absent() {
+542-    ensure_full_history().expect("this history must be complete before it is measured");
+543-
+544-    let eight = [
+545-        (
+546-            "7fdea15f13a0cc2021c5cc69a65a126879e2d554",
+547-            "rbops: phase-019 checkpoint",
+548-        ),
+549-        (
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -7003,11 +7003,9 @@
+ }
+ 
+ /// An `$EDITOR` that names nothing at all is a different mistake from one
+ /// that names a program that is not there, and it is refused by name
+-/// rather than spawned.
+-///
+-/// `editor_program` cannot hand this over — it filters the empty and the
++/// rather than spawned. — it filters the empty and the
+ /// blank away before `.edit` sees them — so `edit_in` is driven directly
+ /// with what `$EDITOR` can actually hold. Nothing is written either way:
+ /// the name is refused before there is a directory to write it into.
+ #[test]
+
+[0m
+[0m$ [0mrg -n "edge_an_editor_that_names_nothing_is_refused_rather_than_spawned" -B 14 src/repl/mod.rs
+6998-                repl.multiline_buffer,
+6999-                vec!["repeat 2 times".to_string()],
+7000-                "with the block the session was holding untouched"
+7001-            );
+7002-            assert_no_scratch_left(&dir);
+7003-        }
+7004-
+7005-        /// An `$EDITOR` that names nothing at all is a different mistake from one
+7006-        /// that names a program that is not there, and it is refused by name
+7007-        /// rather than spawned. — it filters the empty and the
+7008-        /// blank away before `.edit` sees them — so `edit_in` is driven directly
+7009-        /// with what `$EDITOR` can actually hold. Nothing is written either way:
+7010-        /// the name is refused before there is a directory to write it into.
+7011-        #[test]
+7012:        fn edge_an_editor_that_names_nothing_is_refused_rather_than_spawned() {
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -7001,11 +7001,46 @@
+     );
+     assert_no_scratch_left(&dir);
+ }
+ 
++/// A save that is not text is not a program, and saying so is not the same as
++/// saying it failed to read.
++///
++/// The read is bounded by the session's block limit, but the bytes inside
++/// that bound are still decoded as UTF-8, so an editor that wrote a
++/// binary file — a stray `dd`, an editor handed the wrong path — is
++/// reported as what it is rather than as an I/O failure the reader cannot
++/// act on.
++#[cfg(unix)]
++#[test]
++fn edge_a_save_that_is_not_text_is_refused_rather_than_parsed() {
++    let dir = scratch_dir("edit-not-text");
++    let binary = script_editor(&dir, "printf 'set x to \"\\377\"' > \"$1\"");
++    let mut repl = Repl::new();
++    feed(&mut repl, &["repeat 2 times"]);
++
++    let error = repl
++        .edit_with(Some(&binary), &dir)
++        .expect_err("a byte that is not text is not a program");
++
++    assert!(
++        error.contains("is not text"),
++        "and the message says what was saved rather than blaming the read: \
++         {error}"
++    );
++    assert_eq!(
++        repl.multiline_buffer,
++        vec!["repeat 2 times".to_string()],
++        "with the block the session was holding untouched"
++    );
++    assert_no_scratch_left(&dir);
++}
++
+ /// An `$EDITOR` that names nothing at all is a different mistake from one
+ /// that names a program that is not there, and it is refused by name
+-/// rather than spawned. — it filters the empty and the
++/// rather than spawned.
++///
++/// `editor_program` cannot hand this over — it filters the empty and the
+ /// blank away before `.edit` sees them — so `edit_in` is driven directly
+ /// with what `$EDITOR` can actually hold. Nothing is written either way:
+ /// the name is refused before there is a directory to write it into.
+ #[test]
+
+[0m
+[0m$ [0mcargo test --lib onboarding 2>&1 | rg -e "^test repl" -e "^test result" -e "panicked" | sort
+test repl::tests::onboarding::a_hint_in_the_tour_names_the_step_it_is_for ... ok
+test repl::tests::onboarding::a_hint_outside_the_tour_names_the_tour ... ok
+test repl::tests::onboarding::a_tutorial_is_a_numbered_tour_that_ends_at_examples ... ok
+test repl::tests::onboarding::edge_a_block_the_editor_saved_past_the_session_limit_is_refused ... ok
+test repl::tests::onboarding::edge_a_failed_edit_leaves_no_copy_of_the_buffer_behind ... ok
+test repl::tests::onboarding::edge_a_painted_hint_keeps_the_hint_readable ... ok
+test repl::tests::onboarding::edge_a_reset_forgets_the_tour_it_was_walked_through ... ok
+test repl::tests::onboarding::edge_a_save_that_is_not_text_is_refused_rather_than_parsed ... ok
+test repl::tests::onboarding::edge_a_scratch_directory_is_taken_with_it_however_the_edit_ended ... ok
+test repl::tests::onboarding::edge_a_scratch_path_already_taken_is_refused_rather_than_followed ... ok
+test repl::tests::onboarding::edge_an_edit_that_does_not_run_gives_the_block_back ... ok
+test repl::tests::onboarding::edge_an_editor_that_cannot_be_used_is_reported_rather_than_run ... ok
+test repl::tests::onboarding::edge_an_editor_that_names_nothing_is_refused_rather_than_spawned ... ok
+test repl::tests::onboarding::edge_edit_without_an_editor_names_the_variable_and_keeps_the_buffer ... ok
+test repl::tests::onboarding::edge_every_scratch_name_taken_is_reported_as_the_range_it_tried ... ok
+test repl::tests::onboarding::edge_every_step_of_the_tour_can_be_walked_by_typing_it ... ok
+test repl::tests::onboarding::edge_only_the_step_its_own_snippet_moves_the_tour_on ... ok
+test repl::tests::onboarding::edge_the_last_step_taken_is_the_end_of_the_tour ... ok
+test repl::tests::onboarding::edge_the_onboarding_commands_are_reachable_every_way ... ok
+test repl::tests::onboarding::edge_the_scratch_file_is_readable_by_its_owner_and_nobody_else ... ok
+test repl::tests::onboarding::edge_tutorial_with_colour_off_numbers_its_steps_and_emits_no_escapes ... ok
+test repl::tests::onboarding::edit_runs_what_the_editor_left_behind ... ok
+test repl::tests::onboarding::every_tutorial_snippet_is_a_program_the_session_runs ... ok
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 301 filtered out; finished in 0.03s
+[0m
+[0m← [0mEdit tests/unreviewed_work_ack_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/unreviewed_work_ack_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/unreviewed_work_ack_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/unreviewed_work_ack_test.rs
+@@ -94,9 +94,9 @@
+ ("977218301bd20726a43a15d7fa64344939ee097f", "resume phase-058: adopt preserved work. Carries unreviewed code (+612/-30, 6 files, +507 lines under src/ - the REPL compiler-view commands `.bytecode`/`.asm`: src/repl/bytecode_view.rs is new, plus the compact disassembler `disasm::render_compact` exported from src/bytecode/mod.rs, the two command rows in src/repl/commands.rs, the dispatch and printers in src/repl/mod.rs, and this phase's tests). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
+ ("96beaa93fb2193239f4e8409189720002b3e94bc", "resume phase-087: adopt WIP checkpoint. Carries unreviewed code (+546/-104, 23 files, +30/-28 under src/ - `length` over text counts characters instead of UTF-8 bytes at src/runtime.rs, and the unreachable second `length` arm is deleted from src/stdlib.rs, along with the corpus and test expectations that recorded the byte count). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
+ ("bf9ffc3370e97436d193f146102e8c4d69d1fade", "resume phase-089: adopt WIP checkpoint. Carries unreviewed code (+1068/-15, 11 files, +381/-15 under src/ - the typed failure value and `catch error of <Type>`: src/failure.rs is new (`FailureKind`, the closed list, `value_of`), plus the `of <Type>` parse and `catch_kind` in src/parser.rs, the decline path and the bound failure record in both src/interpreter.rs and src/bytecode/vm.rs, the kind in the catch block's parameter list in src/bytecode/codegen.rs, and `catch error of <Kind> <name>` in src/formatter.rs). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
+ ("b48189aa679e0f4df60f5cd5d10a4894d77bc3f7", "resume phase-059: adopt preserved work. Carries unreviewed code (+1321/-85, 22 files, +897/-61 under src/ - REPL failures are now drawn through `Error::render` against the session buffer: `render_error`, `paint_diagnostic` and `is_caret_line` in src/repl/mod.rs, the cell-accurate drawing (`char_cells`, `display_width`, `render_single`, `render_range`) and its two bounds (`MAX_DRAWN_CELLS`, `MAX_DRAWN_LINES`) in src/error.rs, `Expr::Variable(String, Span)` in src/parser.rs and `name_position` in src/analyzer.rs so the caret lands on the name rather than the statement, plus 16 tests and this phase's REPORT.md and FINDINGS.md). Deliberately not rewritten; kept so HEAD's ancestry stays intact. The earlier phase-059 resume it replaces (8389c5a) is not an ancestor of HEAD, so it is not listed: `scan` reports an acknowledgement naming a commit HEAD does not contain as stale, and a stale entry is a failure."),
+-("0e84349b84327cf76c6dcd4fb2a8d1e5ade4411c", "resume phase-061: adopt preserved work. Carries unreviewed code (+942/-5, 5 files, +937/-5 under src/ - the REPL discoverability work: member completion after a module dot (`complete_dotted`/`split_dotted` and the `ALT_DOT` bare-dot case in src/repl/completer.rs), the `$EDITOR` round trip for `.edit` (`editor_program`, `edit_in`, `edit_buffer` in src/repl/mod.rs), the guided tour `:tutorial` with `:hint` (`TUTORIAL`, `TutorialStep`, `tutorial_lines`, `hint_lines`, `step_index`, `show_tutorial`, `show_hint` in src/repl/mod.rs), the inline call-signature hint behind the `Hinter` hook (`signature_hint` in src/repl/editor.rs), `stdlib::module_members` and the three command rows in src/repl/commands.rs), plus 16 tests). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
++("0e84349b84327cf76c6dcd4fb2a8d1e5ade4411c", "resume phase-061: adopt preserved work. Carries unreviewed code (+942/-5, 5 files, +942/-5 under src/ - the REPL discoverability work: member completion after a module dot (`complete_dotted`/`split_dotted` and the `ALT_DOT` bare-dot case in src/repl/completer.rs), the `$EDITOR` round trip for `.edit` (`editor_program`, `edit_in`, `edit_buffer` in src/repl/mod.rs), the guided tour `:tutorial` with `:hint` (`TUTORIAL`, `TutorialStep`, `tutorial_lines`, `hint_lines`, `step_index`, `show_tutorial`, `show_hint` in src/repl/mod.rs), the inline call-signature hint behind the `Hinter` hook (`signature_hint` in src/repl/editor.rs), `stdlib::module_members` and the three command rows in src/repl/commands.rs), plus 16 tests). Deliberately not rewritten; kept so HEAD's ancestry stays intact."),
+ ("c95062eb02a6e336f011a918daac7938f0efee6d", "ack: resume phase-088: add resume commit to ACKNOWLEDGED. Carries no production code: +1/-927 across 2 files, neither under src/ (phase-088's acknowledgement data and its bookkeeping). Acknowledged because the selector is a case-insensitive substring test on `resume phase-` and the subject merely *contains* the phrase; deliberately not rewritten."),
+ // --- `rbops: phase-NNN checkpoint` ---------------------------------------
+ // Already audited, with reasons, by tests/checkpoint_ancestry_test.rs against
+ // tests/checkpoint_ancestry_ack.txt. Re-listed here because this selector is a
+
+[0m
+[0m$ [0mgit diff HEAD --numstat -- src/ tests/; git diff HEAD --numstat -- src/ | awk '{p+=$1; m+=$2} END {print "src total +"p" -"m}'; echo "--- new tests in working tree:"; git diff HEAD -U0 -- src/ tests/ | rg "^\+\s*fn (edge_\w+|\w+)\(\)" -o -r '$1' | wc -l
+52	5	src/repl/editor.rs
+1001	100	src/repl/mod.rs
+1	0	tests/unreviewed_work_ack_test.rs
+src total +1053 -105
+--- new tests in working tree:
+13
+[0m
+Now the report rewrite:
+[0m← [0mWrite phases/phase-061/REPORT.md
+Wrote file successfully.
+[0m
+[0m$ [0mrg -n "passed" phases/phase-061/REPORT.md
+261:| `cargo test --all-targets` | pass — **1864 passed; 0 failed; 0 ignored; 0 filtered out** across 40 test binaries |
+262:| `../rbops/verify.sh phase-061` | pass — `VERIFY PASS — phase-061`, including `cargo test: 1864 passed, 0 failed`, `test quota met: 12 rust / 0 redblue`, `edge case test present: 12`, `no newly skipped tests`, `no gate-weakening constructs added` |
+[0m
+[0m$ [0mcargo fmt --all -- --check && echo "FMT: pass" ; cargo clippy --all-targets -- -D warnings 2>&1 | tail -3
+FMT: pass
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 4.96s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tee /tmp/test.log | rg -e "^test result:" | awk '{n++; p+=$4; f+=$6; i+=$8} END {print "binaries:",n," passed:",p," failed:",f," ignored:",i}'
+binaries: 67  passed: 1865  failed: 0  ignored: 0
+[0m
+[0m$ [0m../rbops/verify.sh phase-061 2>&1 | tail -45
+[32mPASS[0m section: Gates
+  [32mPASS[0m section: Known gaps
+  [32mPASS[0m report has at least one real evidence row
+
+[1m== diff hygiene[0m
+  [32mPASS[0m forbidden-path scan done
+  [32mPASS[0m no gate-weakening constructs added
+  [32mPASS[0m no scratch files
+  [32mPASS[0m diff substance: +1390 -105 (min +5)
+  [32mPASS[0m implementation touched src/ (must_touch: src/)
+
+[1m== cargo fmt[0m
+  [32mPASS[0m cargo fmt --check
+
+[1m== cargo clippy[0m
+  [32mPASS[0m cargo clippy -D warnings
+
+[1m== cargo test[0m
+  [32mPASS[0m cargo test: 1865 passed, 0 failed
+
+[1m== doc tests[0m
+  [32mPASS[0m runs: examples/files.rb
+  [32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [32mPASS[0m failure-asserting test present: 9
+  [32mPASS[0m test quota met: 13 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 13
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [33mWARN[0m report claims 13 passing, actual run has 1865 — under-claimed, fix the number
+  [32mPASS[0m reported test count (13) does not exceed actual (1865)
+
+[32m╔══════════════════════════════════════╗[0m
+[32m║ VERIFY PASS — phase-061                ║[0m
+[32m╚══════════════════════════════════════╝[0m
+[0m
+[0m$ [0mls -la phases/phase-061/ 2>/dev/null; echo "---"; ls -la /home/runner/work/rbops/rbops/phases/phase-061/ 2>/dev/null; echo "--- same file?"; readlink -f phases/phase-061/REPORT.md /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md; echo "--- grep:"; grep -oE '[0-9]+ passed' /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md | head -3
+total 36
+drwxr-xr-x  2 runner runner  4096 Oct 19 05:20 .
+drwxr-xr-x 68 runner runner  4096 Oct 19 05:20 ..
+-rw-r--r--  1 runner runner 26461 Oct 19 09:06 REPORT.md
+---
+total 32
+drwxr-xr-x   2 runner runner  4096 Oct 19 05:50 .
+drwxr-xr-x 128 runner runner  4096 Oct 19 05:01 ..
+-rw-r--r--   1 runner runner     0 Oct 19 05:02 .recovered
+-rw-r--r--   1 runner runner  5997 Oct 19 05:01 PROMPT.md
+-rw-r--r--   1 runner runner 16324 Oct 19 05:50 REPORT.md
+--- same file?
+/home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
+/home/runner/work/rbops/rbops/phases/phase-061/REPORT.md
+--- grep:
+13 passed
+[0m
+[0m$ [0mhead -60 /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md
+# Phase 061 — Complete after the dot, edit in `$EDITOR`, and teach newcomers: member completion, `.edit`, `:tutorial`
+
+## State of the phase when this run started
+
+The phase's implementation was **already in the tree**, committed as `0e84349`
+("resume phase-061: adopt preserved work", +942 −5 across 5 files, all under
+`src/`). This run did not re-derive it and did not remove any of it. It ran the
+gates first, as instructed, and found:
+
+| Gate | Result at the start of this run |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test --all-targets` | **1 failure**: `unreviewed_work_in_head_history_is_acknowledged` |
+| `../rbops/verify.sh phase-061` | not yet run — the failure above blocks it |
+
+Every one of the phase's three features was already implemented, so the finding
+**does not reproduce in its stated form**: `json.` completes, `.edit` exists,
+`:tutorial` and `:hint` exist, and `(` after a name shows a signature. That was
+checked by running them, not by reading the diff:
+
+```
+$ printf ':tutorial\n:quit\n' | ./target/debug/rb
+>>> Redblue tutorial — type each snippet, or ask for a hint with :hint
+
+  1. A value, and a name for it
+  …
+  6. Where to go next
+     Type `json.` and press TAB: the REPL offers the members of a module. Type
+     `(` after a name to see its shape. For more, `:examples`.
+
+  Stuck on a step? Type :hint for the step you are on.
+
+$ printf ':tutorial\n:hint\n:quit\n' | ./target/debug/rb
+>>> Hint for step 1 of 6: Type `set name to "World"`, then `say name` — the name
+answers with the value it was given.
+
+$ printf ':hint\n:quit\n' | ./target/debug/rb
+>>> There is no tutorial step in progress — type :tutorial to start one, and
+:examples for a catalogue of what Redblue can do.
+
+$ printf 'set a to 1\n.edit\n:quit\n' | env -u EDITOR ./target/debug/rb
+>>> Error: .edit has no editor to open: set EDITOR to the program you edit with,
+for example `export EDITOR=vi`
+
+$ printf ':help\n:quit\n' | ./target/debug/rb | grep -E 'tutorial|hint|edit'
+  :tutorial, :tour                 Walk through the guided tour, one numbered step at a time
+  :hint                            Hint for the tutorial step this session is on
+  :edit                            Edit the block being written in $EDITOR, and run what comes back
+```
+
+What did reproduce was the gate: the resume commit carrying that work was itself
+unacknowledged, and the audit says so in as many words.
+
+## The finding that reproduced: the phase's own resume commit was not acknowledged
+
+`cargo test --all-targets`:
+
+```
+---- unreviewed_work_in_head_history_is_acknowledged stdout ----
+[0m
+[0m$ [0mdiff <(sed -n '1,100p' /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md) <(sed -n '1,100p' phases/phase-061/REPORT.md) | head -20; echo "=== placeholders in pipeline copy:"; rg -n "PLACEHOLDER" /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md; echo "=== wc:"; wc -l /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md phases/phase-061/REPORT.md
+79c79
+< test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+---
+>    → the whole file is green: 13 tests, 0 failed, 0 ignored
+82c82
+< ## What changed
+---
+> ## What the first round of review changed, and what the second found
+84,87c84,90
+< `must_touch: ["src/"]` is satisfied: every file in the phase's diff is under
+< `src/`. This run's diff (`0e84349..HEAD` plus the working tree) is the
+< acknowledgement row above, **+1 line, 1 file**; the phase's own implementation is
+< the +942 −5 in `0e84349`, all of it under `src/`.
+---
+> The first review of this run was not a formality: it found that the report
+> described `0e84349` and one acknowledgement row while the working tree carried
+> roughly a thousand lines of unreported REPL work, and that the report shipped a
+> "known gap" — *`:tutorial` sets `tutorial_step = Some(0)` and nothing advances
+> it* — describing a defect that this run's own diff fixes. Both are gone: the
+> "What changed" table below is written against `git diff HEAD` and accounts for
+=== placeholders in pipeline copy:
+168:| `cargo test --all-targets` | TEST_TOTAL_PLACEHOLDER |
+169:| `../rbops/verify.sh phase-061` | VERIFY_PLACEHOLDER |
+=== wc:
+  230 /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md
+  335 phases/phase-061/REPORT.md
+  565 total
+[0m
+[0m$ [0mcp phases/phase-061/REPORT.md /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md && diff -q phases/phase-061/REPORT.md /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md && echo "synced"
+synced
+[0m
+[0m$ [0m../rbops/verify.sh phase-061 2>&1 | tail -22
+[32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [32mPASS[0m failure-asserting test present: 9
+  [32mPASS[0m test quota met: 13 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 13
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [32mPASS[0m reported test count (1864) matches actual (1865)
+
+[32m╔══════════════════════════════════════╗[0m
+[32m║ VERIFY PASS — phase-061                ║[0m
+[32m╚══════════════════════════════════════╝[0m
+[0m
+[0m← [0mEdit phases/phase-061/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
+@@ -257,10 +257,10 @@
+ | Gate | Result |
+ |---|---|
+ | `cargo fmt --all -- --check` | pass — no output |
+ | `cargo clippy --all-targets -- -D warnings` | pass — `Finished dev profile`, no warning or error |
+-| `cargo test --all-targets` | pass — **1864 passed; 0 failed; 0 ignored; 0 filtered out** across 40 test binaries |
+-| `../rbops/verify.sh phase-061` | pass — `VERIFY PASS — phase-061`, including `cargo test: 1864 passed, 0 failed`, `test quota met: 12 rust / 0 redblue`, `edge case test present: 12`, `no newly skipped tests`, `no gate-weakening constructs added` |
++| `cargo test --all-targets` | pass — **1865 passed; 0 failed; 0 ignored; 0 filtered out** (the sum of every `test result:` line in the run) |
++| `../rbops/verify.sh phase-061` | pass — `VERIFY PASS — phase-061`, including `cargo test: 1865 passed, 0 failed`, `test quota met: 13 rust / 0 redblue`, `edge case test present: 13`, `failure-asserting test present: 9`, `no newly skipped tests`, `no gate-weakening constructs added`, and `report honesty: reported test count (1865) matches actual (1865)` |
+ 
+ ## Invariants touched
+ 
+ - **None.** No `Value` variant, no `Error` variant, no grammar change, no change
+
+[0m
+[0m$ [0mgit diff HEAD --numstat -- src/ tests/; echo "--- new edge tests in working tree:"; git diff HEAD -U0 -- src/ tests/ | rg -o "^\+\s*fn (\w+)\(\)" -r '$1' | sort; echo "--- count:"; git diff HEAD -U0 -- src/ tests/ | rg -c "^\+\s*fn \w+\(\)"
+52	5	src/repl/editor.rs
+1001	100	src/repl/mod.rs
+1	0	tests/unreviewed_work_ack_test.rs
+--- new edge tests in working tree:
+edge_a_block_the_editor_saved_past_the_session_limit_is_refused
+edge_a_failed_edit_leaves_no_copy_of_the_buffer_behind
+edge_a_reset_forgets_the_tour_it_was_walked_through
+edge_a_save_that_is_not_text_is_refused_rather_than_parsed
+edge_a_scratch_directory_is_taken_with_it_however_the_edit_ended
+edge_a_scratch_path_already_taken_is_refused_rather_than_followed
+edge_an_edit_that_does_not_run_gives_the_block_back
+edge_an_editor_that_names_nothing_is_refused_rather_than_spawned
+edge_every_scratch_name_taken_is_reported_as_the_range_it_tried
+edge_every_step_of_the_tour_can_be_walked_by_typing_it
+edge_only_the_step_its_own_snippet_moves_the_tour_on
+edge_the_last_step_taken_is_the_end_of_the_tour
+edge_the_scratch_file_is_readable_by_its_owner_and_nobody_else
+--- count:
+13
+[0m
+[0m← [0mEdit phases/phase-061/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
+@@ -82,13 +82,15 @@
+ ## What the first round of review changed, and what the second found
+ 
+ The first review of this run was not a formality: it found that the report
+ described `0e84349` and one acknowledgement row while the working tree carried
+-roughly a thousand lines of unreported REPL work, and that the report shipped a
+-"known gap" — *`:tutorial` sets `tutorial_step = Some(0)` and nothing advances
+-it* — describing a defect that this run's own diff fixes. Both are gone: the
+-"What changed" table below is written against `git diff HEAD` and accounts for
+-every line of it, and the tour advances.
++`+639 −114` across `src/repl/editor.rs` and `src/repl/mod.rs` — scratch-directory
++hardening, `.edit` going through `edit_with`, and the tour progressing — none of
++which the report mentioned, and that the report shipped a "known gap" —
++*`:tutorial` sets `tutorial_step = Some(0)` and nothing advances it* — describing
++a defect that this run's own diff fixes. Both are gone: the "What changed" table
++below is written against `git diff HEAD` and accounts for every line of it, and
++the tour advances.
+ 
+ The second review went further into the code and found four things worth
+ changing rather than describing:
+ 
+
+[0m
+[0m→ [0mRead phases/phase-061/REPORT.md[90m [offset=80, limit=130][0m
+[0m
+[0m← [0mEdit phases/phase-061/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-061/REPORT.md
+@@ -101,15 +101,16 @@
+   `MAX_BLOCK_BYTES + 1` bytes (`Read::take`), so the bytes past the limit are
+   never in memory, and applies the same `exceeds_block_limits` answer on the way
+   out. Both sides of both limits are asserted: a block of exactly 500 lines and
+   a block of exactly 65 536 bytes run, one line and one byte more do not.
+-- **The scratch directory was removed on two paths out of three.** The write and
+-  the `chmod` that follow `create_dir` returned before the `remove_dir_all`, so
+-  those two failures leaked `redblue-edit-<pid>-<n>/` into `std::env::temp_dir()`
+-  — which is what `edge_a_failed_edit_leaves_no_copy_of_the_buffer_behind` claimed
+-  and could not show, because it only exercises failures that happen after the
+-  removal. The directory is now a `ScratchDir` guard removed in `Drop`, so every
+-  way out of the edit takes it, including a panic.
++- **The scratch directory was removed on every path except the two that come
++  before the editor runs.** The `chmod` and the write that follow `create_dir`
++  returned before the `remove_dir_all`, so those two failures leaked
++  `redblue-edit-<pid>-<n>/` into `std::env::temp_dir()` — which is what
++  `edge_a_failed_edit_leaves_no_copy_of_the_buffer_behind` claimed and could not
++  show, because it only exercises failures that happen after the removal. The
++  directory is now a `ScratchDir` guard removed in `Drop`, so every way out of
++  the edit takes it, including a panic.
+ - **`:reset` forgot the bindings but kept the tour.** A session reset half-way
+   through the tour answered `:hint` about a step whose snippet needed the
+   bindings the reset threw away. `reset_session` clears `tutorial_step` and
+   `tutorial_typed` with the rest, and a test pins it.
+
+[0m
+[0m→ [0mRead phases/phase-061/REPORT.md[90m [offset=210, limit=130][0m
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+p='phases/phase-061/REPORT.md'
+s=open(p).read()
+s=s.replace("Seven further tests from `0e84349` were **changed** rather than added","Eight further tests from `0e84349` were **changed** rather than added")
+s=s.replace("Run from a clean tree at the end of this run.","Run at the end of this run, against this working tree.")
+s=s.replace('and the end of the line (`…", 10)`) is a position that *does* answer','and the end of the line (`signature_hint("say split(", 10)`) *does* answer')
+open(p,'w').write(s)
+EOF
+rg -n "Eight further|Run at the end|does\* answer" phases/phase-061/REPORT.md
+120:  (the end) *does* answer; `signature_hint("say é(", 7)` was asserted `None` "not
+232:Eight further tests from `0e84349` were **changed** rather than added, and each
+258:Run at the end of this run, against this working tree.
+297:| out_of_bounds | covered | `edge_a_bracket_after_something_that_is_not_callable_shows_nothing` — a cursor **past the end of the line** (`signature_hint("say split(", 999)`) is `None` rather than a slice panic, and the end of the line (`signature_hint("say split(", 10)`) *does* answer, because a cursor at the end of `say split(` is after the bracket |
+[0m
+[0m$ [0mcp phases/phase-061/REPORT.md /home/runner/work/rbops/rbops/phases/phase-061/REPORT.md && cargo fmt --all -- --check && echo "FMT PASS" && cargo clippy --all-targets -- -D warnings 2>&1 | tail -2
+FMT PASS
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 4.78s
+[0m
+[0m# [0mTodos
+[✓] Read relevant code: exceeds_block_limits, edit_in, reset_session, private_scratch_dir
+[✓] Fix 4: cap edited block with exceeds_block_limits + tests both sides
+[✓] Fix 5: scope guard for scratch dir removal + write/lock failure test
+[✓] Fix 6: malformed_input — add whitespace-only editor test
+[✓] Fix 7: reset_session clears tutorial_step/tutorial_typed + test
+[✓] Fix 8+14: editor.rs signature_hint assertions and stat -c portability
+[✓] Fix 13: private_scratch_dir doc describes serial search
+[✓] Fix 1,2,3,9,10,11,12: REPORT.md rewrite
+[•] Re-run four gates
+[0m
+Final gate run — all four:
