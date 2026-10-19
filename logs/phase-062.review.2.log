@@ -1,0 +1,362 @@
+[93m[1m! [0m agent "reviewer" not found. Falling back to default agent
+[0m
+> build · nemotron-3-ultra-free
+[0m
+[0m→ [0mRead src/repl/debug_repl.rs
+[0m→ [0mRead src/repl/mod.rs
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/interpreter.rs
+[0m→ [0mRead src/debugger.rs
+[0m→ [0mRead src/interpreter.rs[90m [offset=1065][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m✱ [0mGrep "unwrap\(\)|expect\(\)|panic!|unreachable!|todo!|unimplemented!"[90m in src/repl/debug_repl.rs · 20 matches[0m
+[0m✱ [0mGrep "unwrap\(\)|expect\(\)|panic!|unreachable!|todo!|unimplemented!"[90m in src/repl/mod.rs · 20 matches[0m
+[0m✱ [0mGrep "unwrap\(\)|expect\(\)|panic!|unreachable!|todo!|unimplemented!"[90m in src/debugger.rs · 52 matches[0m
+Now let me search for specific issues in the implementation:
+[0m✱ [0mGrep "unwrap\(\)|expect\(\)|panic!|unreachable!|todo!|unimplemented!"[90m in src/repl/debug_repl.rs · 20 matches[0m
+[0m
+[0m$ [0mgrep -n "unwrap\|expect\|panic\|unreachable\|todo\|unimplemented" /home/runner/work/rbops/rbops/redblue/src/repl/debug_repl.rs
+125:                .unwrap_or_else(|poisoned| poisoned.into_inner());
+368:    /// state: a watch that panicked poisoned the mutex, and a poisoned mutex
+369:    /// still holds the reports the watches before the panic produced. Locking
+391:/// [`crate::debugger::lock`] keeps: a watcher that panicked is one failed
+396:        .unwrap_or_else(|poisoned| poisoned.into_inner())
+458:                    .unwrap_or_default()
+561:    /// the answer rather than a panic.
+[0m
+[0m$ [0mgrep -n "unwrap\|expect\|panic\|unreachable\|todo\|unimplemented" /home/runner/work/rbops/rbops/redblue/src/debugger.rs
+19:/// A hook that panicked while holding the lock has already failed the program
+25:        .unwrap_or_else(|poisoned| poisoned.into_inner())
+145:            let scopes = self.scopes.get(self.scope_base..).unwrap_or(self.scopes);
+347:        self.source.get(line - 1).cloned().unwrap_or_default()
+[0m
+[0m→ [0mRead src/repl/debug_repl.rs[90m [limit=60, offset=570][0m
+[0m→ [0mRead src/repl/debug_repl.rs[90m [limit=100, offset=410][0m
+[0m✱ [0mGrep "call_user_function|frame_writes|frame_scope_base"[90m in src/interpreter.rs · 28 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2600, limit=100][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=50, offset=705][0m
+[0m
+[0m$ [0mgrep -A 30 "Tests added" /home/runner/work/rbops/rbops/redblue/phases/phase-062/REPORT.md | head -60
+## Tests added
+
+Eighteen new `#[test]` functions, all through the sub-REPL driver or the real
+read loop over a scripted source — none needs a TTY. Seventeen are in
+`src/repl/mod.rs`'s test module (`repl::tests::…`) and one is in
+`src/repl/commands.rs` (`repl::commands::tests::…`); the two marked **round 1**
+are the review repair.
+
+| Test | Edge class covered |
+|---|---|
+| `repl::commands::tests::the_debug_sub_repl_commands_parse` | malformed input — the five spellings parse to the right variants with the right argument, and `.debug` with no argument parses to `Debug("")` rather than a missing-argument error |
+| `repl::tests::debug_stack_names_a_three_deep_call_chain` | nesting — `.debug outer()` over a three-deep chain, `.stack` names `outer`, `middle`, `inner` in call order |
+| `repl::tests::debug_watch_reports_only_the_steps_where_the_value_changed` | happy path + counting — four statements run, three changes, exactly three report lines and no others; **this is the test that was red first** (the first implementation reported the baseline as a change: `["watch x = 0", "watch x = 1", "watch x = 2"]`) |
+| `repl::tests::debug_locals_shows_the_stepped_frame_and_not_the_callers` | frame isolation — the callee's parameter and local listed, the caller's local and the global the caller overwrote both absent, while the callee could see that global through Redblue's own scoping |
+| `repl::tests::debug_locals_shows_a_constant_the_frame_declared` | frame isolation, second shape — a `constant` binds a global, and the frame that declared it owns it: it is in that frame's `.locals` |
+| `repl::tests::debug_watch_with_no_argument_lists_the_watches_the_session_holds` | empty + duplicate — a bare `.watch` lists the watches the session holds ("No watches." for none), and the same expression watched twice is two watches, listed twice |
+| `repl::tests::debug_a_file_can_be_watched_while_it_runs` | a file under observation — `.run <file>` after the watches are set reports each change the file made, and nothing else |
+| `repl::tests::debug_a_file_whose_name_is_not_rb_is_read_when_it_exists` | the file/code decision — a `.txt` file that exists is read and run, not parsed as an expression |
+| `repl::tests::a_debug_sub_repl_leaves_the_parent_session_untouched` | byte-identity — driven through `session_loop` with a scripted source: history is exactly the two parent-prompt lines, the transcript is a strict prefix plus the post-`.back` line, the sub-REPL's binding absent from the parent's VM, the resumed line's binding present, the parent's `_` never written, the block buffer empty, a `debug>` prompt asked |
+| `repl::tests::edge_a_bare_debug_opens_a_session_and_runs_nothing` | empty — `.debug` with no argument opens with the banner, runs nothing, `.back` returns; the next line answers outside any session |
+| `repl::tests::edge_a_watch_that_cannot_parse_fails_and_the_session_goes_on` | malformed input + **failure produced** — `.watch 1 +` is a reported failure (`Error:` line quoting the source), `parse_only("1 +").is_err()` asserts the property underneath, `.stack` still answers `No live frames.` (also the no-live-frames edge), the session never closed |
+| `repl::tests::edge_a_watch_on_an_unbound_name_reports_per_step_and_the_run_still_finishes` | missing name + **failure produced** — `.watch nosuchname` over a loop reports `Unknown variable 'nosuchname'` once per evaluation (four for the loop run, two for the one-statement run typed after), and the run still answers `= 2` |
+| `repl::tests::edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` | **round 1** — resource/state + **failure produced**: a watch on `files.write(…)` is refused at the call, the report names `files_write`, and the file it would have written is not there afterwards; the program it was watching still answers `= 2`. Red before the fix (with `ask_questions(false)` the watch wrote the file) |
+| `repl::tests::edge_a_debug_of_a_file_that_cannot_be_read_says_so_and_still_opens` | missing resource — `.debug definitely_missing_phase062.rb` answers `Error: cannot read '…'`, the sub-REPL opens anyway, `.stack` answers inside it |
+| `repl::tests::edge_a_debug_of_a_directory_says_it_cannot_be_read_and_still_opens` | **round 1** — malformed/resource: a path that is there but holds no source (a directory) is reported as "cannot read" rather than run as code, and the sub-REPL opens anyway |
+| `repl::tests::edge_a_run_of_a_file_that_cannot_be_read_reports_the_failure_and_the_session_goes_on` | missing resource — `.run <file>` on a file that is not there reports the read failure and the session goes on |
+| `repl::tests::edge_a_run_of_a_file_that_does_not_parse_reports_the_failure_and_the_session_goes_on` | malformed input — `.run <file>` on a file that does not parse reports the failure and the session goes on |
+| `repl::tests::edge_sub_repl_commands_outside_a_session_say_how_to_open_one` | boundary — `.stack`, `.locals`, `.watch x`, `.back` with no session open all answer the one sentence naming `.debug` |
+
+### Edge-case matrix (AGENTS.md §3.2)
+[0m
+[0m$ [0mgrep -A 50 "Edge-case matrix" /home/runner/work/rbops/rbops/redblue/phases/phase-062/REPORT.md | head -70
+### Edge-case matrix (AGENTS.md §3.2)
+
+- **empty** — covered: bare `.debug` (`edge_a_bare_debug_opens_a_session_and_runs_nothing`); `.stack` before any step (`No live frames.`).
+- **singleton** — covered: the one-statement `.debug 1 + 1` run inside the unbound-watch edge (one stop, one end-of-run pass, two reports).
+- **boundary** — covered: sub-REPL commands with no sub-REPL open (`edge_sub_repl_commands_outside_a_session_say_how_to_open_one`).
+- **out_of_bounds** — N/A: this change indexes no user-supplied position; `scope_base` slicing is internal and cannot go past the scope stack (it is taken from the VM at a live frame).
+- **type_mismatch** — covered in its failure shape: a watch on a name that does not exist takes the same per-step error path as any other failing evaluation (`edge_a_watch_on_an_unbound_name…`); arithmetic type failures on watched values take that identical `Err` path — no separate branch exists to test.
+- **numeric_boundary** — N/A: no numeric surface is introduced; watch values are compared with `Value` equality, and `Value::number` already refuses non-finite numbers, so a NaN comparator is not a branch this change has.
+- **unicode** — N/A: no encoding surface is introduced; a watch's name is interpolated into a report line with `Display`, which is exercised for every value across the watch tests.
+- **nesting_recursion** — covered: three-deep call chain for `.stack`; frame isolation for `.locals`.
+- **duplicate_missing_keys** — covered (missing half): watching a name nobody bound reports per step without aborting; re-registering the same watch twice is two independent watches (each compares against its own last value — no shared state exists to corrupt).
+- **malformed_input** — covered: `.watch 1 +` refused at registration; every sub-REPL command's parse is pinned by the alias-table rows; a `.debug` argument that names a directory is reported as unreadable rather than run as code (`edge_a_debug_of_a_directory…`).
+- **resource_and_state** — covered: a watch on an effectful builtin is refused at the call and the file it would have written is not there afterwards (`edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing`) — a debugger that wrote the file it was asked to look at would be the state bug this row is about.
+- **resource_limit** — N/A with reason: the sub-REPL reuses the parent's block limits (`MAX_BLOCK_LINES`/`MAX_BLOCK_BYTES`) through the parent's own `exceeds_block_limits`; the enforcement is tested at the parent, and the forwarding path here is the three lines of `report_block_too_large`. A runaway *run* is bounded by the same step budget the parent never resets.
+
+## Gates
+
+Run in this checkout, on the tree as it now stands, in this order:
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test --all-targets` | **1886 passed, 0 failed** across 67 test binaries (log: `target/tmp/test_final.log`; the long poles are the pre-existing bootstrap self-hosting suites at ~280 s and ~373 s) — the round-1 repair adds two of them (`edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing`, `edge_a_debug_of_a_directory_says_it_cannot_be_read_and_still_opens`) |
+| `cargo test --doc` | 2 passed, 0 failed |
+| `../rbops/verify.sh "phase-062"` | **PASS** — `VERIFY PASS — phase-062`, exit 0, every check green: manifest, report, diff hygiene (`+686 −19`, no forbidden path, no gate-weakening construct, no scratch file), `must_touch: src/`, `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test: 1886 passed, 0 failed`, the doc tests, the `examples/`+`modules/` sweep, test policy (8 rust / 0 redblue, 4 `edge_*`, 2 failure-asserting, 0 newly skipped) and the honesty check (`reported test count (1886) matches actual (1886)`) |
+
+What `verify.sh` does, for the record: it validates that the phase is declared
+in `rbops/phases.json` with its dependencies `.done`; that this report exists
+with its four required sections and at least one evidence row naming a file;
+that the working-tree diff against HEAD touches no forbidden path
+(`.github/workflows/`, `rbops/`, `.opencode/agent/`), adds no gate-weakening
+construct (`#[ignore]`, `// skip`, `allow(clippy::…)` at line start), contains
+no scratch files, and clears the manifest's minimum line count; that at least
+one changed file falls under the phase's `must_touch`; that the four cargo
+gates pass and every `examples/*.rb` and `modules/*.rb` still runs under the
+built binary (baselined pre-existing failures excepted, and the exemption
+revoked for any file this phase touched); that the diff carries at least three
+new `#[test]` functions, at least one `edge_*` test and at least one assertion
+that a *failure* is produced, with no newly skipped or ignored tests; and that
+the test count this report claims is within tolerance of the count its own run
+measured — over-claiming fails the phase, under-claiming only warns.
+
+**`verify.sh "phase-062"`: PASS.** (Run twice: once at the end of the first
+attempt, and once again after the review-round-1 repair, on the tree as it now
+stands — every check green on both runs — manifest, report, diff hygiene,
+`must_touch`, the four cargo gates, the examples sweep, test policy and the
+honesty check.)
+
+## Invariants touched
+[0m
+[0m$ [0mgrep -n "edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing" /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+3570:    fn edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing() {
+[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3565, limit=80][0m
+[0m
+[0m$ [0mgrep -n "import\|files" /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs | head -50
+266:/// `set x to 1` binds `x`, `constant x`, `to x(..)`, `import M` and `module M`
+325:/// Every name an `import` statement binds, from the tokens after the keyword.
+327:/// The whole rest of the line, because one `import` can bind several names and
+328:/// the grammar says so: `import files, network as net` binds `files`, `network`
+329:/// and `net`, and `import json as J` binds `J` as well as leaving `json` naming
+331:/// that read only the identifier after the `import` recorded the first item and
+333:fn imported_names(rest: &[crate::lexer::Token]) -> Vec<(String, usize)> {
+338:            // belongs to another statement, and an `import` says nothing about
+700:    /// an `import`ed module's own `set` and `constant` declarations live.
+1432:    /// looked for — `set x to`, `constant x`, `to x(..)`, `import M`,
+1439:    /// - **An `import` declares more than one name.** `import files, network as
+1440:    ///   net` binds `files`, `network` *and* `net` — the grammar says so, and
+1442:    ///   Reading only the identifier after the `import` recorded the first item
+1471:                    imported_names(&tokens[index + 1..])
+1525:    /// reused across lines, so a `set`, a `to` or an `import` from an earlier line
+1639:    /// result — because a `set`, a `to` and an `import` all bind in the VM, which
+1950:    /// `import` all bind in the VM, and the REPL's map held only `_`, so
+2049:    /// refuse *before* the run: `files.delete("notes.rb")` has to be a message,
+2050:    /// not an answer about what `files.delete` returns. Every spelling is
+2052:    /// `import files as F`, [`stdlib::resolve`] for a module member written flat
+2053:    /// — so `files.delete(…)`, `files_delete(…)` and `F.delete(…)` are one
+2058:    /// files.delete("notes.rb") end` writes a call that appears nowhere in
+2143:    /// with the session: the same root, the same filesystem, the same
+2907:    fn a_session_restores_what_a_previous_one_typed_and_not_the_history_files_header() {
+3561:    /// leaves the process — `files.write` — is refused at the call, before the
+3563:    /// typed `.watch files.write(…)` would be a debugger doing the thing it
+3577:            &format!(".watch files.write(\"{quoted}\", \"clobbered\")"),
+3585:            .filter(|line| line.starts_with("watch files.write("))
+3594:            refusals.iter().all(|line| line.contains("files_write")),
+4029:    /// An `import` publishes a module's functions in the VM under the
+4036:    fn edge_an_imported_modules_internal_names_are_not_session_names() {
+4039:        feed(&mut repl, &["import MathUtils"]);
+4159:        for line in ["import files to F", "set x to 10", r#"say "to""#] {
+4315:    /// `import` all bind there, so it reported "Variable not found" for every name
+4662:        /// A directory for a test's files, named after the test so two running in
+4721:                ("import files", "import"),
+4763:        /// leaves the process, so a call that reaches the filesystem, the
+4769:        /// A *read* is in that list now, and it was not. `files.read` changes
+4771:        /// question could block forever on a FIFO and how `files.read("/home/…")`
+4785:                format!("files.write(\"{quoted}\", \"clobbered\")"),
+4786:                format!("files.delete(\"{quoted}\")"),
+4787:                format!("files.copy(\"{quoted}\", \"{}\")", copy.display()),
+4788:                format!("files_append(\"{quoted}\", \"more\")"),
+4789:                format!("files.read(\"{quoted}\")"),
+4790:                format!("files.lines(\"{quoted}\")"),
+4791:                format!("files.exists(\"{quoted}\")"),
+4843:        fn edge_type_refuses_a_call_written_through_an_import_alias() {
+4845:            feed(&mut repl, &["import files as F", "import json to J"]);
+4848:                ("F.delete(\"notes.rb\")", Some("files_delete")),
+4850:                // under the module's own name: `F` *is* `files`.
+[0m
+[0m$ [0mgrep -n "files" /home/runner/work/rbops/rbops/redblue/src/stdlib.rs | head -50
+20:    "bytes", "console", "csv", "files", "json", "list", "math", "network", "sys", "text", "time",
+51:///   `src/bytecode/vm.rs`), so `files_read` being registered is not by itself a
+52:///   reason `files.read` answers.
+67:        "files",
+236:/// the internal encoding `files.read` is stored under — so it answers as itself.
+386:        "files_read".to_string(),
+387:        Value::Builtin("files_read".to_string()),
+390:        "files_write".to_string(),
+391:        Value::Builtin("files_write".to_string()),
+394:        "files_append".to_string(),
+395:        Value::Builtin("files_append".to_string()),
+398:        "files_exists".to_string(),
+399:        Value::Builtin("files_exists".to_string()),
+402:        "files_lines".to_string(),
+403:        Value::Builtin("files_lines".to_string()),
+406:        "files_delete".to_string(),
+407:        Value::Builtin("files_delete".to_string()),
+410:        "files_copy".to_string(),
+411:        Value::Builtin("files_copy".to_string()),
+414:        "files_rename".to_string(),
+415:        Value::Builtin("files_rename".to_string()),
+500:    // Bytes module: the binary file API. `files` writes text, so without this a
+757:/// `files.read` given a number it cannot read has to say so rather than claim
+811:/// qualification is load-bearing: `files.append` is registered as
+812:/// `files_append`, and unwrapping it to the bare `append` sent a working
+814:/// `files.append(path, "a")` was refused as arguments it cannot use. A name
+898:    "files_read",
+899:    "files_write",
+900:    "files_append",
+901:    "files_exists",
+902:    "files_lines",
+903:    "files_delete",
+904:    "files_copy",
+905:    "files_rename",
+1036:    ("files_read", "files_read(text) -> the whole file as text"),
+1038:        "files_write",
+1039:        "files_write(text, text) -> nothing; writes a file",
+1042:        "files_append",
+1043:        "files_append(text, text) -> nothing; adds to a file",
+1045:    ("files_exists", "files_exists(text) -> yes/no"),
+1047:        "files_lines",
+1048:        "files_lines(text) -> a list of the file's lines",
+1051:        "files_delete",
+1052:        "files_delete(text) -> nothing; removes a file",
+1055:        "files_copy",
+1056:        "files_copy(text, text) -> nothing; copies a file",
+1059:        "files_rename",
+1060:        "files_rename(text, text) -> nothing; moves a file",
+1145:/// `:sighelp files.read` finds `files_read` because that is the name the
+1189:/// - They *write*: a file (`files_write`, `files_append`, `files_delete`,
+[0m
+[0m$ [0mgrep -n "observe_bindings" /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+721:    pub fn observe_bindings(&mut self, scopes: &[CapturedScope], globals: &HashMap<String, Value>) {
+[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=706, limit=30][0m
+[0m
+[0m$ [0mgrep -n "ask_questions" /home/runner/work/rbops/rbops/redblue/src/interpreter.rs | head -20
+373:    /// REPL evaluates `.type` on ([`Vm::ask_questions`]).
+691:    /// caller's decision ([`Vm::ask_questions`]), not something inherited from
+746:    pub fn ask_questions(&mut self, asking: bool) {
+[0m
+Now I have a clear picture of the issues. Let me compile my findings.
+[0m$ [0mgrep -n "frame_writes" /home/runner/work/rbops/rbops/redblue/src/interpreter.rs | head -20
+441:    /// [`DebugEvent::frame_writes`]. One entry per live frame, pushed and popped
+443:    frame_writes: Vec<HashSet<String>>,
+657:            frame_writes: Vec::new(),
+1503:        // concerned. See [`DebugEvent::frame_writes`].
+1504:        if let Some(writes) = self.frame_writes.last_mut() {
+1575:        // [`DebugEvent::frame_writes`]. At the top level there is no frame to
+1578:        if let Some(writes) = self.frame_writes.last_mut() {
+1640:            frame_writes: self.frame_writes.last(),
+2643:        self.frame_writes.push(HashSet::new());
+2666:            self.frame_writes.pop();
+2684:        self.frame_writes.pop();
+[0m
+[0m$ [0mgrep -n "qualified_members" /home/runner/work/rbops/rbops/redblue/src/interpreter.rs | head -20
+360:    qualified_members: HashSet<String>,
+645:            qualified_members: HashSet::new(),
+701:        forked.qualified_members = self.qualified_members.clone();
+1066:    /// out — see [`Vm::qualified_members`]. They are in `globals` because that is
+1076:            .filter(|name| !builtins.contains_key(*name) && !self.qualified_members.contains(*name))
+1095:        self.qualified_members.insert(name.clone());
+1110:        self.qualified_members.contains(name)
+1637:            module_members: &self.qualified_members,
+[0m
+[0m$ [0mgrep -B5 -A30 "edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing" /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+///
+    /// Asserted on the file and not only on the wording of the message: "it
+    /// said no" and "the file is still not there" are different claims, and
+    /// only the second one is the point.
+    #[test]
+    fn edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing() {
+        let mut repl = Repl::new();
+        let path = unwritten_path("watched");
+        let quoted = path.display().to_string();
+
+        let answers = repl.debug_session(&[
+            ".debug",
+            &format!(".watch files.write(\"{quoted}\", \"clobbered\")"),
+            "1 + 1",
+            ".back",
+        ]);
+
+        let refusals: Vec<&str> = answers
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.starts_with("watch files.write("))
+            .collect();
+        assert!(
+            !refusals.is_empty(),
+            "the watch reported the refusal rather than making the write; it \
+             answered:\n{}",
+            answers.join("\n")
+        );
+        assert!(
+            refusals.iter().all(|line| line.contains("files_write")),
+            "and the refusal names the builtin that would have done it: {:?}",
+            refusals
+        );
+        assert!(
+            !path.exists(),
+            "the watched expression wrote nothing: {} is not there",
+[0m
+[0m# [0mTodos
+[•] Write review findings for phase-062
+[0m
+Now I have all the information needed. Let me write the review findings.
+[0m# [0mTodos
+[✓] Write review findings for phase-062
+[0m
+[0m← [0mWrite review_findings.md
+Wrote file successfully.
+[0m
+[0m$ [0mcat /home/runner/work/rbops/rbops/redblue/review_findings.md
+FINDINGS:
+1. [MAJOR] src/interpreter.rs:721 — `observe_bindings` copies only `locals` and `globals` to the scratch VM, but not `qualified_members`, `modules`, `module_aliases`, `declared_modules`, or `objects`. This breaks module member calls (e.g., `files.write()`, `json.parse()`) in `.watch` expressions because `Vm::call_method` checks `qualified_members` to resolve `receiver.method` to the qualified builtin name. Without it, `files.write(...)` fails with "'files' has no method 'write'" instead of reaching the effectful-builtin refusal. The test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` uses `files.write` without `import files`, so it likely fails for the wrong reason (missing method vs. refused effect) — the assertion checks for "files_write" in the refusal text, which would not appear in the actual error. Fix: extend `observe_bindings` to also copy `qualified_members` (and ideally `modules`, `module_aliases`, `declared_modules`, `objects`) from the observed VM.
+
+2. [MAJOR] src/interpreter.rs:721 — The scratch VM's `steps` counter (step budget) is never reset between watch evaluations. `observe_bindings` resets `statement_depth` and drains output but leaves `steps`, `call_depth`, `loop_depth`, `loop_control`, and `assertions_failed` accumulating. With many watches or complex watch expressions (e.g., loops), the shared scratch VM can hit the step limit (default 32M) and cause subsequent watch evaluations to fail with a step-limit error. Fix: reset `steps = 0` (and other per-run counters) in `observe_bindings`, or create a fresh scratch VM per evaluation.
+
+3. [MINOR] src/repl/debug_repl.rs:606 — TOCTOU in `read_argument`: between `read_source(argument)` failing and `std::fs::metadata(argument).is_ok()` check, the filesystem state can change (file created/deleted). If a file is created in this window, a previously-missing `.rb` file is reported as "cannot read" with a stale error; if deleted, a directory may be misclassified as code. Low practical risk for a REPL but a correctness gap. Fix: decide file-vs-code from the single `read_source` result; only fall back to metadata for the `.rb`-suffix rule.
+
+4. [MINOR] src/repl/debug_repl.rs:179 — No limit on number of `.watch` registrations. A user can register unlimited watches, each evaluated at every statement boundary, causing O(watches × statements) work with no bound. Fix: enforce a reasonable cap (e.g., 100 watches) and refuse further registrations.
+
+5. [STYLE] src/repl/debug_repl.rs:122-127 — The debug hook closure returns `DebugAction::Run` but does not catch panics. If `observe` or `evaluate_watches` panics (e.g., due to a bug), the panic propagates out of `Vm::debug_before`, crashing the program being debugged instead of reporting a watch failure. Fix: wrap the hook body in `std::panic::catch_unwind` and report the panic as a watch error.
+
+6. [STYLE] src/repl/mod.rs:3570 — Test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` asserts the watch refusal contains "files_write", but the watch expression `files.write(...)` is used without `import files`. Without the import, `qualified_members` lacks `files_write`, so `call_method` fails with "'files' has no method 'write'" (not a refusal). The test likely passes for the wrong reason or masks finding #1. Fix: either add `import files` to the test setup, or update the assertion to match the actual error (and separately test the refusal path with a proper import).
+
+REVIEW VERDICT: FINDINGS 6
+[0m
+[0m$ [0mgrep -n "fn read_argument" /home/runner/work/rbops/rbops/redblue/src/repl/debug_repl.rs
+602:fn read_argument(argument: &str) -> Argument {
+[0m
+[0m→ [0mRead src/repl/debug_repl.rs[90m [limit=15, offset=600][0m
+[0m
+[0m$ [0mgrep -n "pub(super) fn watch" /home/runner/work/rbops/rbops/redblue/src/repl/debug_repl.rs
+171:    pub(super) fn watch(&mut self, source: &str) -> Vec<String> {
+194:    pub(super) fn watch_lines(&self) -> Vec<String> {
+[0m
+[0m→ [0mRead src/repl/debug_repl.rs[90m [offset=170, limit=25][0m
+[0m
+[0m$ [0mgrep -n "set_debug_hook" /home/runner/work/rbops/rbops/redblue/src/repl/debug_repl.rs
+122:        vm.set_debug_hook(Some(Box::new(move |event| {
+[0m
+[0m→ [0mRead src/repl/debug_repl.rs[90m [offset=118, limit=20][0m
+The line numbers are accurate. Here are the final findings:
+
+```
+FINDINGS:
+1. [MAJOR] src/interpreter.rs:721 — `observe_bindings` copies only `locals` and `globals` to the scratch VM, but not `qualified_members`, `modules`, `module_aliases`, `declared_modules`, or `objects`. This breaks module member calls (e.g., `files.write()`, `json.parse()`) in `.watch` expressions because `Vm::call_method` checks `qualified_members` to resolve `receiver.method` to the qualified builtin name. Without it, `files.write(...)` fails with "'files' has no method 'write'" instead of reaching the effectful-builtin refusal. The test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` uses `files.write` without `import files`, so it likely fails for the wrong reason (missing method vs. refused effect) — the assertion checks for "files_write" in the refusal text, which would not appear in the actual error. Fix: extend `observe_bindings` to also copy `qualified_members` (and ideally `modules`, `module_aliases`, `declared_modules`, `objects`) from the observed VM.
+
+2. [MAJOR] src/interpreter.rs:721 — The scratch VM's `steps` counter (step budget) is never reset between watch evaluations. `observe_bindings` resets `statement_depth` and drains output but leaves `steps`, `call_depth`, `loop_depth`, `loop_control`, and `assertions_failed` accumulating. With many watches or complex watch expressions (e.g., loops), the shared scratch VM can hit the step limit (default 32M) and cause subsequent watch evaluations to fail with a step-limit error. Fix: reset `steps = 0` (and other per-run counters) in `observe_bindings`, or create a fresh scratch VM per evaluation.
+
+3. [MINOR] src/repl/debug_repl.rs:606 — TOCTOU in `read_argument`: between `read_source(argument)` failing and `std::fs::metadata(argument).is_ok()` check, the filesystem state can change (file created/deleted). If a file is created in this window, a previously-missing `.rb` file is reported as "cannot read" with a stale error; if deleted, a directory may be misclassified as code. Low practical risk for a REPL but a correctness gap. Fix: decide file-vs-code from the single `read_source` result; only fall back to metadata for the `.rb`-suffix rule.
+
+4. [MINOR] src/repl/debug_repl.rs:179 — No limit on number of `.watch` registrations. A user can register unlimited watches, each evaluated at every statement boundary, causing O(watches × statements) work with no bound. Fix: enforce a reasonable cap (e.g., 100 watches) and refuse further registrations.
+
+5. [STYLE] src/repl/debug_repl.rs:122-127 — The debug hook closure returns `DebugAction::Run` but does not catch panics. If `observe` or `evaluate_watches` panics (e.g., due to a bug), the panic propagates out of `Vm::debug_before`, crashing the program being debugged instead of reporting a watch failure. Fix: wrap the hook body in `std::panic::catch_unwind` and report the panic as a watch error.
+
+6. [STYLE] src/repl/mod.rs:3570 — Test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` asserts the watch refusal contains "files_write", but the watch expression `files.write(...)` is used without `import files`. Without the import, `qualified_members` lacks `files_write`, so `call_method` fails with "'files' has no method 'write'" (not a refusal). The test likely passes for the wrong reason or masks finding #1. Fix: either add `import files` to the test setup, or update the assertion to match the actual error (and separately test the refusal path with a proper import).
+
+REVIEW VERDICT: FINDINGS 6
+```
