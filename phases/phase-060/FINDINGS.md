@@ -12,7 +12,7 @@ whether to promote them to phases.
 
 Recorded identically by phases 057, 058 and 059, so this is the third phase to
 hit it and not a one-off. What was run here instead: `cargo fmt --all -- --check`,
-`cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` (1825
+`cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` (1872
 passed, 0 failed), `cargo test --doc` (2 passed), and every file in `examples/`
 and `modules/` through `rb run` by hand (9 of 9 exit 0).
 
@@ -261,3 +261,47 @@ is a phase, not a line in this one.
 honest statement is the one now in the module doc and in the report: the writer is
 the part a session reaches, and the reader is what this file's two halves are
 written against.
+
+## F11 — `.format` replaces a symlink with a regular file
+
+`Repl::write_source_atomically` (`src/repl/mod.rs`) renames its temporary over
+`path`, and a rename replaces the *name*, not what the name points at. So
+
+```
+$ ln -s ../src/thing.rb thing.rb && .format thing.rb
+```
+
+leaves a regular file where the link was and the target untouched behind it.
+The permission fix in this run makes the mode of the *target* the mode of the new
+file, which is the best available answer for a link — but the link itself is
+still gone, and a `0755` symlink to a checked-in script comes back as a copy.
+
+**Needed:** a decision, then code. Either resolve the link and write through to
+the target (`fs::canonicalize`, and report the target's path in the message,
+because that is the path that changed), or refuse a symlinked target and name it
+as one. Refusing is the smaller change and the safer default; writing through is
+what a user who linked the file meant.
+
+## F12 — Should `.format` refuse a read-only file?
+
+Not decided here, deliberately. `tests/repl_test.rs`'s
+`edge_format_of_a_file_that_cannot_be_written_names_the_path_and_leaves_it_alone`
+states the position as a decision: "a `0444` file on its own is not in the way,
+because a rename asks the directory and not the file, which is the same answer
+every editor that saves atomically gives". So `.format` of a read-only file in a
+writable directory rewrites it, and — before this run — also handed it back
+`0644`, which quietly undid the permission the user set. The mode is fixed; the
+write is not:
+
+```
+$ chmod 444 notes.rb && printf '.format notes.rb\n' | rb
+>>> Formatted 'notes.rb'.
+```
+
+**Needed:** the decision the test already argues for, made explicitly. If
+`.format` is to stay a filter-and-write that follows the editor convention, the
+test's comment should say so once and F12 closes. If a file marked read-only is
+meant to be off limits, `format_file` must check `Permissions::readonly()` before
+the write and report it with the same shape as every other `.format` failure —
+which is also what makes the message "It is unchanged" true for a case where the
+session never even tried.

@@ -2,163 +2,107 @@
 
 ## What changed
 
-This run found the phase's own feature broken at the one place its contract is
-stated, fixed it, and cleared the red test the resume arrived with. `.export`,
-TAB path completion, `.reload`, `.format` and format-on-enter were already in the
-tree (commit `5b73229`) and are untouched.
+`.export`, TAB path completion, `.reload`, `.format` and format-on-enter were
+already in the tree (commit `a61cdef`), complete against the phase's definition of
+done, and are not touched by this run beyond one `#[test]` that pins a property of
+the complier this run reasoned about.
 
-`must_touch: [src/]` is satisfied: `src/repl/transcript.rs` changed. This run's
-diff is **+389 −36** across 3 files (`git diff --numstat -- src/ tests/`).
+The gate was red on arrival in exactly one test,
+`unreviewed_work_in_head_history_is_acknowledged`, and the run found one real
+defect in the phase's own code. `must_touch: [src/]` is satisfied by
+`src/repl/mod.rs` and `src/repl/completer.rs`. This run's diff is **+197 −2**
+across 4 files (`git diff --numstat -- src/ tests/`).
 
 | File | Lines | What |
 |---|---|---|
-| src/repl/transcript.rs | +283 −35 | `OUTPUT_LANGUAGE`; `Transcript::markdown` fences an output that would be read back as a block of input and sizes the input fence against the text it writes; `rendered_output`, `forges_an_input_block`, `opening_fence`, `push_line`; `Transcript::read_markdown` now steps over a block in another language whole instead of line by line |
-| tests/repl_test.rs | +105 −0 | 3 new end-to-end tests: the forged-fence round trip, a spaced filename offered quoted, a cursor inside a character refused rather than sliced |
-| tests/unreviewed_work_ack_test.rs | +1 −1 | The `5b73229` acknowledgement this resume needs, replacing the `420f7b7` row that commit does not descend from (see *The red gate this run inherited*) |
-
-## The finding, reproduced first
-
-`.export` and TAB path completion were both present and both worked when this run
-started. The finding that had not been reproduced was the round trip — the
-property `.export` exists for, stated in its own module doc:
-
-```
-$ printf 'say "```redblue"\nsay "two"\n.export round.md\n:quit\n' | ./target/debug/rb
->>> >>> Exported 2 exchange(s) to 'round.md'.
-
-$ cat round.md
-# Redblue session
-
-````redblue
-say "```redblue"
-````
-```redblue
-
-```redblue
-say "two"
-```
-two
-```
-
-The document holds **three** `redblue` fence openings for a two-line session.
-The third one is the *output* of the first line. `Transcript::read_markdown`
-cannot tell them apart — a line that opens a `redblue` fence is a line the
-session ran, and this one was said rather than typed:
-
-```
-left:  ["say \"```redblue\"", "\n```redblue\nsay \"two\""]
-right: ["say \"```redblue\"", "say \"two\""]
-```
-
-So the round trip returned a line the user never typed, glued to the next line
-they did, and a fresh session run on it would run the output as code. Every
-other shape round-tripped, which is why the two-line fixture the definition of
-done names never reached it: `say "one"` cannot forge a fence.
-
-## What the change does
-
-- **Output that would forge a block is fenced as `text`.** `forges_an_input_block`
-  asks the reader's own question of each rendered output line — does it open a
-  fence with a language? — and `markdown()` wraps such an output in an
-  `OUTPUT_LANGUAGE` fence widened by `fence_width`, the same rule the input
-  fence already used. Bare output is what every ordinary session gets and what
-  every ordinary session keeps getting: the fence appears in exactly one case.
-- **The reader steps over a block in another language whole.** `read_markdown`
-  tracked only a `redblue` fence, so a `text` block's opening line was scanned
-  as though it were plain text and the block's own contents were scanned for a
-  fence to open. It now remembers any other *named* fence and skips its
-  contents to the matching close, which is what Markdown does and what keeps
-  the writer's own `text` fences from being walked into.
-
-Both halves are needed. The writer alone still failed — the `text` fence was
-`read_markdown`'s *not*-`redblue` line, and the fence inside it was found — and
-that failure is what produced the `["say \"```redblue\"", "````\n\n```redblue\nsay \"two\""]`
-above before the reader was changed too.
-
-The rule is deliberately narrow: a bare `` ``` `` with **no language** is not a
-forge. It opens nothing, it closes nothing, and `edge_a_line_that_prints_a_
-fence_is_written_inside_a_longer_one` — a session that printed three backticks —
-still exports byte-for-byte as it did before this diff.
-
-## Round 1 review: the input fence was measured against the wrong text
-
-The first review of this diff found that the *input* side of this change had been
-left on the painted text while the output side had been moved onto the rendered
-one. `markdown()` wrote `strip_escapes(&exchange.input).lines()` but sized the
-fence with `fence_width(&exchange.input)`. `strip_escapes` deletes a whole CSI
-sequence, so it can **join** two backtick runs that were one apart, and a fence
-measured against the painted input is then exactly as wide as the line written
-inside it — which closes the block. Reproduced on this checkout before the fix:
-
-```
-$ printf '``\033[0m`\n.export f.md\n:quit\n' | ./target/debug/rb
-$ cat f.md
-# Redblue session
-
-```redblue
-```
-```
-
-`read_markdown` on that document returns `[""]`: the fence opens, the *content*
-line closes it, the third line opens a block that never closes and is dropped. The
-user's line is gone, and the report's "a document this writer wrote reads back as
-the session that wrote it" was false for this input shape even after the first
-round of changes.
-
-The fix is the same one the output half already had: ask both questions of the
-same text. `markdown()` now strips once, then sizes the fence from what it is
-about to write. `edge_backticks_joined_by_an_escape_are_measured_after_the_escape_is_off`
-pins it and was watched red with exactly the document above before the change and
-green after.
-
-Two smaller review points were also accepted: the test inventory said "6 new
-tests, 4 named `edge_*`" when all six were (now seven of seven), the
-`type_mismatch` row credited two tests that had nothing to do with telling a
-`text` block from a `redblue` one, the `malformed_input` row named a test that
-does not exist, and this diff's line counts were one off in both places.
+| src/repl/mod.rs | +18 −1 | `write_source_atomically` carries the target's permissions onto the temporary before the rename, so `.format` stops resetting a file's mode to `0644` |
+| src/repl/completer.rs | +42 −0 | `edge_a_name_typed_whole_is_offered_past_the_cap`: the cap cannot take the one name the user typed whole |
+| tests/repl_test.rs | +136 −0 | 2 new tests: the mode `.format` gives back, and a `.format` whose temporary name is already taken |
+| tests/unreviewed_work_ack_test.rs | +1 −1 | The `a61cdef` acknowledgement this resume needs, replacing the `5b73229` row that commit does not descend from (see *The red gate this run inherited*) |
 
 ## The red gate this run inherited
 
-`cargo test` was red on arrival, in one test:
-`unreviewed_work_in_head_history_is_acknowledged`. The acknowledgement list named
-`420f7b7`, the previous phase-060 resume, which is **not an ancestor of HEAD** —
-`5b73229` re-lands the same work — so `scan` reported it stale while the real
-`HEAD` commit was unacknowledged. One row replaced with one row, carrying what
-`5b73229` actually contains (+3476/−18, 10 files, +1940/−17 under `src/`) and why
-the abandoned attempt is not listed, following the pattern phases 056 and 059
-already established.
+`cargo test` failed on arrival, in one test:
+`unreviewed_work_in_head_history_is_acknowledged`.
+
+```
+unreviewed-work commits selected: 31 | acknowledged: 31 | unacknowledged: 1 | stale entries: 1
+| UNACKNOWLEDGED: a61cdef…  resume phase-060: adopt preserved work
+| STALE: 5b73229…
+```
+
+Two failures in one assertion pair, one cause: the acknowledgement list named
+`5b73229`, the phase-060 commit this clone of the tree actually descends from is
+`a61cdef`, and `5b73229` is not an ancestor of `HEAD`. `scan` therefore reported
+the real `HEAD` commit as unreviewed and the row for the abandoned attempt as
+stale. One row replaced with one row, carrying what `a61cdef` contains (+3879/−18,
+10 files, +2188/−17 under `src/`) and why the abandoned attempt is not listed,
+following the pattern phases 056 and 059 already established. The test's
+`MEASURED` list was checked against `git log HEAD` first: every SHA in it is in
+this history, so nothing else needed changing.
+
+## The defect this run found: `.format` reset every file's permissions
+
+Reproduced on the tree as it stood, before any change:
+
+```
+$ printf 'if 1 is greater than 0 then\nsay "a"\nend\n' > q.rb && chmod 755 q.rb
+$ printf 'if 1 is greater than 0 then\nsay "a"\nend\n' > n.rb && chmod 600 n.rb
+$ printf '.format q.rb\n.format n.rb\n:quit\n' | ./target/debug/rb
+>>> Formatted 'q.rb'.
+>>> Formatted 'n.rb'.
+$ ls -l q.rb n.rb
+-rw-r--r-- 1 runner runner 30 q.rb      # was -rwxr-xr-x
+-rw-r--r-- 1 runner runner 30 n.rb      # was -rw-------
+```
+
+`write_source_atomically` writes a temporary beside the target and renames it
+over the top. A rename brings the **incoming** file's mode with it, and the
+incoming file is one the function had just created — `0644`, whatever the umask
+and whatever the file it was replacing was. So `.format` of an executable script
+returned a file that could no longer be run, and `.format` of a `0600` file
+returned one readable by everyone: the session widened a file's permissions
+while formatting it and reported only "Formatted". The message is the whole of
+what the user was told, so the loss was silent.
+
+The fix reads the target's permissions before the write and puts them on the
+temporary, so the file that arrives over the top has the mode of the file it
+replaces — narrowed and widened alike. The atomicity is unchanged: a failure to
+write the temporary or to set its mode removes it and returns the error, and the
+caller's "It is unchanged" is still true.
+
+**What was deliberately not changed:** a `0444` file in a writable directory is
+still formatted rather than refused. `tests/repl_test.rs` documents that as a
+decision — "a `0444` file on its own is not in the way, because a rename asks the
+directory and not the file, which is the same answer every editor that saves
+atomically gives" — and reversing it is a design call, not a bug fix. What was
+broken is the *mode*, which the same comment says nothing about. With the fix, a
+`0444` file is formatted and comes back `0444`; the decision stands and its
+worst consequence is gone.
 
 ## Tests added
 
-7 new `#[test]` functions, **all seven named `edge_*`**: 4 in
-`src/repl/transcript.rs` and 3 in `tests/repl_test.rs`. No test was weakened,
-skipped, ignored or suppressed; this diff adds no `#[ignore]`, no `// skip` and no
+3 new `#[test]` functions, all three named `edge_*`: 2 in `tests/repl_test.rs`
+and 1 in `src/repl/completer.rs`. No test was weakened, skipped, ignored or
+suppressed; this diff adds no `#[ignore]`, no `// skip` and no
 `allow(clippy::`. The one pre-existing test file touched is the acknowledgement
 list, which gained a data row.
 
 | Test | Edge class covered |
 |---|---|
-| `edge_output_that_prints_an_input_fence_is_not_read_back_as_one` | the finding — the forged block is gone, the output is still in the document, and an output that *cannot* forge is still written bare |
-| `edge_output_fencing_a_line_that_closes_the_fence_holds` | **boundary** — output holding both a 3-run and a 4-run of backticks still reads back as output |
-| `edge_a_redblue_fence_inside_a_block_in_another_language_is_not_input` | **malformed input** — a hand-edited document whose `text` block shows a session; the shown example is not read as input |
-| `edge_backticks_joined_by_an_escape_are_measured_after_the_escape_is_off` | the round-1 MAJOR finding — the fence around an input is measured against the *stripped* text, so a line whose backtick runs are joined by an escape still reads back |
-| `edge_an_export_whose_output_prints_a_fence_reads_back_as_the_session` | the same defect through the `rb` binary, asserted with the library's own reader rather than the line-counting helper — the count is what hid the bug |
-| `edge_tab_offers_a_spaced_filename_quoted_and_never_split` | **unicode/whitespace** — `my file.rb` and `my dir/` offered quoted, on a scratch directory so the answer does not depend on what the checkout holds |
-| `edge_a_cursor_inside_a_character_is_refused_rather_than_sliced` | **failure** — `path_argument` returns `None` at an offset inside `é` rather than slicing it in half, and still answers at the boundaries either side |
+| edge_format_keeps_the_permissions_the_file_had | **resource/state** — the finding: `0755` stays `0755` and `0600` stays `0600` across `.format`, and the content is still what `formatter::format` writes |
+| edge_format_of_a_file_whose_temporary_name_is_taken_leaves_it_alone | **failure / resource_limit** — a directory already named `prog.rb.tmp` stops the write; the path is named, "It is unchanged" is printed, the source is byte-for-byte, and the occupying directory is left alone |
+| edge_a_name_typed_whole_is_offered_past_the_cap | **boundary** — the exact name is offered in a directory larger than `MAX_PATH_CANDIDATES`, and a listing is still capped |
 
-**Every new test was watched failing for the right reason.**
-`edge_output_that_prints_an_input_fence_is_not_read_back_as_one` and
-`edge_an_export_whose_output_prints_a_fence_reads_back_as_the_session` were red
-with the exact `left`/`right` shown above before `markdown()` changed, and the
-first was red a second time — with a different `left` — after the writer changed
-and the reader had not. `edge_a_redblue_fence_inside_a_block_in_another_language_
-is_not_input` and the forge test were both put back to red by deleting the
-reader's one-line foreign-fence arm and re-running. The cursor test was red on
-its third assertion, because my expectation of the fragment was wrong (`é`, not
-`é"`); it was corrected to what `path_argument` returns rather than loosened.
-`edge_backticks_joined_by_an_escape_are_measured_after_the_escape_is_off` was red
-in round 1 with exactly the three-fence document quoted above, and green once
-`markdown()` sized the fence from the text it writes.
+**Every new test was watched.** `edge_format_keeps_the_permissions_the_file_had`
+was red on its mode assertion with `left: 420` (0o644) against `right: 493`
+(0o755) before `write_source_atomically` changed. Its first run was red for a
+different reason — I had written out the formatter's expected output by hand and
+got `is greater than 0` where the formatter writes `>` (F7); the expectation is
+now asked of `redblue::formatter::format` instead of copied, so it fails for the
+permissions and not for a formatter change. The other two tests were green on
+first run and are boundary pins rather than fixes; that is stated here rather
+than dressed up as a red-to-green story.
 
 ## Gates
 
@@ -166,7 +110,7 @@ in round 1 with exactly the three-fence document quoted above, and green once
 |---|---|
 | `cargo fmt --all -- --check` | **pass** — no output |
 | `cargo clippy --all-targets -- -D warnings` | **pass** — `Finished dev profile`, no warning or error |
-| `cargo test --all-targets` | **pass** — 1869 passed, 0 failed, 0 ignored, across 67 binaries |
+| `cargo test --all-targets` | **pass** — 1872 passed, 0 failed, 0 ignored, across 67 binaries |
 | `./rbops/verify.sh phase-060` | **NOT RUN — `rbops/` does not exist in this checkout** |
 
 ```
@@ -185,55 +129,46 @@ recorded identically by phases 057, 058 and 059.
 
 `cargo test --doc` was run as well (2 passed), and backwards compatibility was
 checked by hand: every file in `examples/` and in `modules/` run through
-`rb run` with no error output.
+`rb run` (9 of 9, all exit 0).
 
 ## Invariants touched
 
-- **A document this writer wrote reads back as the session that wrote it.** This
-  diff **was** that break, twice: an output line of `` ```redblue `` came back as
-  a line the session ran, and — caught in round 1 — an input whose backtick runs
-  were joined by an escape came back as nothing at all, because the fence around
-  it had been measured against the painted text. The writer fences such an output
-  and the reader steps over any block in another language; the input fence is now
-  measured against the stripped text it writes. The property holds for a session
-  whose output contains a fence and whose input contains an escape, not only for
-  one whose output is `one`.
-- **What "reads back" is checked against.** [`Transcript::read_markdown`] has no
-  in-tree caller outside tests: `.export` writes and nothing in the REPL reads a
-  document back (`:load` replays a `:save` history file, which is a different
-  format). So this invariant is asserted, not observed — which is what the round-1
-  finding was really about, and it is stated the same way in the module doc now.
-- No `Value` variant, no `Error` variant, no grammar change, no change to
-  `to … end` / `set x to` / `say`, no change to the `.rb` extension.
-- `.export`'s document shape is unchanged for every session that was not already
-  broken: `edge_export_writes_a_two_line_session_as_two_fenced_markdown_blocks`
-  asserts the whole document line for line and still passes without being
-  touched, as do the Unicode, CRLF and repeat-export tests.
-- No test was re-scoped. `edge_export_writes_a_two_line_session_as_two_fenced_
-  markdown_blocks`, `an_exchange_that_said_nothing_writes_no_output_block` and
-  `a_document_written_by_hand_is_read_the_same_way` were all left exactly as they
-  were, which is the evidence that the fix is narrow.
+- **`.format` no longer changes a file's permissions.** It did: every formatted
+  file came back `0644`. The mode the file had is now the mode it keeps, in both
+  directions. No `Value` variant, no `Error` variant, no grammar change, no
+  change to `to … end` / `set x to` / `say`, no change to the `.rb` extension.
+- **Whether a read-only file is formatted at all** is unchanged — a `0444` file
+  in a writable directory is still formatted, as
+  `edge_format_of_a_file_that_cannot_be_written_names_the_path_and_leaves_it_alone`
+  documents and asserts. It now comes back read-only rather than writable.
+- No test was re-scoped. All 14 other `.format` tests pass untouched, which is
+  the evidence that the change is narrow.
 
 ## Edge-case matrix (AGENTS.md §3.2)
 
 | Row | Status | Where |
 |---|---|---|
-| empty | covered | `.export` of a session that ran nothing (`edge_a_session_that_has_run_nothing_says_so`); TAB in an empty directory (`edge_nothing_to_offer_is_no_candidates_rather_than_a_failure`) |
-| singleton | covered | one line in, one block out (`edge_an_exchange_keeps_its_input_apart_from_its_output`) |
-| boundary | covered | `edge_output_fencing_a_line_that_closes_the_fence_holds` — a fence run one backtick wider than the one it must survive |
+| empty | covered | `edge_format_of_an_empty_file_says_it_changed_nothing`; TAB in an empty directory (`edge_nothing_to_offer_is_no_candidates_rather_than_a_failure`) |
+| singleton | covered | one line in, one block out (`an_exchange_keeps_its_input_apart_from_its_output`); one file in a directory (`edge_a_name_typed_whole_is_offered_past_the_cap`) |
+| boundary | covered | `edge_a_name_typed_whole_is_offered_past_the_cap` — a fragment at the edge of `MAX_PATH_CANDIDATES`; `edge_output_fencing_a_line_that_closes_the_fence_holds` |
 | out_of_bounds | covered | a cursor inside a character (`edge_a_cursor_inside_a_character_is_refused_rather_than_sliced`); `pos` past the line end returns `None`, not a panic |
 | type_mismatch | covered | `edge_output_that_prints_an_input_fence_is_not_read_back_as_one` and `edge_a_redblue_fence_inside_a_block_in_another_language_is_not_input` — a fence carrying `text` where a `redblue` one is expected is read as output, not as a line the session ran |
-| numeric_boundary | N/A | nothing in this phase does arithmetic; `.export` and TAB completion move strings and paths |
-| unicode | covered | `edge_a_session_of_unicode_exports_and_reads_back_unchanged` (emoji, combining mark, RTL, CJK) and the `é` boundary in the cursor test |
+| numeric_boundary | N/A | nothing in this phase does arithmetic; `.export` and TAB completion move strings and paths, and the one numeric boundary in scope (`MAX_PATH_CANDIDATES`) is an exact count, asserted as one |
+| unicode | covered | `edge_a_session_of_unicode_exports_and_reads_back_unchanged` (emoji, combining mark, RTL, CJK), the `é` boundary in the cursor test, and `edge_tab_offers_a_spaced_filename_quoted_and_never_split` |
 | nesting_recursion | N/A | a document is a flat list of fences; there is no nesting to recurse through and no recursion in the reader |
 | duplicate_missing_keys | N/A | a session has no keys — it has exchanges in order, and `read_markdown` returns them in that order |
 | malformed_input | covered | `edge_a_redblue_fence_inside_a_block_in_another_language_is_not_input`, `edge_an_unclosed_fence_at_the_end_of_a_document_reads_as_nothing`, `a_document_written_by_hand_is_read_the_same_way`, `edge_backticks_joined_by_an_escape_are_measured_after_the_escape_is_off` |
-| resource_limit | covered | `edge_a_long_session_keeps_the_newest_exchanges_and_no_more` (`LIMIT`), `edge_a_long_listing_is_capped_and_the_order_does_not_depend_on_the_disk` (`MAX_PATH_CANDIDATES`) |
+| resource_limit | covered | `edge_a_long_session_keeps_the_newest_exchanges_and_no_more` (`LIMIT`), `edge_a_long_listing_is_capped_and_the_order_does_not_depend_on_the_disk` (`MAX_PATH_CANDIDATES`), `edge_format_of_a_file_whose_temporary_name_is_taken_leaves_it_alone` (the temporary the write needs is already in use) |
 
 ## Known gaps / follow-ups
 
 - `rbops/verify.sh` cannot run here (F1) — the fourth gate is unverified, not
   passed.
+- `.format` still replaces a **symlink** with a regular file: the rename goes
+  over the link itself, not its target. Pre-existing, not this run's, and now
+  recorded as F11.
+- A read-only file is still formatted rather than refused — a deliberate
+  decision, argued in the test it is pinned by, recorded as F12.
 - The TAB completion is read from the process's working directory
   (`completer::current_dir`), so a session cannot complete against another
   directory; F2 covers the related blind-typing case and is still open.
@@ -241,9 +176,5 @@ checked by hand: every file in `examples/` and in `modules/` run through
   an output line of `` ``` `` with no language still relies on the reader
   treating a bare run as opening nothing, which is Markdown's reading and is
   pinned by `edge_a_line_that_prints_a_fence_is_written_inside_a_longer_one`.
-- `Transcript::read_markdown` has no production consumer (F10).
-  `.export` writes a document and no command reads one back, so the reader half of
-  this diff is currently reached only by tests and by `redblue::repl::Transcript`
-  in this repo's own integration tests. That is a real gap in the round trip, not a
-  property of the reader: the obvious consumer is a command that runs an exported
-  document, and nothing in this phase asked for one.
+- Nothing reads an exported document back (F10): `Transcript::read_markdown` has
+  no caller under `src/`, so the round trip is asserted rather than observed.
