@@ -48,6 +48,17 @@ MAX_ATTEMPTS="${RBOPS_MAX_ATTEMPTS:-3}"
 MAX_DEFERRALS="${RBOPS_MAX_DEFERRALS:-5}"
 CHECKPOINT_SECS="${RBOPS_CHECKPOINT_SECS:-300}"
 
+# The project config opencode resolves the reviewer's agent block out of, and
+# the permission keys that could widen a reviewer if they were not denied.
+#
+# The review request NAMES this file and the keys it denies. It used to name
+# neither, and said instead that the checkout has no config at all — a story
+# that was true when it was written and false the moment the project shipped
+# its own opencode.json. A request that tells the reviewer the wrong thing
+# about the tree it is judging is worse than one that says nothing.
+PROJECT_CONFIG="opencode.json"
+REVIEWER_WIDENING_KEYS="edit bash task todowrite skill lsp question webfetch websearch doom_loop external_directory"
+
 log()  { printf '%s [dispatch] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 die()  { printf '%s [dispatch] FATAL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit 2; }
 
@@ -148,6 +159,86 @@ bump()   { # bump <phase> <file>
   mkdir -p "$(dirname "$f")"; printf '%s' "$((n+1))" > "$f"
 }
 read_n() { local f; f="$(marker "$1" "$2")"; [ -f "$f" ] && tr -cd '0-9' < "$f" || printf '0'; }
+# A marker whose VALUE is not a number (the base commit of a phase). read_n
+# strips every non-digit, which would turn a SHA into noise, so this reads the
+# first line verbatim.
+read_line() { local f; f="$(marker "$1" "$2")"; [ -f "$f" ] && head -1 "$f" || printf ''; }
+
+# ------------------------------------------------------- the reviewer's config
+# The file opencode would read for the reviewer's agent block: the PROJECT's
+# own config, at the checkout root. opencode merges the project config over
+# the global one, per key, so this file is the one the agent block is read
+# from — not the global file, and not the pipeline repo's own.
+project_config_path() { printf '%s/%s' "$PROJECT_DIR" "$PROJECT_CONFIG"; }
+
+# The mode the reviewer's agent block declares, read out of that file.
+reviewer_config_mode() {
+  local cfg; cfg="$(project_config_path)"
+  [ -f "$cfg" ] || { printf 'none'; return 0; }
+  "$JQ" -r '.agent.reviewer.mode // "unset"' "$cfg" 2>/dev/null || printf 'unreadable'
+}
+
+# The keys the reviewer's agent block denies, read out of that file.
+#
+# Both of opencode's permission shapes are read: a bare action ("deny") and an
+# object of pattern -> action ({"**": "deny"}). The second is the same deny
+# spelled another way when every pattern in it denies.
+reviewer_denied_keys() {
+  local cfg; cfg="$(project_config_path)"
+  [ -f "$cfg" ] || { printf 'none'; return 0; }
+  "$JQ" -r '
+    (.agent.reviewer.permission // {}) as $p
+    | [ $p | to_entries[]
+        | select(
+            (.value == "deny")
+            or ((.value | type) == "object"
+                and (.value | length) > 0
+                and (.value | to_entries | map(.value) | all(. == "deny")))
+          )
+        | .key ]
+    | join(", ")
+  ' "$cfg" 2>/dev/null || printf 'none'
+}
+
+# Refuse to start a review whose reviewer would not be read-only.
+#
+# The failure mode this exists to catch is SILENT: opencode falls back to
+# default_agent: build — whose edit and bash are allow — and the review runs
+# anyway, and its verdict is trusted. So the mode and every key that could
+# widen the reviewer are resolved out of the very file opencode would read,
+# and a review that would not be read-only does not start.
+assert_reviewer_read_only() {
+  local phase="$1" cfg key val rc=0 mode
+  cfg="$(project_config_path)"
+  if [ ! -f "$cfg" ]; then
+    log "$phase REVIEW REFUSED — no project config at $cfg: the reviewer would resolve to nothing and fall back to the default agent"
+    return 1
+  fi
+  mode="$(reviewer_config_mode)"
+  if [ "$mode" != "primary" ]; then
+    log "$phase REVIEW REFUSED — agent.reviewer.mode is '$mode' in $cfg: only 'primary' binds --agent reviewer"
+    rc=1
+  fi
+  for key in $REVIEWER_WIDENING_KEYS; do
+    val="$("$JQ" -r --arg k "$key" '
+      (.agent.reviewer.permission[$k] // null) as $v
+      | if $v == null then "unset"
+        elif ($v | type) == "string" then $v
+        elif ($v | type) == "object" then
+          (if ($v | length) == 0 then "allow"
+           elif ($v | to_entries | map(.value) | all(. == "deny")) then "deny"
+           else "allow" end)
+        else "invalid" end
+    ' "$cfg" 2>/dev/null)"
+    [ -n "$val" ] || val="unreadable"
+    if [ "$val" != "deny" ]; then
+      log "$phase REVIEW REFUSED — agent.reviewer.permission.$key is '$val' in $cfg: it must deny"
+      rc=1
+    fi
+  done
+  [ "$rc" -eq 0 ] && log "$phase reviewer resolves read-only out of $cfg"
+  return "$rc"
+}
 # Every deferral path funnels through here so none can loop forever: each
 # deferral bumps the counter, and at MAX_DEFERRALS the phase blocks for a
 # human instead of retrying forever. (The two review-path defers once bypassed
@@ -552,6 +643,13 @@ cmd_run() {
   # END STATE. Work inherited from a previous attempt must count toward the
   # diff and the test quota, or a retry is punished for the tree it was given.
   local base; base="$(in_project git rev-parse HEAD)"
+
+  # The review runs in a separate process, usually in a later job, so the base
+  # it diffs against has to be written down. `cmd_review` used to re-derive it
+  # from HEAD at review time, by which point the pipeline had committed the
+  # phase's work: `git diff base..HEAD` was empty and the reviewer was handed
+  # an empty change set for every phase whose work had been committed.
+  printf '%s\n' "$base" > "$(marker "$phase" .base)"
 
   # Two kinds of preserved work exist, and they are NOT equal:
   #
@@ -1043,7 +1141,28 @@ cmd_review() {
     return 0
   fi
 
+  # A review whose reviewer would not be read-only does not start. The refusal
+  # names the key that would widen it, because the failure it prevents is
+  # silent: opencode falls back to default_agent: build and the review runs
+  # anyway, and its verdict is trusted.
+  if ! assert_reviewer_read_only "$phase"; then
+    touch "$(marker "$phase" .blocked)"
+    log "$phase BLOCKED — the reviewer would not be read-only; a human must look"
+    return 3
+  fi
+
   local base; base="$(in_project git rev-parse HEAD)"
+
+  # The base the RUN recorded, when this history still has it. The run captures
+  # it before any resume merge and writes it down; the review runs in a
+  # separate process, often after the pipeline committed the phase's work, so
+  # re-deriving the base from HEAD at review time produced an empty diff and a
+  # reviewer with nothing to read.
+  local recorded; recorded="$(read_line "$phase" .base)"
+  if [ -n "$recorded" ] && in_project git cat-file -e "${recorded}^{commit}" 2>/dev/null; then
+    base="$recorded"
+    log "$phase review diffs against the base the run recorded: ${recorded:0:7}"
+  fi
   local round=0
 
   # Rounds 1..MAX may fix; round MAX+1 reviews ONLY. The loop used to end after
@@ -1071,10 +1190,14 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       printf '# Review request - round %s of phase %s\n\n' "$round" "$phase"
       printf 'The gate is green. Your job is to find what is still wrong.\n'
       printf 'The contract below is authoritative and is inlined here on purpose:\n'
-      printf 'dispatch runs you with --dir pointing at the redblue checkout, which has\n'
-      printf 'no opencode.json, so `--agent reviewer` resolves to nothing and silently\n'
-      printf 'falls back to the default agent. Referring you to a config file or an\n'
-      printf '.opencode/agent/*.md path meant you ran with NO contract for every phase.\n\n'
+      printf 'dispatch runs you with --dir pointing at the redblue checkout, which ships\n'
+      printf 'its own opencode.json at the checkout root. opencode merges the project\n'
+      printf 'config over the global one, so that file is the one your agent block is\n'
+      printf 'read from. The reviewer agent is declared there with mode "%s" and\n' \
+        "$(reviewer_config_mode)"
+      printf 'with these keys denied: %s.\n' "$(reviewer_denied_keys)"
+      printf 'Referring you to a config file or an .opencode/agent/*.md path meant you\n'
+      printf 'ran with NO contract for every phase.\n\n'
       printf -- '---\n\n'
       cat "$RBOPS_ROOT/rbops/agents/reviewer.md" 2>/dev/null \
         || printf '!! THE REVIEWER CONTRACT IS MISSING. Treat this review as INVALID.\n'

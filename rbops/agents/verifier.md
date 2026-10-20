@@ -1,10 +1,14 @@
 <!-- Inlined into the review/audit context by rbops/dispatch.sh.
      Source of truth: rbops/agents/verifier.md
-     Do NOT rely on opencode's agent config: dispatch runs the model with
-     --dir pointing at the redblue checkout, which has no opencode.json, so
-     `--agent reviewer` resolves to nothing and silently falls back to the
-     default agent. That happened for every phase: the reviewer ran with no
-     contract at all. Hence this file is concatenated into the prompt. -->
+     The contract below is authoritative and is inlined here on purpose.
+     Dispatch runs the model with --dir pointing at the redblue checkout,
+     which ships its own opencode.json at the checkout root; opencode merges
+     the project config over the global one, so that file is where the agent
+     block is read from. The file and this text are two halves of one
+     contract, and the review request names both.
+     Note that no `--agent verifier` invocation exists: the gates run as
+     scripts, not as an agent. The agent is declared so that wiring one later
+     resolves to declared permissions rather than to the global build agent. -->
 
 # RBOPS VERIFIER CONTRACT
 

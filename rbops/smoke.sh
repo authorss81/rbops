@@ -53,6 +53,40 @@ build_fixture() {
 
   mkdir -p "$PROJ/src" "$PROJ/tests" "$PROJ/examples" "$PROJ/modules" "$PROJ/target/debug"
   printf '[package]\nname="redblue"\nversion="0.1.0"\nedition="2021"\n' > "$PROJ/Cargo.toml"
+  # The project ships the config opencode resolves the reviewer out of. Without
+  # it the dispatcher refuses to start a review — correctly: the reviewer would
+  # resolve to nothing and fall back to the default agent, whose edit and bash
+  # are allow. The fixture has to look like the real checkout, or the review
+  # path this suite exercises is not the one that runs in production.
+  cat > "$PROJ/opencode.json" <<'EOJ'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "reviewer": {
+      "description": "Read-only reviewer for the fixture project.",
+      "mode": "primary",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny",
+        "todowrite": "deny",
+        "skill": "deny",
+        "lsp": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "doom_loop": "deny",
+        "external_directory": "deny"
+      }
+    },
+    "verifier": {
+      "description": "Runs the fixture project's gates.",
+      "mode": "primary",
+      "permission": { "edit": "allow", "bash": "allow" }
+    }
+  }
+}
+EOJ
   : > "$PROJ/src/lib.rs"
   : > "$PROJ/examples/hello.rb"
   : > "$PROJ/modules/MathUtils.rb"
@@ -1506,9 +1540,12 @@ head_ "20. the reviewer is a real gate, not a rubber stamp"
 #
 #  1. `--agent reviewer` resolved to NOTHING ("agent not found, falling back to
 #     default agent"), because dispatch runs opencode with --dir at the redblue
-#     checkout, which has no opencode.json. The reviewer was then told to read
-#     `.opencode/agent/reviewer.md`, which does not exist. So it ran with no
-#     contract at all. One review log is 654 bytes of file-not-found errors.
+#     checkout, which shipped no opencode.json. The reviewer was then told to
+#     read `.opencode/agent/reviewer.md`, which does not exist. So it ran with
+#     no contract at all. One review log is 654 bytes of file-not-found errors.
+#     The project now ships that config, the dispatcher resolves the reviewer
+#     out of it, and section 33 asserts that the review refuses to start when
+#     the reviewer would not be read-only.
 #  2. The parser read "no [SEVERITY] tag found" as APPROVAL. Phase-013's review
 #     contained six real defect classes in prose and was discarded wholesale.
 #
@@ -2670,6 +2707,122 @@ case "$out" in
   *)  ok "prior attempts alone do not make a phase stale (rc=$rc)" ;;
 esac
 
+# =========================================================== 33. the reviewer's own resolution
+head_ "33. the reviewer is resolved read-only out of the file opencode reads"
+# The phase-084 finding: `--agent reviewer` resolved to NOTHING, because the
+# project shipped no opencode.json and opencode fell back to default_agent:
+# build - whose edit and bash are allow. The reviewer was therefore the one
+# component allowed to edit the tree it was judging, and nothing noticed.
+#
+# The project now ships the config. Three things have to hold, and each is
+# asserted here rather than argued:
+#
+#   1. the review request NAMES the config the reviewer is resolved out of and
+#      the keys that config denies, and no longer claims the checkout has no
+#      config - a request that misinforms the reviewer about the tree it is
+#      judging is worse than one that says nothing;
+#   2. a reviewer that would NOT be read-only stops the review, by name,
+#      before the model is called - the failure it prevents is silent;
+#   3. the review request carries the phase's committed change set.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+R() { RBOPS_MIN_OUTPUT=1 D review phase-001 2>&1 | strip; }
+R >/dev/null 2>&1
+ctx="$PIPE/logs/phase-001.review.1.ctx"
+if grep -q 'opencode.json' "$ctx" 2>/dev/null; then
+  ok "the request names the config the reviewer is resolved out of"
+else
+  no "the request does not name the shipped config"
+fi
+if grep -q 'has no opencode.json' "$ctx" 2>/dev/null; then
+  no "the request still claims the checkout has no opencode.json"
+else
+  ok "the request no longer claims there is no config"
+fi
+_missing=""
+for _k in edit bash task todowrite skill lsp question webfetch websearch doom_loop external_directory; do
+  grep -q "$_k" "$ctx" 2>/dev/null || _missing="$_missing $_k"
+done
+[ -z "$_missing" ] && ok "the request names every key the reviewer has denied" \
+                   || no "the request does not name:$_missing"
+if grep -rq 'has no opencode.json' "$PIPE/rbops/agents/" 2>/dev/null; then
+  no "an agent contract still claims the checkout has no opencode.json"
+else
+  ok "no agent contract claims there is no config"
+fi
+
+# A reviewer that would not be read-only does not start a review. Each case
+# mutates the fixture's own config, which is the file opencode would read.
+REFUSE_OUT=""
+refuse_case() {  # $1 = jq filter, $2 = label
+  build_fixture >/dev/null; use_stubs
+  D run phase-001 >/dev/null 2>&1
+  "$JQ" "$1" "$PROJ/opencode.json" > "$PROJ/opencode.json.new" 2>/dev/null \
+    && mv "$PROJ/opencode.json.new" "$PROJ/opencode.json"
+  REFUSE_OUT="$(R)"
+  case "$REFUSE_OUT" in
+    *"REVIEW REFUSED"*) ok "$2" ;;
+    *) no "$2 - the review was NOT refused"; printf '%s\n' "$REFUSE_OUT" | tail -4 | sed 's/^/      /' ;;
+  esac
+}
+refuse_case '.agent.reviewer.permission.edit = "allow"' "a writable reviewer stops the review"
+case "$REFUSE_OUT" in
+  *"permission.edit"*) ok "the refusal names the key that would widen the reviewer" ;;
+  *) no "the refusal does not name the key that would widen the reviewer" ;;
+esac
+refuse_case 'del(.agent.reviewer.permission.websearch)' "an undeclared widening key stops the review"
+case "$REFUSE_OUT" in
+  *"permission.websearch"*) ok "the refusal names the undeclared key" ;;
+  *) no "the refusal does not name the undeclared key" ;;
+esac
+refuse_case '.agent.reviewer.mode = "subagent"' "a subagent-mode reviewer stops the review"
+case "$REFUSE_OUT" in
+  *"mode"*) ok "the refusal names the mode" ;;
+  *) no "the refusal does not name the mode" ;;
+esac
+refuse_case '.agent.reviewer.permission.edit = {"**": "allow"}' \
+  "the object form of an allow stops the review"
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+rm -f "$PROJ/opencode.json"
+out="$(R)"
+case "$out" in
+  *"REVIEW REFUSED"*) ok "a missing config stops the review" ;;
+  *) no "a missing config did NOT stop the review"; printf '%s\n' "$out" | tail -4 | sed 's/^/      /' ;;
+esac
+# The object form of a DENY is the same deny, spelled another way, and must be
+# accepted - a check that refused it would forbid the shape that closes the
+# hole for good.
+build_fixture >/dev/null; use_stubs
+D run phase-001 >/dev/null 2>&1
+"$JQ" '.agent.reviewer.permission.edit = {"**": "deny"}' "$PROJ/opencode.json" \
+  > "$PROJ/opencode.json.new" 2>/dev/null && mv "$PROJ/opencode.json.new" "$PROJ/opencode.json"
+out="$(R)"
+case "$out" in
+  *"REVIEW REFUSED"*) no "the object form of a deny was refused" ;;
+  *) ok "the object form of a deny is accepted" ;;
+esac
+
+# The change set the reviewer is handed: the phase's own work, committed. The
+# base is the one the RUN recorded, not HEAD at review time - by which point
+# the pipeline had committed the phase's work and the diff was empty.
+build_fixture >/dev/null; use_stubs
+pre="$(cd "$PROJ" && git rev-parse HEAD)"
+D run phase-001 >/dev/null 2>&1
+( cd "$PROJ" && git add -A && git -c user.email=t@t -c user.name=t commit -qm "phase work" ) >/dev/null 2>&1
+R >/dev/null 2>&1
+ctx="$PIPE/logs/phase-001.review.1.ctx"
+if grep -q "$pre..HEAD" "$ctx" 2>/dev/null; then
+  ok "the request diffs against the base the run recorded"
+else
+  no "the request diffs against HEAD at review time, not the recorded base"
+fi
+if sed -n '/## 1. Committed changes/,/## 2. Uncommitted/p' "$ctx" 2>/dev/null | grep -q 'diff --git'; then
+  ok "the review request carries the committed change set"
+else
+  no "the committed section of the request is empty"
+fi
+
 # =========================================================== verdict
 printf '\n%s%s%s\n' "$DIM" "────────────────────────────────────────" "$OFF"
 if [ "$FAIL" -eq 0 ]; then
@@ -2678,7 +2831,7 @@ if [ "$FAIL" -eq 0 ]; then
 fi
 printf '%sSMOKE FAIL%s  %d passed, %d failed\n' "$RED" "$OFF" "$PASS" "$FAIL"
 exit 1
-# =========================================================== 33. every deferral is counted
+# =========================================================== 34. every deferral is counted
 # Phase-053 spun for ~12 hours and ~120 CI runs, each ~6 minutes, every one
 # reporting `success`, and produced nothing. The preflight-refusal branch did a
 # bare `touch .deferred` instead of calling defer_phase, so it never bumped
