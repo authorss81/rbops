@@ -347,6 +347,11 @@ run_agent() {
   # to die has usually died before this. A model killed LATER than this had time
   # to work, and whatever it produced is kept - the case that matters is the one
   # where the runner cancelled the run and the model never got going.
+  # The role decides whether "the tree is unchanged" means anything. The
+  # reviewer is READ-ONLY and is SUPPOSED to change nothing; the auditor works
+  # in the pipeline repo, not the project. Only the build agent - the one that
+  # owes the phase a change - can be judged by the tree.
+  local role="${RBOPS_AGENT_ROLE:-build}"
   local no_work_seconds="${RBOPS_NO_WORK_SECONDS:-2700}"
   local nowork_count=0 nowork_note="" prev_model="" prev_elapsed=0
   for m in $models; do
@@ -372,34 +377,49 @@ $msg"
     call_elapsed=$(( $(date +%s) - call_started ))
     tree_after="$(tree_fingerprint)"
     post="$(wc -c < "$logfile")"; growth=$((post-pre))
+    # Two independent questions, and either one being yes means NO WORK.
+    #
+    # The tree is the better question. A model that owes the phase a change and
+    # leaves the tree byte-for-byte as it found it has done nothing, whatever it
+    # said and whatever the clock says. Phase-062's fix round 3 was exactly that:
+    # it read for ten minutes, narrated at length, exited 0, and changed
+    # nothing - and the pipeline spent a review round and then BLOCKED the phase
+    # over a model that had not touched the work at all.
+    #
+    # The clock is only needed for the case the tree cannot answer: a model
+    # killed EARLY that left something behind, which is work that is not
+    # finished.
+    #
     # A killed model: 124 is `timeout`, 137 SIGKILL, 141 SIGPIPE, 143 SIGTERM.
     # The runner cancelling a job is a SIGTERM, and a `timeout` firing is a 124.
-    if [ "$code" -eq 124 ] || [ "$code" -eq 137 ] || [ "$code" -eq 141 ] || [ "$code" -eq 143 ]; then
-      # Two independent questions, and either one being yes means no work.
-      #
-      # The tree: a model that was killed and left the tree exactly as it found
-      # it wrote nothing, whatever the clock says. The clock is only needed for
-      # the case the tree cannot answer - a model killed EARLY that left
-      # something behind, which is work that is not finished.
-      local wrote_something=1
-      [ "$tree_before" = "$tree_after" ] && wrote_something=0
-      if [ "$wrote_something" -eq 0 ] || [ "$call_elapsed" -lt "$no_work_seconds" ]; then
-        nowork_count=$((nowork_count+1))
-        if [ "$wrote_something" -eq 0 ]; then
-          log "model $m was killed after ${call_elapsed}s and wrote nothing at all - it did NO WORK"
-          prev_model="$m"; prev_elapsed="$call_elapsed"
-          nowork_note="## THE PREVIOUS ATTEMPT DID NO WORK
-The model before you ($prev_model) was killed after ${prev_elapsed} seconds. It wrote NOTHING
-at all - the working tree is exactly as it was before it started - so there is no work of
-its to continue and no half-finished attempt to pick up. You were launched to REPLACE it,
-not to resume it.
+    local no_work=0 wrote_something=1
+    [ "$tree_before" = "$tree_after" ] && wrote_something=0
+    if [ "$role" = "build" ] && [ "$wrote_something" -eq 0 ]; then
+      no_work=1
+      log "model $m finished without changing anything - the tree is exactly as it found it - so it did NO WORK"
+    elif [ "$code" -eq 124 ] || [ "$code" -eq 137 ] || [ "$code" -eq 141 ] || [ "$code" -eq 143 ]; then
+      if [ "$call_elapsed" -lt "$no_work_seconds" ]; then
+        no_work=1
+        log "model $m was killed after ${call_elapsed}s - before it could have started fixing (${no_work_seconds}s) - what it left is partial, so it did NOT finish"
+      else
+        log "model $m was killed after ${call_elapsed}s - it had time to work, keeping what it produced"
+        return "$code"
+      fi
+    fi
+    if [ "$no_work" -eq 1 ]; then
+      nowork_count=$((nowork_count+1))
+      prev_model="$m"; prev_elapsed="$call_elapsed"
+      if [ "$wrote_something" -eq 0 ]; then
+        nowork_note="## THE PREVIOUS ATTEMPT DID NO WORK
+The model before you ($prev_model) ran for ${prev_elapsed} seconds and wrote NOTHING at all -
+the working tree is exactly as it was before it started - so there is no work of its to
+continue and no half-finished attempt to pick up. It may have said a great deal while doing
+it. You were launched to REPLACE it, not to resume it.
 
 Start from the finding itself. Do not go looking for work the previous attempt left
 behind, and do not report anything as done that you have not done and seen for yourself."
-        else
-          log "model $m was killed after ${call_elapsed}s - before it could have started fixing (${no_work_seconds}s) - what it left is partial, so it did NOT finish"
-          prev_model="$m"; prev_elapsed="$call_elapsed"
-          nowork_note="## THE PREVIOUS ATTEMPT DID NOT FINISH
+      else
+        nowork_note="## THE PREVIOUS ATTEMPT DID NOT FINISH
 The model before you ($prev_model) was killed after ${prev_elapsed} seconds, before it could
 have finished what it was doing. It left changes behind, but they are partial and
 unverified - treat them as a hint, not as work. You were launched to REPLACE it and to
@@ -407,16 +427,13 @@ finish the finding, not to resume its attempt.
 
 Read what it left before you change it, and do not report anything as done that you have
 not done and seen for yourself."
-        fi
-        if [ "$nowork_count" -ge 2 ]; then
-          log "two models in a row were killed before they could start - $nowork_count attempts did no work - blocking the phase"
-          return 76
-        fi
-        log "dispatching the next model in the chain instead"
-        continue
       fi
-      log "model $m was killed after ${call_elapsed}s - it had time to work, keeping what it produced"
-      return "$code"
+      if [ "$nowork_count" -ge 2 ]; then
+        log "two models in a row did no work - $nowork_count attempts did nothing - blocking the phase"
+        return 76
+      fi
+      log "dispatching the next model in the chain instead"
+      continue
     fi
     # A model can exit 0 having produced nothing — an unknown model id, a free
     # tier that has been revoked, or a CLI that gives up quietly. Accepting exit
@@ -1104,7 +1121,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       log "WARNING: review ctx for $phase is ${rctx_bytes} bytes — over the 90KB internal budget"
     fi
 
-    run_agent "$REVIEW_MODELS" "$LOG_DIR/$phase.review.$round.log" "$rctx" \
+    RBOPS_AGENT_ROLE=review run_agent "$REVIEW_MODELS" "$LOG_DIR/$phase.review.$round.log" "$rctx" \
         --dir "$PROJECT_DIR" --agent reviewer --title "rbops-review-${phase}-${round}"
 
     local rc_round=$?
@@ -1379,7 +1396,7 @@ cmd_audit() {
     printf 'the pipeline, then APPEND evidence-backed phases to rbops/phases.json.\n'
     printf 'Every phase needs a real file:line. Do not invent work.\n'
   } >> "$LOG_DIR/audit.ctx"
-  run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" "$LOG_DIR/audit.ctx" \
+  RBOPS_AGENT_ROLE=audit run_agent "$AUDIT_MODELS" "$LOG_DIR/audit.log" "$LOG_DIR/audit.ctx" \
       --dir "$RBOPS_ROOT" --title "rbops-audit"
   local code=$?
   if [ "$code" = "75" ]; then

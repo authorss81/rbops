@@ -559,6 +559,38 @@ if printf '%s' "$out" | grep -c "it did NO WORK" | grep -qE '^2$'; then
 else
   no "the no-work retry did not stop at one"
 fi
+
+# A model that exits 0 having changed NOTHING did no work, however much it
+# said. Phase-062's fix round 3 was exactly that: it read for ten minutes,
+# narrated at length, exited 0, and changed nothing - and the phase blocked
+# over it. The tree is the question that catches it; the clock cannot.
+build_fixture >/dev/null; use_stubs
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+if [ "$1" = "models" ]; then exit 0; fi
+n=0
+[ -f "$SMOKE_PIPE/logs/phase-001.log" ] && n=1
+if [ "$n" = "0" ]; then
+  echo "I read a great many files and considered the design at length."
+  echo "exit 0 with a lot to say and nothing to show for it"
+else
+  echo "second model did the work"
+fi
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$( RBOPS_MIN_OUTPUT=1 D run phase-001 2>&1 | strip )"
+if printf '%s' "$out" | grep -q "finished without changing anything"; then
+  ok "a model that exits 0 having changed nothing is called no work"
+else
+  no "a model that changed nothing was accepted as work"
+fi
+if printf '%s' "$out" | grep -q "dispatching the next model in the chain"; then
+  ok "the chain advances after a model that changed nothing"
+else
+  no "the chain did not advance after a model that changed nothing"
+fi
+build_fixture >/dev/null; use_stubs
 # Restore a working toolchain for the rest of the suite.
 build_fixture >/dev/null; use_stubs
 
