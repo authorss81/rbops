@@ -1922,6 +1922,12 @@ if ( cd "$PROJ" && git log --oneline ) | grep -q 'adopt WIP checkpoint'; then
   ok "the work was adopted as a single-parent commit on main"
 else
   no "no adopt commit — the WIP work may have been dropped"
+  # This check has failed intermittently - the same dispatch.sh passed it in one
+  # CI run and failed it in the next, with no change in between. So it is
+  # FLAKY, and a flake that says nothing is a flake nobody can fix. The lines
+  # that decide it are printed when it fails, so the next occurrence says WHY.
+  printf '%s' "$out" | grep -E 'WIP|wip|merge|commit|checkpoint' | head -6 | sed 's/^/      /'
+  printf '      --- refs and log: ' && ( cd "$PROJ" && git log --oneline -3 | tr '\n' ' ' ) && echo
 fi
 if grep -q 'half-finished work' "$PROJ/src/vm.rs" 2>/dev/null; then
   ok "the WIP work itself was still applied"
