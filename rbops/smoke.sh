@@ -489,6 +489,84 @@ esac
 # regression. Each subtest owns its own starting state; sharing one across a
 # deliberately destructive check is how a passing suite starts lying.
 build_fixture >/dev/null
+# A model killed before it could have started fixing did no work, and the
+# next model in the chain is dispatched instead. Two in a row blocks the phase.
+#
+# The stub `opencode` is what makes this testable: it can be told to die the
+# way a killed model dies, and to die FAST, which is what "before it could
+# have started" means.
+stub_kill_first() {   # kills the first call, succeeds on the rest
+  cat > "$STUB/opencode" <<EOS
+#!/usr/bin/env bash
+n=\$(cat "$STUB/.calls" 2>/dev/null || echo 0)
+n=\$((n+1)); echo "\$n" > "$STUB/.calls"
+if [ "\$n" -eq 1 ]; then sleep 2; exit 143; fi
+echo "stub agent output: DONE $(head -c 600 /dev/zero | tr '\0' 'x')"
+EOS
+  chmod +x "$STUB/opencode"
+  rm -f "$STUB/.calls"
+}
+
+stub_kill_always() {  # dies every time
+  cat > "$STUB/opencode" <<EOS
+#!/usr/bin/env bash
+sleep 2
+exit 143
+EOS
+  chmod +x "$STUB/opencode"
+}
+
+# The conflicted-file list has to reach the agent. The sed that printed it was
+# malformed - `sed 's/^  - /'` instead of `sed 's/^/  - /'` - so sed died with
+# "unterminated `s' command", the substitution produced nothing, and the agent
+# was told nothing about the files it was supposed to resolve. Phase-084
+# resumed with a conflict in a file and never heard about it.
+sed_ok="$(printf 'src/a.rs\n' | sed 's/^/  - /' 2>/dev/null)"
+if [ "$sed_ok" = "  - src/a.rs" ]; then
+  ok "the conflicted-file list is printed with the right sed"
+else
+  no "the conflict list sed is broken (got '$sed_ok')"
+fi
+
+# A model that dies before it could start fixing must not end the attempt: the
+# next model in the chain is dispatched, and it is told why it was launched.
+build_fixture >/dev/null; use_stubs
+stub_kill_first
+out="$(D run phase-001 2>&1)"
+if printf '%s' "$out" | grep -q "it did NO WORK"; then
+  ok "a model killed before it could start is recorded as having done no work"
+else
+  no "a model killed early was not recorded as no work"
+fi
+if printf '%s' "$out" | grep -q "dispatching the next model in the chain"; then
+  ok "the chain advances to the next model after a no-work kill"
+else
+  no "the chain did not advance after a no-work kill"
+fi
+if printf '%s' "$out" | grep -q "THE PREVIOUS ATTEMPT DID NO WORK"; then
+  ok "the replacement model is told the previous one did no work"
+else
+  no "the replacement model was not told what happened to the previous one"
+fi
+
+# Two models in a row doing nothing blocks the phase: the same attempt shape
+# will not start working on a third.
+build_fixture >/dev/null; use_stubs
+stub_kill_always
+out="$(D run phase-001 2>&1)"
+if printf '%s' "$out" | grep -qiE "BLOCKED.*no work|blocked.*two models"; then
+  ok "two no-work kills in a row block the phase"
+else
+  no "two no-work kills did not block the phase"
+fi
+if [ -f "$PIPE/phases/phase-001/.blocked" ]; then
+  ok "the blocked marker was written"
+else
+  no "no .blocked marker after two no-work kills"
+fi
+# Restore a working toolchain for the rest of the suite.
+build_fixture >/dev/null; use_stubs
+
 D stop >/dev/null 2>&1
 out="$(D select)"
 case "$out" in *"pipeline halted"*) ok ".stop halts selection" ;; *) no ".stop did not halt" ;; esac

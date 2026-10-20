@@ -340,18 +340,84 @@ run_agent() {
     fi
     msg="$(cat "$prompt_file")"
   fi
+  # A model killed before it could have started fixing did no work at all.
+  #
+  # 45 minutes is the floor: long enough for a model to read the finding, look
+  # at the code and start editing, and short enough that a model which is going
+  # to die has usually died before this. A model killed LATER than this had time
+  # to work, and whatever it produced is kept - the case that matters is the one
+  # where the runner cancelled the run and the model never got going.
+  local no_work_seconds="${RBOPS_NO_WORK_SECONDS:-2700}"
+  local nowork_count=0 nowork_note="" prev_model="" prev_elapsed=0
   for m in $models; do
     m="$(printf '%s' "$m" | tr -d ' \r')"
     [ -n "$m" ] || continue
     log "model → $m"
     pre="$(wc -c < "$logfile")"
+    local call_started call_elapsed call_msg tree_before tree_after
+    call_started="$(date +%s)"
+    tree_before="$(tree_fingerprint)"
     if [ -n "$msg" ]; then
-      timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" "$msg" >>"$logfile" 2>&1
+      # The next model is told what happened to the one before it. Without that,
+      # a model launched to replace a dead one spends its first minutes looking
+      # for work that was never done, and then reports on work it did not do.
+      call_msg="$msg"
+      [ -n "$nowork_note" ] && call_msg="$nowork_note
+$msg"
+      timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" "$call_msg" >>"$logfile" 2>&1
     else
       timeout "${RBOPS_MODEL_TIMEOUT:-3000}" opencode run --model "$m" "$@" >>"$logfile" 2>&1
     fi
     code=$?
+    call_elapsed=$(( $(date +%s) - call_started ))
+    tree_after="$(tree_fingerprint)"
     post="$(wc -c < "$logfile")"; growth=$((post-pre))
+    # A killed model: 124 is `timeout`, 137 SIGKILL, 141 SIGPIPE, 143 SIGTERM.
+    # The runner cancelling a job is a SIGTERM, and a `timeout` firing is a 124.
+    if [ "$code" -eq 124 ] || [ "$code" -eq 137 ] || [ "$code" -eq 141 ] || [ "$code" -eq 143 ]; then
+      # Two independent questions, and either one being yes means no work.
+      #
+      # The tree: a model that was killed and left the tree exactly as it found
+      # it wrote nothing, whatever the clock says. The clock is only needed for
+      # the case the tree cannot answer - a model killed EARLY that left
+      # something behind, which is work that is not finished.
+      local wrote_something=1
+      [ "$tree_before" = "$tree_after" ] && wrote_something=0
+      if [ "$wrote_something" -eq 0 ] || [ "$call_elapsed" -lt "$no_work_seconds" ]; then
+        nowork_count=$((nowork_count+1))
+        if [ "$wrote_something" -eq 0 ]; then
+          log "model $m was killed after ${call_elapsed}s and wrote nothing at all - it did NO WORK"
+          prev_model="$m"; prev_elapsed="$call_elapsed"
+          nowork_note="## THE PREVIOUS ATTEMPT DID NO WORK
+The model before you ($prev_model) was killed after ${prev_elapsed} seconds. It wrote NOTHING
+at all - the working tree is exactly as it was before it started - so there is no work of
+its to continue and no half-finished attempt to pick up. You were launched to REPLACE it,
+not to resume it.
+
+Start from the finding itself. Do not go looking for work the previous attempt left
+behind, and do not report anything as done that you have not done and seen for yourself."
+        else
+          log "model $m was killed after ${call_elapsed}s - before it could have started fixing (${no_work_seconds}s) - what it left is partial, so it did NOT finish"
+          prev_model="$m"; prev_elapsed="$call_elapsed"
+          nowork_note="## THE PREVIOUS ATTEMPT DID NOT FINISH
+The model before you ($prev_model) was killed after ${prev_elapsed} seconds, before it could
+have finished what it was doing. It left changes behind, but they are partial and
+unverified - treat them as a hint, not as work. You were launched to REPLACE it and to
+finish the finding, not to resume its attempt.
+
+Read what it left before you change it, and do not report anything as done that you have
+not done and seen for yourself."
+        fi
+        if [ "$nowork_count" -ge 2 ]; then
+          log "two models in a row were killed before they could start - $nowork_count attempts did no work - blocking the phase"
+          return 76
+        fi
+        log "dispatching the next model in the chain instead"
+        continue
+      fi
+      log "model $m was killed after ${call_elapsed}s - it had time to work, keeping what it produced"
+      return "$code"
+    fi
     # A model can exit 0 having produced nothing — an unknown model id, a free
     # tier that has been revoked, or a CLI that gives up quietly. Accepting exit
     # 0 as success is how a phase "passes" with zero work done, so require BOTH
@@ -380,6 +446,24 @@ run_agent() {
 # prose about retrying a build would falsely defer a phase.
 infra_failure() {
   grep -qiE 'HTTP[ /]?(429|5[0-9][0-9])|too many requests|rate[ _-]?limit|insufficient[ _-]?quota|quota exceeded|model not found|unknown model|invalid model|no such model|overloaded|upstream error|ECONNRESET|ETIMEDOUT|stream.*(closed|failed)|UnknownError|unexpected server error' "$1"
+}
+
+# A fingerprint of the project's working tree: what is changed, what is
+# staged, what is committed, and what is untracked. Two fingerprints that differ
+# mean the tree is not what it was.
+#
+# HEAD is part of it because an agent is allowed to commit its own work, and a
+# committed fix leaves every file byte-identical - only the commit is new. A
+# check that watched file contents alone would call that "nothing happened".
+tree_fingerprint() {
+  in_project bash -c '
+    git rev-parse HEAD 2>/dev/null
+    git status --porcelain 2>/dev/null
+    git diff HEAD 2>/dev/null
+    git ls-files --others --exclude-standard 2>/dev/null | while read -r f; do
+      if [ -f "$f" ]; then printf "%s " "$f"; cksum < "$f" 2>/dev/null; fi
+    done
+  ' 2>/dev/null | cksum
 }
 
 # Push work-in-progress every CHECKPOINT_SECS so a timeout or cancellation
@@ -664,7 +748,7 @@ Your tree is the previous attempt's work merged onto newer \`main\`, and the mer
 did not resolve cleanly. Files containing conflict markers (\`<<<<<\`, \`=======\`,
 \`>>>>>>>\`) are already on disk:
 
-$(in_project git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^  - /')
+$(in_project git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/  - /')
 
 Before anything else:
 1. Open each conflicted file and resolve every marker.
@@ -769,6 +853,18 @@ run_agent "$IMPL_MODELS" "$LOG_DIR/$phase.log" "$LOG_DIR/$phase.ctx" \
     --dir "$PROJECT_DIR" --agent build --title "rbops-${phase}"
 code=$?
 stop_checkpoint_loop
+  if [ "$code" = "76" ]; then
+    # Two models in a row were killed before either could start fixing. The
+    # phase is not making progress and will not make progress on a third
+    # attempt of the same shape, so it is blocked for a human rather than
+    # retried. No attempt is consumed: nothing was attempted.
+    log "$phase BLOCKED - two models in a row were killed before they could start working"
+    tail -6 "$LOG_DIR/$phase.log" | sed 's/^/    | /'
+    rm -f "$(marker "$phase" .deferred)" "$(marker "$phase" .deferred_attempts)" \
+          "$(marker "$phase" .failed)" "$(marker "$phase" .watchdog)"
+    touch "$(marker "$phase" .blocked)"
+    return 3
+  fi
 
 # --- progress watchdog ------------------------------------------------------
 # An attempt can burn its whole budget and produce nothing, and the pipeline
@@ -1066,6 +1162,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     grep -oE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.(rs|rb|md|json|toml)' "$rlog" 2>/dev/null \
       | grep -vE '^(Cargo\.lock|Cargo\.toml)$' | sort -u > "$cited" || true
     local before after touched=0 f
+    local before_tree after_tree
     before="$(mktemp)"; after="$(mktemp)"
     while read -r f; do
       [ -n "$f" ] || continue
@@ -1073,7 +1170,25 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
         printf '%s %s\n' "$(cksum < "$PROJECT_DIR/$f" | awk '{print $1"-"$2}')" "$f" >> "$before"
       fi
     done < "$cited"
-    if [ -s "$before" ]; then log "fix round $round: $(wc -l < "$cited") file(s) cited by the findings"; fi
+    if [ -s "$before" ]; then
+      # Two different numbers, and the log reported the larger one under the
+      # smaller one's name. `cited` is every file path the reviewer MENTIONED
+      # anywhere - including in its own narration and in findings that are not
+      # blocking - while the findings block names the files a fix has to touch.
+      # A review naming 19 files and finding 3 read as "19 cited, 4 fixed" and
+      # looked like the model was ignoring most of them.
+      local mentioned only_findings
+      mentioned="$(wc -l < "$cited")"
+      only_findings=0
+      if grep -qE '^FINDINGS:' "$rlog" 2>/dev/null; then
+        only_findings="$(sed -n '/^FINDINGS:/,$p' "$rlog" 2>/dev/null \
+          | grep -oE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.(rs|rb|md|json|toml)' \
+          | grep -vE '^(Cargo\.lock|Cargo\.toml)$' | sort -u | wc -l | tr -d ' ')"
+      fi
+      log "fix round $round: ${only_findings:-0} file(s) named in the findings, ${mentioned} mentioned by the reviewer"
+    fi
+    # Taken BEFORE the fix pass, so it can be compared with the one after it.
+    before_tree="$(tree_fingerprint)"
     # Scope snapshot: how many lines does this fix round add to the phase?
     # A single BLOCKER fix that adds ~1000 lines is not a fix, it is a rewrite
     # wearing a fix's clothes — phase-020 grew +990/+1118 lines per round while
@@ -1116,7 +1231,15 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     if [ -s "$before" ]; then
       touched="$(join -j 2 -o 1.1,2.1 <(sort -k2 "$before") <(sort -k2 "$after") 2>/dev/null \
                 | awk '$1 != $2 {print $1}' | wc -l | tr -d ' ')"
-      if [ "${touched:-0}" -eq 0 ]; then
+      # Whether the WORKING TREE changed at all, and not only whether a cited
+      # file changed. A fix that lands in a file the findings did not name is
+      # still a fix, and a fix the agent committed leaves every file
+      # byte-identical and only the HEAD different - both read as "no attempt"
+      # to a check that watches file contents alone. Phase-062 was blocked by
+      # exactly that: a fix pass that read for ten minutes and changed nothing,
+      # next to a fix pass that changed a file the findings had not mentioned.
+      after_tree="$(tree_fingerprint)"
+      if [ "${touched:-0}" -eq 0 ] && [ "$before_tree" = "$after_tree" ]; then
         log "fix round $round DID NOT TOUCH any file cited by the findings:"
         sed 's/^/    /' "$cited" | sed -n '1,8p'
         log "the pass reported progress without editing the code under review — not retrying"
@@ -1125,7 +1248,11 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
         log "$phase BLOCKED - fix pass never addressed the findings"
         return 3
       fi
-      log "fix round $round: $touched cited file(s) actually changed"
+      if [ "${touched:-0}" -eq 0 ]; then
+        log "fix round $round: no cited file changed, but the working tree did - treating it as an attempt"
+      else
+        log "fix round $round: $touched cited file(s) actually changed"
+      fi
     fi
     local added_after fix_delta
     added_after="$(in_project git diff --numstat "$base" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
