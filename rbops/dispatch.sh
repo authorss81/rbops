@@ -182,7 +182,10 @@ reviewer_config_mode() {
 #
 # Both of opencode's permission shapes are read: a bare action ("deny") and an
 # object of pattern -> action ({"**": "deny"}). The second is the same deny
-# spelled another way when every pattern in it denies.
+# spelled another way only when every pattern in it denies AND one of them is
+# a catch-all ("*" or "**"): a narrow pattern ("*.md") denies the paths it
+# matches and leaves every other path to the rules above it, so it is not a
+# deny of the key.
 reviewer_denied_keys() {
   local cfg; cfg="$(project_config_path)"
   [ -f "$cfg" ] || { printf 'none'; return 0; }
@@ -193,7 +196,8 @@ reviewer_denied_keys() {
             (.value == "deny")
             or ((.value | type) == "object"
                 and (.value | length) > 0
-                and (.value | to_entries | map(.value) | all(. == "deny")))
+                and (.value | to_entries | map(.value) | all(. == "deny"))
+                and ((.value | has("*")) or (.value | has("**"))))
           )
         | .key ]
     | join(", ")
@@ -207,6 +211,12 @@ reviewer_denied_keys() {
 # anyway, and its verdict is trusted. So the mode and every key that could
 # widen the reviewer are resolved out of the very file opencode would read,
 # and a review that would not be read-only does not start.
+#
+# "deny" means the bare action, or the object form of it that covers
+# everything ({"**": "deny"}). A narrow object — {"*.md": "deny"} — is NOT a
+# deny: opencode evaluates the last matching rule, so every path the pattern
+# does not match falls through to the rules above it, and the global config's
+# "external_directory": {"**": "allow"} is one of them.
 assert_reviewer_read_only() {
   local phase="$1" cfg key val rc=0 mode
   cfg="$(project_config_path)"
@@ -226,13 +236,18 @@ assert_reviewer_read_only() {
         elif ($v | type) == "string" then $v
         elif ($v | type) == "object" then
           (if ($v | length) == 0 then "allow"
-           elif ($v | to_entries | map(.value) | all(. == "deny")) then "deny"
+           elif ($v | to_entries | map(.value) | all(. == "deny")) then
+             (if ($v | has("*")) or ($v | has("**")) then "deny" else "narrow-deny" end)
            else "allow" end)
         else "invalid" end
     ' "$cfg" 2>/dev/null)"
     [ -n "$val" ] || val="unreadable"
     if [ "$val" != "deny" ]; then
-      log "$phase REVIEW REFUSED — agent.reviewer.permission.$key is '$val' in $cfg: it must deny"
+      if [ "$val" = "narrow-deny" ]; then
+        log "$phase REVIEW REFUSED — agent.reviewer.permission.$key is '$val' in $cfg: a narrow pattern denies only the paths it matches, and every other path falls through to the rules above it"
+      else
+        log "$phase REVIEW REFUSED — agent.reviewer.permission.$key is '$val' in $cfg: it must deny"
+      fi
       rc=1
     fi
   done

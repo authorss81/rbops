@@ -2782,6 +2782,17 @@ case "$REFUSE_OUT" in
 esac
 refuse_case '.agent.reviewer.permission.edit = {"**": "allow"}' \
   "the object form of an allow stops the review"
+# A NARROW deny is not a deny. opencode evaluates the last matching rule, so
+# {"*.md": "deny"} denies the markdown files and leaves every other path to
+# the rules above it - and the global config grants external_directory
+# {"**": "allow"} above the agent's own rules. A reviewer that may read
+# outside the checkout must not pass as a read-only one.
+refuse_case '.agent.reviewer.permission.external_directory = {"*.md": "deny"}' \
+  "a narrow-pattern deny stops the review"
+case "$REFUSE_OUT" in
+  *"permission.external_directory"*) ok "the refusal names the key the narrow deny is on" ;;
+  *) no "the refusal does not name the key the narrow deny is on" ;;
+esac
 build_fixture >/dev/null; use_stubs
 D run phase-001 >/dev/null 2>&1
 rm -f "$PROJ/opencode.json"
