@@ -407,7 +407,7 @@ $msg"
     elif [ "$code" -eq 124 ] || [ "$code" -eq 137 ] || [ "$code" -eq 141 ] || [ "$code" -eq 143 ]; then
       if [ "$call_elapsed" -lt "$no_work_seconds" ]; then
         no_work=1
-        log "model $m was killed after ${call_elapsed}s - before it could have started fixing (${no_work_seconds}s) - what it left is partial, so it did NOT finish"
+        log "model $m was killed after ${call_elapsed}s - before it could have started fixing (${no_work_seconds}s) - so it did NO WORK"
       else
         log "model $m was killed after ${call_elapsed}s - it had time to work, keeping what it produced"
         return "$code"
