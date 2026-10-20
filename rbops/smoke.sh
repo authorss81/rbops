@@ -562,6 +562,49 @@ fi
 # Restore a working toolchain for the rest of the suite.
 build_fixture >/dev/null; use_stubs
 
+# A BLOCKER nobody checked is a claim, not a check, and it is downgraded to a
+# MAJOR in the review log - where a human can see it happened.
+#
+# Phase-062 was blocked on a BLOCKER claiming the debugger could not stop the
+# program, while a test in the repository asserted that it could. A guess that
+# stops a good phase costs a fix pass, a re-review, and sometimes the phase.
+build_fixture >/dev/null; use_stubs
+export SMOKE_PIPE="$PIPE" SMOKE_PROJ="$PROJ"
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+n=0
+[ -f "$SMOKE_PIPE/logs/phase-001.fix.1.log" ] && n=1
+if [ "$n" = "0" ]; then
+  # review round 1: one VERIFIED blocker and one that nobody checked
+  echo "1. [BLOCKER] src/vm.rs:412 - the real thing - VERIFIED: ran the test, it fails"
+  echo "2. [BLOCKER] src/debugger.rs:99 - the VM ignores the action - nobody checked this"
+  echo "REVIEW VERDICT: FINDINGS 2"
+else
+  echo "| src/vm.rs | +40 -10 | fixed |"
+  echo "fix done"
+fi
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$(R)"
+if printf '%s' "$out" | grep -q "carried no VERIFIED marker - downgraded to MAJOR"; then
+  ok "an unverified BLOCKER is reported as downgraded"
+else
+  no "the downgrade was not reported"
+fi
+if grep -q "nobody checked this" "$PIPE/logs/phase-001.review.1.log" 2>/dev/null \
+   && grep "nobody checked this" "$PIPE/logs/phase-001.review.1.log" | grep -q '\[MAJOR\]'; then
+  ok "the unverified BLOCKER was downgraded in the review log"
+else
+  no "the unverified BLOCKER was not downgraded in the log"
+fi
+if grep "VERIFIED: ran the test" "$PIPE/logs/phase-001.review.1.log" 2>/dev/null | grep -q '\[BLOCKER\]'; then
+  ok "a VERIFIED BLOCKER keeps its severity"
+else
+  no "a verified BLOCKER was downgraded"
+fi
+build_fixture >/dev/null; use_stubs
+
 D stop >/dev/null 2>&1
 out="$(D select)"
 case "$out" in *"pipeline halted"*) ok ".stop halts selection" ;; *) no ".stop did not halt" ;; esac

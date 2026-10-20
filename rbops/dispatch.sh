@@ -1099,6 +1099,31 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     #
     # A review that cannot be parsed must not be able to approve anything.
     local rlog="$LOG_DIR/$phase.review.$round.log"
+
+    # An unverified BLOCKER is a claim, not a check, and the pipeline treats a
+    # BLOCKER as "the phase cannot ship". A guess that stops a good phase costs
+    # more than the defect it hypothesises: a fix pass, a re-review, and
+    # sometimes the phase. Phase-062 was blocked on a BLOCKER claiming the
+    # debugger could not stop the program, while a test in the repository
+    # asserted that it could.
+    #
+    # So a BLOCKER without a VERIFIED marker is downgraded to MAJOR, IN THE LOG,
+    # where a human reading the review can see that it happened. The log is the
+    # record; rewriting it silently would leave the record lying about what the
+    # reviewer said.
+    #
+    # MAJOR blocks exactly as BLOCKER does, so this changes the finding's
+    # weight and not the phase's fate. That is the intent: an unverified claim
+    # is still fixed, and still cannot be ignored, but it is no longer the
+    # reviewer's strongest word.
+    local unverified_blockers
+    unverified_blockers="$(grep -E '\[BLOCKER\]' "$rlog" 2>/dev/null | grep -cv 'VERIFIED')"
+    unverified_blockers="${unverified_blockers:-0}"
+    if [ "$unverified_blockers" -gt 0 ]; then
+      sed -i -E '/\[BLOCKER\]/ { /VERIFIED/! s/\[BLOCKER\]/[MAJOR]/; }' "$rlog" 2>/dev/null || true
+      log "review round $round: $unverified_blockers BLOCKER(s) carried no VERIFIED marker - downgraded to MAJOR"
+    fi
+
     local has_sev has_clean has_verdict blocking
     # NOTE: no `|| echo 0` here. `grep -c` already prints 0 on no match (and
     # exits 1 doing it), so `|| echo 0` would append a SECOND line and leave
