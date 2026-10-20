@@ -580,7 +580,7 @@ exit 0
 EOS
 chmod +x "$STUB/opencode"
 out="$( RBOPS_MIN_OUTPUT=1 D run phase-001 2>&1 | strip )"
-if printf '%s' "$out" | grep -q "finished without changing anything"; then
+if printf '%s' "$out" | grep -q "ran and changed nothing"; then
   ok "a model that exits 0 having changed nothing is called no work"
 else
   no "a model that changed nothing was accepted as work"

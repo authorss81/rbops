@@ -394,9 +394,16 @@ $msg"
     # The runner cancelling a job is a SIGTERM, and a `timeout` firing is a 124.
     local no_work=0 wrote_something=1
     [ "$tree_before" = "$tree_after" ] && wrote_something=0
-    if [ "$role" = "build" ] && [ "$wrote_something" -eq 0 ]; then
+    #
+    # The tree only judges a model that RAN. A model that never got to try -
+    # a rate limit, a revoked free tier, a dead model id - also leaves the tree
+    # untouched, and calling that "no work" would turn a dead chain into a
+    # blocked phase instead of a deferred one. So the rule needs the model to
+    # have run AND said plenty: exit 0 with real output.
+    if [ "$role" = "build" ] && [ "$wrote_something" -eq 0 ] \
+       && [ "$code" -eq 0 ] && [ "$growth" -ge "${RBOPS_MIN_OUTPUT:-500}" ]; then
       no_work=1
-      log "model $m finished without changing anything - the tree is exactly as it found it - so it did NO WORK"
+      log "model $m ran and changed nothing - the tree is exactly as it found it - so it did NO WORK"
     elif [ "$code" -eq 124 ] || [ "$code" -eq 137 ] || [ "$code" -eq 141 ] || [ "$code" -eq 143 ]; then
       if [ "$call_elapsed" -lt "$no_work_seconds" ]; then
         no_work=1
