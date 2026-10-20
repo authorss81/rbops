@@ -586,7 +586,7 @@ fi
 exit 0
 EOS
 chmod +x "$STUB/opencode"
-out="$(R)"
+out="$(RBOPS_MIN_OUTPUT=1 D review phase-001 2>&1 | strip)"
 if printf '%s' "$out" | grep -q "carried no VERIFIED marker - downgraded to MAJOR"; then
   ok "an unverified BLOCKER is reported as downgraded"
 else
