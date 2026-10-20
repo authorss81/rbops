@@ -636,7 +636,7 @@ else
 fi
 # And a LIST must keep every entry from both sides: the ACK table is one, and
 # taking one side whole drops acknowledgements the audit still needs.
-if grep -q "every entry" "$PIPE/rbops/agents/reviewer.md" 2>/dev/null; then
+if grep -q "every entry" "$PIPE/rbops/dispatch.sh" 2>/dev/null; then
   ok "the conflict prompt says a list must keep every entry from both sides"
 else
   no "the conflict prompt does not mention lists"
