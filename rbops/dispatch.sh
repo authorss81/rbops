@@ -1177,14 +1177,15 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       # blocking - while the findings block names the files a fix has to touch.
       # A review naming 19 files and finding 3 read as "19 cited, 4 fixed" and
       # looked like the model was ignoring most of them.
+      # A file is "named in the findings" when it appears on a line that
+      # carries a severity. Not when it appears under a FINDINGS: heading:
+      # a reviewer that writes one finding and no heading has still named a
+      # file in a finding, and counting the heading would say zero.
       local mentioned only_findings
       mentioned="$(wc -l < "$cited")"
-      only_findings=0
-      if grep -qE '^FINDINGS:' "$rlog" 2>/dev/null; then
-        only_findings="$(sed -n '/^FINDINGS:/,$p' "$rlog" 2>/dev/null \
-          | grep -oE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.(rs|rb|md|json|toml)' \
-          | grep -vE '^(Cargo\.lock|Cargo\.toml)$' | sort -u | wc -l | tr -d ' ')"
-      fi
+      only_findings="$(grep -E '\[(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\]' "$rlog" 2>/dev/null \
+        | grep -oE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.(rs|rb|md|json|toml)' \
+        | grep -vE '^(Cargo\.lock|Cargo\.toml)$' | sort -u | wc -l | tr -d ' ')"
       log "fix round $round: ${only_findings:-0} file(s) named in the findings, ${mentioned} mentioned by the reviewer"
     fi
     # Taken BEFORE the fix pass, so it can be compared with the one after it.
