@@ -605,6 +605,60 @@ else
 fi
 build_fixture >/dev/null; use_stubs
 
+# A phase resumed with unresolved conflicts spent the attempt MERGING, not on
+# its own work, so a gate failure there must not cost it one of its three
+# attempts. It defers instead - and the deferral is bounded, so it ends in a
+# human rather than in a loop.
+build_fixture >/dev/null; use_stubs
+# Forge a recovery branch that CONFLICTS with main: both sides change the same
+# line of the same file, which is the only way a squash-merge really conflicts.
+( cd "$PROJ" \
+  && git checkout -q -b conflicted \
+  && printf '// the recovery side\n' > conflicted.txt \
+  && git add -A && git commit -qm "conflicting work" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git checkout -q main \
+  && printf '// main moved on\n' > conflicted.txt \
+  && git add -A && git commit -qm "main moved on" ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+if [ -f "$PIPE/phases/phase-001/.conflict" ]; then
+  ok "a conflicted resume writes the .conflict marker"
+else
+  no "the conflicted resume did not write the .conflict marker"
+fi
+# The agent is told WHICH file is conflicted. The sed that printed the list was
+# malformed, so the list came out empty and the agent never heard about it -
+# phase-084 resumed onto a conflict in a file and was sent in blind.
+if printf '%s' "$out" | grep -q "conflicted.txt"; then
+  ok "the agent is told which file is conflicted"
+else
+  no "the agent was not told which file is conflicted"
+fi
+# And a LIST must keep every entry from both sides: the ACK table is one, and
+# taking one side whole drops acknowledgements the audit still needs.
+if grep -q "every entry" "$PIPE/rbops/agents/reviewer.md" 2>/dev/null; then
+  ok "the conflict prompt says a list must keep every entry from both sides"
+else
+  no "the conflict prompt does not mention lists"
+fi
+# A gate failure on a conflicted resume defers instead of consuming an attempt.
+build_fixture >/dev/null; use_stubs
+mkdir -p "$PIPE/phases/phase-001"
+touch "$PIPE/phases/phase-001/.conflict"
+printf '0' > "$PIPE/phases/phase-001/.attempts"
+out="$( RBOPS_MIN_OUTPUT=500 D run phase-001 | strip )"
+if [ -f "$PIPE/phases/phase-001/.deferred" ]; then
+  ok "a gate failure on a conflicted resume defers"
+else
+  no "a gate failure on a conflicted resume did not defer"
+fi
+if [ "$(cat "$PIPE/phases/phase-001/.attempts" 2>/dev/null || echo x)" = "0" ]; then
+  ok "the conflicted deferral consumed no attempt"
+else
+  no "the conflicted deferral consumed an attempt"
+fi
+build_fixture >/dev/null; use_stubs
+
 D stop >/dev/null 2>&1
 out="$(D select)"
 case "$out" in *"pipeline halted"*) ok ".stop halts selection" ;; *) no ".stop did not halt" ;; esac

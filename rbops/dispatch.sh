@@ -570,6 +570,10 @@ cmd_run() {
     else
       in_project git merge --abort 2>/dev/null || true
       in_project git reset -q --hard HEAD 2>/dev/null || true
+      # The merge was clean this time, so this attempt did not start with
+      # unresolved conflicts. The marker says exactly that, and leaving it
+      # would divert every later gate failure away from the attempt budget.
+      rm -f "$(marker "$phase" .conflict)"
       log "recovery branch present but not usable — starting clean"
     fi
   fi
@@ -755,7 +759,12 @@ Before anything else:
 2. Keep BOTH intents. \`main\` has moved since the attempt was parked - usually a
    new phase landed - so its version may contain work the attempt never saw.
    Do not resolve by taking one side wholesale.
-3. Then continue and finish the phase as described below.
+3. If the conflicted file is a LIST of entries rather than code, every entry
+   from BOTH sides must survive. The one this pipeline keeps hitting is the
+   acknowledgement table in tests/unreviewed_work_ack_test.rs: taking one side
+   whole drops acknowledgements for commits that are still on main, and the
+   audit then refuses the NEXT phase for naming a commit it does contain.
+4. Then continue and finish the phase as described below.
 
 The gate decides whether the resolved tree is acceptable. A conflict left
 unresolved will fail it.
@@ -956,6 +965,20 @@ done
   if [ "$code" -ne 0 ]; then
     rm -f "$(marker "$phase" .done)" "$(marker "$phase" .checkpoint)"
     touch "$(marker "$phase" .failed)"
+    # A phase resumed with UNRESOLVED CONFLICTS spent this attempt merging the
+    # parked attempt onto a newer main, not on its own work: that work was
+    # already done. A gate failure there is as likely to be a bad resolution as
+    # a bad implementation, and neither should cost the phase one of its three
+    # attempts - the phase would block on a merge technicality while its work
+    # sat complete on a branch.
+    #
+    # It defers instead. That is the existing mechanism for "not now, and do not
+    # count it": no attempt consumed, and bounded by MAX_DEFERRALS, so the
+    # phase ends in a human rather than in a loop.
+    if [ -f "$(marker "$phase" .conflict)" ]; then
+      defer_phase "$phase" "the inherited work had to be merged onto a newer main and the gate refused the result"
+      return $?
+    fi
     local a; a="$(read_n "$phase" .attempts)"; bump "$phase" .attempts
     a="$(read_n "$phase" .attempts)"
     if [ "$a" -ge "$MAX_ATTEMPTS" ]; then
@@ -969,6 +992,9 @@ done
 
   # gate passed — do NOT mark done yet, the reviewer must sign off first
   rm -f "$(marker "$phase" .failed)" "$(marker "$phase" .deferred)" "$(marker "$phase" .deferred_attempts)"
+  # The conflict, if there was one, is resolved now: this attempt did not start
+  # with one, so the marker must not outlive it.
+  rm -f "$(marker "$phase" .conflict)"
   log "$phase passed the gate — awaiting review"
   # A green gate means there is no failure left to report, so the verdict file
   # must not survive into a future attempt for this phase. Left in place it
