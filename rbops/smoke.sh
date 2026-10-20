@@ -495,21 +495,12 @@ build_fixture >/dev/null
 # The stub `opencode` is what makes this testable: it can be told to die the
 # way a killed model dies, and to die FAST, which is what "before it could
 # have started" means.
-stub_kill_first() {   # kills the first call, succeeds on the rest
+stub_kill_run() {   # answers the auth probe, dies on the model call
   cat > "$STUB/opencode" <<EOS
 #!/usr/bin/env bash
-n=\$(cat "$STUB/.calls" 2>/dev/null || echo 0)
-n=\$((n+1)); echo "\$n" > "$STUB/.calls"
-if [ "\$n" -eq 1 ]; then sleep 2; exit 143; fi
-echo "stub agent output: DONE $(head -c 600 /dev/zero | tr '\0' 'x')"
-EOS
-  chmod +x "$STUB/opencode"
-  rm -f "$STUB/.calls"
-}
-
-stub_kill_always() {  # dies every time
-  cat > "$STUB/opencode" <<EOS
-#!/usr/bin/env bash
+if [ "\$1" = "models" ]; then exit 0; fi
+msg=""; for a in "\$@"; do msg="\$a"; done
+printf '%s' "\$msg" > "\$(dirname "\$0")/../last-prompt.txt"
 sleep 2
 exit 143
 EOS
@@ -530,8 +521,9 @@ fi
 
 # A model that dies before it could start fixing must not end the attempt: the
 # next model in the chain is dispatched, and it is told why it was launched.
+# Two models in a row doing nothing blocks the phase.
 build_fixture >/dev/null; use_stubs
-stub_kill_first
+stub_kill_run
 out="$(D run phase-001 2>&1)"
 if printf '%s' "$out" | grep -q "it did NO WORK"; then
   ok "a model killed before it could start is recorded as having done no work"
@@ -543,17 +535,12 @@ if printf '%s' "$out" | grep -q "dispatching the next model in the chain"; then
 else
   no "the chain did not advance after a no-work kill"
 fi
-if printf '%s' "$out" | grep -q "THE PREVIOUS ATTEMPT DID NO WORK"; then
+# The replacement model is TOLD, and the stub records what it was given.
+if grep -q "THE PREVIOUS ATTEMPT DID NO WORK" "$STUB/../last-prompt.txt" 2>/dev/null; then
   ok "the replacement model is told the previous one did no work"
 else
   no "the replacement model was not told what happened to the previous one"
 fi
-
-# Two models in a row doing nothing blocks the phase: the same attempt shape
-# will not start working on a third.
-build_fixture >/dev/null; use_stubs
-stub_kill_always
-out="$(D run phase-001 2>&1)"
 if printf '%s' "$out" | grep -qiE "BLOCKED.*no work|blocked.*two models"; then
   ok "two no-work kills in a row block the phase"
 else
@@ -563,6 +550,14 @@ if [ -f "$PIPE/phases/phase-001/.blocked" ]; then
   ok "the blocked marker was written"
 else
   no "no .blocked marker after two no-work kills"
+fi
+# The retry happens ONCE: the second no-work kill blocks, it does not go on to
+# a third model. A phase that cannot start on two models in a row will not
+# start on six, and each attempt costs real minutes.
+if printf '%s' "$out" | grep -c "it did NO WORK" | grep -qE '^2$'; then
+  ok "the no-work retry happens exactly once"
+else
+  no "the no-work retry did not stop at one"
 fi
 # Restore a working toolchain for the rest of the suite.
 build_fixture >/dev/null; use_stubs
@@ -1716,7 +1711,7 @@ case "$out" in
   *) no "it did not block on a non-fix" ;;
 esac
 case "$out" in
-  *"fix round 1: 1 file(s) cited by the findings"*) ok "the findings' files were tracked" ;;
+  *"fix round 1: 1 file(s) named in the findings"*) ok "the findings' files were tracked" ;;
   *) no "cited files were not tracked" ;;
 esac
 # Only ONE fix round may have been spent: a second would mean it looped.
