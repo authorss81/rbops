@@ -1,0 +1,1361 @@
+[0m
+> build · minimax-m3.1-flash-free
+[0m
+[0m→ [0mRead tests/text_split_join_test.rs[90m [offset=740, limit=80][0m
+[0m→ [0mRead tests/loop_bounds_test.rs[90m [offset=150, limit=80][0m
+I'll start by reading the relevant files to understand the current state.
+[0m→ [0mRead phases/phase-088/REPORT.md
+[0m→ [0mRead phases/phase-088/FINDINGS.md
+[0m→ [0mRead phases/phase-088/scan.py
+[0m→ [0mRead tests/loop_bounds_test.rs[90m [limit=80, offset=365][0m
+[0m
+[0m$ [0mgrep -n "expect" src/interpreter.rs | head -60
+17:    expect_range_number, expect_repeat_count, finite_number, range_has_next, Captured,
+153:/// can still read [`Vm::take_expectation_failure`], which is set on the VM that
+213:                "The interpreter thread stopped unexpectedly".to_string(),
+437:    expectation_failure: Option<crate::testing::assertions::TestAssertionError>,
+681:            expectation_failure: None,
+783:        self.expectation_failure = None;
+1080:    /// Takes the structured failure from the most recent failed `expect`, so a
+1081:    /// caller such as the test harness can report expected and actual values
+1083:    pub fn take_expectation_failure(
+1086:        self.expectation_failure.take()
+1872:                let start = expect_range_number(&start_val, "from", span)?;
+1873:                let end = expect_range_number(&end_val, "to", span)?;
+1874:                let step = expect_range_number(&step_val, "by", span)?;
+1904:                // `expect_repeat_count`, which the bytecode VM reads the same
+1906:                let turns = expect_repeat_count(&count_val, self.span())?;
+2028:                    // one expects: `?` hands the failure to it, and it is the
+2291:            // A failed `expect` is a test result rather than an error, and the
+2305:                        // `expect` is recorded the yes/no form cannot tell a
+2307:                        // not: a second failing `expect` inside a guard written
+2323:            Expr::Expect { actual, expected } => {
+2325:                let e = self.evaluate(expected)?;
+2329:                        self.expectation_failure = Some(failure.clone());
+[0m
+[0m$ [0mgrep -rn "take_expectation_failure" src/ | head -20
+src/testing/harness.rs:224:            if let Some(failure) = vm.take_expectation_failure() {
+src/interpreter.rs:153:/// can still read [`Vm::take_expectation_failure`], which is set on the VM that
+src/interpreter.rs:1083:    pub fn take_expectation_failure(
+src/bytecode/vm.rs:925:    pub fn take_expectation_failure(
+[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2280, limit=70][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2010, limit=50][0m
+[0m→ [0mRead src/lib.rs
+[0m→ [0mRead tests/redblue_test.rs[90m [limit=240][0m
+[0m→ [0mRead tests/loop_bounds_test.rs[90m [limit=150][0m
+[0m
+[0m$ [0mgrep -n "pub fn run\b\|pub fn run(" -A 20 src/interpreter.rs | head -60
+1483:    pub fn run(&mut self, program: &Program) -> Result<Value> {
+1484-        let result = self.run_statements(program)?;
+1485-
+1486-        // Print collected output. Through the one boundary a program writes
+1487-        // through, so the WebAssembly playground can collect what the native
+1488-        // binary would have printed.
+1489-        for line in &self.output {
+1490-            crate::wasm::emit(&format!("{}\n", line));
+1491-        }
+1492-
+1493-        Ok(result)
+1494-    }
+1495-
+1496-    /// Runs `program` and answers with what it returned, printing nothing.
+1497-    ///
+1498-    /// [`Vm::run`] prints what the program *said*, which is right for a program
+1499-    /// and wrong for a question about a value: `.type f()` is not asking to hear
+1500-    /// what `f` prints, and a REPL that printed it would answer a question with
+1501-    /// output the user did not type. The lines are still buffered — nothing is
+1502-    /// lost, and a caller that wants them reads them with [`Vm::take_output`] —
+1503-    /// so this is about what reaches the terminal and not about the VM keeping
+[0m
+[0m$ [0mgrep -n "YesNo" src/value.rs | head -30; echo ---; grep -n "fn run_statements" -A 30 src/interpreter.rs | head -50
+252:    YesNo(bool),
+328:            Value::YesNo(b) => write!(f, "{}", if *b { "yes" } else { "no" }),
+365:            Value::YesNo(_) => "yes/no",
+377:            Value::YesNo(b) => *b,
+---
+1518:    fn run_statements(&mut self, program: &Program) -> Result<Value> {
+1519-        let mut result = Value::Nothing;
+1520-
+1521-        for statement in &program.statements {
+1522-            result = self.execute_statement(statement)?;
+1523-        }
+1524-
+1525-        Ok(result)
+1526-    }
+1527-
+1528-    fn push_scope(&mut self) {
+1529-        self.locals.push(CapturedScope::new());
+1530-    }
+1531-
+1532-    fn pop_scope(&mut self) {
+1533-        self.locals.pop();
+1534-    }
+1535-
+1536-    /// Builds the function value for a declaration, closing over every local
+1537-    /// scope that is live where the declaration is executed.
+1538-    ///
+1539-    /// The capture is a copy taken at declaration time, so a variable the
+1540-    /// function reads is the value it had where the function was written, and
+1541-    /// a variable it assigns is assigned only for that one call. Globals are
+1542-    /// not captured and are read live, which is what a declaration that
+1543-    /// changes a global — a counter, a registry — is written to do.
+1544-    fn make_function(&self, name: &str, params: &[String], body: &[Stmt]) -> Value {
+1545-        let captured: Captured = self.locals.clone();
+1546-        Value::Function(FunctionValue {
+1547-            name: name.to_string(),
+1548-            params: params.to_vec(),
+[0m
+[0m$ [0mgrep -n "time_sleep_of_zero_seconds_is_accepted" -A 30 tests/time_builtin_test.rs
+279:fn time_sleep_of_zero_seconds_is_accepted() {
+280-    match eval("set slept to time.sleep(0)\nslept is nothing\n") {
+281-        Ok(Value::YesNo(true)) => {}
+282-        Ok(other) => panic!(
+283-            "a zero-second sleep must be allowed and answer nothing, got {:?}",
+284-            other
+285-        ),
+286-        Err(e) => panic!("a zero-second sleep must be allowed, got {:?}", e),
+287-    }
+288-}
+289-
+290-/// `time.unix` parses years `chrono` accepts but `time.format` cannot represent,
+291-/// so the two builtins disagreed about whether the instant existed. A date
+292-/// outside the window both accept is a `Runtime` error naming `time.unix`.
+293-#[test]
+294-fn edge_time_unix_of_a_date_outside_the_shared_window_is_an_error() {
+295-    for (text, what) in [
+296-        ("-99999-01-01 00:00:00", "a year past what a date can name"),
+297-        ("-262143-01-01 00:00:00", "the earliest year chrono parses"),
+298-        (
+299-            "-9999-01-01 00:00:00",
+300-            "before the window time.format accepts",
+301-        ),
+302-    ] {
+303-        let source = format!("say time.unix(\"{text}\")");
+304-        match eval_err(&source) {
+305-            Error::Runtime(message, _) => assert!(
+306-                message.contains("time.unix"),
+307-                "{} should be refused as a time.unix error, got `{}`",
+308-                what,
+309-                message
+[0m
+[0m$ [0mgrep -n "fn ok\|fn fails\|fn both_print\|fn strip_markers" -A 25 tests/assertions_test.rs tests/might_fail_test.rs | head -120
+tests/assertions_test.rs:64:fn ok(result: Result<(), redblue::testing::assertions::TestAssertionError>) -> Result<(), String> {
+tests/assertions_test.rs-65-    result.map_err(|failure| format!("accepted a wrong input: {}", failure))
+tests/assertions_test.rs-66-}
+tests/assertions_test.rs-67-
+tests/assertions_test.rs:68:fn fails(
+tests/assertions_test.rs-69-    result: Result<(), redblue::testing::assertions::TestAssertionError>,
+tests/assertions_test.rs-70-) -> Result<(), String> {
+tests/assertions_test.rs-71-    match result {
+tests/assertions_test.rs-72-        Ok(()) => Err("accepted a wrong input".to_string()),
+tests/assertions_test.rs-73-        Err(failure) if failure.message.is_empty() => {
+tests/assertions_test.rs-74-            Err("rejected a wrong input but with no message".to_string())
+tests/assertions_test.rs-75-        }
+tests/assertions_test.rs-76-        Err(_) => Ok(()),
+tests/assertions_test.rs-77-    }
+tests/assertions_test.rs-78-}
+tests/assertions_test.rs-79-
+tests/assertions_test.rs-80-// ---------------------------------------------------------------------------
+tests/assertions_test.rs-81-// Probes: one per surviving assertion, both directions.
+tests/assertions_test.rs-82-// ---------------------------------------------------------------------------
+tests/assertions_test.rs-83-
+tests/assertions_test.rs-84-fn probe_assert_list_length() -> Result<(), String> {
+tests/assertions_test.rs-85-    ok(assert_list_length(&list(vec![number(1.0), number(2.0)]), 2))?;
+tests/assertions_test.rs-86-    fails(assert_list_length(&list(vec![number(1.0)]), 2))?;
+tests/assertions_test.rs-87-    fails(assert_list_length(&text("not a list"), 0))
+tests/assertions_test.rs-88-}
+tests/assertions_test.rs-89-
+tests/assertions_test.rs-90-fn probe_assert_number_in_range() -> Result<(), String> {
+tests/assertions_test.rs-91-    ok(assert_number_in_range(5.0, 1.0, 10.0))?;
+tests/assertions_test.rs-92-    fails(assert_number_in_range(50.0, 1.0, 10.0))
+tests/assertions_test.rs-93-}
+--
+tests/might_fail_test.rs:157:fn both_print(source: &str, expected: &[&str]) {
+tests/might_fail_test.rs-158-    let (tree, byte) = both(source);
+tests/might_fail_test.rs-159-    assert_eq!(
+tests/might_fail_test.rs-160-        tree.output, expected,
+tests/might_fail_test.rs-161-        "tree-walking output for:\n{}",
+tests/might_fail_test.rs-162-        source
+tests/might_fail_test.rs-163-    );
+tests/might_fail_test.rs-164-    assert_eq!(byte.output, expected, "bytecode output for:\n{}", source);
+tests/might_fail_test.rs-165-}
+tests/might_fail_test.rs-166-
+tests/might_fail_test.rs-167-/// The value both engines ended with, asserted.
+tests/might_fail_test.rs-168-#[track_caller]
+tests/might_fail_test.rs-169-fn both_value(source: &str, expected: Value) {
+tests/might_fail_test.rs-170-    let (tree, byte) = both(source);
+tests/might_fail_test.rs-171-    assert_eq!(
+tests/might_fail_test.rs-172-        tree.result.as_ref().ok(),
+tests/might_fail_test.rs-173-        Some(&expected),
+tests/might_fail_test.rs-174-        "tree-walking value for:\n{}",
+tests/might_fail_test.rs-175-        source
+tests/might_fail_test.rs-176-    );
+tests/might_fail_test.rs-177-    assert_eq!(
+tests/might_fail_test.rs-178-        byte.result.as_ref().ok(),
+tests/might_fail_test.rs-179-        Some(&expected),
+tests/might_fail_test.rs-180-        "bytecode value for:\n{}",
+tests/might_fail_test.rs-181-        source
+tests/might_fail_test.rs-182-    );
+--
+tests/might_fail_test.rs:1079:    fn strip_markers(block: &mut redblue::bytecode::Block, removed: &mut usize) {
+tests/might_fail_test.rs-1080-        block.code.retain(|instruction| {
+tests/might_fail_test.rs-1081-            let marker = instruction.opcode == redblue::bytecode::Opcode::Nop
+tests/might_fail_test.rs-1082-                && instruction.arg == MIGHT_FAIL_END_MARKER;
+tests/might_fail_test.rs-1083-            if marker {
+tests/might_fail_test.rs-1084-                *removed += 1;
+tests/might_fail_test.rs-1085-            }
+tests/might_fail_test.rs-1086-            !marker
+tests/might_fail_test.rs-1087-        });
+tests/might_fail_test.rs-1088-        for child in block.blocks.iter_mut() {
+tests/might_fail_test.rs-1089-            strip_markers(child, removed);
+tests/might_fail_test.rs-1090-        }
+tests/might_fail_test.rs-1091-    }
+tests/might_fail_test.rs-1092-
+tests/might_fail_test.rs-1093-    let source = "to ok()\n\
+tests/might_fail_test.rs-1094-         \x20   give back 5\n\
+tests/might_fail_test.rs-1095-         \x20   end\n\
+tests/might_fail_test.rs-1096-         \x20   to guarded()\n\
+tests/might_fail_test.rs-1097-         \x20       set kept to might fail ok()\n\
+tests/might_fail_test.rs-1098-         \x20   end\n\
+tests/might_fail_test.rs-1099-         \x20   to fails_after()\n\
+tests/might_fail_test.rs-1100-         \x20       give back files.read(\"/nope/later\")\n\
+tests/might_fail_test.rs-1101-         \x20   end\n\
+tests/might_fail_test.rs-1102-         \x20   say guarded()\n\
+tests/might_fail_test.rs-1103-         \x20   say fails_after()";
+tests/might_fail_test.rs-1104-
+[0m
+[0m$ [0msed -n '195,250p;320,345p' tests/assertions_test.rs
+match probe() {
+            Ok(()) => println!("{name}: covered (accepts correct input, rejects wrong input)"),
+            Err(reason) => panic!("{name} is not correctly implemented: {reason}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Empty / singleton
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edge_empty_and_singleton_inputs() {
+    // Empty list of length 0, empty text, and the nothing value are all
+    // distinguishable from their non-empty neighbours.
+    ok(assert_list_length(&list(vec![]), 0)).unwrap();
+    fails(assert_list_length(&list(vec![]), 1)).unwrap();
+
+    ok(assert_text_contains("", "")).unwrap();
+    fails(assert_text_contains("", "a")).unwrap();
+
+    ok(assert_text_matches("", r"^$")).unwrap();
+    fails(assert_text_matches("", r"\d")).unwrap();
+
+    ok(assert_number_in_range(0.0, 0.0, 0.0)).unwrap();
+    fails(assert_number_in_range(0.0, -1.0, -0.5)).unwrap();
+
+    // A singleton is the smallest list the length assertion must accept.
+    ok(assert_list_length(&list(vec![number(1.0)]), 1)).unwrap();
+    ok(assert_values_equal(
+        &list(vec![number(1.0)]),
+        &list(vec![number(1.0)]),
+    ))
+    .unwrap();
+    fails(assert_values_equal(&list(vec![number(1.0)]), &list(vec![]))).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Numeric boundary
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edge_numeric_boundaries() {
+    // The range is inclusive at both ends.
+    ok(assert_number_in_range(1.0, 1.0, 10.0)).unwrap();
+    ok(assert_number_in_range(10.0, 1.0, 10.0)).unwrap();
+    fails(assert_number_in_range(f64::NAN, 0.0, 1.0)).unwrap();
+    fails(assert_number_in_range(
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        1.0,
+    ))
+    .unwrap();
+
+    // 2^53 and 2^53 + 2 are the neighbouring doubles at that magnitude, and
+    // 2^53 + 1 is not representable at all, so equality is exact about the
+                shown,
+                (failure.expected, failure.actual)
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unicode
+// ---------------------------------------------------------------------------
+
+#[test]
+fn edge_unicode_text_is_matched_by_bytes_of_the_real_string() {
+    ok(assert_text_contains("héllo 🎉 日本語", "🎉")).unwrap();
+    ok(assert_text_contains("日本語", "本")).unwrap();
+    // A substring that spans no character boundary must not match.
+    fails(assert_text_contains("日本語", "本x語")).unwrap();
+    // Precomposed and decomposed accents are distinct byte sequences.
+    ok(assert_text_contains("\u{e9}", "\u{e9}")).unwrap();
+    fails(assert_text_contains("\u{65}\u{301}", "\u{e9}")).unwrap();
+    fails(assert_text_matches("שלום 12", r"\p{Greek}")).unwrap();
+    ok(assert_text_matches("שלום 12", r"\d$")).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Malformed input
+[0m
+[0m$ [0msed -n '290,330p;1060,1085p' tests/might_fail_test.rs
+say label\n\
+         say \"alive\"",
+        &["nothing", "alive"],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A guarded call inside a larger expression
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_guarded_call_is_an_expression_wherever_a_value_is_taken() {
+    // `might fail <call>` is an expression, not a statement, so it can be an
+    // argument, a list element, a record value, or a parenthesized operand of a
+    // larger expression. Each of these leaves exactly one value behind it, which is
+    // what `a_guard_leaves_one_value_on_the_operand_stack` pins from the bytecode
+    // side.
+    both_print(
+        "set l to [might fail files.read(\"/nope/x\"), 7]\n\
+         say l",
+        &["[nothing, 7]"],
+    );
+}
+
+#[test]
+fn edge_a_guarded_call_as_a_record_value_does_not_disturb_its_neighbours() {
+    // The boundary of the one-value rule on the side where it is easiest to get
+    // wrong: a record's keys and values are read positionally off the operand
+    // stack, so a guard that left a second value behind would shift every value
+    // after it and build the record out of the wrong pairs — a stray `nothing`
+    // where a key belongs, and a `RuntimeError` about a key that was not text.
+    both_print(
+        "set r to {a: might fail files.read(\"/nope/x\"), b: 2}\n\
+         say r",
+        &["{a: nothing, b: 2}"],
+    );
+}
+
+#[test]
+fn a_guard_leaves_one_value_on_the_operand_stack() {
+    // The bytecode VM keeps an operand stack, and a guard that pushed its
+/// running its last instruction. A region left by a jump (a `break` out of a loop
+/// the guarded call is in) never reaches the marker that drops the guard, so a
+/// frame can finish with its own guard still installed.
+///
+/// The frame that just finished is at index `finished`, which is the *length*
+/// after the pop, so the bound that drops its guard is `>=` and not `>`. With
+/// `>` the stale entry survives above every live guard, where the marker — which
+/// checks only the top — can no longer pop it, and the next failure raised in a
+/// frame entered at the same depth meets a guard whose recovery runs in a block
+/// that no longer exists.
+///
+/// The compiler never writes such a file — a marker is emitted for every guard it
+/// installs — so the case is built by taking the marker out of the compiled block,
+/// which is the state a frame is left in by the jump this describes. Without the
+/// fix the leftover guard swallows the second failure and leaves the operand stack
+/// short, and the run reports `bytecode asked for 1 values its frame never pushed`
+/// instead of the failure the callee raised.
+#[test]
+fn a_guard_whose_frame_finished_does_not_swallow_the_next_call_s_failure() {
+    fn strip_markers(block: &mut redblue::bytecode::Block, removed: &mut usize) {
+        block.code.retain(|instruction| {
+            let marker = instruction.opcode == redblue::bytecode::Opcode::Nop
+                && instruction.arg == MIGHT_FAIL_END_MARKER;
+            if marker {
+                *removed += 1;
+            }
+[0m
+[0m$ [0mgrep -n "fn edge_empty_and_singleton_inputs\|fn edge_numeric_boundaries\|fn edge_unicode_text_is_matched_by_bytes_of_the_real_string" tests/assertions_test.rs; echo ---; grep -n "fn a_guarded_call_is_an_expression_wherever_a_value_is_taken\|fn edge_a_guarded_call_as_a_record_value_does_not_disturb_its_neighbours\|fn strip_markers\|fn a_guard_whose_frame_finished_does_not_swallow_the_next_call_s_failure" tests/might_fail_test.rs
+207:fn edge_empty_and_singleton_inputs() {
+237:fn edge_numeric_boundaries() {
+332:fn edge_unicode_text_is_matched_by_bytes_of_the_real_string() {
+---
+301:fn a_guarded_call_is_an_expression_wherever_a_value_is_taken() {
+315:fn edge_a_guarded_call_as_a_record_value_does_not_disturb_its_neighbours() {
+1078:fn a_guard_whose_frame_finished_does_not_swallow_the_next_call_s_failure() {
+1079:    fn strip_markers(block: &mut redblue::bytecode::Block, removed: &mut usize) {
+[0m
+[0m$ [0mls -la phases/phase-088/; echo ---; git status --short; echo ---; git log --oneline -5
+total 60
+drwxr-xr-x  2 runner runner  4096 Oct 21 18:33 .
+drwxr-xr-x 71 runner runner  4096 Oct 21 16:07 ..
+-rw-r--r--  1 runner runner  9500 Oct 21 19:09 FINDINGS.md
+-rw-r--r--  1 runner runner 22576 Oct 21 19:27 REPORT.md
+-rw-r--r--  1 runner runner 11981 Oct 21 18:26 scan.py
+-rw-r--r--  1 runner runner  1453 Oct 21 18:27 scanned-files.txt
+---
+ M phases/phase-088/FINDINGS.md
+ M phases/phase-088/REPORT.md
+ A phases/phase-088/scan.py
+ A phases/phase-088/scanned-files.txt
+ M tests/loop_bounds_test.rs
+ M tests/loop_control_test.rs
+ M tests/redblue_test.rs
+ M tests/stdlib_module_docs_test.rs
+ M tests/time_builtin_test.rs
+ M tests/unreviewed_work_ack_test.rs
+---
+f0d4a46 resume phase-088: adopt preserved work
+c6e9837 rbops: phase-084 (2026-10-21T16:05:27Z)
+1d73e8c resume phase-084: adopt preserved work
+b21821d fix: the unix-only test imports were removed by a Windows-only lint
+1dbfd1c phase-062: fix the two MAJOR findings in the watch scratch VM
+[0m
+[0m$ [0mgrep -rn "does not even make the run fail\|recorded rather than raised\|never made \`run_source\` fail\|take_expectation_failure" phases/ docs/ *.md 2>/dev/null | head -30
+phases/phase-088/REPORT.md:18:| `tests/loop_bounds_test.rs` | +197 −16 | `edge_type_mismatch_count_is_not_a_loop` and `edge_type_mismatch_iterable_is_not_a_loop` now `take_output()` and assert it is empty; `runaway_loop_is_catchable_from_inside_redblue` asserts `take_expectation_failure().is_none()`; `edge_nested_loops_each_get_the_full_cap` asserts `12`; `step_budget_does_not_fire_under_the_limit` asserts `10`; `edge_step_budget_is_not_spent_by_unentered_loops` asserts `never` was not printed **and** the line after an unentered loop did run; `edge_deeply_nested_loops_terminate` asserts `65536`. Two new tests pin the *positive* direction — a loop that does run prints one line per turn, and a loop whose body says nothing still runs every turn — and that second one pins the loop's own value by ending its program on the loop, so the value the run hands back is the loop's and not the `say` after it |
+phases/phase-088/REPORT.md:22:| `tests/text_split_join_test.rs` | +20 −0 | `a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program` now reads `take_expectation_failure()` — its `expect caught to be yes` never made `run_source` fail, so a `catch` that caught nothing passed |
+phases/phase-088/REPORT.md:169:reads `take_expectation_failure()`, and
+phases/phase-088/REPORT.md:172:reads `take_expectation_failure()` too. Nineteen tests were given an assertion
+phases/phase-088/scan.py:34:* `take_output`, `.output`, `stdout`, `take_expectation_failure` and
+phases/phase-088/scan.py:78:    r"take_output|\.output|stdout|take_expectation_failure|expect_err|Ok\(Value::"
+phases/phase-006/REPORT.md:71:hand the `Vm` back and `take_expectation_failure` keeps working in the harness.
+[0m
+[0m# [0mTodos
+[•] Fix MAJOR: remove redundant take_expectation_failure assertions in text_split_join_test.rs and loop_bounds_test.rs; assert the program's value instead; rewrite comments
+[ ] Fix MINOR: scan.py docstring must say a Redblue-level `expect ... to be` does count
+[ ] Fix MINOR: loop_bounds_test.rs `never` check must discriminate for the `for each` row too
+[ ] Fix MINOR: REPORT.md/FINDINGS.md count of the hand-checked candidates (one count, one split)
+[ ] Update REPORT.md rows for the two changed tests (numstat, line numbers, description)
+[ ] Re-run the four gates: cargo fmt --check, cargo clippy, cargo test --all-targets, cargo test --doc (+ verify.sh)
+[0m
+[0m$ [0mgrep -n "pub fn run_isolated" -A 25 src/interpreter.rs | head -60
+155:pub fn run_isolated(program: &Program) -> (Vm, Result<Value>) {
+156-    run_isolated_in(program, std::path::Path::new("."))
+157-}
+158-
+159-/// [`run_isolated`] with the directory the program was found beside, which is
+160-/// where its `redblue.manifest` is and what its module paths are read against.
+161-///
+162-/// `run_isolated` is this against the working directory, which is what a program
+163-/// run as itself wants. A root of its own is what makes `rb run subdir/prog.rb`
+164-/// resolve the manifest *that program* declares rather than the one belonging to
+165-/// whatever directory the host was in.
+166:pub fn run_isolated_in(program: &Program, root: &std::path::Path) -> (Vm, Result<Value>) {
+167-    run_isolated_with_depth_in(program, resolve_max_call_depth(), root)
+168-}
+169-
+170-/// [`run_isolated_with_depth`] against `root` — see [`run_isolated_in`].
+171:pub fn run_isolated_with_depth(program: &Program, depth: usize) -> (Vm, Result<Value>) {
+172-    run_isolated_with_depth_in(program, depth, std::path::Path::new("."))
+173-}
+174-
+175-/// [`run_isolated_with_depth`] against `root` — see [`run_isolated_in`].
+176-///
+177-/// Split out for the same reason [`run_isolated_with_depth`] is: a test has to
+178-/// be able to ask for a stack this process cannot reserve — the case
+179-/// [`run_without_a_sized_thread`] decides — and the only way to reach it without
+180-/// mutating the process environment is to hand the number in. It reads a depth,
+181-/// not bytes: the size asked for is `depth * STACK_BYTES_PER_CALL`, so a depth
+182-/// past what any thread can carry asks for the impossible and the refusal is the
+183-/// answer under test.
+184:pub fn run_isolated_with_depth_in(
+185-    program: &Program,
+186-    depth: usize,
+187-    root: &std::path::Path,
+188-) -> (Vm, Result<Value>) {
+189-    let limit = depth.max(1);
+190-    let threaded = program.clone();
+191-    let root = root.to_path_buf();
+192-    let builder = std::thread::Builder::new()
+193-        .name("redblue-vm".to_string())
+194-        .stack_size(limit.saturating_mul(STACK_BYTES_PER_CALL));
+195-
+196-    let joined = match builder.spawn({
+197-        let root = root.clone();
+198-        move || {
+199-            let mut vm = Vm::new_in(&root);
+200-            let result = vm.run(&threaded);
+201-            (vm, result)
+202-        }
+203-    }) {
+204-        Ok(handle) => handle.join(),
+205-        Err(_) => return run_without_a_sized_thread(program, limit, root),
+206-    };
+207-
+208-    match joined {
+209-        Ok(result) => result,
+[0m
+[0m→ [0mRead tests/text_split_join_test.rs[90m [limit=60][0m
+[0m
+[0m$ [0mgrep -n "take_output\|run_isolated\|fn eval\|fn outputs\|BytecodeVm" tests/text_split_join_test.rs | head -40
+32:use redblue::bytecode::vm::BytecodeVm;
+43:fn eval(source: &str) -> Value {
+50:fn eval_err(source: &str) -> Error {
+784:    let (mut vm, outcome) = redblue::run_isolated(&program);
+792:        vm.take_output(),
+1072:        let mut vm = BytecodeVm::new();
+1108:        let mut vm = BytecodeVm::new();
+[0m
+[0m→ [0mRead tests/text_split_join_test.rs[90m [limit=60, offset=1050][0m
+[0m
+[0m← [0mEdit tests/text_split_join_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/text_split_join_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/text_split_join_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/text_split_join_test.rs
+@@ -767,27 +767,31 @@
+     "catch error\n",
+     "    set caught to yes\n",
+     "end\n",
+     "expect caught to be yes\n",
++    "caught\n",
+ );
+-match redblue::run_source(source) {
+-    Ok(()) => {}
+-    Err(error) => panic!("a wrongly typed split must be caught, not fatal: {error:?}"),
+-}
+-// `run_source` answers `Result<(), Error>` and throws the program's value away,
+-// so `Ok(())` above says the program **ran** — and a failed `expect` is
+-// recorded rather than raised, so it does not even make the run fail. The
+-// `expect caught to be yes` in the program is the whole assertion and has to
+-// be read; without this line a `catch` that never caught anything passed.
++// One run, and every answer it gives read: it **ran**, it ended on the flag
++// its own `catch` set, and it said nothing.
++//
++// The `expect caught to be yes` at the top level is the program's own check,
++// and a failed `expect` **fails the run**: `Expr::Expect` answers
++// `Err(Error::Runtime(..))` (`src/interpreter.rs:2331`) and nothing here
++// catches it, so the run coming back `Ok` already proves the `catch` fired.
++// The value below is the second, independent reading of the same run — what
++// the program *answered*, not whether it ran.
+ let tokens = redblue::lexer::Lexer::tokenize(source).expect("the fixture lexes");
+ let program = redblue::parser::parse(tokens).expect("the fixture parses");
+ redblue::analyzer::analyze(&program).expect("the fixture analyzes");
+ let (mut vm, outcome) = redblue::run_isolated(&program);
+-outcome.expect("the fixture runs");
+-assert!(
+-    vm.take_expectation_failure().is_none(),
+-    "`expect caught to be yes` failed, so the wrongly typed split was not \
+-     caught by the program's own try"
++let value = outcome.unwrap_or_else(|error| {
++    panic!("a wrongly typed split must be caught, not fatal: {error:?}")
++});
++assert_eq!(
++    value,
++    Value::YesNo(true),
++    "the program's `caught` flag must be `yes`: the wrongly typed split was \
++     not caught by the program's own try"
+ );
+ assert_eq!(
+     vm.take_output(),
+     Vec::<String>::new(),
+
+[0m
+Now let me make the fixes. First, the MAJOR finding in `tests/text_split_join_test.rs`:
+[0m← [0mEdit tests/loop_bounds_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/loop_bounds_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/loop_bounds_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/loop_bounds_test.rs
+@@ -168,21 +168,26 @@
+         "catch error\n",
+         "    set caught to yes\n",
+         "end\n",
+         "expect caught to be yes\n",
++        "caught\n",
+     );
+ 
+     let mut vm = Vm::with_max_iterations(100);
+-    vm.run(&parse(source))
++    let value = vm
++        .run(&parse(source))
+         .expect("the loop's RuntimeError must be catchable");
+-    // The `expect` in the program is the assertion, and it is **not** the same as
+-    // the run having succeeded: a failed `expect` is recorded and the run carries
+-    // on. So the run's own success says nothing here and the recorded
+-    // expectation is what has to be read.
+-    assert!(
+-        vm.take_expectation_failure().is_none(),
+-        "`expect caught to be yes` failed, so the loop's RuntimeError was not \
+-         catchable from inside the program"
++    // The `expect caught to be yes` at the top level is the program's own check,
++    // and a failed `expect` **fails the run**: `Expr::Expect` answers
++    // `Err(Error::Runtime(..))` (`src/interpreter.rs:2331`) and nothing here
++    // catches it, so the run coming back `Ok` already proves the `catch` fired.
++    // The value below is the second, independent reading of the same run — what
++    // the program *answered*, not whether it ran.
++    assert_eq!(
++        value,
++        redblue::Value::YesNo(true),
++        "the program's `caught` flag must be `yes`: the loop's RuntimeError was \
++         not catchable from inside the program"
+     );
+ }
+ 
+ // ---------------------------------------------------------------------------
+
+[0m
+Now the same fix in `tests/loop_bounds_test.rs`:
+[0m← [0mEdit tests/loop_bounds_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/loop_bounds_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/loop_bounds_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/loop_bounds_test.rs
+@@ -382,17 +382,19 @@
+         // times.
+         (
+             "while",
+             "set i to 5\nwhile i is 0\n    say \"never\"\nend",
+-            "nothing",
++            Vec::<String>::new(),
+         ),
+         // An empty list, a loop over it, and a line after it that *does* run —
+         // which is what proves the budget was not merely enough for the first
+-        // statement and then spent.
++        // statement and then spent. The body says `never` as well, so the check
++        // below is the same one the `while` row gets: a body that ran at all
++        // would have printed it.
+         (
+             "for each",
+-            "for each x in []\n    set n to 1\nend\nsay \"after\"",
+-            "after",
++            "for each x in []\n    say \"never\"\nend\nsay \"after\"",
++            vec!["after".to_string()],
+         ),
+     ] {
+         let mut vm = Vm::with_max_steps(4);
+         vm.run(&parse(source)).unwrap_or_else(|error| {
+@@ -407,16 +409,14 @@
+             "an unentered {} loop must not run its body, and `never` is what \
+              would say so. It printed {printed:?}",
+             name,
+         );
+-        if expected != "nothing" {
+-            assert_eq!(
+-                printed,
+-                vec![expected.to_string()],
+-                "the statement after an unentered {} loop must still run",
+-                name,
+-            );
+-        }
++        assert_eq!(
++            printed,
++            expected,
++            "an unentered {} loop must print exactly the lines written outside it",
++            name,
++        );
+     }
+ }
+ 
+ /// The step budget is what makes a runaway loop *testable*, not merely
+
+[0m
+Now the MINOR finding on the shared `never` check:
+[0m← [0mEdit phases/phase-088/scan.py
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-088/scan.py
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-088/scan.py
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-088/scan.py
+@@ -41,15 +41,20 @@
+   a test that asserts a *failure* was produced is never mistaken for a vacuous
+   one.
+ * `panic!` does **not** count: a test that panics only on `Err` proves the
+   program ran, and proves nothing about what it said.
+-* A Redblue-level `expect ... to be` does **not** count. It lives inside a
+-  fixture and is the program's own business; the Rust test around it may still
+-  be asserting nothing about what the program answered.
++* A Redblue-level `expect ... to be` **does** count. It lives inside a fixture,
++  the program checks its own answer, and a failed `expect` is a `Runtime` error
++  the run hands back (`src/interpreter.rs:2331`), so the Rust test around it
++  fails when the check fails. The program's own check is an assertion, not a
++  reachability check.
+ 
+-The helper step is the one that matters: five of the candidates an earlier
+-scan flagged assert through a helper whose `Result` is `.unwrap()`ed, and a
+-scan that cannot see through a helper reads them as vacuous.
++The helper step is the one that matters: six of the candidates an earlier scan
++flagged are not defects — five of them assert through a helper (three through
++`ok()` / `fails()`, whose `Result` is `.unwrap()`ed, and two through
++`both_print`, which compares both engines' output to a literal) and the sixth
++is a nested helper rather than a test at all — and a scan that cannot see
++through a helper reads them as vacuous.
+ 
+ The output is one line per vacuous test: the file, the line the test is
+ defined on, and its name. The count of those lines is the number the report
+ has to state.
+
+[0m
+Now the scanner docstring (MINOR finding 2):
+[0m$ [0mpython3 phases/phase-088/scan.py tests; echo "---base---"; rm -rf /tmp/base088 && mkdir -p /tmp/base088 && git archive c6e9837 tests | tar -x -C /tmp/base088 && python3 phases/phase-088/scan.py /tmp/base088/tests
+scanned 68 files in tests
+vacuous tests: 0
+---base---
+scanned 68 files in /tmp/base088/tests
+loop_bounds_test.rs:186	edge_zero_iterations_is_allowed
+loop_bounds_test.rs:207	edge_exactly_max_iterations_succeeds
+loop_bounds_test.rs:272	edge_nested_loops_each_get_the_full_cap
+loop_bounds_test.rs:309	step_budget_does_not_fire_under_the_limit
+loop_bounds_test.rs:322	edge_step_budget_is_not_spent_by_unentered_loops
+loop_bounds_test.rs:570	edge_fractional_and_negative_counts_run_zero_times
+loop_bounds_test.rs:586	edge_type_mismatch_count_is_not_a_loop
+loop_bounds_test.rs:596	edge_type_mismatch_iterable_is_not_a_loop
+loop_bounds_test.rs:637	edge_deeply_nested_loops_terminate
+loop_control_test.rs:486	edge_a_break_stops_the_loop_before_the_iteration_cap
+redblue_test.rs:4	test_hello_world
+redblue_test.rs:10	test_numbers
+redblue_test.rs:22	test_math
+redblue_test.rs:35	test_list
+redblue_test.rs:46	test_function
+stdlib_module_docs_test.rs:242	edge_the_bytecode_vm_answers_the_same_builtins_the_walker_does
+time_builtin_test.rs:273	time_sleep_of_zero_seconds_is_accepted
+vacuous tests: 17
+[0m
+[0m$ [0mcargo test --test loop_bounds_test --test text_split_join_test 2>&1 | tail -40
+2026-10-21 20:26:44
+Today's date:
+Wednesday, October 21, 2026
+Parsed timestamp:
+1705321800
+Time module demo complete!
+test shipped_examples_fit_inside_the_published_limits ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+[1m[92m     Running[0m tests/text_split_join_test.rs (target/debug/deps/text_split_join_test-9e1621627e2277e7)
+
+running 20 tests
+test a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program ... ok
+test a_by_in_front_of_an_operator_is_a_variable_and_never_a_label ... ok
+test dotted_and_flat_spellings_agree_for_every_reachable_builtin ... ok
+test edge_a_record_where_a_list_is_wanted_is_refused_not_iterated ... ok
+test edge_empty_list_joins_to_empty_text ... ok
+test edge_empty_subject_splits_to_one_empty_part ... ok
+2
+2
+test edge_empty_separator_is_a_caught_error_and_join_with_one_still_concatenates ... ok
+test edge_subject_longer_than_the_separator_keeps_every_part ... ok
+test edge_a_number_is_where_a_text_is_wanted_is_refused_cleanly_on_both_engines ... ok
+test edge_unicode_subject_splits_on_character_boundaries ... ok
+a,b
+a,b
+test a_label_and_the_value_it_labels_may_be_written_on_different_lines ... ok
+test edge_nested_and_deep_subjects_do_not_recurse ... ok
+test spec_md_text_section_runs_verbatim ... ok
+test split_and_join_refuse_a_wrongly_typed_argument_and_name_the_builtin ... ok
+test text_split_reaches_dotted_without_an_import_and_that_is_the_rule ... ok
+test reachability_table_holds_for_every_row ... ok
+test the_by_label_is_read_for_split_and_join_and_for_no_other_call ... ok
+test the_bytecode_vm_answers_split_and_join_the_same_as_the_interpreter ... ok
+test table_every_join_case_answers_the_same_on_both_engines ... ok
+test table_every_split_case_answers_the_same_on_both_engines ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+[0m
+[0m$ [0mcargo test --test loop_bounds_test 2>&1 | tail -50
+Array:
+[1, 2, 3]
+Stringified:
+{"name": "Alice", "age": 30, "active": true}
+Demo complete!
+test step_budget_bounds_a_program_of_many_short_loops ... ok
+Hello, World!
+Hello, World!
+Hello, World!
+a die:
+5
+the only member of a range of one:
+5
+between 0 and 1:
+0.23011702022018832
+between -10 and -5:
+-5.1540884184635365
+a colour:
+red
+the same three, shuffled:
+[green, red, blue]
+30
+20
+42
+25
+2
+All arithmetic tests completed
+10
+test step_budget_does_not_fire_under_the_limit ... ok
+test step_budget_makes_a_runaway_loop_assertable ... ok
+test runaway_loop_process_exits_instead_of_hanging ... ok
+65536
+test edge_deeply_nested_loops_terminate ... ok
+Current time:
+{seconds: 1792614406, nanoseconds: 450893300}
+Unix timestamp:
+1792614406
+Sleeping for 1 second...
+Done sleeping!
+Formatted time:
+2026-10-21 20:26:46
+Today's date:
+Wednesday, October 21, 2026
+Parsed timestamp:
+1705321800
+Time module demo complete!
+test shipped_examples_fit_inside_the_published_limits ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+[0m
+[0m$ [0mcargo test --test loop_bounds_test 2>&1 | grep -E "runaway_loop_is_catchable|edge_step_budget_is_not_spent|test result"
+test edge_step_budget_is_not_spent_by_unentered_loops ... ok
+test runaway_loop_is_catchable_from_inside_redblue ... ok
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+[0m
+[0m← [0mWrite tests/tmp_mutation_check.rs
+Wrote file successfully.
+[0m
+Let me verify the new assertions actually discriminate (mutation check) with a temporary test file:
+[0m$ [0mcargo test --test tmp_mutation_check -- --nocapture 2>&1 | tail -30
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 3.09s
+[1m[92m     Running[0m tests/tmp_mutation_check.rs (target/debug/deps/tmp_mutation_check-acf52383a25f06cf)
+
+running 3 tests
+error was: Some(Runtime("Values not equal: YesNo(true) vs YesNo(false)", Span { line: 10, column: 1, end_line: 10, end_column: 1 }))
+never
+after
+printed: ["never", "after"]
+test the_correct_fixture_answers_yes_and_says_nothing ... ok
+test a_failed_expect_fails_the_run ... ok
+test a_body_that_runs_prints_never_and_fails_the_check ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
+[0m$ [0mrm tests/tmp_mutation_check.rs && git status --short
+M phases/phase-088/FINDINGS.md
+ M phases/phase-088/REPORT.md
+ A phases/phase-088/scan.py
+ A phases/phase-088/scanned-files.txt
+ M tests/loop_bounds_test.rs
+ M tests/loop_control_test.rs
+ M tests/redblue_test.rs
+ M tests/stdlib_module_docs_test.rs
+ M tests/text_split_join_test.rs
+ M tests/time_builtin_test.rs
+ M tests/unreviewed_work_ack_test.rs
+[0m
+[0m# [0mTodos
+[✓] Fix MAJOR: remove redundant take_expectation_failure assertions in text_split_join_test.rs and loop_bounds_test.rs; assert the program's value instead; rewrite comments
+[✓] Fix MINOR: scan.py docstring must say a Redblue-level `expect ... to be` does count
+[✓] Fix MINOR: loop_bounds_test.rs `never` check must discriminate for the `for each` row too
+[•] Fix MINOR: REPORT.md/FINDINGS.md count of the hand-checked candidates (one count, one split)
+[ ] Update REPORT.md rows for the two changed tests (numstat, line numbers, description)
+[ ] Re-run the four gates: cargo fmt --check, cargo clippy, cargo test --all-targets, cargo test --doc (+ verify.sh)
+[0m
+[0m$ [0mgit diff --numstat c6e9837 -- tests/ phases/; echo "--- new line numbers ---"; grep -n "^fn edge_zero_iterations_is_allowed\|^fn edge_exactly_max_iterations_succeeds\|^fn edge_nested_loops_each_get_the_full_cap\|^fn step_budget_does_not_fire_under_the_limit\|^fn edge_step_budget_is_not_spent_by_unentered_loops\|^fn edge_fractional_and_negative_counts_run_zero_times\|^fn edge_type_mismatch_count_is_not_a_loop\|^fn edge_type_mismatch_iterable_is_not_a_loop\|^fn edge_deeply_nested_loops_terminate\|^fn runaway_loop_is_catchable_from_inside_redblue\|^fn edge_a_loop_that_does_run_prints_one_line_per_turn_in_order\|^fn edge_a_loop_whose_body_says_nothing_still_runs_every_turn" tests/loop_bounds_test.rs; echo ---; grep -n "^fn edge_a_break_stops_the_loop_before_the_iteration_cap" tests/loop_control_test.rs; grep -n "^fn test_hello_world\|^fn test_numbers\|^fn test_math\|^fn test_list\|^fn test_function\|^fn edge_the_value_a_program_ends_on_is_a_number_and_not_its_rendering\|^fn edge_an_empty_answer_is_pinned_for_both_shapes_of_empty\|^fn edge_a_program_that_says_something_differs_from_one_that_does_not\|^fn edge_a_program_that_cannot_run_reports_a_failure_rather_than_no_output" tests/redblue_test.rs; grep -n "^fn edge_the_bytecode_vm_answers_the_same_builtins_the_walker_does\|^fn edge_a_builtin_that_answers_the_wrong_value_fails_on_both_engines\|^fn edge_a_builtin_given_a_text_says_nothing_and_names_the_refusal\|^fn edge_a_builtin_that_cannot_answer_is_refused_by_the_library_not_answered_wrongly" tests/stdlib_module_docs_test.rs; grep -n "^fn time_sleep_of_zero_seconds_is_accepted" tests/time_builtin_test.rs; grep -n "^fn a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program" tests/text_split_join_test.rs
+168	0	phases/phase-088/FINDINGS.md
+335	0	phases/phase-088/REPORT.md
+334	0	phases/phase-088/scan.py
+68	0	phases/phase-088/scanned-files.txt
+203	17	tests/loop_bounds_test.rs
+12	1	tests/loop_control_test.rs
+190	15	tests/redblue_test.rs
+232	18	tests/stdlib_module_docs_test.rs
+28	4	tests/text_split_join_test.rs
+12	2	tests/time_builtin_test.rs
+20	13	tests/unreviewed_work_ack_test.rs
+--- new line numbers ---
+159:fn runaway_loop_is_catchable_from_inside_redblue() {
+205:fn edge_zero_iterations_is_allowed() {
+242:fn edge_exactly_max_iterations_succeeds() {
+313:fn edge_nested_loops_each_get_the_full_cap() {
+358:fn step_budget_does_not_fire_under_the_limit() {
+378:fn edge_step_budget_is_not_spent_by_unentered_loops() {
+656:fn edge_fractional_and_negative_counts_run_zero_times() {
+684:fn edge_type_mismatch_count_is_not_a_loop() {
+699:fn edge_type_mismatch_iterable_is_not_a_loop() {
+719:fn edge_a_loop_that_does_run_prints_one_line_per_turn_in_order() {
+742:fn edge_a_loop_whose_body_says_nothing_still_runs_every_turn() {
+812:fn edge_deeply_nested_loops_terminate() {
+---
+491:fn edge_a_break_stops_the_loop_before_the_iteration_cap() {
+52:fn test_hello_world() {
+60:fn test_numbers() {
+74:fn test_math() {
+89:fn test_list() {
+102:fn test_function() {
+122:fn edge_the_value_a_program_ends_on_is_a_number_and_not_its_rendering() {
+166:fn edge_an_empty_answer_is_pinned_for_both_shapes_of_empty() {
+194:fn edge_a_program_that_says_something_differs_from_one_that_does_not() {
+215:fn edge_a_program_that_cannot_run_reports_a_failure_rather_than_no_output() {
+249:fn edge_the_bytecode_vm_answers_the_same_builtins_the_walker_does() {
+299:fn edge_a_builtin_that_answers_the_wrong_value_fails_on_both_engines() {
+352:fn edge_a_builtin_given_a_text_says_nothing_and_names_the_refusal() {
+422:fn edge_a_builtin_that_cannot_answer_is_refused_by_the_library_not_answered_wrongly() {
+279:fn time_sleep_of_zero_seconds_is_accepted() {
+759:fn a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program() {
+[0m
+[0m$ [0mgit diff c6e9837 -- tests/text_split_join_test.rs
+diff --git a/tests/text_split_join_test.rs b/tests/text_split_join_test.rs
+index 0eec0a2..016304e 100644
+--- a/tests/text_split_join_test.rs
++++ b/tests/text_split_join_test.rs
+@@ -768,11 +768,35 @@ fn a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program()
+         "    set caught to yes\n",
+         "end\n",
+         "expect caught to be yes\n",
++        "caught\n",
++    );
++    // One run, and every answer it gives read: it **ran**, it ended on the flag
++    // its own `catch` set, and it said nothing.
++    //
++    // The `expect caught to be yes` at the top level is the program's own check,
++    // and a failed `expect` **fails the run**: `Expr::Expect` answers
++    // `Err(Error::Runtime(..))` (`src/interpreter.rs:2331`) and nothing here
++    // catches it, so the run coming back `Ok` already proves the `catch` fired.
++    // The value below is the second, independent reading of the same run — what
++    // the program *answered*, not whether it ran.
++    let tokens = redblue::lexer::Lexer::tokenize(source).expect("the fixture lexes");
++    let program = redblue::parser::parse(tokens).expect("the fixture parses");
++    redblue::analyzer::analyze(&program).expect("the fixture analyzes");
++    let (mut vm, outcome) = redblue::run_isolated(&program);
++    let value = outcome.unwrap_or_else(|error| {
++        panic!("a wrongly typed split must be caught, not fatal: {error:?}")
++    });
++    assert_eq!(
++        value,
++        Value::YesNo(true),
++        "the program's `caught` flag must be `yes`: the wrongly typed split was \
++         not caught by the program's own try"
++    );
++    assert_eq!(
++        vm.take_output(),
++        Vec::<String>::new(),
++        "the fixture says nothing itself, so any line here is the program leaking"
+     );
+-    match redblue::run_source(source) {
+-        Ok(()) => {}
+-        Err(error) => panic!("a wrongly typed split must be caught, not fatal: {error:?}"),
+-    }
+ }
+ 
+ // ---------------------------------------------------------------------------
+[0m
+[0m← [0mEdit phases/phase-088/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+@@ -14,9 +14,9 @@
+ 
+ | File | Lines | What |
+ |---|---|---|
+ | `tests/stdlib_module_docs_test.rs` | +232 −18 | `edge_the_bytecode_vm_answers_the_same_builtins_the_walker_does` no longer matches `Ok(_) => {}`; it asserts six **literal** expected lines, on the bytecode VM *and* on the walker. `edge_a_builtin_that_answers_the_wrong_value_fails_on_both_engines` pins seven literals per engine. `edge_a_builtin_given_a_text_says_nothing_and_names_the_refusal` holds both engines to a refusal that names the builtin. New: `edge_a_builtin_that_cannot_answer_is_refused_by_the_library_not_answered_wrongly` — the library's own entry point (`run_source`) must come back `Err`, the error must be a `Runtime` error naming the builtin, and neither engine may have printed a line before refusing |
+-| `tests/loop_bounds_test.rs` | +197 −16 | `edge_type_mismatch_count_is_not_a_loop` and `edge_type_mismatch_iterable_is_not_a_loop` now `take_output()` and assert it is empty; `runaway_loop_is_catchable_from_inside_redblue` asserts `take_expectation_failure().is_none()`; `edge_nested_loops_each_get_the_full_cap` asserts `12`; `step_budget_does_not_fire_under_the_limit` asserts `10`; `edge_step_budget_is_not_spent_by_unentered_loops` asserts `never` was not printed **and** the line after an unentered loop did run; `edge_deeply_nested_loops_terminate` asserts `65536`. Two new tests pin the *positive* direction — a loop that does run prints one line per turn, and a loop whose body says nothing still runs every turn — and that second one pins the loop's own value by ending its program on the loop, so the value the run hands back is the loop's and not the `say` after it |
++| `tests/loop_bounds_test.rs` | +203 −17 | `edge_type_mismatch_count_is_not_a_loop` and `edge_type_mismatch_iterable_is_not_a_loop` now `take_output()` and assert it is empty; `runaway_loop_is_catchable_from_inside_redblue` ends its program on the flag the `catch` set and asserts the value the run hands back is `YesNo(true)`; `edge_nested_loops_each_get_the_full_cap` asserts `12`; `step_budget_does_not_fire_under_the_limit` asserts `10`; `edge_step_budget_is_not_spent_by_unentered_loops` asserts the **exact** lines printed, and **both** of its fixtures put a `say "never"` in the body, so the shared `never` check discriminates on either row rather than on one; `edge_deeply_nested_loops_terminate` asserts `65536`. Two new tests pin the *positive* direction — a loop that does run prints one line per turn, and a loop whose body says nothing still runs every turn — and that second one pins the loop's own value by ending its program on the loop, so the value the run hands back is the loop's and not the `say` after it |
+ | `tests/loop_control_test.rs` | +12 −1 | `edge_a_break_stops_the_loop_before_the_iteration_cap` now ends its program on the variable the body changes and asserts the value `1` — the number of turns the loop actually took, not the absence of an error |
+ | `tests/time_builtin_test.rs` | +12 −2 | `time_sleep_of_zero_seconds_is_accepted` matched `Ok(_) => {}`; it now ends its program on `slept is nothing` and asserts the `YesNo(true)` that comparison answers, which is the shape `time.sleep` is documented to have |
+ | `tests/redblue_test.rs` | +190 −15 | all five tests now assert the exact lines their program prints, through a `printed()` helper that runs the program **once** and reads `run_isolated` + `take_output`. Four new tests: a value that is a number and not its rendering, both shapes of empty output, a guard that the helper is actually reading output, and a program that fails rather than printing nothing — the last of these now uses `expect_err`, so the refusal is asserted in one line instead of a `match` |
+ | `tests/text_split_join_test.rs` | +20 −0 | `a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program` now reads `take_expectation_failure()` — its `expect caught to be yes` never made `run_source` fail, so a `catch` that caught nothing passed |
+
+[0m
+[0m← [0mEdit phases/phase-088/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+@@ -18,9 +18,9 @@
+ | `tests/loop_bounds_test.rs` | +203 −17 | `edge_type_mismatch_count_is_not_a_loop` and `edge_type_mismatch_iterable_is_not_a_loop` now `take_output()` and assert it is empty; `runaway_loop_is_catchable_from_inside_redblue` ends its program on the flag the `catch` set and asserts the value the run hands back is `YesNo(true)`; `edge_nested_loops_each_get_the_full_cap` asserts `12`; `step_budget_does_not_fire_under_the_limit` asserts `10`; `edge_step_budget_is_not_spent_by_unentered_loops` asserts the **exact** lines printed, and **both** of its fixtures put a `say "never"` in the body, so the shared `never` check discriminates on either row rather than on one; `edge_deeply_nested_loops_terminate` asserts `65536`. Two new tests pin the *positive* direction — a loop that does run prints one line per turn, and a loop whose body says nothing still runs every turn — and that second one pins the loop's own value by ending its program on the loop, so the value the run hands back is the loop's and not the `say` after it |
+ | `tests/loop_control_test.rs` | +12 −1 | `edge_a_break_stops_the_loop_before_the_iteration_cap` now ends its program on the variable the body changes and asserts the value `1` — the number of turns the loop actually took, not the absence of an error |
+ | `tests/time_builtin_test.rs` | +12 −2 | `time_sleep_of_zero_seconds_is_accepted` matched `Ok(_) => {}`; it now ends its program on `slept is nothing` and asserts the `YesNo(true)` that comparison answers, which is the shape `time.sleep` is documented to have |
+ | `tests/redblue_test.rs` | +190 −15 | all five tests now assert the exact lines their program prints, through a `printed()` helper that runs the program **once** and reads `run_isolated` + `take_output`. Four new tests: a value that is a number and not its rendering, both shapes of empty output, a guard that the helper is actually reading output, and a program that fails rather than printing nothing — the last of these now uses `expect_err`, so the refusal is asserted in one line instead of a `match` |
+-| `tests/text_split_join_test.rs` | +20 −0 | `a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program` now reads `take_expectation_failure()` — its `expect caught to be yes` never made `run_source` fail, so a `catch` that caught nothing passed |
++| `tests/text_split_join_test.rs` | +28 −4 | `a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program` now ends its program on the flag the `catch` set and asserts the value the run hands back is `YesNo(true)`, so a `catch` that caught nothing cannot pass. A failed `expect` is a `Runtime` error the run hands back (`src/interpreter.rs:2331`), so the program's own top-level `expect caught to be yes` already fails the run — the value assertion is the second, independent reading of the same run |
+ | `tests/unreviewed_work_ack_test.rs` | +20 −13 | the delivery rule is re-pointed from `resume phase-084:` to `resume phase-088:`, the phase that owns the file now, and phase-084's delivery commit `1d73e8c` is acknowledged **by SHA** with its numstat — it is an ancestor of HEAD and stays one, so the entry cannot go stale the way a re-created delivery commit's SHA would |
+ | `phases/phase-088/scan.py` | new | the scanner that counts the reachability-only tests, published so the next audit can re-run it instead of believing a number |
+ | `phases/phase-088/scanned-files.txt` | new | the file list that scan read — all 68 `tests/*.rs` files |
+ | `phases/phase-088/REPORT.md` | new | this file |
+
+[0m
+[0m→ [0mRead phases/phase-088/REPORT.md[90m [offset=130, limit=60][0m
+[0m
+[0m← [0mEdit phases/phase-088/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+@@ -136,24 +136,26 @@
+ nothing about what the program said, recorded or answered. `assert_eq!`,
+ `assert_ne!` and `assert_matches!` count, as does an `assert!` whose condition
+ says more than `is_ok()`; a `panic!` does **not** count, because a test that
+ panics only on `Err` proves the program ran and nothing else; a Redblue-level
+-`expect ... to be` does count, because the program checks its own answer and the
+-Rust test around it fails when it does not.
++`expect ... to be` does count, because the program checks its own answer and a
++failed check is a `Runtime` error the run hands back
++(`src/interpreter.rs:2331`), so the Rust test around it fails when it does not.
++The scanner's own docstring says the same thing, in step with the code it runs.
+ 
+ All seventeen were given an assertion; none was deleted.
+ 
+ | Test | Given |
+ |---|---|
+-| `loop_bounds_test.rs:200` `edge_zero_iterations_is_allowed` | the count of turns the loop took: `0` |
+-| `loop_bounds_test.rs:237` `edge_exactly_max_iterations_succeeds` | the count of turns: `10` |
+-| `loop_bounds_test.rs:308` `edge_nested_loops_each_get_the_full_cap` | output `["12"]` |
+-| `loop_bounds_test.rs:353` `step_budget_does_not_fire_under_the_limit` | output `["10"]` |
+-| `loop_bounds_test.rs:373` `edge_step_budget_is_not_spent_by_unentered_loops` | `never` absent; the line after the unentered loop printed |
+-| `loop_bounds_test.rs:651` `edge_fractional_and_negative_counts_run_zero_times` | the count of turns: `0` |
+-| `loop_bounds_test.rs:679` `edge_type_mismatch_count_is_not_a_loop` | `take_output()` empty |
+-| `loop_bounds_test.rs:694` `edge_type_mismatch_iterable_is_not_a_loop` | `take_output()` empty |
+-| `loop_bounds_test.rs:807` `edge_deeply_nested_loops_terminate` | output `["65536"]` |
++| `loop_bounds_test.rs:205` `edge_zero_iterations_is_allowed` | the count of turns the loop took: `0` |
++| `loop_bounds_test.rs:242` `edge_exactly_max_iterations_succeeds` | the count of turns: `10` |
++| `loop_bounds_test.rs:313` `edge_nested_loops_each_get_the_full_cap` | output `["12"]` |
++| `loop_bounds_test.rs:358` `step_budget_does_not_fire_under_the_limit` | output `["10"]` |
++| `loop_bounds_test.rs:378` `edge_step_budget_is_not_spent_by_unentered_loops` | the exact lines: `[]` for the `while` row, `["after"]` for the `for each` row, and `never` absent from both — a body that ran would have printed it, because **both** fixtures say `never` in the body |
++| `loop_bounds_test.rs:656` `edge_fractional_and_negative_counts_run_zero_times` | the count of turns: `0` |
++| `loop_bounds_test.rs:684` `edge_type_mismatch_count_is_not_a_loop` | `take_output()` empty |
++| `loop_bounds_test.rs:699` `edge_type_mismatch_iterable_is_not_a_loop` | `take_output()` empty |
++| `loop_bounds_test.rs:812` `edge_deeply_nested_loops_terminate` | output `["65536"]` |
+ | `loop_control_test.rs:491` `edge_a_break_stops_the_loop_before_the_iteration_cap` | the count of turns: `1` |
+ | `stdlib_module_docs_test.rs:249` `edge_the_bytecode_vm_answers_the_same_builtins_the_walker_does` | six literal lines, bytecode VM and walker |
+ | `time_builtin_test.rs:279` `time_sleep_of_zero_seconds_is_accepted` | `YesNo(true)`: the sleep was allowed and answered `nothing` |
+ | `redblue_test.rs:52` `test_hello_world` | the exact line: `["Hello, World!"]` |
+@@ -162,27 +164,30 @@
+ | `redblue_test.rs:89` `test_list` | the exact line: `["[1, 2, 3]"]` |
+ | `redblue_test.rs:102` `test_function` | the exact line: `["Hello, World!"]` |
+ 
+ Two more were strengthened although the scanner does not require it — both carry a
+-Redblue-level `expect ... to be`, which the scanner counts as an assertion,
+-while the Rust test around them still said nothing about the program's answer:
+-`loop_bounds_test.rs:159` `runaway_loop_is_catchable_from_inside_redblue` now
+-reads `take_expectation_failure()`, and
++Redblue-level `expect ... to be`, which the scanner counts as an assertion, while
++the Rust test around them said nothing about the program's answer:
++`loop_bounds_test.rs:159` `runaway_loop_is_catchable_from_inside_redblue` and
+ `text_split_join_test.rs:759`
+-`a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program` now
+-reads `take_expectation_failure()` too. Nineteen tests were given an assertion
+-in all; the scanner names seventeen of them.
++`a_wrongly_typed_split_argument_is_caught_by_try_catch_in_a_redblue_program`. Each
++of them now ends its program on the flag its own `catch` set and asserts the
++value the run hands back is `YesNo(true)`, so the assertion is the program's
++answer and not the fact that it ran. Nineteen tests were given an assertion in
++all; the scanner names seventeen of them.
+ 
+-Five further candidates were checked by hand and are **not** defects, so the
+-scanner does not name them: `assertions_test.rs:207`, `:237` and `:332` assert
+-through `ok()` / `fails()`, whose `Result` is `.unwrap()`ed
++Six further candidates were checked by hand and are **not** defects, so the
++scanner does not name them: `assertions_test.rs:207`, `:237` and `:332` are three
++tests that assert through `ok()` / `fails()`, whose `Result` is `.unwrap()`ed
+ (`assertions_test.rs:64`, `:68`) — a wrong result panics; `might_fail_test.rs:301`
+-and `:315` assert through `both_print` (`might_fail_test.rs:157`), which compares
+-both engines' output to a literal; `might_fail_test.rs:1079` `strip_markers` is not
+-a test at all but a nested helper inside
+-`a_guard_whose_frame_finished_does_not_swallow_the_next_call_s_failure`. The
+-scanner reaches the same verdict on all five — it follows the helper — and they
+-are recorded here so the next auditor does not re-open them.
++and `:315` are two more that assert through `both_print`
++(`might_fail_test.rs:157`), which compares both engines' output to a literal; and
++`might_fail_test.rs:1079` `strip_markers` is not a test at all but a nested helper
++inside `a_guard_whose_frame_finished_does_not_swallow_the_next_call_s_failure`.
++So the six are **five tests that assert through a helper** and **one nested
++helper that is not a test** — and the scanner reaches the same verdict on all
++six, because it follows the helper. They are recorded here so the next auditor
++does not re-open them.
+ 
+ ## Gates
+ 
+ | Gate | Result |
+
+[0m
+[0m$ [0mgrep -n "loop_bounds_test.rs:714\|loop_bounds_test.rs:737\|loop_bounds_test.rs:719\|loop_bounds_test.rs:742" phases/phase-088/REPORT.md
+90:| `edge_a_loop_that_does_run_prints_one_line_per_turn_in_order` | `loop_bounds_test.rs:714` | loop that **must** run, exact turn count |
+91:| `edge_a_loop_whose_body_says_nothing_still_runs_every_turn` | `loop_bounds_test.rs:737` | the body says nothing; a loop statement is worth `nothing` |
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops/redblue && python3 - <<'EOF'
+import re
+p = 'phases/phase-088/REPORT.md'
+s = open(p).read()
+s = s.replace('`loop_bounds_test.rs:714`', '`loop_bounds_test.rs:719`')
+s = s.replace('`loop_bounds_test.rs:737`', '`loop_bounds_test.rs:742`')
+open(p,'w').write(s)
+EOF
+grep -n "loop_bounds_test.rs:719\|loop_bounds_test.rs:742" phases/phase-088/REPORT.md
+90:| `edge_a_loop_that_does_run_prints_one_line_per_turn_in_order` | `loop_bounds_test.rs:719` | loop that **must** run, exact turn count |
+91:| `edge_a_loop_whose_body_says_nothing_still_runs_every_turn` | `loop_bounds_test.rs:742` | the body says nothing; a loop statement is worth `nothing` |
+[0m
+[0m→ [0mRead phases/phase-088/REPORT.md[90m [limit=80, offset=288][0m
+[0m
+[0m$ [0msed -n '275,292p' tests/expect_test.rs
+assert_fails("expect [[1]] to be [1]");
+}
+
+#[test]
+fn expect_inside_a_control_flow_block() {
+    // Not reachable through the `// test` scanner, which stops at `end`.
+    assert!(run_program("if yes then\nexpect 1 to be 1\nend").is_ok());
+
+    let err = run_program("if yes then\nexpect 1 to be 2\nend")
+        .expect_err("expect inside a taken if-branch must fail");
+    assert!(
+        err.to_string().contains('1') && err.to_string().contains('2'),
+        "failure must name both values, got: {}",
+        err
+    );
+
+    run_program("if no then\nexpect 1 to be 2\nend")
+        .expect("a skipped branch must not evaluate its expect");
+[0m
+[0m← [0mEdit phases/phase-088/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md
+@@ -327,8 +327,21 @@
+   The scanner is `phases/phase-088/scan.py`, the file list it read is
+   `phases/phase-088/scanned-files.txt`, and the exact commands are in the section
+   above, so the next audit can re-run it instead of taking the number on trust.
+   The discrepancy and the reasoning are in `FINDINGS.md` §3.
++- **A failed `expect` fails the run, and this phase's round-1 report said the
++  opposite.** `Expr::Expect` answers `Err(Error::Runtime(..))`
++  (`src/interpreter.rs:2331`), and nothing catches that at the top level, so
++  `run_source` and `Vm::run` come back `Err` — the suite already pins it at
++  `tests/expect_test.rs:283` ("expect inside a taken if-branch must fail"). The
++  round-1 report claimed the opposite ("its `expect caught to be yes` never made
++  `run_source` fail"), and the two tests it strengthened asserted
++  `take_expectation_failure().is_none()` *after* the `.expect(...)` that the
++  same failure had already turned into a panic — a check that could not fail.
++  Both tests now end their program on the flag their own `catch` set and assert
++  the value the run hands back, which is the program's **answer** rather than a
++  second reading of the same fact. The scanner's docstring said the opposite of
++  what the scanner does as well, and is now in step with the code it runs.
+ - **The previous phase's gate row does not reconcile with its own tree.**
+   `phases/phase-087/REPORT.md:137` records `1766 passed` for the same gate; the
+   base commit `c6e9837` holds 1967 `#[test]` functions and measures 1967. The
+   gap is in that row, and this phase's round-1 report compounded it by adding
+
+[0m
+[0m← [0mEdit phases/phase-088/FINDINGS.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-088/FINDINGS.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-088/FINDINGS.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-088/FINDINGS.md
+@@ -81,14 +81,21 @@
+ - A `panic!` does **not** count. A test that panics only on `Err` proves the
+   program ran and proves nothing about what it said — which is the defect.
+ - A Redblue-level `expect ... to be` **does** count: it lives inside a fixture,
+   the program checks its own answer, and the Rust test around it fails when the
+-  check fails.
++  check fails. A failed `expect` is a `Runtime` error the run hands back
++  (`src/interpreter.rs:2331`), so the run's own success is the assertion — the
++  suite pins it at `tests/expect_test.rs:283` ("expect inside a taken if-branch
++  must fail"). This phase's own round-1 report had this backwards, and the two
++  tests it strengthened on the strength of that mistake are fixed in
++  `REPORT.md`.
+ 
+-The helper step is the one that matters: five of the hits an earlier scan
+-flagged are not defects — four of them assert through a helper whose `Result` is
+-`.unwrap()`ed, and the fifth is a nested helper rather than a test — and a scan
+-that cannot see through a helper reads them as vacuous.
++The helper step is the one that matters: six of the hits an earlier scan
++flagged are not defects — five of them assert through a helper (three through
++`ok()` / `fails()`, whose `Result` is `.unwrap()`ed, and two through
++`both_print`, which compares both engines' output to a literal) and the sixth
++is a nested helper rather than a test — and a scan that cannot see through a
++helper reads them as vacuous.
+ 
+ So the likely cause of "twenty" is a scan that did not resolve assertion-bearing
+ helpers, and one that did not count a fixture's own `expect` as an assertion. The
+ auditor may want to fold helper resolution into their scanner before the next
+
+[0m
+[0m→ [0mRead phases/phase-088/FINDINGS.md[90m [limit=50, offset=50][0m
+[0m
+[0m$ [0mcargo fmt --all && git diff --stat && cargo fmt --all -- --check && echo "FMT CHECK PASS"
+phases/phase-088/FINDINGS.md       | 160 ++++++++++++++----
+ phases/phase-088/REPORT.md         | 322 ++++++++++++++++++++++++++---------
+ phases/phase-088/scan.py           | 334 +++++++++++++++++++++++++++++++++++++
+ phases/phase-088/scanned-files.txt |  68 ++++++++
+ tests/loop_bounds_test.rs          | 134 ++++++++++-----
+ tests/loop_control_test.rs         |  13 +-
+ tests/redblue_test.rs              |  46 ++---
+ tests/stdlib_module_docs_test.rs   |  88 +++++++++-
+ tests/text_split_join_test.rs      |  32 ++--
+ tests/time_builtin_test.rs         |  14 +-
+ tests/unreviewed_work_ack_test.rs  |  33 ++--
+ 11 files changed, 1035 insertions(+), 209 deletions(-)
+FMT CHECK PASS
+[0m
+[0m$ [0mgit diff c6e9837 -- tests/loop_bounds_test.rs | head -120
+diff --git a/tests/loop_bounds_test.rs b/tests/loop_bounds_test.rs
+index 82ae001..631e1b6 100644
+--- a/tests/loop_bounds_test.rs
++++ b/tests/loop_bounds_test.rs
+@@ -169,11 +169,25 @@ fn runaway_loop_is_catchable_from_inside_redblue() {
+         "    set caught to yes\n",
+         "end\n",
+         "expect caught to be yes\n",
++        "caught\n",
+     );
+ 
+     let mut vm = Vm::with_max_iterations(100);
+-    vm.run(&parse(source))
++    let value = vm
++        .run(&parse(source))
+         .expect("the loop's RuntimeError must be catchable");
++    // The `expect caught to be yes` at the top level is the program's own check,
++    // and a failed `expect` **fails the run**: `Expr::Expect` answers
++    // `Err(Error::Runtime(..))` (`src/interpreter.rs:2331`) and nothing here
++    // catches it, so the run coming back `Ok` already proves the `catch` fired.
++    // The value below is the second, independent reading of the same run — what
++    // the program *answered*, not whether it ran.
++    assert_eq!(
++        value,
++        redblue::Value::YesNo(true),
++        "the program's `caught` flag must be `yes`: the loop's RuntimeError was \
++         not catchable from inside the program"
++    );
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -182,46 +196,73 @@ fn runaway_loop_is_catchable_from_inside_redblue() {
+ 
+ /// Edge: a loop that must not iterate at all is not an error, however small the
+ /// cap. A cap of 1 still permits zero iterations.
++///
++/// The program ends on the variable the loop body would have changed, so the
++/// value the run hands back is the count of turns the loop took — zero, not
++/// merely "no error". A loop that ran one turn anyway would leave the variable
++/// changed, and the run would answer `1` where the answer must be `0`.
+ #[test]
+ fn edge_zero_iterations_is_allowed() {
+     for (name, source) in [
+-        ("repeat", "set n to 0\nrepeat 0 times\n    set n to 1\nend"),
++        (
++            "repeat",
++            "set n to 0\nrepeat 0 times\n    set n to 1\nend\nn",
++        ),
+         (
+             "for each",
+-            "set n to 0\nfor each x in []\n    set n to 1\nend",
++            "set n to 0\nfor each x in []\n    set n to 1\nend\nn",
++        ),
++        (
++            "while",
++            "set i to 0\nwhile i is 5\n    set i to i + 1\nend\ni",
+         ),
+-        ("while", "set i to 0\nwhile i is 5\n    set i to i + 1\nend"),
+     ] {
+-        run_capped(source, 1).unwrap_or_else(|error| {
++        let value = run_capped(source, 1).unwrap_or_else(|error| {
+             panic!(
+                 "a zero-iteration {} loop must not spend budget: {:?}",
+                 name, error
+             )
+         });
++        assert_eq!(
++            value,
++            redblue::Value::Number(0.0),
++            "a zero-iteration {} loop must not run its body at all",
++            name
++        );
+     }
+ }
+ 
+ /// Edge: a loop that runs *exactly* the cap succeeds. An off-by-one that rejects
+ /// `max` is the common way an iteration cap is written wrong.
++///
++/// The count the loop reached is the answer, not the absence of an error: a cap
++/// that stopped the loop one turn early would still succeed, and the variable
++/// would be one short of the cap.
+ #[test]
+ fn edge_exactly_max_iterations_succeeds() {
+     for (name, source) in [
+         (
+             "repeat",
+-            "set n to 0\nrepeat 10 times\n    set n to n + 1\nend",
++            "set n to 0\nrepeat 10 times\n    set n to n + 1\nend\nn",
+         ),
+         (
+             "for each",
+-            "set n to 0\nfor each x in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n    set n to x\nend",
++            "set n to 0\nfor each x in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n    set n to x\nend\nn",
+         ),
+         (
+             "while",
+-            "set i to 0\nwhile i is not 10\n    set i to i + 1\nend",
++            "set i to 0\nwhile i is not 10\n    set i to i + 1\nend\ni",
+         ),
+     ] {
+-        run_capped(source, 10).unwrap_or_else(|error| {
++        let value = run_capped(source, 10).unwrap_or_else(|error| {
+             panic!("exactly the cap must be allowed for {}: {:?}", name, error)
+         });
++        assert_eq!(
++            value,
++            redblue::Value::Number(10.0),
++            "a {} loop must run exactly the cap's ten turns, not fewer",
++            name
++        );
+     }
+ }
+ 
+@@ -271,10 +312,18 @@ fn edge_iteration_cap_applies_to_each_loop_form() {
+ #[test]
+ fn edge_nested_loops_each_get_the_full_cap() {
+     let mut vm = Vm::with_max_iterations(10);
+-    let program = parse("set n to 0\nfor each outer in [1, 2, 3]\n    for each inner in [1, 2, 3, 4]\n        set n to n + 1\n    end\nend");
++    let program = parse("set n to 0\nfor each outer in [1, 2, 3]\n    for each inner in [1, 2, 3, 4]\n        set n to n + 1\n    end\nend\nsay n");
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings 2>&1 | tail -20
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 4.70s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^test result|error|warning: unused" | sort | uniq -c | head -20
+1 Failed to read 'typed-catch-missing-file.txt': No such file or directory (os error 2)
+      2 caught error
+     33 error
+      1 error ✓ 🎉 café
+      1 outer took it: error
+      1 outer untyped handler: error
+      1 test a_missing_end_is_reported_as_an_error ... ok
+      1 test a_program_that_fails_still_reports_its_own_error_under_the_debugger ... ok
+      1 test a_wellformed_program_reports_no_errors ... ok
+      1 test a_word_form_applied_to_the_wrong_type_is_a_clean_runtime_error ... ok
+      1 test an_index_that_is_not_a_whole_number_is_a_runtime_error ... ok
+      1 test brand_roles_are_distinct_from_error_and_prompt ... ok
+      1 test break_outside_a_loop_is_a_clean_runtime_error ... 1
+      1 test bytecode_reports_a_compile_error_instead_of_listing_nothing ... ok
+      1 test catch_error_name_binds_the_message ... ok
+      1 test catch_error_name_runs_and_compiles_through_the_cli ... ok
+      1 test constant_syntax_errors_are_reported ... ok
+      1 test depth_error_is_catchable_by_try_catch ... ok
+      1 test diagnostics_surface_a_spanned_analyzer_error ... ok
+      1 test diagnostics_surface_a_spanned_lexer_error ... ok
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | grep -E "^test result:" | awk '{p+=$4; f+=$6; i+=$8} END {print "passed:", p, "failed:", f, "ignored:", i}'
+passed: 1976 failed: 0 ignored: 0
+[0m
+[0m$ [0mgit grep -hE '^\s*#\[test\]' -- '*.rs' | wc -l; git grep -hE '^\s*#\[test\]' c6e9837 -- '*.rs' | wc -l; cargo test --doc 2>&1 | tail -5
+1976
+1967
+test src/bootstrap.rs - bootstrap (line 6) ... ok
+test src/bytecode/mod.rs - bytecode (line 12) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+[0m
+[0m$ [0mls ../rbops/ 2>&1 | head; ls ../phases/phase-088/.base 2>&1 | head -3; ls rbops 2>&1 | head -2
+agents
+baseline.json
+dispatch.sh
+gen-prompts.sh
+phases.json
+progress_watchdog.sh
+setup-deploy-key.ps1
+smoke.sh
+verify.sh
+../phases/phase-088/.base
+ls: cannot access 'rbops': No such file or directory
+[0m
