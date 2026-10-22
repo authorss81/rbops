@@ -730,29 +730,36 @@ build_fixture >/dev/null; use_stubs
 # wrong: phase-084 found something NEW in every round and was converging
 # slowly, and a total-round cap would have killed it.
 build_fixture >/dev/null; use_stubs
+# The phase needs a gate-passed tree before it can be reviewed, so it is run
+# first with the normal stub.
+RBOPS_MIN_OUTPUT=500 D run phase-001 >/dev/null 2>&1
 export SMOKE_PIPE="$PIPE" SMOKE_PROJ="$PROJ"
 cat > "$STUB/opencode" <<'EOS'
 #!/usr/bin/env bash
 if [ "$1" = "models" ]; then exit 0; fi
-n=0
-[ -f "$SMOKE_PIPE/logs/phase-001.review.1.log" ] && n=1
-if [ "$n" = "0" ]; then
-  # review round 1: one blocking finding
+# The review call and the fix call are told apart by which log exists: the
+# review writes logs/phase-001.review.N.log and the fix writes
+# logs/phase-001.fix.N.log. So the reviewer says the SAME finding in round 1
+# and in round 2, which is what "not converging" looks like.
+if [ ! -f "$SMOKE_PIPE/logs/phase-001.review.1.log" ]; then
   echo "1. [BLOCKER] src/vm.rs:412 - the defect is here - fix it - done"
   echo "REVIEW VERDICT: FINDINGS 1"
-else
-  # the fix pass, and then the SAME finding again - the cycle is not converging
+elif [ ! -f "$SMOKE_PIPE/logs/phase-001.fix.1.log" ]; then
   echo "| src/vm.rs | +10 -1 | fixed |"
   echo "fix done"
+else
+  echo "1. [BLOCKER] src/vm.rs:412 - the defect is here - fix it - done"
+  echo "REVIEW VERDICT: FINDINGS 1"
 fi
 exit 0
 EOS
 chmod +x "$STUB/opencode"
-out="$( RBOPS_MIN_OUTPUT=1 D run phase-001 2>&1 | strip )"
+out="$( RBOPS_MIN_OUTPUT=1 D review phase-001 2>&1 | strip )"
 if printf '%s' "$out" | grep -q "reported only findings the fix rounds have already seen"; then
   ok "a review that repeats its findings is blocked as non-convergent"
 else
   no "a repeating review was not blocked"
+  printf '%s' "$out" | grep -E 'review round|fix round|BLOCK' | head -6 | sed 's/^/      /'
 fi
 build_fixture >/dev/null; use_stubs
 

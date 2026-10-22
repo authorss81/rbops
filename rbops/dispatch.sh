@@ -709,10 +709,14 @@ cmd_run() {
     newer_ref="recovery"
   fi
   if [ "$newer_ref" = "wip" ]; then
+    # The ORIGINAL wording and the ORIGINAL commit subject. The subject is what
+    # the acknowledgement audit looks for, and the log line is what the smoke
+    # suite reads - a WIP resume that says something else is a WIP resume the
+    # audit and the suite do not recognise.
+    log "squashing WIP checkpoint for $phase (newer preserved work, squashed onto main)"
     if in_project git merge --squash --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1; then
-      in_project git commit -q -m "resume $phase: adopt preserved work" >/dev/null 2>&1 || true
-      log "resumed from the newer preserved work (rbops-wip/$phase, squashed onto main)"
-      touch "$(marker "$phase" .recovered)"
+      in_project git commit -q -m "resume $phase: adopt WIP checkpoint" >/dev/null 2>&1 || true
+      touch "$(marker "$phase" .checkpoint)"
       resumed=1
     elif [ -n "$(in_project git diff --name-only --diff-filter=U 2>/dev/null)" ]; then
       # Conflicted, and the conflict is in the WORK rather than in the commit
@@ -1357,8 +1361,9 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     if [ "$rc_round" = "75" ]; then
       log "review round $round: model chain unusable — deferring, no attempt consumed"
       defer_phase "$phase" "model chain unusable in review round $round"
+      local rc=$?
       stop_checkpoint_loop
-      return $?
+      return "$rc"
     fi
 
     # --- parse the review -------------------------------------------------------
@@ -1553,8 +1558,9 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       log "fix round $round: model chain unusable — deferring"
       rm -f "$cited" "$before" "$after"
       defer_phase "$phase" "model chain unusable in fix round $round"
+      local rc=$?
       stop_checkpoint_loop
-      return $?
+      return "$rc"
     fi
 
     while read -r f; do
