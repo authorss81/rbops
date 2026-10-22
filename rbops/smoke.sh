@@ -741,15 +741,17 @@ if [ "$1" = "models" ]; then exit 0; fi
 # review writes logs/phase-001.review.N.log and the fix writes
 # logs/phase-001.fix.N.log. So the reviewer says the SAME finding in round 1
 # and in round 2, which is what "not converging" looks like.
-if [ ! -f "$SMOKE_PIPE/logs/phase-001.review.1.log" ]; then
+n=$(cat "$SMOKE_PIPE/.reviewcalls" 2>/dev/null || echo 0)
+n=$((n+1)); echo "$n" > "$SMOKE_PIPE/.reviewcalls"
+if [ $((n % 2)) -eq 1 ]; then
+  # An ODD call is the reviewer: round 1 and round 2 both report the SAME
+  # finding, which is what a review that is not converging looks like.
   echo "1. [BLOCKER] src/vm.rs:412 - the defect is here - fix it - done"
   echo "REVIEW VERDICT: FINDINGS 1"
-elif [ ! -f "$SMOKE_PIPE/logs/phase-001.fix.1.log" ]; then
+else
+  # An EVEN call is the fix pass.
   echo "| src/vm.rs | +10 -1 | fixed |"
   echo "fix done"
-else
-  echo "1. [BLOCKER] src/vm.rs:412 - the defect is here - fix it - done"
-  echo "REVIEW VERDICT: FINDINGS 1"
 fi
 exit 0
 EOS
@@ -772,6 +774,7 @@ build_fixture >/dev/null; use_stubs
   && git add -A && git commit -qm "older attempt" \
   && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
   && git reset -q --hard HEAD~1 \
+  && sleep 2 \
   && printf '// newer checkpoint work\n' >> src/vm.rs \
   && git add -A && git commit -qm "newer checkpoint" \
   && git update-ref "refs/remotes/origin/rbops-wip/phase-001" HEAD \
@@ -781,6 +784,7 @@ if printf '%s' "$out" | grep -q "taking the newer"; then
   ok "the newer preserved work is chosen over the older"
 else
   no "the newer preserved work was not chosen"
+  printf '%s' "$out" | grep -E 'resum|checkpoint|recovery|BLOCK|DEFER' | head -6 | sed 's/^/      /'
 fi
 if grep -q "newer checkpoint work" "$PROJ/src/vm.rs" 2>/dev/null; then
   ok "the newer preserved work is what the agent inherits"
