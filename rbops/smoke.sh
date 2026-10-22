@@ -737,6 +737,17 @@ export SMOKE_PIPE="$PIPE" SMOKE_PROJ="$PROJ"
 cat > "$STUB/opencode" <<'EOS'
 #!/usr/bin/env bash
 if [ "$1" = "models" ]; then exit 0; fi
+# --dir is where the agent is told to work. A stub that ignores it edits the
+# smoke's own directory instead of the project, and the fix-pass check is then
+# right to say nothing was touched.
+dir="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir) dir="$2"; shift 2 ;;
+    --model|--agent|--title) shift 2 ;;
+    *) shift ;;
+  esac
+done
 # The review call and the fix call are told apart by which log exists: the
 # review writes logs/phase-001.review.N.log and the fix writes
 # logs/phase-001.fix.N.log. So the reviewer says the SAME finding in round 1
@@ -752,7 +763,7 @@ else
   # An EVEN call is the fix pass, and it must really change the file the
   # finding cites - a fix that changes nothing is caught by the fix-pass check
   # and blocks the phase before the review gets a second round.
-  printf '// fixed\n' >> src/vm.rs
+  printf '// fixed\n' >> "$dir/src/vm.rs"
   echo "| src/vm.rs | +10 -1 | fixed |"
   echo "fix done"
 fi
