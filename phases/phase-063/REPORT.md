@@ -2,7 +2,7 @@
 
 ## Resumed run
 
-The previous attempt's work was preserved in commit `1032539` (`resume
+The previous attempt's work was preserved in commit `8d7c994` (`resume
 phase-063: adopt preserved work`), which made every gate see an empty phase
 diff: `verify.sh` reported "no changed files detected against HEAD" and
 "no implementation change" even though the tree held the completed work. The
@@ -12,10 +12,13 @@ no code was changed in this run: the commit was uncommitted with
 diff is visible again against `c6e9837`, the parent the preserved commit was
 built on.
 
-After that, the four gates were run from the restored tree and all passed;
-`verify.sh phase-063` now reports `VERIFY PASS`. No deliberate change was made
-to the code because the only failure was diff visibility — the work below was
-already complete and every test was already green.
+After that, the four gates were run from the restored tree and all passed:
+`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --all-targets` (2038 passed, 0 failed, 0 ignored) and
+`verify.sh phase-063` (`VERIFY PASS`). No code was changed because the only
+failure was diff visibility — the work below was already complete and every
+test was already green. This run re-measured the diff and corrected the test
+counts in this report to what the tree actually adds against `c6e9837`.
 
 ## What changed
 
@@ -64,10 +67,12 @@ measured against the baseline.
 
 ## Tests added
 
-69 new `#[test]` functions (50 in `src/`, 15 in `tests/repl_printing_test.rs`,
-4 in `tests/unreviewed_work_ack_test.rs`), zero ignored, zero skipped, zero
-`allow(clippy::` suppressions. 60 of them are named `edge_*`. 18 of them are
-round 2's, 5 are round 3's, 9 are round 4's and 4 are round 5's.
+71 new `#[test]` functions (53 in `src/`, 15 in
+`tests/repl_printing_test.rs`, 3 in `tests/unreviewed_work_ack_test.rs`),
+zero ignored, zero skipped, zero `allow(clippy::` suppressions. 62 of them are
+named `edge_*`. Measured directly against `c6e9837` the diff adds all 71; the
+gate's post-suite count reads 22 rust tests and 18 `edge_*` tests, which is
+still well over its floor (3 and 1).
 
 | Test | Edge class covered |
 |---|---|
