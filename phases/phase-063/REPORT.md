@@ -1,9 +1,27 @@
 # Phase 063 — Print values three ways: `.pretty`, `.json`, `.table`
 
+## Resumed run
+
+The previous attempt's work was preserved in commit `1032539` (`resume
+phase-063: adopt preserved work`), which made every gate see an empty phase
+diff: `verify.sh` reported "no changed files detected against HEAD" and
+"no implementation change" even though the tree held the completed work. The
+preserved commit was the phase's own delivery commit, not another phase's, and
+no code was changed in this run: the commit was uncommitted with
+`git reset --mixed HEAD~1` (working tree untouched, no file lost) so the phase
+diff is visible again against `c6e9837`, the parent the preserved commit was
+built on.
+
+After that, the four gates were run from the restored tree and all passed;
+`verify.sh phase-063` now reports `VERIFY PASS`. No deliberate change was made
+to the code because the only failure was diff visibility — the work below was
+already complete and every test was already green.
+
 ## What changed
 
-Baseline is `b21821d` (the commit before this phase's work landed). The
-adopted work is in `a31d067`; round 2's changes are the rows marked *round 2*,
+The historical rounds below were measured against `b21821d` (the commit before
+this phase's work landed) and the adopted work in `a31d067`; the current working
+diff is against `c6e9837`. Round 2's changes are the rows marked *round 2*,
 round 3's are marked *round 3*, round 4's are marked *round 4*, and round 5's
 — the second review's findings — are marked *round 5*. The line counts are
 measured against the baseline.
@@ -106,7 +124,7 @@ round 2's, 5 are round 3's, 9 are round 4's and 4 are round 5's.
 | `edge_pretty_of_a_text_a_terminal_would_mangle_reads_back_as_the_value` (round 4) | acceptance: what `.pretty` writes is a document the language's own `json.parse` reads back as the value it came from — even when the value holds a mark a terminal acts on |
 | `edge_the_json_document_is_the_language_s_own_writer_s_document` (round 4) | acceptance: the document `.json` prints is the document the language's own writer writes, byte for byte |
 | `edge_the_json_a_session_prints_is_the_document_json_stringify_writes` (round 4, integration) | acceptance: the same value, printed by `.json` and by the language's own `json.stringify` inside a real session, is byte for byte the same document |
-| `edge_the_json_document_writes_the_marks_a_terminal_would_act_on_as_they_are` (round 4, integration) | unicode/escapes: `.json` is a document first and a terminal rendering second, and `.pretty` is the rendering that spells the marks out |
+| `edge_the_json_document_escapes_the_marks_a_terminal_would_act_on` (round 4/5, integration) | unicode/escapes: `.json` is a document first and a terminal rendering second, and the marks are escaped |
 | `edge_json_stringify_refuses_a_value_nested_past_its_budget` (round 5) | resource limit — the language's own writer refuses depth past 64 with a catchable error instead of overflowing the stack |
 | `edge_json_stringify_refuses_a_value_with_no_json_literal` (round 5) | type mismatch — a function, a builtin and an object are refused by name, never written as `null` |
 | `edge_json_stringify_escapes_the_characters_a_terminal_acts_on` (round 5) | unicode/escapes — a bidi override, a zero-width mark, a C1 control, a bidi control and a BOM are escaped, not written raw |
