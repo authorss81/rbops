@@ -1,0 +1,84 @@
+[91m[1mError: [0m{
+  "name": "UnknownError",
+  "data": {
+    "message": "Unexpected server error. Check server logs for details.",
+    "ref": "err_fdd4da5c"
+  }
+}
+[0m
+> reviewer · nemotron-3-ultra-free
+[0m
+[0m→ [0mRead src/repl/render.rs
+[0m→ [0mRead src/repl/mod.rs
+[0m→ [0mRead src/runtime.rs[90m [offset=1800, limit=150][0m
+[0m→ [0mRead src/repl/render.rs[90m [offset=1277][0m
+[0m→ [0mRead tests/repl_printing_test.rs
+[0m→ [0mRead src/error.rs
+[0m→ [0mRead src/runtime.rs[90m [offset=1790][0m
+[0m✱ [0mGrep "json_escape_text"[90m in src · 5 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [limit=70, offset=1730][0m
+[0m✱ [0mGrep "impl.*Display.*for.*Value"[90m in src · 1 match[0m
+[0m→ [0mRead src/value.rs[90m [limit=100, offset=310][0m
+[0m✱ [0mGrep "stack.?overflow|MAX_RENDER_DEPTH|too_deep"[90m in . · 24 matches[0m
+[0m✱ [0mGrep "json_stringify.*deep|Display.*deep|to_string.*deep"[90m in . · 0 matches[0m
+[0m→ [0mRead SPEC.md[90m [offset=1370, limit=100][0m
+[0m✱ [0mGrep "say.*json|json.*say"[90m in tests · 22 matches[0m
+Now I have enough information. Let me write the review with my findings.
+
+---
+
+## Findings
+
+### 1. [MAJOR] src/runtime.rs:1796 — `json_stringify` has unbounded recursion, no depth limit
+
+The `json_stringify` function recursively processes lists and records (lines 1819-1828) with no depth check. A value built at runtime with nesting deeper than the Rust stack can hold (e.g., `repeat 2000 times set xs to [xs] end`) causes a **fatal stack overflow abort**, not a catchable error. The REPL's `.json` command added a depth budget (`MAX_RENDER_DEPTH = 64`) in `render.rs:99`, but the language's own `json.stringify` — which the SPEC says `.json` must match byte-for-byte — has no such limit.
+
+**VERIFIED:** Traced the code path: `json_stringify` → `json_stringify` (recursive for `Value::List` and `Value::Record`) with no depth parameter or check. A 2000-deep list recurses 2000 times → stack overflow → process abort.
+
+---
+
+### 2. [MAJOR] src/value.rs:314 — `Value::Display` has unbounded recursion, no depth limit
+
+The `Display` impl for `Value` (lines 329-338) recursively calls `to_string()` on list items and record fields with no depth limit. The session's default answer at `repl/mod.rs:1370` uses `format!("= {}", value)` which invokes this `Display`. The language's `say` command also uses it. A deeply nested value crashes the session with a fatal stack overflow.
+
+**VERIFIED:** Traced the code path: `Display::fmt` → `v.to_string()` for each item/field → recursive `Display` calls with no depth parameter or check. Same 2000-deep list → stack overflow → process abort.
+
+---
+
+### 3. [MAJOR] src/runtime.rs:1830-1832 vs src/repl/render.rs:129-134 — SPEC drift: `json.stringify` writes `null` for functions/builtins/objects, but `.json` refuses them
+
+SPEC.md:1382-1383 states: "The REPL's `.json` command prints the document `json.stringify` writes, byte for byte". However:
+- `json_stringify` (runtime.rs:1830-1832) writes `"null"` for `Value::Function`, `Value::Builtin`, `Value::Object`
+- `.json` (render.rs:129-134) refuses with an error: "JSON has no literal for a value of the kind `function`..."
+
+These are contradictory. A program calling `json.stringify(f)` gets `"null"`, but `.json f` in the REPL gets an error.
+
+---
+
+### 4. [MAJOR] src/runtime.rs:1735-1757 — `json_escape_text` doesn't escape terminal control characters; `.json` writes them raw
+
+`json_escape_text` only escapes JSON-required characters (quote, backslash, newline, tab, control chars < 0x20). It does **not** escape bidi overrides (`\u{202E}`), zero-width marks (`\u{200B}`), C1 controls (`\u{85}`), etc. The test at `tests/repl_printing_test.rs:295-319` confirms `.json "\u202e"` writes the raw RTL override to the terminal, which reorders the line. SPEC.md:1384-1388 acknowledges this: ".json is a document first and a terminal rendering second... written as the value holds them". But this means a terminal can be mangled by the REPL's own output.
+
+---
+
+### 5. [MAJOR] src/error.rs:257-282 — Error renderer's `WIDE` table is incomplete; caret placement wrong for some emoji
+
+The `WIDE` ranges (lines 263-282) cover East Asian Wide/Fullwidth and three emoji blocks, but miss: `U+2B50` (⭐), `U+2728` (✨), `U+1F004`, `U+1F0CF`, regional indicators `U+1F1E6–U+1F1FF`. Also, variation selector `U+FE0F` is in `ZERO_WIDTH` (line 251) so `❤️` (U+2764 U+FE0F) is counted as 1 cell instead of 2. The table renderer fixed this by using `unicode-width` (round 3), but the error renderer's caret placement still uses the incomplete table.
+
+**VERIFIED:** Read `char_cells` at error.rs:296-310 and `WIDE` at 263-282. `⭐` (U+2B50) not in any range → `char_cells` returns 1, terminal draws 2 → caret off by one.
+
+---
+
+### 6. [MINOR] src/repl/render.rs:449-458 — `mangles_the_terminal` misses some terminal-active characters
+
+The function checks `is_control()` and specific ranges for bidi/zero-width marks, but may miss other characters terminals act on (e.g., some C1 controls, OSC sequences). The test at line 1158 only tests `\u{1b}[31m` (ESC) and `\u{202e}` (RTL override).
+
+---
+
+## Verdict
+
+```
+FINDINGS: 6
+```
+
+REVIEW VERDICT: FINDINGS 6
