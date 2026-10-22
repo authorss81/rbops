@@ -725,6 +725,63 @@ else
 fi
 build_fixture >/dev/null; use_stubs
 
+# The review/fix cycle must block when it stops converging, and must NOT
+# block when it is still finding new things. A round counter would get this
+# wrong: phase-084 found something NEW in every round and was converging
+# slowly, and a total-round cap would have killed it.
+build_fixture >/dev/null; use_stubs
+export SMOKE_PIPE="$PIPE" SMOKE_PROJ="$PROJ"
+cat > "$STUB/opencode" <<'EOS'
+#!/usr/bin/env bash
+if [ "$1" = "models" ]; then exit 0; fi
+n=0
+[ -f "$SMOKE_PIPE/logs/phase-001.review.1.log" ] && n=1
+if [ "$n" = "0" ]; then
+  # review round 1: one blocking finding
+  echo "1. [BLOCKER] src/vm.rs:412 - the defect is here - fix it - done"
+  echo "REVIEW VERDICT: FINDINGS 1"
+else
+  # the fix pass, and then the SAME finding again - the cycle is not converging
+  echo "| src/vm.rs | +10 -1 | fixed |"
+  echo "fix done"
+fi
+exit 0
+EOS
+chmod +x "$STUB/opencode"
+out="$( RBOPS_MIN_OUTPUT=1 D run phase-001 2>&1 | strip )"
+if printf '%s' "$out" | grep -q "reported only findings the fix rounds have already seen"; then
+  ok "a review that repeats its findings is blocked as non-convergent"
+else
+  no "a repeating review was not blocked"
+fi
+build_fixture >/dev/null; use_stubs
+
+# The newer preserved work wins. A checkpoint written five minutes ago was
+# ignored in favour of a branch from an earlier attempt, which is how phase-084
+# lost the same fix round six times to the job cap.
+build_fixture >/dev/null; use_stubs
+( cd "$PROJ" \
+  && printf '// older recovery work\n' >> src/vm.rs \
+  && git add -A && git commit -qm "older attempt" \
+  && git update-ref "refs/remotes/origin/rbops-recovery/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 \
+  && printf '// newer checkpoint work\n' >> src/vm.rs \
+  && git add -A && git commit -qm "newer checkpoint" \
+  && git update-ref "refs/remotes/origin/rbops-wip/phase-001" HEAD \
+  && git reset -q --hard HEAD~1 ) >/dev/null 2>&1
+out="$( RBOPS_MIN_OUTPUT=1 D run phase-001 2>&1 | strip )"
+if printf '%s' "$out" | grep -q "taking the newer"; then
+  ok "the newer preserved work is chosen over the older"
+else
+  no "the newer preserved work was not chosen"
+fi
+if grep -q "newer checkpoint work" "$PROJ/src/vm.rs" 2>/dev/null; then
+  ok "the newer preserved work is what the agent inherits"
+else
+  no "the agent did not inherit the newer preserved work"
+fi
+build_fixture >/dev/null; use_stubs
+
 D stop >/dev/null 2>&1
 out="$(D select)"
 case "$out" in *"pipeline halted"*) ok ".stop halts selection" ;; *) no ".stop did not halt" ;; esac

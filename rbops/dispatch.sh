@@ -678,7 +678,60 @@ cmd_run() {
   # #[ignore] the interrupted run had added. The agent dutifully built on it
   # and the phase got worse than starting clean.
   local resumed=0
+  # Which preserved work to inherit: the NEWER of the two refs.
+  #
+  # Recovery wins on QUALITY - a complete attempt the gate evaluated beats a
+  # half-written one, and a stale WIP checkpoint outranking a complete attempt
+  # once made a retry inherit a broken tree. But it used to win on AGE too,
+  # which is wrong: a checkpoint written five minutes ago was ignored in
+  # favour of a branch from an earlier attempt.
+  #
+  # phase-084 lost the same fix round six times to the 300-minute job cap. The
+  # work was checkpointed every 300 seconds - once the review phase was
+  # covered - and then not used, because recovery was preferred whatever its
+  # date.
+  #
+  # So: take the newer, and let the preflight judge it. The preflight already
+  # runs on whatever is inherited, and an inherited diff that does not pass it
+  # has its gaps handed to the agent rather than being thrown away.
+  local newer_ref=""
+  local rec_ts=0 wip_ts=0
   if in_project git rev-parse --verify -q "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
+    rec_ts="$(in_project git log -1 --format=%ct "origin/rbops-recovery/$phase" 2>/dev/null || echo 0)"
+  fi
+  if in_project git rev-parse --verify -q "origin/rbops-wip/$phase" >/dev/null 2>&1; then
+    wip_ts="$(in_project git log -1 --format=%ct "origin/rbops-wip/$phase" 2>/dev/null || echo 0)"
+  fi
+  if [ "$wip_ts" -gt "$rec_ts" ] && [ "$wip_ts" -gt 0 ]; then
+    newer_ref="wip"
+    log "$phase has newer preserved work on rbops-wip ($wip_ts) than on rbops-recovery ($rec_ts) - taking the newer"
+  else
+    newer_ref="recovery"
+  fi
+  if [ "$newer_ref" = "wip" ]; then
+    if in_project git merge --squash --no-edit -X theirs "origin/rbops-wip/$phase" >/dev/null 2>&1; then
+      in_project git commit -q -m "resume $phase: adopt preserved work" >/dev/null 2>&1 || true
+      log "resumed from the newer preserved work (rbops-wip/$phase, squashed onto main)"
+      touch "$(marker "$phase" .recovered)"
+      resumed=1
+    elif [ -n "$(in_project git diff --name-only --diff-filter=U 2>/dev/null)" ]; then
+      # Conflicted, and the conflict is in the WORK rather than in the commit
+      # history: the checkpoint was taken against a main that has since moved.
+      # Hand it to the agent rather than throwing the work away - phase-019's
+      # recovery held a 5629-line bytecode VM, and starting clean would mean
+      # re-deriving all of it. The gate still decides whether the resolved tree
+      # is any good.
+      log "resumed from the newer preserved work (rbops-wip/$phase) WITH UNRESOLVED CONFLICTS"
+      in_project git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/    conflict: /' | sed -n '1,10p'
+      touch "$(marker "$phase" .recovered)"
+      touch "$(marker "$phase" .conflict)"
+      resumed=1
+    else
+      in_project git merge --abort 2>/dev/null || true
+      in_project git reset -q --hard HEAD 2>/dev/null || true
+      log "the newer preserved work would not apply cleanly - continuing from main"
+    fi
+  elif in_project git rev-parse --verify -q "origin/rbops-recovery/$phase" >/dev/null 2>&1; then
     # --squash, never a real merge. A real `git merge` records BOTH parents, and
     # when the preserved work came from a WIP checkpoint that branch's history is
     # full of `rbops: phase-NNN checkpoint <ts>` commits. Merging it into the
@@ -1132,12 +1185,29 @@ done
   # The conflict, if there was one, is resolved now: this attempt did not start
   # with one, so the marker must not outlive it.
   rm -f "$(marker "$phase" .conflict)"
+  # The findings this phase has already had reported are only interesting while
+  # the phase is being reviewed. Once it is done, the record of them is history.
+  rm -f "$(marker "$phase" .seen_findings)"
   log "$phase passed the gate — awaiting review"
   # A green gate means there is no failure left to report, so the verdict file
   # must not survive into a future attempt for this phase. Left in place it
   # would inject a stale FAIL list into the context of whatever runs next.
   rm -f "$LOG_DIR/$phase.gateout"
   return 0
+}
+
+# One fingerprint per severity-tagged finding in a review log.
+#
+# The fingerprint is the finding's TEXT with every number replaced, so a finding
+# that moved from line 412 to line 430 is still the same finding, while a
+# different finding in the same file is a different fingerprint. Digits are
+# what move: line numbers, counts, byte sizes.
+finding_fingerprints() {   # finding_fingerprints <review-log>
+  grep -E '^[[:space:]]*[0-9]+[.][[:space:]]*\[(BLOCKER|CRITICAL|MAJOR|MINOR|STYLE)\]' "$1" 2>/dev/null \
+    | sed -E 's/[0-9]+/#/g; s/[[:space:]]+/ /g' \
+    | while IFS= read -r line; do
+        printf '%s' "$line" | cksum | awk '{print $1"-"$2}'
+      done
 }
 
 # -------------------------------------------------------------------- reviewer
@@ -1153,6 +1223,7 @@ cmd_review() {
   # next tick re-enters review from round 1 on the same tree.
   if [ -f "$RBOPS_ROOT/phases/.stop" ]; then
     log "review halted by phases/.stop — $phase keeps its gate-passed tree for a later tick"
+    stop_checkpoint_loop
     return 0
   fi
 
@@ -1163,6 +1234,7 @@ cmd_review() {
   if ! assert_reviewer_read_only "$phase"; then
     touch "$(marker "$phase" .blocked)"
     log "$phase BLOCKED — the reviewer would not be read-only; a human must look"
+    stop_checkpoint_loop
     return 3
   fi
 
@@ -1179,6 +1251,18 @@ cmd_review() {
     log "$phase review diffs against the base the run recorded: ${recorded:0:7}"
   fi
   local round=0
+
+  # The fix rounds below edit the project, and this job can be killed while
+  # they work: GitHub's job timeout does not run the steps after it, so the
+  # tree those rounds built was never committed and never pushed. It was
+  # simply lost, and the next attempt re-derived it.
+  #
+  # The checkpoint loop pushes the project tree to rbops-wip/<phase> every 300
+  # seconds. It used to run only for the IMPLEMENT phase, which left the fix
+  # rounds as the one stretch of a phase's work with nothing protecting it.
+  # phase-084 lost the same fix round six times to the 300-minute job cap.
+  start_checkpoint_loop "$phase"
+  local checkpoint_stopped=0
 
   # Rounds 1..MAX may fix; round MAX+1 reviews ONLY. The loop used to end after
   # the last fix, so that fix was never reviewed: phase-025 blocked with a
@@ -1273,6 +1357,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     if [ "$rc_round" = "75" ]; then
       log "review round $round: model chain unusable — deferring, no attempt consumed"
       defer_phase "$phase" "model chain unusable in review round $round"
+      stop_checkpoint_loop
       return $?
     fi
 
@@ -1331,10 +1416,44 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     # phases/phase-080/.done` ran in the same minute.
     blocking="$(grep -coE '\[(BLOCKER|CRITICAL|MAJOR)\]|\*\*?(BLOCKER|CRITICAL|MAJOR)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL|MAJOR):' "$rlog" 2>/dev/null)"; blocking="${blocking:-0}"
 
+    # A review that reports the SAME findings again, after the fix rounds had a
+    # chance to fix them, is not converging. It is the cycle that never ends:
+    # the reviewer says the same thing, the fix agent changes something else,
+    # and the next round says the same thing again.
+    #
+    # This is measured, not counted. Persisting the round number across attempts
+    # would be the obvious thing and it is WRONG: a phase whose review finds
+    # something NEW each round is making progress, and cutting it off after N
+    # rounds in total would block exactly the work that is going somewhere.
+    # phase-084 found different findings in every round (1, 2, 1, 4, 1) and was
+    # converging slowly; a round counter would have killed it.
+    #
+    # So what is remembered is WHICH findings have been reported, and the phase
+    # is blocked only when a round brings nothing new. A round that brings
+    # anything new is progress and the phase carries on, however many rounds
+    # that takes.
+    local seen_marker; seen_marker="$(marker "$phase" .seen_findings)"
+    if [ "$blocking" -gt 0 ]; then
+      local all_seen=1 any_finding=0 fp
+      while IFS= read -r fp; do
+        [ -n "$fp" ] || continue
+        any_finding=1
+        grep -qxF "$fp" "$seen_marker" 2>/dev/null || all_seen=0
+      done <<< "$(finding_fingerprints "$rlog")"
+      if [ "$any_finding" -eq 1 ] && [ "$all_seen" -eq 1 ]; then
+        log "$phase BLOCKED - review round $round reported only findings the fix rounds have already seen: the review is not converging"
+        touch "$(marker "$phase" .blocked)"
+        stop_checkpoint_loop
+        return 3
+      fi
+      finding_fingerprints "$rlog" >> "$seen_marker" 2>/dev/null || true
+    fi
+
     if [ "$blocking" -gt 0 ]; then
       if [ "$round" -ge "$verify_round" ]; then
         touch "$(marker "$phase" .blocked)"
         log "$phase BLOCKED - verification round still finds blocking findings"
+        stop_checkpoint_loop
         return 3
       fi
       log "review round $round: $blocking blocking finding(s) - fixing"
@@ -1354,6 +1473,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       if [ "$round" -ge "$verify_round" ]; then
         log "$phase BLOCKED - reviewer never produced a parseable verdict in $round rounds"
         touch "$(marker "$phase" .blocked)"
+        stop_checkpoint_loop
         return 3
       fi
       log "retrying review with an explicit re-request"
@@ -1433,6 +1553,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
       log "fix round $round: model chain unusable — deferring"
       rm -f "$cited" "$before" "$after"
       defer_phase "$phase" "model chain unusable in fix round $round"
+      stop_checkpoint_loop
       return $?
     fi
 
@@ -1460,6 +1581,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
         rm -f "$cited" "$before" "$after"
         touch "$(marker "$phase" .blocked)"
         log "$phase BLOCKED - fix pass never addressed the findings"
+        stop_checkpoint_loop
         return 3
       fi
       if [ "${touched:-0}" -eq 0 ]; then
@@ -1489,6 +1611,7 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
 if grep -qE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(BLOCKER|CRITICAL):' "$LOG_DIR/$phase.review.$round.log" 2>/dev/null; then
     touch "$(marker "$phase" .blocked)"
     log "$phase BLOCKED - blocking findings survive $round review round(s)"
+    stop_checkpoint_loop
     return 3
   fi
 
@@ -1509,6 +1632,7 @@ if grep -qE '\[(BLOCKER|CRITICAL)\]|\*\*?(BLOCKER|CRITICAL)\*\*?|(^|[^A-Za-z])(B
 
   # On the live path: the workflow calls select + run + review, never tick.
   maybe_audit
+  stop_checkpoint_loop
   return 0
 }
 
