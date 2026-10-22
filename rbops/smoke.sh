@@ -749,7 +749,10 @@ if [ $((n % 2)) -eq 1 ]; then
   echo "1. [BLOCKER] src/vm.rs:412 - the defect is here - fix it - done"
   echo "REVIEW VERDICT: FINDINGS 1"
 else
-  # An EVEN call is the fix pass.
+  # An EVEN call is the fix pass, and it must really change the file the
+  # finding cites - a fix that changes nothing is caught by the fix-pass check
+  # and blocks the phase before the review gets a second round.
+  printf '// fixed\n' >> src/vm.rs
   echo "| src/vm.rs | +10 -1 | fixed |"
   echo "fix done"
 fi
