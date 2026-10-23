@@ -40,9 +40,9 @@ PROJECT_DIR="${RBOPS_PROJECT_DIR:-.}"
 JQ="${JQ:-jq}"
 
 # Model chains, ranked. Overridable, comma-separated, first entry is primary.
-IMPL_MODELS="${RBOPS_IMPL_MODELS:-opencode/minimax-m3.1-flash-free,opencode/big-pickle,opencode/longcat-2.5-preview-free,opencode/beam-free,opencode/nemotron-3.5-super-vl-free,opencode/nemotron-3-ultra-free}"
-REVIEW_MODELS="${RBOPS_REVIEW_MODELS:-opencode/minimax-m3.1-flash-free,opencode/nemotron-3-ultra-free,opencode/big-pickle,opencode/longcat-2.5-preview-free,opencode/beam-free,opencode/nemotron-3.5-super-vl-free}"
-AUDIT_MODELS="${RBOPS_AUDIT_MODELS:-opencode/minimax-m3.1-flash-free,opencode/big-pickle,opencode/longcat-2.5-preview-free,opencode/beam-free,opencode/nemotron-3.5-super-vl-free,opencode/nemotron-3-ultra-free}"
+IMPL_MODELS="${RBOPS_IMPL_MODELS:-opencode/big-pickle,opencode/longcat-2.5-preview-free,opencode/beam-free,opencode/nemotron-3.5-super-vl-free,opencode/nemotron-3-ultra-free}"
+REVIEW_MODELS="${RBOPS_REVIEW_MODELS:-opencode/nemotron-3-ultra-free,opencode/big-pickle,opencode/longcat-2.5-preview-free,opencode/beam-free,opencode/nemotron-3.5-super-vl-free}"
+AUDIT_MODELS="${RBOPS_AUDIT_MODELS:-opencode/big-pickle,opencode/longcat-2.5-preview-free,opencode/beam-free,opencode/nemotron-3.5-super-vl-free,opencode/nemotron-3-ultra-free}"
 
 MAX_ATTEMPTS="${RBOPS_MAX_ATTEMPTS:-3}"
 MAX_DEFERRALS="${RBOPS_MAX_DEFERRALS:-5}"

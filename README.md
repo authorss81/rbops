@@ -143,8 +143,8 @@ halt survives a runner being replaced.
 
 ### Models
 
-Order is deliberate: `opencode/minimax-m3.1-flash-free` leads, then
-`muse-spark-1.3-contributor-free`. The strongest coder on the free tier goes
+Order is deliberate: `opencode/big-pickle` leads, then
+`opencode/longcat-2.5-preview-free`. The strongest coder on the free tier goes
 first because a dead model advances the chain **without consuming a phase
 attempt**, so an unavailable or revoked entry costs about two seconds rather
 than a retry from `MAX_ATTEMPTS`. That makes a long chain cheap insurance
@@ -156,8 +156,8 @@ To see what your key can actually reach:
 OPENCODE_API_KEY=... opencode models
 ```
 
-If `minimax-m3.1-flash-free` is not listed for your key it will simply be skipped and
-the chain moves to muse-spark. To change the order, edit `RBOPS_IMPL_MODELS`
+If `big-pickle` is not listed for your key it will simply be skipped and
+the chain moves to the next model. To change the order, edit `RBOPS_IMPL_MODELS`
 (and the reviewer/audit chains) in `.github/workflows/rbops.yml`, plus
 `.models` in `rbops/phases.json` and the agent models in `opencode.json`.
 
