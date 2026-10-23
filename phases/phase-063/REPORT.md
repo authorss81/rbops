@@ -2,7 +2,7 @@
 
 ## Resumed run
 
-The previous attempt's work was preserved in commit `8d7c994` (`resume
+The previous attempt's work was preserved in commit `21a347c` (`resume
 phase-063: adopt preserved work`), which made every gate see an empty phase
 diff: `verify.sh` reported "no changed files detected against HEAD" and
 "no implementation change" even though the tree held the completed work. The
@@ -15,10 +15,11 @@ built on.
 After that, the four gates were run from the restored tree and all passed:
 `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
 `cargo test --all-targets` (2038 passed, 0 failed, 0 ignored) and
-`verify.sh phase-063` (`VERIFY PASS`). No code was changed because the only
-failure was diff visibility — the work below was already complete and every
-test was already green. This run re-measured the diff and corrected the test
-counts in this report to what the tree actually adds against `c6e9837`.
+`verify.sh phase-063` (`VERIFY PASS`, `+3815 −200`). No code was changed
+because the only failure was diff visibility — the work below was already
+complete and every test was already green. This run re-measured the diff and
+corrected the test counts in this report to what the tree actually adds against
+`c6e9837`.
 
 ## What changed
 
