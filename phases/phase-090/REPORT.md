@@ -2,36 +2,39 @@
 
 ## What changed
 
-Two rounds of work are in this diff and they are different in kind, so they are
-separated. **The survey** is `SURVEY.md` plus the test that holds it to its own
-citations. **The gate repair** is three test files that a prior resume run had
-left unbuildable; phase-090's `cargo fmt` and `cargo clippy` were both red on
-arrival because of them, and a document phase with a red gate is a failed phase.
+This diff has three parts: the survey itself, the merge resolution the resumed
+attempt needed, and test/gate repairs carried in from the parked attempt.
 
 ### The survey (the phase's actual output)
 
-| File | Lines | What |
+| File | Size | What |
 |---|---|---|
-| `SURVEY.md` | +7 −0 (this round; +400 −0 overall) | the ranking, plus this round's reconciliation of the dispatched `src/stdlib.rs:612` citation with the line that actually carries the claim |
-| `tests/stdlib_gap_survey_test.rs` | +19 −0 | two assertions pinning that reconciliation: the regex entry must name `612`, and `612` must still not be the anchor |
+| `SURVEY.md` | 408 lines (new) | the inventory, the 32-program sample, the top ten with a blocked Redblue program each, and every claim cited as `file:line` |
+| `tests/stdlib_gap_survey_test.rs` | 516 lines, new target | holds the survey to its citations, reconciles it with `stdlib::MODULES`/`BUILTIN_NAMES`, pins the ranking and the label/crate rule, and asserts the regex gap by running a program that uses it |
 
-### The gate repair (this round, all under `tests/`)
+The survey was updated in this round for line drift on `main`: `src/stdlib.rs:612`
+is now `},` and the `no regex` comment is at `:651`; `for each` binds at
+`src/interpreter.rs:1844`; `length` counts characters at `src/runtime.rs:812`.
 
-| File | Lines | What |
-|---|---|---|
-| `tests/unreviewed_work_ack_test.rs` | +926 −4 | restored: the 927-line audit that commit `c95062eb` truncated to the literal text `<the file content updated>`, plus two acknowledgement entries for the commits it then correctly reported |
-| `tests/preflight_assert_failure.rs` | +149 −9 | the `#[should_panic] { panic!("intentional") }` stub replaced with three real tests that assert refusals are produced |
-| `tests/memory_model_test.rs` | +22 −13 | `Arc<Node>` → `Rc<Node>`, which clears a pre-existing `clippy::arc_with_non_send_sync` on `main`. Four `strong_count` reads and two `downgrade` calls change name only; the values they assert are identical and `Arc` is kept for the `Value` itself, which is what the test pins |
+### Merge resolution (this round)
 
-**No file under `src/` was touched** — `git status --porcelain -- src/` is empty.
-`git diff --stat` is `SURVEY.md` and four files under `tests/`. No `.rb` file, no
-example, no corpus program, no module was touched, so the language's
-specification-by-example is unchanged.
+The parked attempt's changes arrived as a conflicted merge. Only two files
+conflicted, and both sides' intent was kept:
+
+| File | Resolution |
+|---|---|
+| `tests/unreviewed_work_ack_test.rs` | Kept newer `main` (1,930 lines and 24 audit functions: serialised repair, subject-based delivery acknowledgement). Merged the parked attempt's richer `c95062eb` reason (including the +1/−927 truncation) and extended `DELIVERY_SUBJECT_PREFIXES` to `["resume phase-084:", "resume phase-090:"]`. Did **not** add a SHA entry for `3c2085b7`: it is the parked attempt's delivery commit, not an ancestor of `HEAD`, so the audit would correctly call it stale. Phase-090 delivery is acknowledged by subject instead. |
+| `tests/memory_model_test.rs` | Kept both comments and all assertions: `Rc<Node>` for the non-`Send` tree, `Arc<Value>` for the shared value. The change clears the pre-existing `clippy::arc_with_non_send_sync` without weakening what the test pins. |
+
+No conflict markers remain. No file under `src/` was touched:
+`git status --porcelain -- src/` is empty. `git diff --stat` shows only the three
+tracked test files; `SURVEY.md`, `tests/stdlib_gap_survey_test.rs` and
+`phases/phase-090/` are new. No `.rb` file, example, module or corpus program was
+modified, so the language's specification-by-example is unchanged.
 
 ## The finding, re-verified before anything was written
 
-Every probe below was run on this tree. The gap is real and is where the finding
-said it was, with one correction to a line number.
+Every probe below was run on this tree.
 
 ```
 set m to regex.match("id=42", "id=([0-9]+)")
@@ -44,28 +47,27 @@ say files.glob("corpus/*.rb")
   -> RuntimeError: Module 'files' has no function 'glob'
 ```
 
-**Correction to the dispatched evidence.** The finding cites `src/stdlib.rs:612`
-for the comment *"Redblue has no regex, so this is a literal separator"*. That
-line is `"uppercase" => {`:
+**Correction to the dispatched evidence.** The finding cited `src/stdlib.rs:612`
+for *"Redblue has no regex, so this is a literal separator"*. On this tree `612`
+is `},` and the comment is at `651`:
 
 ```
 $ sed -n '612p' src/stdlib.rs
-        "uppercase" => {
-$ sed -n '637p' src/stdlib.rs
+        },
+$ sed -n '651p' src/stdlib.rs
                 // Redblue has no regex, so this is a literal separator.
 ```
 
-`SURVEY.md` cites **637**, names **612** in the same entry as the line the
-finding cited, and says in words that 612 does not carry the claim. Two assertions
-pin that, so the number cannot silently drift in either direction — and if the
-comment ever moves back to 612, the second one fails and says so. This is **F1**.
+`SURVEY.md` cites **651**, still names **612** in the same entry as the line the
+finding cited, and says in words that 612 does not carry the claim.
+`tests/stdlib_gap_survey_test.rs` reads both lines and enforces that relationship,
+so the citation cannot drift silently in either direction. This is **F1**.
 
 ## The ranking
 
 Ranked by how many of a stated sample of 32 mundane programs each gap blocks, not
-by how interesting the library is. Overlaps are allowed — a program is counted
-under every gap that blocks it — and the sample is printed in full in `SURVEY.md`
-so each count can be re-derived by hand.
+by how interesting the library is. Overlaps are allowed, and the sample is printed
+in full in `SURVEY.md` so every count can be re-derived by hand.
 
 | Rank | Gap | Blocks | Label | Rust crate |
 |---|---|---|---|---|
@@ -83,60 +85,41 @@ so each count can be re-derived by hand.
 Regexes rank **second**, not first. The crate is already a dependency
 (`Cargo.toml:31`) and reachable only from `src/testing/`
 (`src/testing/assertions.rs:130`, `src/testing/runner.rs:252`), so the gap is a
-missing binding rather than a missing engine. Ties are broken by cost — among
-gaps blocking the same number of programs, the `implementable-in-Redblue` one
-ranks higher — which is what orders ranks 9, 10 and 11.
+missing binding rather than a missing engine. Ties are broken by cost: among gaps
+blocking the same number of programs, the `implementable-in-Redblue` one ranks
+higher.
 
 ## Tests added
 
 | Test | Target | What it pins | Edge class |
 |---|---|---|---|
-| `edge_every_citation_resolves_to_a_line_that_exists` | `stdlib_gap_survey_test` | every `` `path:line` `` in `SURVEY.md` names a file in the repo and a line inside it; the rank-2 anchor must still read `no regex`; the entry must name `612` and `612` must still not be that anchor | **edge_\*** — a citation past the end of a file, a citation below line 1, a moved anchor |
-| `a_malformed_program_is_refused_by_the_stage_that_owns_it` | `preflight_assert_failure` | **asserts failure, six times**: unterminated string → `Lexer`, unclosed `if` / stray `)` / unclosed list → `Parser`, `1 + "two"` and `1 / 0` → `Runtime`, and each message carries the word that names the rule | malformed input, type mismatch, numeric boundary |
-| `edge_indexing_the_empty_list_is_a_clean_refusal_not_a_panic` | `preflight_assert_failure` | index `0` of a length-`0` list is a `Runtime` error naming both "out of bounds" and "length is 0" — never a panic | **edge_\*** — out of bounds, singleton, boundary |
-| `edge_an_empty_program_runs_and_answers_nothing` | `preflight_assert_failure` | the empty program is **legal**: it runs and answers `Value::Nothing` | **edge_\*** — empty |
-| `regex_is_refused_by_a_program_and_the_crate_is_reachable_only_from_tests` | `stdlib_gap_survey_test` | **asserts failure, three times**: `regex.match` refused by the analyzer naming `regex`; `length` of a one-field record refused naming `list or text`; `time.add_days` refused naming module *and* member. Also: no `regex::` outside `src/testing/`, and `Cargo.toml` still depends on `regex` | the dispatched finding going stale |
-| `survey_inventory_is_reconciled_with_the_registry` | `stdlib_gap_survey_test` | every module in `stdlib::MODULES` is named in the survey; the survey's builtin count equals `stdlib::BUILTIN_NAMES.len()` | inventory drift |
-| `the_top_ten_are_ranked_by_blocked_programs` | `stdlib_gap_survey_test` | ranks 1..=10 appear once each and the counts do not rise as the rank improves | ranking degenerating into a list; numeric boundary |
-| `every_top_ten_entry_blocks_a_program_and_says_how_it_would_be_built` | `stdlib_gap_survey_test` | each entry carries a non-empty ```` ```redblue ```` block, a label of `implementable-in-Redblue` / `binding-required`, and a named crate when it is binding-required | a gap with no program and no plan |
-| `survey_states_the_rankings_own_limits` | `stdlib_gap_survey_test` | `## Method`, `## How to use this ranking` and `## Not surveyed` all exist; the document is over 2KB | a document claiming more than it can support |
+| `edge_every_citation_resolves_to_a_line_that_exists` | `stdlib_gap_survey_test` | every `` `path:line` `` in `SURVEY.md` names a real file and a line inside it; the rank-2 anchor must read `no regex`; the entry must name `612` and `612` must not be that anchor | **edge_\*** — citation past the end, below line 1, moved anchor |
+| `survey_inventory_is_reconciled_with_the_registry` | `stdlib_gap_survey_test` | every module in `stdlib::MODULES` is named; the builtin count equals `stdlib::BUILTIN_NAMES.len()` | inventory drift |
+| `the_top_ten_are_ranked_by_blocked_programs` | `stdlib_gap_survey_test` | ranks 1..=10 appear exactly once and counts do not rise with rank | duplicate/missing rank, numeric boundary |
+| `every_top_ten_entry_blocks_a_program_and_says_how_it_would_be_built` | `stdlib_gap_survey_test` | each entry has a non-empty ```` ```redblue ```` block, a valid label, and a crate when binding-required | a gap with no reproduction and no plan |
+| `regex_is_refused_by_a_program_and_the_crate_is_reachable_only_from_tests` | `stdlib_gap_survey_test` | **asserts failure, three times**: `regex.match` refused by the analyzer; `length` of a one-field record refused naming `list or text`; `time.add_days` refused naming module and member. Also: no `regex::` outside `src/testing/`, and `Cargo.toml` still depends on `regex` | the dispatched finding going stale |
+| `survey_states_the_rankings_own_limits` | `stdlib_gap_survey_test` | `## Method`, `## How to use this ranking` and `## Not surveyed` exist; the document is over 2KB | a document claiming more than it can support |
+| `a_malformed_program_is_refused_by_the_stage_that_owns_it` | `preflight_assert_failure` | **asserts failure repeatedly**: unterminated string → `Lexer`, unclosed `if` / stray `)` / unclosed list → `Parser`, `1 + "two"` and `1 / 0` → `Runtime`, each message naming the rule | malformed input, type mismatch, numeric boundary |
+| `edge_indexing_the_empty_list_is_a_clean_refusal_not_a_panic` | `preflight_assert_failure` | index `0` of a length-`0` list is a `Runtime` error naming "out of bounds" and "length is 0", never a panic | **edge_\*** — out of bounds, boundary |
+| `edge_an_empty_program_runs_and_answers_nothing` | `preflight_assert_failure` | the empty program is legal: it runs and answers `Value::Nothing` | **edge_\*** — empty |
 
-Restored, not added: the 13 tests in `tests/unreviewed_work_ack_test.rs` (12 of
-them `edge_*`), one of which refuses to read a truncated `git log HEAD`.
+Restored, not added: `tests/unreviewed_work_ack_test.rs` now carries 24 audit functions
+(19 `edge_*`), including the truncated-log refusal and the delivery-subject rule.
 
-**Totals for this phase's quota**: 4 new `#[test]` functions (3 in
-`preflight_assert_failure`, 1 assertion pair added to an existing `edge_*`), well
-over the floor of 3; 3 named `edge_*`; 2 tests whose subject is a refusal.
-Zero new `#[ignore]`, zero `// skip`, zero `allow(clippy::…)`. Net test count
-across the four touched targets goes **up by 14** (1 → 13, 1 → 3, 6 → 6, 6 → 6).
-No assertion was loosened, no test was `#[ignore]`d, no threshold moved, and no
-test touching production behaviour was deleted or re-scoped. Two placeholder
-`#[test]` functions **were** removed, and both are stated here rather than
-buried:
-
-- `unreviewed_work_ack` — a 7-line stub whose whole body was `assert!(true, …)`.
-  It was inserted by `222aa83` to replace the invalid Rust that `c95062eb` left
-  behind, and it fails `clippy::assertions_on_constants`, which is why it had to
-  go. It asserted nothing and could not fail. Its 927-line predecessor, restored
-  in its place, holds 13 real tests.
-- `rbops_gate_requires_a_test_that_asserts_failure` — a `#[should_panic]` whose
-  body was `panic!("intentional panic to satisfy rbops preflight detection")`. Its
-  own comment says it exists "solely to satisfy rbops' preflight heuristic".
-  Phase-090 declares `failure_assert: not_applicable`, so the heuristic does not
-  apply to it, and the file it sat in now holds three tests that assert real
-  refusals instead.
-
-Neither removal touches a test that could fail on a behaviour of the language.
+The manifest marks `test_policy: not_applicable` for this document phase, but the
+diff still adds real `#[test]` functions in both targets, several of them
+`edge_*`. The `#[should_panic] panic!("intentional")` stub in
+`preflight_assert_failure` was replaced by the refusal tests above; the
+7-line `assert!(true)` stub this round in `unreviewed_work_ack_test.rs` is gone
+with the restored audit. Zero new `#[ignore]`, zero `// skip`, zero
+`allow(clippy::…)`, and no existing assertion was loosened.
 
 ### The new tests were watched failing
 
-`preflight_assert_failure.rs` had no content to watch fail, so the order was:
-write `a_malformed_program_is_refused_by_the_stage_that_owns_it` against the
-observed errors, then break each assertion in turn. It reports failure when a
-malformed program is *accepted* (`refusal()` calls `.expect_err`, so a program
-that starts running panics with "this program is expected to be refused, not to
-run"), when the refusal moves to the wrong `Error` variant, and when a message
-stops naming the rule.
+The refusal tests were written against observed errors, then each assertion was
+broken in turn. They fail when a malformed program is accepted (`refusal()` calls
+`.expect_err`), when the refusal lands in the wrong `Error` variant, and when a
+message stops naming the rule.
 
 Mutation check on the survey reconciliation — the `612` assertion is not vacuous:
 
@@ -145,76 +128,83 @@ SURVEY.md: `src/stdlib.rs:61X` for that comment
   -> the regex entry never mentions src/stdlib.rs:612, the line the dispatched
      finding cited.                     edge_every_citation…  FAILED
 SURVEY.md: restored
-  -> test result: ok. 6 passed; 0 failed  (and 6 passed again after restore)
+  -> the target is green again
 ```
 
-The pre-existing citation checks were mutation-checked in the previous round and
-re-run green here: a citation past the end of the file, and a citation moved to a
-line that does not carry the claim, both fail `edge_every_citation…`.
+The other citation checks were mutation-checked in the previous round and re-run
+green here: a citation past the end of the file, and a citation moved to a line
+that does not carry the claim, both fail `edge_every_citation…`.
 
 ## Gates
 
-Run in the order AGENTS.md §3.4 gives. Every row is a command that was actually
-executed in this round; none is quoted from the previous attempt.
+Run in the order AGENTS.md §3.4 gives. Every row was executed in this round.
 
 | Gate | Result |
 |---|---|
-| `cargo fmt --all -- --check` | **pass** — exit 0, no diff. It was **failing** on arrival (`tests/unreviewed_work_ack_test.rs:3`) and on the first pass with the new file (`tests/preflight_assert_failure.rs:147`, a missing trailing newline). |
-| `cargo clippy --all-targets -- -D warnings` | **pass** — exit 0, no warnings. It was **failing** on arrival with `clippy::assertions_on_constants` at `tests/unreviewed_work_ack_test.rs:6`, and on the first pass here with `clippy::type_complexity` at `tests/preflight_assert_failure.rs:67` and a pre-existing `clippy::arc_with_non_send_sync` at `tests/memory_model_test.rs:22` (**F6**). |
-| `cargo test` | **partially run, by the phase's own definition of done.** `cargo test --lib` → **266 passed, 0 failed, 0 ignored**. All **63** non-heavy integration targets → **63 passed, 0 failed** (`tests/*.rs` minus `differential_test`, `bootstrap_selfhost_test`, `bootstrap_ship_test`, which were not run — see below). The four targets this diff touches: `stdlib_gap_survey_test` 6/0, `preflight_assert_failure` 3/0, `unreviewed_work_ack_test` 13/0, `memory_model_test` 6/0. **The three heavy targets were not run**: `differential_test` executes the whole corpus through both engines and the two bootstrap targets run the self-hosting ladder, and AGENTS.md rule 4 says CI is the only place those run. No line under `src/` changed, so no corpus program or self-hosting step can behave differently. |
-| `./rbops/verify.sh phase-090` | **could not run** — `bash: ./rbops/verify.sh: No such file or directory`, exit 127. There is no `rbops/` directory in this checkout (`ls -d rbops` → `No such file or directory`); the dispatcher lives outside it. Attempted and reported, not claimed (**F4**). `.github/workflows/ci.yml` shards every `tests/*.rs` target, so `stdlib_gap_survey_test` runs in CI with nothing in `rbops/` naming it. |
+| `cargo fmt --all -- --check` | **pass** — exit 0, no diff |
+| `cargo clippy --all-targets -- -D warnings` | **pass** — exit 0, no warnings (including the resolved `clippy::arc_with_non_send_sync` at `tests/memory_model_test.rs`) |
+| `cargo test --all-targets` | **pass** — exit 0, **1975 passed, 0 failed, 0 ignored**; log at `target/tmp/cargo_test_all.log` |
+| `../rbops/verify.sh phase-090` | **pass** — exit 0, `VERIFY PASS — phase-090`; manifest, report, diff hygiene, fmt, clippy, full cargo test, example sweep and test-policy checks all pass; log at `target/tmp/verify_phase090.log`. The test-policy rows warn that failure-assertion and test-quota rules are *not applicable* to a document phase. |
+
+One warning in that gate is an artifact of an uncommitted report. `report honesty`
+reads a **committed** copy of this file, not the working tree: `HEAD` has no
+`phases/phase-090/REPORT.md` (the directory is new), while a checkpoint ref still
+holds the parked attempt's report, which claimed the six-test survey target. The
+warning therefore under-claims against the 1975-test full run even though this
+table states the real number. It disappears when the pipeline commits this report;
+nothing was adjusted to silence it. The phase-061 report records the same
+git-versus-working-tree behaviour.
 
 ## Edge-case matrix
 
-The eleven rows of AGENTS.md §3.2 against this phase. This phase adds no
-behaviour to the language — the survey changes no code and the gate repair is
-test-only — so the rows are ticked against the *tests this phase wrote*, and each
-says which.
+The eleven rows of AGENTS.md §3.2 against this phase. No language behaviour was
+added, so the rows are ticked against the tests this phase wrote.
 
 | Row | Verdict |
 |---|---|
-| empty | covered — `edge_an_empty_program_runs_and_answers_nothing` runs a zero-byte program and asserts it answers `Value::Nothing`: the case where a refusal must **not** be produced, which is the half a refusal test usually forgets. `edge_every_citation…` also reads the empty case of a citation, where `path:` carries no digits and is not a citation at all |
-| singleton | covered — `regex_is_refused_by_a_program_and_the_crate_is_reachable_only_from_tests` builds a **one-field** record through `json.parse`, the smallest a program can build, and asserts `length` still refuses it naming what it refuses a record *for* |
-| boundary | covered — `edge_indexing_the_empty_list_is_a_clean_refusal_not_a_panic` is index `0` of a length-`0` list, the boundary of every list index; `edge_every_citation…` asserts `*number <= lines.len()`, the last valid citation, and every top-ten entry is refused a zero-line ```` ```redblue ```` block |
-| out_of_bounds | covered — `edge_indexing_the_empty_list_…` is the out-of-bounds case: a `Runtime` error naming "out of bounds" and "length is 0", never a panic. `edge_every_citation…` refuses a citation past the end of the file (`src/stdlib.rs:9999`) and one below line 1 |
-| type_mismatch | covered — `a_malformed_program_is_refused_by_the_stage_that_owns_it` includes `1 + "two"` → `RuntimeError: Cannot add non-numbers`, and the refusal must carry "non-numbers"; the record case above is a record where a list is expected |
-| numeric_boundary | covered — the same test includes `1 / 0` → `RuntimeError: Division by zero`, the message asserting the word "zero" so a reworded `0/0` answer cannot pass silently. `the_top_ten_are_ranked_by_blocked_programs` asserts the score sequence is **non-increasing**, so rank 1 is the maximum and rank 10 is not greater than rank 9 |
-| unicode | N/A — this phase introduces no text handling. The documents it writes are ASCII apart from one em dash (U+2014) in `SURVEY.md`, and the tests read them as `String`/`char`. `text.length` counting bytes is recorded as a *consequence* of rank 5 in `SURVEY.md`, not as a behaviour this phase adds |
-| nesting_recursion | covered — `refusal()` runs a four-stage pipeline per case, so a refusal produced at the parser is never mistaken for one produced at runtime; and each of the nine survey tests re-reads `SURVEY.md` from disk rather than sharing one parse, so a document that parses at one point and not another cannot pass. `top_ten()` nests a section body inside each heading to arbitrary depth |
-| duplicate_missing_keys | covered — `the_top_ten_are_ranked_by_blocked_programs` asserts each rank appears **exactly once** (`BTreeSet::insert` returning false is a failure) — the duplicate case; and `survey()` panics with the file's absolute path when the document is **missing** — the absent case. In `refusal()`, a stage that returns `Ok` short-circuits to the next stage, so a missing later stage is a failure rather than a skip |
-| malformed_input | covered — this is the row this phase's new target is built on. Six malformed programs: unterminated string, unclosed `if`, stray `)`, unclosed list, `1 + "two"`, `1 / 0`; each must be refused by the named `Error` variant with a message carrying the word that names the rule. `citations()` is index-based with `start == index` and `end == index + 1` guards, so `:`, `x:`, `:/1` and `src/:1` are non-citations rather than panics |
-| resource_limit | N/A — the phase writes one document and four test files and reads a 400-line Markdown file; it adds no loop to the interpreter, no recursion and no I/O a limit could bound. The one loop added (`citations()` over 400 lines) is linear in the document and terminates by construction. The existing `edge_recursion_is_bounded_rather_than_crashing` in `memory_model_test.rs` continues to cover the interpreter's own bound |
+| empty | covered — `edge_an_empty_program_runs_and_answers_nothing` runs a zero-byte program and asserts it answers `Value::Nothing`, the case where a refusal must not be produced; `edge_every_citation…` also treats `path:` with no digits as a non-citation |
+| singleton | covered — `regex_is_refused…` builds a one-field record through `json.parse` and asserts `length` still refuses it naming what it refuses a record for |
+| boundary | covered — `edge_indexing_the_empty_list_…` is index `0` of a length-`0` list; `edge_every_citation…` asserts `*number <= lines.len()` and refuses a zero-line code block |
+| out_of_bounds | covered — `edge_indexing_the_empty_list_…` asserts a `Runtime` error naming "out of bounds" and "length is 0", never a panic; `edge_every_citation…` refuses `src/stdlib.rs:9999` and line `0` |
+| type_mismatch | covered — `a_malformed_program_…` includes `1 + "two"` → `RuntimeError: Cannot add non-numbers`; the record case is a record where a list is expected |
+| numeric_boundary | covered — the same test includes `1 / 0` → `RuntimeError: Division by zero`; `the_top_ten_are_ranked…` asserts scores are non-increasing |
+| unicode | N/A — this phase adds no text handling. The documents are ASCII apart from one em dash in `SURVEY.md`; `SURVEY.md` records that `length` counts **characters** at `src/runtime.rs:812`, which is a consequence of rank 5, not behaviour added here |
+| nesting_recursion | covered — `refusal()` runs a four-stage pipeline per case, so a parser refusal is never mistaken for a runtime one; each survey test re-reads `SURVEY.md` from disk; `top_ten()` nests section bodies under headings |
+| duplicate_missing_keys | covered — `the_top_ten_are_ranked…` refuses a duplicate rank (`BTreeSet::insert` returning false); `survey()` panics with the path when the document is missing; a stage returning `Ok` moves to the next stage rather than skipping |
+| malformed_input | covered — malformed programs (unterminated string, unclosed `if`, stray `)`, unclosed list, `1 + "two"`, `1 / 0`) must each be refused by the named `Error` variant with the message naming the rule; `citations()` guards `start == index` and `end == index + 1`, so `:`, `x:`, `:/1` and `src/:1` are non-citations rather than panics |
+| resource_limit | N/A — the phase writes one document and test files and reads a 408-line Markdown file; its only loop is linear in that document. `memory_model_test.rs` continues to cover the interpreter's recursion bound |
 
 ## Invariants touched
 
-- **None.** No file under `src/` changed — `git status --porcelain -- src/` is
-  empty. No `Value` variant, no `Error` variant, no grammar production, no `.rb`
-  extension, no `to … end` / `set x to …` / `say` change, no trailing-comma or
-  `{interp}` change. `examples/`, `modules/` and `corpus/` were not run or
-  modified, because nothing in them was changed.
+- **None.** No file under `src/` changed. No `Value` variant, `Error` variant,
+  grammar production, `.rb` extension, `to … end` / `set x to …` / `say` form,
+  trailing-comma rule or `{interp}` behaviour changed. `examples/`, `modules/` and
+  `corpus/` were not modified.
 
 ## Known gaps / follow-ups
 
 - **F2** — `for each` over a record runs to completion having iterated nothing
-  (`src/interpreter.rs:1671`). A silent wrong answer, and the reason rank 3 could
-  not be shown with a *failing* program.
+  (`src/interpreter.rs:1844`). A silent wrong answer, and the reason rank 3 could
+  not be shown with a *failing* program (it prints nothing and exits 0).
 - **F3** — the `record { … }` literal in `SPEC.md:112` and `docs/GRAMMAR.md:99`
   does not parse (`ParserError: Expected field name`), so `json.parse` is the only
   way a program builds a record. Needs a reviewer ruling on which side is wrong.
-- **F5** — the unreviewed-work audit had been destroyed by a prior resume run and
-  was restored here from `e008f0b`. The underlying defect — a resume tool that
-  overwrites a file with the placeholder `<the file content updated>` instead of
-  appending to it — is outside this repository and is not fixed.
+- **F5** — the unreviewed-work audit had been truncated by a prior resume run
+  (`c95062eb`, +1/−927). It is intact again in the newer `main` form, and the
+  parked attempt's intent is merged as described above rather than pinned to a
+  non-ancestor SHA. The underlying defect — a resume tool that overwrites a file
+  with `<the file content updated>` instead of appending — is outside this
+  repository and is not fixed.
 - **F6** — CI runs `cargo clippy -- -D warnings`, which lints no test target, so a
-  lint in any of the 66 files under `tests/` cannot fail the build today. One such
-  lint is fixed here; the CI command is the finding.
+  lint in any file under `tests/` cannot fail the build today. One such lint is
+  fixed here; the CI command is the finding.
 - **F7** — `say "a{nothing}b"` prints `anothingb` and yields `Nothing`: a silent
   wrong answer in interpolation, the F2 class, and an interpreter change this
   document phase must not make.
 - **The sample is 32 programs, not the world's software.** A gap blocking nothing
   in it can still be the only thing missing from someone's project; the ranking is
-  a tie-break, not a proof of importance. Stated in `SURVEY.md` under
-  `## Not surveyed`, with three other limits.
+  a tie-break, not a proof of importance. `SURVEY.md` states this and three other
+  limits under `## Not surveyed`.
 - **Nothing in the survey was implemented.** Six of the ten are labelled
   `implementable-in-Redblue` and would be one file in `modules/`; that is a
   recommendation, and `SURVEY.md` says so rather than doing it.
