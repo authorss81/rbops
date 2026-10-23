@@ -1131,7 +1131,7 @@ done
   # A dead model chain (75) or an infra-shaped log is a RETRYABLE infra fault.
   # It must never be counted as a phase attempt: nothing was attempted, so
   # burning MAX_ATTEMPTS on it would block a phase that never even ran.
-  if [ "$code" = "75" ] || infra_failure "$LOG_DIR/$phase.log"; then
+  if [ "$code" = "75" ] || { [ "$code" -ne 0 ] && infra_failure "$LOG_DIR/$phase.log"; }; then
     tail -6 "$LOG_DIR/$phase.log" | sed 's/^/    | /'
     defer_phase "$phase" "infra"
     return $?
