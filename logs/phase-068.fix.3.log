@@ -1,0 +1,1147 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0mgit status && git log --oneline -5
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   src/repl/commands.rs
+	modified:   src/repl/completer.rs
+	modified:   src/repl/mod.rs
+	modified:   tests/repl_test.rs
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	phases/phase-068/
+	src/repl/shell.rs
+
+no changes added to commit (use "git add" and/or "git commit -a")
+25502fb rbops: phase-067 (2026-10-24T06:58:16Z)
+22858d6 rbops: phase-066 (2026-10-24T05:05:08Z)
+4685f5a rbops: phase-065 (2026-10-24T04:12:44Z)
+2223189 fix(test): use forward slash in quoted path in repl_test for cross-platform compatibility
+889a8fc rbops: phase-064 (2026-10-23T18:55:16Z)
+[0m
+[0m→ [0mRead src/repl/shell.rs[90m [limit=500][0m
+[0m
+[0m$ [0mfind phases/phase-068 -type f | sort && echo "---" && ls phases/phase-068
+phases/phase-068/FINDINGS.md
+phases/phase-068/REPORT.md
+---
+FINDINGS.md
+REPORT.md
+[0m
+[0m$ [0msed -n '2740,3080p' src/repl/mod.rs
+fn print_functions(&self) {
+        let Some(lines) = self.function_lines() else {
+            println!("No functions defined.");
+            return;
+        };
+
+        println!("Functions:");
+        for line in lines {
+            println!("{}", line);
+        }
+    }
+
+    /// Reads the file at `path` and runs its source in this session's VM.
+    ///
+    /// `:load` runs, which is what `:help` promises: "Load and run a file". It
+    /// used to read the file and print its size without running anything, so a
+    /// session that loaded a file and carried on held none of the bindings the
+    /// file declared.
+    ///
+    /// The source goes through [`Repl::execute_code`] rather than
+    /// [`Repl::run_file`], so the bindings it makes are the session's own and
+    /// stay available to the lines that follow — the difference from `:run`,
+    /// which runs the file in a VM of its own and throws them away.
+    fn load_file(&mut self, path: &str) {
+        let resolved = self.resolve_path(path);
+        let source = match std::fs::read_to_string(&resolved) {
+            Ok(content) => content,
+            Err(e) => {
+                println!("Could not load file: {}: {}", path, e);
+                return;
+            }
+        };
+
+        self.last_file = Some(LastFile::Loaded(path.to_string()));
+        println!("Loaded {} bytes from '{}'.", source.len(), path);
+        // The path, not `<session>`: a name this file binds is reported by
+        // `.which` as `path:line`, which is a place the user can open. A file
+        // that failed to run has said so already, in the same rendered error a
+        // typed line would have produced.
+        let _ = self.execute_code_from(path, 0, &source);
+    }
+
+    /// The directory the process started in, which is where a fresh session is.
+    fn process_directory() -> PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    /// The user's home directory, when the host has one.
+    fn home_directory() -> Option<PathBuf> {
+        #[cfg(windows)]
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+        #[cfg(not(windows))]
+        let home = std::env::var_os("HOME");
+        home.map(PathBuf::from).filter(|path| path.is_absolute())
+    }
+
+    /// `path` with a leading `~` or `~/` replaced by `home`.
+    ///
+    /// Only the current user's home is expanded: `~other/name` needs the system
+    /// account database, which this session deliberately does not read. A
+    /// missing home leaves the path as typed, so a failure names what the user
+    /// actually wrote.
+    fn expand_tilde_with_home(path: &str, home: Option<&Path>) -> PathBuf {
+        let Some(rest) = path.strip_prefix('~') else {
+            return PathBuf::from(path);
+        };
+        if !rest.is_empty() && !rest.starts_with(['/', '\\']) {
+            return PathBuf::from(path);
+        }
+        match home {
+            Some(home) if rest.is_empty() => home.to_path_buf(),
+            Some(home) => home.join(rest.trim_start_matches(['/', '\\'])),
+            None => PathBuf::from(path),
+        }
+    }
+
+    /// `path` as this session means it: a leading `~` expanded, an absolute path
+    /// unchanged, a relative one under the session's working directory.
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        let path = Self::expand_tilde_with_home(path, Self::home_directory().as_deref());
+        if path.is_absolute() {
+            path
+        } else {
+            self.cwd.join(path)
+        }
+    }
+
+    /// Removes `.` and `..` from `path` without resolving symlinks.
+    ///
+    /// `canonicalize` was doing two jobs: validating the directory and turning
+    /// it into the real path. The second is not what `.cd` means — a session
+    /// that entered `link` should still say `link` — so validation uses
+    /// `metadata` (which follows the link) and the stored path stays lexical.
+    fn normalize_path(path: PathBuf) -> PathBuf {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normalized.pop() && !normalized.has_root() {
+                        normalized.push(component.as_os_str());
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                    normalized.push(component.as_os_str());
+                }
+            }
+        }
+        normalized
+    }
+
+    /// The directory relative file arguments are resolved against.
+    fn session_directory(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// Moves the session, not the process.
+    ///
+    /// A path that is not a directory leaves the session where it was: half a
+    /// `.cd` would be a session that cannot say which directory its next
+    /// relative `:load` means.
+    fn change_directory(&mut self, path: &str) -> Result<(), String> {
+        let candidate = self.resolve_path(path.trim());
+        let metadata = candidate
+            .metadata()
+            .map_err(|error| format!("Error: could not change directory to '{path}': {error}"))?;
+        if !metadata.is_dir() {
+            return Err(format!("Error: '{path}' is not a directory."));
+        }
+        self.cwd = Self::normalize_path(candidate);
+        Ok(())
+    }
+
+    /// The visible entries of the session directory, directories marked.
+    fn directory_listing(&self) -> Result<Vec<String>, String> {
+        shell::listing(&self.cwd)
+    }
+
+    fn print_session_listing(&self) {
+        match self.directory_listing() {
+            Ok(names) => {
+                println!("{}:", self.cwd.display());
+                for name in names {
+                    println!("{name}");
+                }
+            }
+            Err(message) => println!("{}", self.style.paint(Paint::Error, &message)),
+        }
+    }
+
+    /// `!<command>`: run it in the host shell and show what it said.
+    fn run_shell(&self, command: &str) {
+        match shell::run(command) {
+            Ok(outcome) => self.print_shell_outcome(&outcome),
+            Err(message) => println!("{}", self.style.paint(Paint::Error, &message)),
+        }
+    }
+
+    /// `.pipe <command>`: the last value this session produced, on the
+    /// command's standard input.
+    ///
+    /// The value comes from `_`, the same binding the prompt shows after a
+    /// line, so what `.pipe` sends is what the user just saw.
+    fn pipe_last(&self, command: &str) -> Result<shell::ShellOutcome, String> {
+        let value = self.variables.get("_").ok_or_else(|| {
+            "Error: .pipe has no last result to send; run a line that produces a \
+             value first."
+                .to_string()
+        })?;
+        let owned: String;
+        let input = match value {
+            Value::Text(text) => text.as_str(),
+            other => {
+                owned = other.to_string();
+                owned.as_str()
+            }
+        };
+        shell::pipe(command, input)
+    }
+
+    /// Shows a command's own output and the status the host gave it.
+    ///
+    /// A nonzero status is a fact about the command, not a failure of the REPL,
+    /// so it is printed as an exit code and the session stays where it was.
+    fn print_shell_outcome(&self, outcome: &shell::ShellOutcome) {
+        if !outcome.stdout.is_empty() {
+            print!("{}", outcome.stdout);
+            if !outcome.stdout.ends_with('\n') {
+                println!();
+            }
+        }
+        if !outcome.stderr.is_empty() {
+            eprint!("{}", outcome.stderr);
+            if !outcome.stderr.ends_with('\n') {
+                eprintln!();
+            }
+        }
+        if outcome.truncated {
+            let limit = shell::MAX_OUTPUT_BYTES / (1024 * 1024);
+            eprintln!("[output stopped after {limit} MiB]");
+        }
+        match outcome.code {
+            Some(code) => println!("exit code: {code}"),
+            None => println!("exit: terminated by a signal"),
+        }
+        let _ = io::stdout().flush();
+    }
+
+    /// Writes the session's history to `path`, one entry per line, in the
+    /// format [`ReplHistory::load_from_file`] reads back — and read back by
+    /// [`Repl::restore_session`], which is what made the round trip one.
+    fn save_session(&self, path: &str) {
+        let mut document = String::new();
+        for index in 0..self.history.len() {
+            if let Some(entry) = self.history.get(index) {
+                document.push_str(entry);
+                document.push('\n');
+            }
+        }
+
+        // Only a session carrying aliases or macros gets a state section. A
+        // session without them writes exactly the history file it always did,
+        // which is what keeps an existing saved session readable and its line
+        // count unchanged.
+        if !self.aliases.is_empty() || !self.macros.is_empty() {
+            document.push_str(SESSION_STATE_MARKER);
+            document.push('\n');
+
+            let mut aliases: Vec<(&String, &String)> = self.aliases.iter().collect();
+            aliases.sort_by(|left, right| left.0.cmp(right.0));
+            for (name, value) in aliases {
+                document.push_str(&format!("alias {name} {value}\n"));
+            }
+
+            let mut macros: Vec<(&String, &Vec<String>)> = self.macros.iter().collect();
+            macros.sort_by(|left, right| left.0.cmp(right.0));
+            for (name, lines) in macros {
+                document.push_str(&format!("macro {name} {}\n", lines.len()));
+                for line in lines {
+                    document.push_str(line);
+                    document.push('\n');
+                }
+            }
+        }
+
+        let destination = self.resolve_path(path);
+        match std::fs::write(&destination, document) {
+            Ok(()) => println!(
+                "Session saved to '{}' ({} line(s)).",
+                path,
+                self.history.len()
+            ),
+            Err(e) => println!("Could not save session: {}", e),
+        }
+    }
+
+    /// Writes the session as Markdown — to `path`, or to stdout when given
+    /// nothing — and says where it went.
+    ///
+    /// The other half of `:save`, and a different document. `:save` writes the
+    /// lines the session *typed*, one per line, so a session can be restored; this
+    /// writes what the session *ran* and what it said, so a reader who was not at
+    /// the terminal can read it. Neither is the other: a transcript of inputs and
+    /// no outputs is a log, and the scrollback it replaces carried the prompts and
+    /// the colour codes as well.
+    ///
+    /// The destination is part of what the command means, so the message names it
+    /// and a failure names the path that failed — "No such file or directory"
+    /// alone does not say which of the paths in the command was at fault.
+    fn export_session(&self, path: Option<&str>) {
+        let document = self.transcript.markdown();
+        match path {
+            None => println!("{}", document.trim_end()),
+            Some(path) => match std::fs::write(self.resolve_path(path), &document) {
+                Ok(()) => println!(
+                    "Exported {} exchange(s) to '{}'.",
+                    self.transcript.len(),
+                    path
+                ),
+                Err(e) => println!("Could not export session to '{}': {}", path, e),
+            },
+        }
+    }
+
+    /// Reads a history file written by [`Repl::save_session`] back into this
+    /// session, and re-runs what it holds.
+    ///
+    /// `:save` had no other half: nothing in the REPL ever called
+    /// [`ReplHistory::load_from_file`], so a saved session could not be loaded
+    /// and the round trip was asserted only between two `ReplHistory`s in a unit
+    /// test, never through the commands that write and read the file.
+    ///
+    /// The file replaces the history rather than being appended to it: `:save`
+    /// writes the whole session, so restoring it into a session that has since
+    /// typed more lines would give back two sessions at once.
+    ///
+    /// The lines are *run*, not only listed. A restore that only filled the
+    /// history printed "Restored 2 line(s)" and left the session unable to read
+    /// what those lines had bound: `set x to 1`, `:save`, a fresh session,
+    /// `:restore`, `say x` was still `AnalyzerError: Unknown variable 'x'`. The
+    /// lines were back and the state they had made was not, which is the half
+    /// `:restore` was named for.
+    fn restore_session(&mut self, path: &str) {
+        let resolved = self.resolve_path(path);
+        let document = match std::fs::read_to_string(&resolved) {
+            Ok(document) => document,
+            Err(e) => {
+                println!("Could not restore session: {}", e);
+                return;
+            }
+        };
+
+        // The state section, when there is one, is after the marker. The history
+        // is what came before it, so the marker and the records after it are not
+        // loaded as lines the user appears to have typed.
+        let (history_text, state_text) = Self::split_session_state(&document);
+
+        let mut restored = ReplHistory::new(HISTORY_LIMIT);
+        for line in history_text.lines() {
+            if !line.trim().is_empty() {
+                restored.push(line.to_string());
+            }
+        }
+
+        let lines: Vec<String> = (0..restored.len())
+            .filter_map(|index| restored.get(index).cloned())
+            .collect();
+        let restored_lines = lines.len();
+        self.history = restored;
+
+        let restored = Self::parse_session_state(state_text);
+        for warning in restored.warnings {
+            println!("{}", warning);
+        }
+        self.aliases = restored.aliases;
+        self.macros = restored.macros;
+
+        let (replayed, skipped) = self.replay(&lines);
+        println!("Restored {} line(s) from '{}'", restored_lines, path);
+        if restored_lines > 0 {
+            println!(
+[0m
+[0m$ [0mcat phases/phase-068/FINDINGS.md && echo "=====REPORT=====" && cat phases/phase-068/REPORT.md
+# Phase 068 — findings outside this phase
+
+## TAB completion still uses the process directory
+
+`src/repl/completer.rs:412` completes a path argument with `current_dir()`, which
+is the process directory. After `.cd`, `:load <TAB>` therefore still offers the
+process tree while `:load <name>` resolves against the session directory. `.ls`
+makes the session directory visible but does not move completion.
+
+This needs the editor's `SessionCompleter` to receive the session `cwd` (the same
+snapshot mechanism it already uses for names), or `ReplCompleter::complete_path`
+to take the directory as an argument. Out of scope here because it changes the
+editor/REPL plumbing and the phase's shell/directory commands are complete and
+gated without it.
+
+## `.debug <relative file>` still uses the process directory
+
+`src/repl/debug_repl.rs:440` reads a debug file with `std::fs::read_to_string`
+directly. The phase finding named `:load`, `:save` and `:export`; the debug
+sub-REPL's file argument should use the same session resolver in a follow-up.
+=====REPORT=====
+# Phase 068 — Talk to the shell without leaving: `!cmd`, `.pipe`, `.cd`, `.pwd`, `.ls`
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| src/repl/shell.rs | +460 | new host-shell module: deadline-bounded `run`, streaming `pipe`, capped output, `listing`, `ShellOutcome`, and the clean no-shell refusal |
+| src/repl/mod.rs | +574 −18 | `cwd` session state, tilde-aware path resolution for every file argument, symlink-preserving `.cd`, `.cd`/`.pwd`/`.ls` dispatch and listing, `!` and `.pipe` dispatch, shell output/exit/truncation rendering, help line, cwd in checkpoints/reset |
+| src/repl/commands.rs | +134 −0 | `Shell`, `Pipe`, `ChangeDir`, `PrintWorkingDirectory`, `ListDirectory` variants and table rows; `!` special parse; `.cd` path completion and `<directory>` usage; argument-text coverage |
+| src/repl/completer.rs | +1 −1 | `DIRECTORY_SEPARATOR` shared with `.ls` so both use the same directory marking |
+| tests/repl_test.rs | +41 | end-to-end `!` output/exit and `.pipe`/`.cd`/`.pwd`/`.ls`/`:load` session test, run on every host |
+
+`!cmd` runs through `sh -c` (or `cmd /C` on Windows), prints the command's stdout and stderr, and always reports its exit status. A failing command's status is printed as `exit code: N`; it is the command's result, not a REPL error. An empty `!` is refused with a usage line before any process is spawned.
+
+`.pipe <cmd>` writes the session's `_` value to the command's stdin. The writer runs on its own thread while the main thread drains stdout and stderr, so a 1 MB payload through `cat` cannot deadlock on a full output pipe. No last result is a named refusal.
+
+Both shell paths now have a deadline (30 seconds) and a per-stream output cap (8 MiB): a command that would hold the session for ever is killed, and one that would fill memory has its read end closed and is reported as truncated. The pipe writer distinguishes a broken pipe — the command stopped reading, which is its own answer — from any other write failure, which is reported instead of silently discarded. `.cd` validates through `metadata` and stores the lexical path, so entering a symlink keeps the name the user typed rather than rewriting it to the target; `~` at the start of a path expands to the host home directory.
+
+The session now owns a working directory (`cwd`), distinct from the process directory. `.cd` changes only the session and leaves it unchanged on failure; `.pwd` prints it. `.ls` lists it with a trailing `/` on directories, using the same constant as phase-060 completion. `:load`, `:save`, `:restore`, `:run` and `.export` resolve relative paths against it. Checkpoints carry `cwd`, and `:reset` returns it to the process directory.
+
+Host-only status is stated in the help text and in the `.pipe` description; a target without `sh`/`cmd` gets `NO_SHELL` rather than an obscure spawn failure.
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| shell_runs_a_host_command_and_reports_output_and_exit_code | happy path — output and zero exit asserted separately |
+| edge_shell_reports_a_failing_exit_code_instead_of_a_repl_failure | failure — non-zero status is surfaced, not translated into `Error:` |
+| edge_shell_with_an_empty_command_is_a_usage_error_and_spawns_nothing | empty / malformed input — `!` with no command |
+| pipe_sends_the_last_value_to_the_commands_stdin | direction — `_` reaches `cat`'s stdin, not its stdout |
+| edge_pipe_with_no_last_result_names_what_is_missing | empty — no `_` yet |
+| edge_pipe_to_a_failing_command_surfaces_its_exit_and_keeps_the_session | failure + state — exit 9, bindings survive |
+| edge_pipe_streams_a_megabyte_payload | resource limit — 1 MB survives unchanged without deadlock |
+| edge_change_directory_to_a_missing_path_names_it_and_leaves_the_directory_alone | missing / failure — path named, cwd unchanged |
+| edge_change_directory_makes_load_resolve_there_and_pwd_is_distinct | boundary — session directory is not the process directory; bare `:load` resolves there; `.ls` agrees |
+| edge_change_directory_accepts_a_relative_path_from_the_session_directory | relative path — `.cd nested` and `.cd ..` resolve under the session directory |
+| edge_restore_brings_back_the_session_directory | checkpoint state — restoring a checkpoint restores the directory relative paths resolve against |
+| edge_reset_returns_the_session_directory_to_the_process_directory | reset state — `:reset` moves the session back to the process directory |
+| edge_shell_carries_unicode_through_unchanged | unicode — emoji and accents in command output |
+| edge_listing_marks_directories_with_the_completion_separator | boundary — directories end in `/`, files do not |
+| edge_a_command_that_overruns_its_deadline_is_stopped (shell.rs) | resource limit — a command that never exits is killed and named |
+| edge_a_pipe_command_that_overruns_its_deadline_is_stopped (shell.rs) | resource limit — the same deadline covers a command that owns stdin |
+| edge_output_over_the_limit_is_closed_and_marked_truncated (shell.rs) | resource limit — an endless writer is capped and the outcome says so |
+| edge_pipe_to_a_command_that_stops_reading_is_not_a_repl_failure (shell.rs) | failure — the command's early close is its own answer, not a second error |
+| edge_a_leading_tilde_expands_to_the_home_directory | path edge — `~` expands only as the first component and only when a home exists |
+| edge_change_directory_keeps_the_symlink_path_the_user_entered | boundary — `.cd link` keeps `link`, rather than rewriting it to the target |
+| empty_shell_command_is_refused_without_starting_a_process (shell.rs) | empty — the refusal is the constant, before spawn |
+| listing_of_a_missing_directory_names_the_path (shell.rs) | missing resource — listing failure names the path |
+| edge_shell_and_directory_commands_parse (commands.rs) | malformed input — `!` keeps the whole command, empty `!`, missing `.pipe`/`.cd` arguments, `.pwd`/`.ls` |
+| shell_escape_shows_command_output_and_exit_code (repl_test.rs) | end-to-end dispatch — `hi`, zero exit and failing exit in one session |
+| edge_pipe_cd_and_ls_use_the_session_directory (repl_test.rs) | end-to-end state on every host — pipe output through `sort`, `.cd`, `.pwd`, `.ls` and `:load` share one directory |
+
+### Mandatory edge-case matrix
+
+- **empty** — covered: empty `!`, empty `.pipe` argument, no last `_`, and an empty command refused before spawning.
+- **singleton** — covered: exactly one last value piped, one directory changed, one file loaded by bare name.
+- **boundary** — covered: session directory versus process directory; directory separator in `.ls`; a 1 MB payload boundary.
+- **out_of_bounds** — N/A: no indexing or positional access was added; a missing path is the nearest analogue and is covered as a clean error.
+- **type_mismatch** — N/A: `.pipe` accepts any `Value` and renders it as text; no command takes a typed value and no coercion was added.
+- **numeric_boundary** — N/A: no arithmetic or numeric formatting was added; exit codes are the host's own `i32`.
+- **unicode** — covered: `edge_shell_carries_unicode_through_unchanged`.
+- **nesting_recursion** — N/A: no recursive structure is walked; values are rendered by the existing `Display`.
+- **duplicate_missing_keys** — N/A: no keyed collection is added or read by these commands; missing paths are covered.
+- **malformed_input** — covered: empty `!`, missing `.pipe`/`.cd` arguments, missing directory, missing listing path.
+- **resource_limit** — covered: the 1 MB pipe test, the 30-second command deadline, the 8 MiB output cap, and an endless writer whose read end is closed; listing is a directory read, bounded by the filesystem listing already used by completion.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| cargo fmt --all -- --check | pass |
+| cargo clippy --all-targets -- -D warnings | pass |
+| cargo test --all-targets | 2132 passed, 0 failed, 0 ignored |
+| ../rbops/verify.sh phase-068 | pass — `VERIFY PASS — phase-068` |
+
+## Invariants touched
+
+- None in the language: no grammar, keyword, `Value`/`Error` variant or `.rb` extension changed.
+- REPL-only: `!` is a new command prefix, and `.pipe`/`.cd`/`.pwd`/`.ls` are new command-table entries. `:load`, `:save`, `:restore`, `:run` and `.export` now resolve relative paths against the session directory; absolute paths are unchanged.
+- Checkpoints now include the session directory, so restoring a checkpoint restores where relative paths point as well as the bindings.
+
+## Known gaps / follow-ups
+
+- TAB completion still resolves paths against the process directory, not the session directory. `.ls` makes the session directory visible, but a `.cd` followed by `:load <TAB>` still offers the old tree. This needs the editor's completer to receive the session `cwd`; recorded in FINDINGS.md rather than smuggled into this phase.
+- `.debug <relative file>` still reads against the process directory. The finding named `:load`, `:save` and `:export`; opening the debug sub-REPL on a file is a separate path and should share the resolver in a follow-up.
+[0m
+[0m$ [0mgrep -n "tempfile\|temp_dir\|OsStringExt\|non.utf\|non_utf\|from_bytes" -r src tests Cargo.toml | head -50
+src/repl/debug_repl.rs:761:        let dir = std::env::temp_dir().join(format!(
+src/repl/history.rs:426:        let mut name = scratch_name("non-utf8").into_bytes();
+src/repl/history.rs:428:        let path = scratch_dir().join(OsStr::from_bytes(&name));
+src/repl/mod.rs:4288:        let scratch = std::env::temp_dir();
+src/repl/mod.rs:6874:        fn temp_dir(name: &str) -> std::path::PathBuf {
+src/repl/mod.rs:6986:            let dir = temp_dir("repl_type_effects");
+src/repl/mod.rs:7152:            let dir = temp_dir("repl_type_callee");
+src/repl/mod.rs:7248:            let dir = temp_dir("repl_type_only_questions");
+tests/wasm_test.rs:271:fn files_reads_back_what_it_wrote_in_a_temp_dir() {
+tests/wasm_test.rs:272:    let dir = temp_dir("wasm_files_round_trip");
+tests/wasm_test.rs:303:    let dir = temp_dir("wasm_files_missing");
+tests/wasm_test.rs:682:    let dir = temp_dir("wasm_bytes_round_trip");
+tests/wasm_test.rs:1147:    let dir = temp_dir("wasm_not_text");
+tests/wasm_test.rs:1179:fn temp_dir(name: &str) -> std::path::PathBuf {
+tests/phase_088_scanner_test.rs:108:        let root = std::env::temp_dir().join(format!(
+tests/handout_claims_test.rs:52:    let dir = std::env::temp_dir().join(format!(
+tests/stdlib_modules_test.rs:135:fn files_write_then_read_round_trips_in_a_temp_dir() {
+tests/bytecode_test.rs:245:fn edge_non_utf8_string_constant_is_rejected() {
+tests/discovery_test.rs:227:fn edge_non_utf8_rb_file_is_reported_as_an_io_error() {
+tests/discovery_test.rs:228:    let dir = scratch_dir("non-utf8");
+[0m
+[0m$ [0mgrep -n "save_session\|restore_session\|Could not save session\|Could not restore session" src/repl/mod.rs
+149:/// was, and it is read back by [`Repl::restore_session`] before the history is
+1640:                self.save_session(&path);
+1656:                    self.restore_session(&path);
+2950:    /// [`Repl::restore_session`], which is what made the round trip one.
+2951:    fn save_session(&self, path: &str) {
+2992:            Err(e) => println!("Could not save session: {}", e),
+3024:    /// Reads a history file written by [`Repl::save_session`] back into this
+3042:    fn restore_session(&mut self, path: &str) {
+3047:                println!("Could not restore session: {}", e);
+3106:    /// Reads the aliases and macros [`Repl::save_session`] wrote after the state
+[0m
+[0m← [0mEdit src/repl/shell.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
+@@ -186,10 +186,10 @@
+         }
+     };
+ 
+     let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+-    let (stdout, stdout_truncated) = join_reader(stdout, drain_deadline);
+-    let (stderr, stderr_truncated) = join_reader(stderr, drain_deadline);
++    let (stdout, stdout_truncated) = join_reader(stdout, drain_deadline)?;
++    let (stderr, stderr_truncated) = join_reader(stderr, drain_deadline)?;
+ 
+     Ok(Collected {
+         stdout,
+         stderr,
+@@ -203,23 +203,29 @@
+ /// A reader that is still blocked when the deadline passes is detached, so a
+ /// process that inherited the pipe cannot turn a finished command into a hung
+ /// session. The empty result is marked truncated because output that was still
+ /// in the pipe was not read.
++///
++/// A reader that panicked is an error rather than empty output: the command did
++/// write something, and reporting nothing would hide both the loss and the
++/// failure that caused it.
+ #[cfg(any(unix, windows))]
+ fn join_reader(
+     handle: Option<thread::JoinHandle<(Vec<u8>, bool)>>,
+     deadline: Instant,
+-) -> (Vec<u8>, bool) {
++) -> Result<(Vec<u8>, bool), String> {
+     let Some(handle) = handle else {
+-        return (Vec::new(), false);
++        return Ok((Vec::new(), false));
+     };
+     while !handle.is_finished() {
+         if Instant::now() >= deadline {
+-            return (Vec::new(), true);
++            return Ok((Vec::new(), true));
+         }
+         thread::sleep(POLL_INTERVAL);
+     }
+-    handle.join().unwrap_or_default()
++    handle.join().map_err(|_| {
++        "Error: the shell command's output reader stopped unexpectedly.".to_string()
++    })
+ }
+ 
+ /// Runs `command` in the host shell and waits for it to finish.
+ pub fn run(command: &str) -> Result<ShellOutcome, String> {
+
+[0m
+[0m← [0mEdit src/repl/shell.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
+@@ -350,11 +350,12 @@
+     .map_err(|error| format!("Error: could not list {}: {error}", path.display()))?;
+ 
+ let mut names = Vec::new();
+ for entry in entries.flatten() {
+-    let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+-        continue;
+-    };
++    // A name the host cannot render as text is still an entry: replacing
++    // the undecodable bytes keeps it visible instead of letting `.ls`
++    // silently disagree with the directory.
++    let name = entry.file_name().to_string_lossy().into_owned();
+     if name.starts_with('.') {
+         continue;
+     }
+     let separator = if entry
+
+[0m
+[0m$ [0msed -n '400,445p' src/repl/history.rs && sed -n '743,780p' src/repl/debug_repl.rs
+/// A limit of zero means "keep nothing", so a push into it must store
+    /// nothing rather than the single entry that pop-then-push leaves behind.
+    #[test]
+    fn edge_zero_size_history_stores_nothing() {
+        let mut history = ReplHistory::new(0);
+
+        history.push("set x to 1".to_string());
+
+        assert_eq!(
+            history.len(),
+            0,
+            "a zero-sized history cannot hold an entry"
+        );
+        assert!(history.is_empty());
+    }
+
+    /// A path is a path, not text. Naming the parameter `&str` meant a history
+    /// file whose own name is not UTF-8 could not be saved or loaded at all, and
+    /// every caller holding a `PathBuf` had to convert lossily to name one.
+    #[cfg(unix)]
+    #[test]
+    fn edge_a_file_whose_own_name_is_not_utf8_can_be_saved_and_loaded() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut name = scratch_name("non-utf8").into_bytes();
+        name.extend_from_slice(&[0xff, 0xfe]);
+        let path = scratch_dir().join(OsStr::from_bytes(&name));
+        let _ = fs::remove_file(&path);
+
+        let saved = filled(&["set x to 1"]);
+        saved
+            .save_to_file(&path)
+            .expect("a non-UTF-8 path is still a path");
+
+        let mut loaded = ReplHistory::new(100);
+        loaded
+            .load_from_file(&path)
+            .expect("and it reads back the same way");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(0).map(String::as_str), Some("set x to 1"));
+
+        let _ = fs::remove_file(&path);
+    }
+    //! The scratch VM a watch is evaluated on, and the roots it resolves against.
+
+    use std::path::PathBuf;
+
+    use crate::parser::Program;
+    use crate::repl::style::Style;
+    use crate::Vm;
+
+    use super::{lock, DebugRepl};
+
+    /// A directory of its own with a module in it.
+    ///
+    /// The module is called `Probe` and exists nowhere else, so an import of it
+    /// only resolves for a VM rooted here. The process's own directory has
+    /// `modules/MathUtils.rb` and `modules/SuiteKit.rb` and no `Probe`, so a VM
+    /// rooted at `.` cannot import it - which is what makes the difference
+    /// between the two roots observable at all.
+    fn directory_with_a_probe_module() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "redblue_watch_root_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let modules = dir.join("modules");
+        std::fs::create_dir_all(&modules).expect("the module directory should be creatable");
+        std::fs::write(
+            modules.join("Probe.rb"),
+            "module Probe\n    to probe()\n        give back 7\n    end\n    export all\nend\n",
+        )
+        .expect("the module should be writable");
+        dir
+    }
+
+    /// The program `source` is, parsed but not analysed.
+    fn program(source: &str) -> Program {
+        let tokens = crate::lexer::Lexer::tokenize(source).expect("the source should lex");
+[0m
+[0m$ [0mgrep -n "fn scratch_dir\|fn scratch_name" -A12 src/repl/history.rs
+139:    fn scratch_name(prefix: &str) -> String {
+140-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+141-        let serial = COUNTER.fetch_add(1, Ordering::SeqCst);
+142-        format!("{}-{}", prefix, serial)
+143-    }
+144-
+145-    /// Where the history files under test are written, inside the project
+146-    /// checkout rather than in a user's temp directory.
+147:    fn scratch_dir() -> PathBuf {
+148-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/repl-history");
+149-        fs::create_dir_all(&dir).expect("scratch directory should be creatable");
+150-        dir
+151-    }
+152-
+153-    /// Where the history file under test is written.
+154-    fn scratch_path(name: &str) -> PathBuf {
+155-        scratch_dir().join(format!("{}.txt", scratch_name(name)))
+156-    }
+157-
+158-    fn filled(entries: &[&str]) -> ReplHistory {
+159-        let mut history = ReplHistory::new(100);
+[0m
+[0m← [0mEdit src/repl/shell.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/shell.rs
+@@ -377,8 +377,38 @@
+ #[cfg(test)]
+ mod tests {
+     use super::{listing, run, EMPTY_COMMAND};
+ 
++    /// A command that keeps the shell busy past any test deadline.
++    #[cfg(any(unix, windows))]
++    fn sleep_command() -> &'static str {
++        if cfg!(windows) {
++            "ping -n 6 127.0.0.1 > nul"
++        } else {
++            "exec sleep 5"
++        }
++    }
++
++    /// A command that writes far more than a small output limit.
++    #[cfg(any(unix, windows))]
++    fn endless_output_command() -> &'static str {
++        if cfg!(windows) {
++            "for /L %i in (1,1,1000000) do @echo x"
++        } else {
++            "yes"
++        }
++    }
++
++    /// A command that succeeds without reading its standard input.
++    #[cfg(any(unix, windows))]
++    fn immediate_command() -> &'static str {
++        if cfg!(windows) {
++            "exit /b 0"
++        } else {
++            "true"
++        }
++    }
++
+     #[test]
+     fn empty_shell_command_is_refused_without_starting_a_process() {
+         assert_eq!(run(" ").unwrap_err(), EMPTY_COMMAND);
+     }
+@@ -394,11 +424,35 @@
+     }
+ 
+     #[cfg(unix)]
+     #[test]
++    fn edge_listing_keeps_names_that_are_not_utf8() {
++        use std::ffi::OsStr;
++        use std::os::unix::ffi::OsStrExt;
++
++        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("target/tmp/repl-shell/non-utf8-listing");
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).expect("the scratch directory should be creatable");
++        std::fs::write(dir.join(OsStr::from_bytes(b"bad-\xff-name")), b"x")
++            .expect("a non-UTF-8 name is still a file name");
++
++        let names = listing(&dir).expect("the directory should be listable");
++        let _ = std::fs::remove_dir_all(&dir);
++
++        assert!(
++            names
++                .iter()
++                .any(|entry| entry.contains("bad-") && entry.contains("-name")),
++            "the undecodable name is listed rather than silently skipped: {names:?}"
++        );
++    }
++
++    #[cfg(any(unix, windows))]
++    #[test]
+     fn edge_a_command_that_overruns_its_deadline_is_stopped() {
+         let refusal = super::run_with(
+-            "exec sleep 5",
++            sleep_command(),
+             std::time::Duration::from_millis(100),
+             super::MAX_OUTPUT_BYTES,
+         )
+         .expect_err("a command that outlives its deadline is stopped");
+@@ -408,13 +462,13 @@
+             "the refusal says the command was stopped rather than waiting for ever: {refusal}"
+         );
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, windows))]
+     #[test]
+     fn edge_a_pipe_command_that_overruns_its_deadline_is_stopped() {
+         let refusal = super::pipe_with(
+-            "exec sleep 5",
++            sleep_command(),
+             "input",
+             std::time::Duration::from_millis(100),
+             super::MAX_OUTPUT_BYTES,
+         )
+@@ -425,13 +479,17 @@
+             "the refusal says the pipe command was stopped: {refusal}"
+         );
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, windows))]
+     #[test]
+     fn edge_output_over_the_limit_is_closed_and_marked_truncated() {
+-        let outcome = super::run_with("yes", std::time::Duration::from_secs(5), 32)
+-            .expect("a command whose output is capped still finishes");
++        let outcome = super::run_with(
++            endless_output_command(),
++            std::time::Duration::from_secs(5),
++            32,
++        )
++        .expect("a command whose output is capped still finishes");
+ 
+         assert!(
+             outcome.truncated,
+             "the outcome says the output was cut short"
+@@ -442,13 +500,13 @@
+             "and exactly the limit was kept, not the whole stream"
+         );
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(any(unix, windows))]
+     #[test]
+     fn edge_pipe_to_a_command_that_stops_reading_is_not_a_repl_failure() {
+         let outcome = super::pipe_with(
+-            "true",
++            immediate_command(),
+             &"x".repeat(1024 * 1024),
+             std::time::Duration::from_secs(5),
+             super::MAX_OUTPUT_BYTES,
+         )
+@@ -463,5 +521,24 @@
+             !outcome.truncated,
+             "nothing was written back, so nothing was truncated"
+         );
+     }
++
++    #[cfg(any(unix, windows))]
++    #[test]
++    fn edge_a_panicking_output_reader_is_reported_instead_of_dropping_output() {
++        let handle = std::thread::spawn(|| -> (Vec<u8>, bool) {
++            panic!("the reader failed");
++        });
++
++        let result = super::join_reader(
++            Some(handle),
++            std::time::Instant::now() + std::time::Duration::from_secs(1),
++        );
++
++        let refusal = result.expect_err("a panicked reader is a failure, not empty output");
++        assert!(
++            refusal.contains("reader"),
++            "the refusal names the failed reader: {refusal}"
++        );
++    }
+ }
+
+[0m
+[0m$ [0mgrep -rn "Could not save session\|Could not restore session\|Could not export session" . --include=*.rs
+./tests/repl_test.rs:773:        .assert_stdout_contains("Could not restore session:")
+./tests/repl_test.rs:834:        .assert_stdout_contains("Could not restore session:")
+./src/repl/mod.rs:2992:            Err(e) => println!("Could not save session: {}", e),
+./src/repl/mod.rs:3019:                Err(e) => println!("Could not export session to '{}': {}", path, e),
+./src/repl/mod.rs:3047:                println!("Could not restore session: {}", e);
+[0m
+[0m$ [0msed -n '750,850p' tests/repl_test.rs
+3,
+        "every line of the session was written to the file:\n{}",
+        contents
+    );
+}
+
+/// A restore of a file that is not there is reported, and the session that asked
+/// for it keeps its own history.
+#[test]
+fn edge_restore_of_a_missing_path_reports_the_failure() {
+    let missing = scratch_path("never-saved", "txt");
+    std::fs::remove_file(&missing).expect("the scratch file should be removable");
+    assert!(
+        !missing.exists(),
+        "the path under test must not exist before the test runs"
+    );
+
+    let s = session(&format!(
+        "set kept to 1\n:restore {}\n:history\n:quit\n",
+        missing.display()
+    ));
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("Could not restore session:")
+        .assert_stdout_contains("     1  set kept to 1");
+}
+
+/// A checkpoint is the whole session, not just the binding map: `.restore`
+/// brings back the value a name had and the last result `_` that was showing,
+/// and `.sessions` lists it as the current checkpoint.
+#[test]
+fn checkpoint_restore_brings_back_bindings_and_last_result_end_to_end() {
+    let s = session(
+        "set x to 1\n\
+         40 + 2\n\
+         .checkpoint a\n\
+         set x to 9\n\
+         1 + 1\n\
+         .restore a\n\
+         say \"x={x}\"\n\
+         .sessions\n\
+         :quit\n",
+    );
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("Checkpoint 'a' saved.")
+        .assert_stdout_contains("Restored checkpoint 'a'.")
+        .assert_stdout_contains("= 42")
+        .assert_stdout_contains("x=1")
+        .assert_stdout_contains("* a");
+}
+
+/// An empty undo or redo stack is a named empty, and a session with no
+/// checkpoints says so rather than printing a blank table.
+#[test]
+fn edge_undo_and_redo_and_sessions_with_nothing_to_show_say_so() {
+    let s = session(".undo\n.redo\n.sessions\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("Nothing to undo.")
+        .assert_stdout_contains("Nothing to redo.")
+        .assert_stdout_contains("No checkpoints in this session.");
+}
+
+/// A change after an undo clears the redo history, and the session states that
+/// rather than letting a stale `.redo` replay a state that no longer follows.
+#[test]
+fn edge_redo_after_a_new_change_reports_that_the_redo_history_was_cleared() {
+    let s = session("set x to 1\n.undo\nset y to 2\n.redo\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("Redo history cleared by a new change.")
+        .assert_stdout_contains("Nothing to redo.");
+}
+
+/// The dot spelling of `.restore` is the in-memory checkpoint; the colon
+/// spelling is still the saved session file. The two do not fall through into
+/// each other, which is what the help text's one sentence promises.
+#[test]
+fn edge_dot_restore_of_an_unknown_name_is_a_checkpoint_error_not_a_file_error() {
+    let s = session(".restore missing\n:restore missing-file\n:quit\n");
+
+    s.assert_exited_ok()
+        .assert_stdout_contains("no checkpoint named 'missing'")
+        .assert_stdout_contains("Could not restore session:")
+        .assert_stdout_lacks("Unknown command 'restore'");
+}
+
+/// The undo stack is bounded in the running session too, and the drop is
+/// stated: a user who walks back past the bound is told which step is gone.
+#[test]
+fn edge_undo_past_its_bound_drops_the_oldest_step_with_a_notice() {
+    let mut input = String::new();
+    for index in 0..=50 {
+        input.push_str(&format!("set v{} to {}\n", index, index));
+    }
+    input.push_str(".undo\n:quit\n");
+
+    let s = session(&input);
+
+    s.assert_exited_ok()
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2988,9 +2988,13 @@
+             "Session saved to '{}' ({} line(s)).",
+             path,
+             self.history.len()
+         ),
+-        Err(e) => println!("Could not save session: {}", e),
++        Err(e) => println!(
++            "Could not save session to '{}': {}",
++            destination.display(),
++            e
++        ),
+     }
+ }
+ 
+ /// Writes the session as Markdown — to `path`, or to stdout when given
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -3047,9 +3047,13 @@
+ let resolved = self.resolve_path(path);
+ let document = match std::fs::read_to_string(&resolved) {
+     Ok(document) => document,
+     Err(e) => {
+-        println!("Could not restore session: {}", e);
++        println!(
++            "Could not restore session from '{}': {}",
++            resolved.display(),
++            e
++        );
+         return;
+     }
+ };
+ 
+
+[0m
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 5.42s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tail -60
+█ █  █    █ █  █ █  █    █ █  █   
+                       ███  ███  █ █  ███  █    █ █  ███ 
+                       █ █  █    █ █  █ █  █    █ █  █   
+                       █ █  ████ ███  ███  ████ ███  ████
+
+Welcome to Redblue v0.2.0 - tree-walking interpreter
+Type ':help' for commands, ':quit' to exit
+TAB completes, Up arrow walks back through history, !! repeats the last line
+
+>>> Error: no checkpoint named 'missing'. Use .sessions to list this session's checkpoints; :restore <filename> reads a saved history file instead.
+>>> Could not restore session from '/home/runner/work/rbops/rbops/redblue/missing-file': No such file or directory (os error 2)
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <repl_test::Session>::assert_stdout_contains
+   3: repl_test::edge_dot_restore_of_an_unknown_name_is_a_checkpoint_error_not_a_file_error
+   4: repl_test::edge_dot_restore_of_an_unknown_name_is_a_checkpoint_error_not_a_file_error::{closure#0}
+   5: <repl_test::edge_dot_restore_of_an_unknown_name_is_a_checkpoint_error_not_a_file_error::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- edge_restore_of_a_missing_path_reports_the_failure stdout ----
+
+thread 'edge_restore_of_a_missing_path_reports_the_failure' (316321) panicked at tests/repl_test.rs:44:9:
+stdout should contain "Could not restore session:"
+--- actual ---
+                       ███  ████ ███  ███  █    █ █  ████
+                       █ █  █    █ █  █ █  █    █ █  █   
+                       ███  ███  █ █  ███  █    █ █  ███ 
+                       █ █  █    █ █  █ █  █    █ █  █   
+                       █ █  ████ ███  ███  ████ ███  ████
+
+Welcome to Redblue v0.2.0 - tree-walking interpreter
+Type ':help' for commands, ':quit' to exit
+TAB completes, Up arrow walks back through history, !! repeats the last line
+
+>>> >>> Could not restore session from '/home/runner/work/rbops/rbops/redblue/target/tmp/repl/never-saved-315979-6.txt': No such file or directory (os error 2)
+>>>      1  set kept to 1
+     2  :restore /home/runner/work/rbops/rbops/redblue/target/tmp/repl/never-saved-315979-6.txt
+     3  :history
+>>> Goodbye!
+
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+   1: core::panicking::panic_fmt
+   2: <repl_test::Session>::assert_stdout_contains
+   3: repl_test::edge_restore_of_a_missing_path_reports_the_failure
+   4: repl_test::edge_restore_of_a_missing_path_reports_the_failure::{closure#0}
+   5: <repl_test::edge_restore_of_a_missing_path_reports_the_failure::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    edge_dot_restore_of_an_unknown_name_is_a_checkpoint_error_not_a_file_error
+    edge_restore_of_a_missing_path_reports_the_failure
+
+test result: FAILED. 93 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+[1m[91merror[0m: test failed, to rerun pass `--test repl_test`
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -2989,9 +2989,9 @@
+         path,
+         self.history.len()
+     ),
+     Err(e) => println!(
+-        "Could not save session to '{}': {}",
++        "Could not save session: '{}': {}",
+         destination.display(),
+         e
+     ),
+ }
+
+[0m
+[0m← [0mEdit src/repl/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+@@ -3048,9 +3048,9 @@
+ let document = match std::fs::read_to_string(&resolved) {
+     Ok(document) => document,
+     Err(e) => {
+         println!(
+-            "Could not restore session from '{}': {}",
++            "Could not restore session: '{}': {}",
+             resolved.display(),
+             e
+         );
+         return;
+
+[0m
+[0m$ [0mcargo fmt --all && cargo test --test repl_test 2>&1 | tail -20
+test edge_vars_lists_the_names_the_session_bound_not_only_the_last_result ... ok
+test edge_undo_past_its_bound_drops_the_oldest_step_with_a_notice ... ok
+test edge_vars_lists_the_session_bindings ... ok
+test edge_a_piped_block_that_never_closes_does_not_grow_without_limit ... ok
+test edge_which_names_every_module_one_import_binds_and_a_reset_forgets_their_lines ... ok
+test reload_reruns_the_last_loaded_file_and_reproduces_its_output ... ok
+test reload_reruns_the_last_run_file_and_reproduces_its_output ... ok
+test repl_carries_a_binding_from_one_line_to_the_next ... ok
+test macro_replays_three_recorded_lines_with_identical_output ... ok
+test repl_load_runs_the_file_rather_than_only_measuring_it ... ok
+test repl_reports_an_uncaught_error_and_stays_alive ... ok
+test repl_runs_a_multiline_block ... ok
+test repl_runs_a_program_that_catches_its_own_error ... ok
+test repl_runs_commands_and_quits ... ok
+test repl_shows_the_result_of_an_expression_under_vars ... ok
+test shell_escape_shows_command_output_and_exit_code ... ok
+test repl_runs_a_block_the_last_word_heuristic_missed ... ok
+
+test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+[0m
