@@ -1,0 +1,75 @@
+[0m
+> reviewer · nemotron-3-ultra-free
+[0m
+[0m→ [0mRead src/repl/mod.rs
+[0m→ [0mRead src/bytecode/vm.rs
+[0m→ [0mRead src/repl/commands.rs
+[0m→ [0mRead src/repl/mod.rs[90m [offset=1190][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=2454][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3662][0m
+[0m✱ [0mGrep "mod tests"[90m in src/repl · 15 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=5208][0m
+[0m✱ [0mGrep "mod engines"[90m in src/repl/mod.rs · 1 match[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=9277][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1, limit=100][0m
+[0m✱ [0mGrep "fn user_names|fn user_value"[90m in src/interpreter.rs · 2 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=50, offset=1190][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=50, offset=1380][0m
+[0m✱ [0mGrep "module_aliases"[90m in src/interpreter.rs · 14 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1430, limit=100][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=2955, limit=50][0m
+[0m✱ [0mGrep "fn observe_bindings"[90m in src/interpreter.rs · 1 match[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=30, offset=790][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=815, limit=50][0m
+[0m✱ [0mGrep "struct CallContext"[90m in src/interpreter.rs · 1 match[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=50, offset=280][0m
+[0m✱ [0mGrep "fn root"[90m in src/interpreter.rs · 4 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=20, offset=765][0m
+[0m✱ [0mGrep "fn imported_modules"[90m in src/interpreter.rs · 1 match[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1243, limit=20][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=50, offset=3095][0m
+[0m✱ [0mGrep "fn module_member_values"[90m in src/interpreter.rs · 1 match[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1263, limit=30][0m
+Now I have a thorough understanding of the changes. Let me write my findings.
+
+## Findings
+
+### 1. [MAJOR] src/repl/mod.rs:2938-2977 — Module imports with aliases don't persist across bytecode REPL lines
+When the session uses the bytecode engine (`.vm bytecode`), each call to `run_bytecode` creates a fresh `BytecodeVm` (line 2946). The `adopt_bytecode_bindings` method (lines 2966-2977) only transfers globals via `observe_bindings`, but **does not call `observe_context`** to transfer the bytecode VM's `module_aliases`, `declared_modules`, `published_members`, or `objects` to the walker VM's `CallContext`. 
+
+On the next REPL line, `run_bytecode` creates another fresh VM and seeds it from `session_bindings()` (line 2948), which reads from the walker VM. Since the walker VM's `CallContext` was never updated with the bytecode VM's module aliases, the alias mapping (e.g., `F` → `files` from `import files as F`) is lost. A subsequent line using `F.read()` fails because the fresh bytecode VM has no `module_aliases` entry to resolve `F` to `files`.
+
+This breaks basic multi-line usage on the bytecode engine. The REPORT.md documents "Objects/modules created on the bytecode side are not structurally transplanted into the tree-walker's context" but doesn't disclose they also don't persist **on the bytecode side itself** across REPL lines.
+
+**VERIFIED**: Traced the exact path: `run_bytecode` (2938) → fresh `BytecodeVm` (2946) → `adopt_bytecode_bindings` (2966) calls only `observe_bindings` (2976) not `observe_context` → next `run_bytecode` seeds from walker VM (2948) which lacks the module aliases → `F.read()` fails to resolve.
+
+### 2. [MAJOR] src/repl/mod.rs:2966-2977 — Bytecode VM context (modules, aliases, objects) not transferred to walker VM
+`adopt_bytecode_bindings` copies only globals (via `user_bindings()` which filters builtins and `published_members`), but does not call `self.vm.observe_context(&compiled_context)` to transfer:
+- `module_aliases` (alias → module name mappings)
+- `declared_modules` (module declarations)
+- `objects` (object type declarations)  
+- `qualified_members` (published qualified names)
+
+This means switching from bytecode back to walker loses all module imports, module declarations, and object declarations made on the bytecode side. The REPORT.md acknowledges this as a "known gap" but the gap is wider than described — it also breaks persistence on the bytecode side (Finding 1).
+
+**VERIFIED**: `adopt_bytecode_bindings` (2966-2977) calls `observe_bindings` (2976) but never `observe_context`. The walker VM's `CallContext` (interpreter.rs:285-322) holds `module_aliases`, `declared_modules`, `qualified_members`, `objects` — none are updated.
+
+### 3. [MINOR] src/repl/mod.rs:3549-3583 — Restored Walker session with aliases changes default prompt behavior
+`save_session` writes an `engine walker` record when the session has aliases/macros even on the default Walker engine (line 3561). On restore, `engine_named_in_prompt` is set to `restored.engine_recorded` (line 3683), causing the prompt to change from `>>> ` to `tree-walking interpreter >>> ` for sessions that **never explicitly used `.vm`**. This contradicts the documented invariant: "the default `>>> ` is unchanged for sessions that never switch" (mod.rs:786-788).
+
+### 4. [MINOR] src/repl/mod.rs:9277-9553 — No test for bare `.vm` query form
+The REPORT.md claims "empty — covered: bare `.vm` is the query form and changes no state" but the `engines` test module has no test for `.vm` with no argument. The `set_engine` method (2237-2250) handles this correctly (returns `Ok(())` and prints current engine), but it's untested.
+
+### 5. [STYLE] src/repl/mod.rs:3554-3558 — Comment contradicts code on when engine is recorded
+Comment at line 3554-3557: "The engine is recorded even when it is the default." But the condition at line 3558 is `if !self.aliases.is_empty() || !self.macros.is_empty() || self.engine != Engine::Walker` — a pure Walker session with no aliases/macros does **not** get an engine record. The comment describes the intent for sessions that *do* get a state section, but as written it's misleading.
+
+---
+
+FINDINGS:
+1. [BLOCKER] src/repl/mod.rs:2938-2977 — Module imports with aliases don't persist across bytecode REPL lines — VERIFIED: traced exact path through run_bytecode → fresh VM → adopt_bytecode_bindings only calls observe_bindings → next run seeds from walker VM lacking module_aliases
+2. [MAJOR] src/repl/mod.rs:2966-2977 — Bytecode VM context (modules, aliases, objects) not transferred to walker VM — VERIFIED: adopt_bytecode_bindings calls observe_bindings but not observe_context
+3. [MINOR] src/repl/mod.rs:3549-3583 — Restored Walker session with aliases changes default prompt behavior
+4. [MINOR] src/repl/mod.rs:9277-9553 — No test for bare `.vm` query form
+5. [STYLE] src/repl/mod.rs:3554-3558 — Comment contradicts code on when engine is recorded
+
+REVIEW VERDICT: FINDINGS 5

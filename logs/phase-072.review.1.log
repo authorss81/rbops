@@ -1,0 +1,83 @@
+[0m
+> reviewer · nemotron-3-ultra-free
+[0m
+[0m→ [0mRead src/repl/mod.rs
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=670, limit=100][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=500, offset=1190][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=930, limit=100][0m
+[0m✱ [0mGrep "engine_command"[90m in src/repl · 2 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=2200, limit=300][0m
+[0m✱ [0mGrep "fn execute_line"[90m in src/repl/mod.rs · 1 match[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=200, offset=2060][0m
+[0m✱ [0mGrep "fn execute_code"[90m in src/repl/mod.rs · 2 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=300, offset=2600][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=2895, limit=150][0m
+[0m✱ [0mGrep "fn save_session|fn restore_session"[90m in src/repl/mod.rs · 2 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3530, limit=200][0m
+[0m✱ [0mGrep "engines::"[90m in src/repl · 0 matches[0m
+[0m✱ [0mGrep "mod tests"[90m in src/repl/mod.rs · 15 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=5190, limit=500][0m
+[0m✱ [0mGrep "engines"[90m in src/repl/mod.rs · 22 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=300, offset=9255][0m
+[0m✱ [0mGrep "a_vm_switch_is_named_by_the_next_prompt"[90m in src/repl/mod.rs · 1 match[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=100, offset=9640][0m
+[0m✱ [0mGrep "fn replay"[90m in src/repl/mod.rs · 2 matches[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3815, limit=100][0m
+[0m✱ [0mGrep "fn new_in"[90m in src/bytecode/vm.rs · 1 match[0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=835, limit=50][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3025, limit=50][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=2880, limit=50][0m
+[0m✱ [0mGrep "fn compare_answer"[90m in src/repl/mod.rs · 1 match[0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=100, offset=4755][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=50, offset=3775][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=50, offset=3945][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=50, offset=3990][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=20, offset=925][0m
+[0m✱ [0mGrep "pub const ENGINE"[90m in src/repl · 1 match[0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3655, limit=50][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=30, offset=3545][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3705, limit=50][0m
+[0m→ [0mRead src/repl/mod.rs[90m [limit=20, offset=1310][0m
+Now I have a clear understanding of the changes and the bug. Let me formulate the findings.
+
+**FINDINGS:**
+
+1. **[BLOCKER] src/repl/mod.rs:3665-3668** — `restore_session` does not restore the default engine (Walker) when the saved session has no engine record. The save code (line 3553-3555) only writes an `engine` line when `engine != Engine::Walker`. The restore code (lines 3665-3668) only updates `self.engine` when `restored.engine.is_some()`. This means restoring a Walker session into a Bytecode session leaves the engine as Bytecode instead of switching to Walker. The replicated lines then run on the wrong engine. VERIFIED: traced the exact code path - `save_session` omits the engine line for Walker (line 3553-3555), `parse_session_state` leaves `engine` as `None` when no line present, `restore_session` only assigns when `Some` (lines 3665-3668).
+
+2. **[MAJOR] src/bytecode/vm.rs:945-957** — `user_bindings()` constructs a fresh `stdlib::builtins()` HashMap on every call to filter builtins. This is O(N) allocation per call where N = number of builtins (~50+). In a REPL session with frequent engine switches, this allocates repeatedly for a static filter set. The builtins set is constant; it should be cached or the VM should track its own builtins at init.
+
+3. **[MINOR] src/repl/mod.rs:1311-1321** — `render_prompt_format` prepends the engine label when `engine_named_in_prompt` is true AND the prompt format doesn't contain `{engine}`. However, if a user sets `:prompt {engine} > ` then switches engines, the `{engine}` placeholder is replaced correctly. But if they then switch back to Walker, the prompt shows "tree-walking interpreter > " (correct). The logic is sound but the condition `!self.prompt_format.contains("{engine}")` means a custom prompt without `{engine}` gets the engine name prepended on every switch, which could produce "bytecode VM tree-walking interpreter > " after multiple switches if not careful. Actually, re-reading: `engine_named_in_prompt` is set once on first `.vm` and never reset, so it only prepends once. The logic is correct but subtle.
+
+4. **[MINOR] src/repl/mod.rs:3549** — `save_session` writes the state section (marker + aliases + macros) when `engine != Engine::Walker` OR aliases/macros exist. But it only writes the `engine` line inside that section when `engine != Engine::Walker`. This means a Walker session with aliases saves a state section with no engine line. On restore into a Bytecode session, the aliases restore but the engine stays Bytecode (per finding #1). The state section should either always include the engine line, or the restore should default to Walker when absent.
+
+5. **[STYLE] src/bytecode/vm.rs:676-679** — The comment for `published_members` says "so a REPL switching back to the tree-walker can hand over the session's own bindings without also handing over internal `Module_member` spellings the user never wrote." The term "Module_member" should be "qualified member" or "mangled member" to match the code's `qualified_member` terminology. The internal names are `Module_member` format (e.g., `MathUtils_circle_area`) but the comment uses a different casing.
+
+Let me verify finding #1 is not covered by tests. The test `edge_vm_choice_survives_save_and_restore` only tests Bytecode→Walker restore. There's no test for Walker→Bytecode restore or Walker→Walker restore into a Bytecode session.
+
+```
+FINDINGS:
+1. [BLOCKER] src/repl/mod.rs:3665 — restore_session does not restore default engine (Walker) when saved session has no engine record; save_session omits engine line for Walker (line 3553), parse_session_state leaves engine=None, restore_session only assigns when Some — VERIFIED: traced exact code path lines 3553-3555, 3712-3720, 3665-3668
+2. [MAJOR] src/bytecode/vm.rs:945 — user_bindings() allocates fresh stdlib::builtins() HashMap on every call for filtering; builtins set is constant and should be cached
+3. [MINOR] src/repl/mod.rs:1317 — render_prompt_format prepends engine label when engine_named_in_prompt and no {engine} placeholder; condition is subtle but correct
+4. [MINOR] src/repl/mod.rs:3549 — save_session writes state section for Walker+aliases but omits engine line; restore_session then fails to restore engine (see BLOCKER)
+5. [STYLE] src/bytecode/vm.rs:677 — comment says "Module_member" but code uses qualified_member naming (e.g., MathUtils_circle_area)
+
+REVIEW VERDICT: FINDINGS 5
+```
+[0m✱ [0mGrep "fn builtins"[90m in src/stdlib.rs · 2 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=300, limit=30][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=675, limit=10][0m
+[0m✱ [0mGrep "fn qualified_member"[90m in src/bytecode/vm.rs · 0 matches[0m
+[0m✱ [0mGrep "qualified_member"[90m in src/bytecode/vm.rs · 5 matches[0m
+Now I have all the information needed. Here are my findings:
+
+```
+FINDINGS:
+1. [BLOCKER] src/repl/mod.rs:3665 — restore_session does not restore default engine (Walker) when saved session has no engine record; save_session omits engine line for Walker (line 3553), parse_session_state leaves engine=None, restore_session only assigns when Some — VERIFIED: traced exact code path lines 3553-3555, 3712-3720, 3665-3668
+2. [MAJOR] src/bytecode/vm.rs:945 — user_bindings() allocates fresh stdlib::builtins() HashMap on every call for filtering; builtins set is constant (~50 entries) and should be cached
+3. [MINOR] src/repl/mod.rs:1317 — render_prompt_format prepends engine label when engine_named_in_prompt and no {engine} placeholder; logic is correct but condition is subtle
+4. [MINOR] src/repl/mod.rs:3549 — save_session writes state section for Walker+aliases but omits engine line; restore_session then fails to restore engine (see BLOCKER)
+5. [STYLE] src/bytecode/vm.rs:677 — comment says "Module_member" but code uses qualified_member naming (e.g., MathUtils_circle_area)
+
+REVIEW VERDICT: FINDINGS 5
+```
