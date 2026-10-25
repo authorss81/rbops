@@ -1,0 +1,2714 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0msed -n '1,320p' tests/libraries_policy_test.rs
+//! LIBRARIES.md is the standing answer to a question every stdlib phase would
+//! otherwise re-open: should this be written in Redblue, wrapped around a Rust
+//! crate, or not built at all?
+//!
+//! The policy is only useful if it is (a) actually written down, (b) reachable
+//! from the two files an agent reads first, and (c) complete over the ranked
+//! gaps in SURVEY.md. An undecided gap sends the next phase back to arguing from
+//! scratch, which is the finding this phase exists to close. So the document is
+//! checked here instead of trusted.
+
+use std::path::PathBuf;
+
+const POLICY: &str = "LIBRARIES.md";
+const README: &str = "README.md";
+const AGENTS: &str = "AGENTS.md";
+
+/// The three decisions the policy is allowed to make.
+const SECTIONS: [&str; 3] = [
+    "## 1. Written in Redblue",
+    "## 2. Bindings to Rust crates",
+    "## 3. Not built at all",
+];
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn read(name: &str) -> String {
+    let path = repo_root().join(name);
+    std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "{name} must exist and be readable at {}: {error}. LIBRARIES.md is \
+             the whole deliverable of this phase; a policy nobody wrote down is \
+             the finding left unfixed.",
+            path.display()
+        )
+    })
+}
+
+/// The body of one `## ` section, up to the next `## ` heading.
+fn section<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
+    let start = doc.find(heading)? + heading.len();
+    let rest = &doc[start..];
+    let end = rest.find("\n## ").unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn sections(doc: &str) -> Vec<&str> {
+    SECTIONS
+        .iter()
+        .map(|heading| {
+            section(doc, heading).unwrap_or_else(|| {
+                panic!(
+                    "LIBRARIES.md has no `{heading}` section. The policy has to \
+                     separate the three answers it gives: written in Redblue, a \
+                     binding, or not built at all."
+                )
+            })
+        })
+        .collect()
+}
+
+/// Every top-ten gap in SURVEY.md carries an explicit `SURVEY.md rank N` marker
+/// in exactly one of the three sections. The marker is the decision; a gap with
+/// no marker is a gap the next phase has to re-litigate.
+#[test]
+fn edge_every_ranked_gap_is_decided_in_exactly_one_section() {
+    let doc = read(POLICY);
+    let bodies = sections(&doc);
+
+    for rank in 1..=10 {
+        let marker = format!("rank {rank} |");
+        let decided: Vec<usize> = bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| body.contains(&marker))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            decided.len(),
+            1,
+            "{marker} appears in {} of the three sections ({decided:?}). Every \
+             gap ranked in SURVEY.md has to fall on exactly one side of the \
+             line, or the policy is silent about work a phase will be asked to \
+             do.",
+            decided.len()
+        );
+    }
+}
+
+/// Each section is more than a heading: it says why its entries belong there.
+#[test]
+fn each_section_states_a_reason_not_just_a_list() {
+    let doc = read(POLICY);
+    for (heading, body) in SECTIONS.iter().zip(sections(&doc)) {
+        assert!(
+            body.len() > 200,
+            "`{heading}` is only {} bytes. A list of names with no reason is \
+             taste; the policy has to say why each class belongs on that side.",
+            body.len()
+        );
+        assert!(
+            body.contains("because") || body.contains("Why"),
+            "`{heading}` never gives a reason (`because` / `Why`). The phase \
+             asks for entries justified by their reason, not by taste."
+        );
+    }
+}
+
+/// The binding section names a concrete crate for each numeric or native
+/// capability, and the crates it says are already dependencies are in
+/// `Cargo.toml`.
+#[test]
+fn binding_entries_name_specific_rust_crates() {
+    let doc = read(POLICY);
+    let body = section(&doc, SECTIONS[1]).expect("the binding section exists");
+
+    let required = [
+        "regex",
+        "chrono",
+        "walkdir",
+        "glob",
+        "base64",
+        "hex",
+        "percent-encoding",
+        "sha2",
+        "tch",
+        "ndarray",
+        "nalgebra",
+        "statrs",
+        "ring",
+        "aes-gcm",
+        "ed25519-dalek",
+    ];
+    for crate_name in required {
+        assert!(
+            body.contains(crate_name),
+            "the binding section never names `{crate_name}`. A binding entry \
+             without a crate is a plan that cannot be started."
+        );
+    }
+
+    let manifest = read("Cargo.toml");
+    for already_a_dependency in ["regex", "chrono", "reqwest"] {
+        assert!(
+            manifest.contains(already_a_dependency),
+            "LIBRARIES.md presents `{already_a_dependency}` as the numpy-pattern \
+             precedent, and Cargo.toml no longer depends on it. The precedent \
+             has to be real."
+        );
+    }
+}
+
+/// The policy is honest about speed: it promises readability, says interpreted
+/// Redblue is slower than Python, and names the native backend as the only
+/// thing that would change that.
+#[test]
+fn the_speed_answer_is_stated_plainly_and_not_hedged() {
+    let doc = read(POLICY).to_lowercase();
+
+    for claim in [
+        "slower than python",
+        "readability",
+        "native backend",
+        "only thing",
+        "pytorch",
+        "numpy",
+        "not achievable",
+    ] {
+        assert!(
+            doc.contains(claim),
+            "LIBRARIES.md never says `{claim}`. The policy has to state plainly \
+             that a PyTorch-equivalent written in Redblue is not achievable, \
+             that interpreted Redblue is slower than Python, and that a native \
+             backend is the only thing that changes the speed answer."
+        );
+    }
+}
+
+/// An agent reaches the policy from the two files it already reads: the project
+/// README and the agent contract.
+#[test]
+fn edge_policy_is_linked_from_readme_and_agents() {
+    for name in [README, AGENTS] {
+        let text = read(name);
+        assert!(
+            text.contains("(LIBRARIES.md)") || text.contains("[LIBRARIES.md]"),
+            "{name} does not link LIBRARIES.md. A policy the next implementer \
+             never sees is a policy that gets re-argued."
+        );
+    }
+}
+
+/// The written-in-Redblue section covers the classes the phase names, including
+/// data structures, and gives each one a reason rather than a bare name.
+#[test]
+fn edge_data_structures_are_written_in_redblue() {
+    let doc = read(POLICY);
+    let body = section(&doc, SECTIONS[0]).expect("the written-in-Redblue section exists");
+
+    for entry in ["Data structures", "stacks", "queues", "trees", "graphs"] {
+        assert!(
+            body.contains(entry),
+            "the written-in-Redblue section never mentions `{entry}`. Data \
+             structures are a class the phase names explicitly; leaving them \
+             out sends the next phase back to arguing the question."
+        );
+    }
+    assert!(
+        body.contains("interpreter already owns") || body.contains("control flow"),
+        "the data-structures entry gives no reason. It has to say why the work \
+         belongs in Redblue rather than in a binding."
+    );
+}
+
+/// The policy says the speed limit out loud: interpreted Redblue cannot out-run
+/// a native library, and only a native backend changes that answer.
+#[test]
+fn the_native_speed_limit_is_stated_without_a_promise() {
+    let doc = read(POLICY).to_lowercase();
+
+    assert!(
+        doc.contains("cannot out-run a native library"),
+        "LIBRARIES.md never says interpreted Redblue cannot out-run a native \
+         library. The honest speed answer has to name the limit, not just say \
+         'slower than Python'."
+    );
+    assert!(
+        doc.contains("only thing") && doc.contains("native backend"),
+        "LIBRARIES.md does not name the native backend as the only thing that \
+         changes the speed answer."
+    );
+    for promise in ["redblue is fast", "as fast as", "out-run python"] {
+        assert!(
+            !doc.contains(promise),
+            "LIBRARIES.md promises `{promise}`. Speed is not a design goal the \
+             language should claim."
+        );
+    }
+}
+
+/// A binding-required capability is still refused cleanly today. The policy is
+/// describing an open gap, not a surface that already exists.
+#[test]
+fn edge_binding_required_directory_gap_is_a_clean_refusal() {
+    let tokens = redblue::lexer::Lexer::tokenize("say files.glob(\"corpus/*.rb\")\n")
+        .expect("the probe program lexes");
+    let ast = redblue::parser::parse(tokens).expect("the probe program parses");
+    let (_vm, result) = redblue::run_isolated(&ast);
+
+    assert!(
+        result.is_err(),
+        "files.glob ran; LIBRARIES.md ranks directories as binding-required, so \
+         the gap must still be open."
+    );
+    let message = format!("{}", result.unwrap_err());
+    assert!(
+        message.contains("files") && message.contains("glob"),
+        "files.glob was refused as `{message}`, which does not name both the \
+         module and the member."
+    );
+}
+
+/// The premise of the binding section, re-verified on this tree: a program that
+/// reaches for a binding-required library is refused today. If one of these
+/// calls started working, the entry would describe a gap that had closed.
+#[test]
+fn binding_required_libraries_are_refused_today() {
+    let analyzer_refusal = refusal_of(
+        "say base64.decode(\"aGk=\")\n",
+        "a program called `base64.decode`, which LIBRARIES.md lists as a \
+         required binding. If it now runs, the policy's ranking has to be \
+         re-measured.",
+    );
+    assert!(
+        analyzer_refusal.contains("base64"),
+        "`base64.decode` was refused as `{analyzer_refusal}`, which does not name \
+         the library a reader would go looking for."
+    );
+
+    let runtime_refusal = refusal_of(
+        "set born to time.unix(\"1990-03-04 00:00:00\")\nsay time.add_days(born, 365)\n",
+        "`time.add_days` ran. LIBRARIES.md presents date arithmetic as a \
+         binding-required gap; if the gap closed, the entry is stale.",
+    );
+    assert!(
+        runtime_refusal.contains("add_days") && runtime_refusal.contains("time"),
+        "`time.add_days` was refused as `{runtime_refusal}`, which does not name \
+         both the module and the member."
+    );
+}
+
+/// Run a program and return the first stage's error as text, panicking if the
+/// whole pipeline accepts it.
+fn refusal_of(source: &str, why: &str) -> String {
+    let tokens = redblue::lexer::Lexer::tokenize(source).expect("the probe program lexes");
+    let ast = redblue::parser::parse(tokens).expect("the probe program parses");
+    if let Err(error) = redblue::analyzer::analyze(&ast) {
+        return format!("{error}");
+    }
+    let (_vm, result) = redblue::run_isolated(&ast);
+    assert!(
+        result.is_err(),
+        "{why} It answered `{:?}`.",
+        result.as_ref().ok()
+    );
+    match result {
+        Ok(value) => panic!("{why} It answered `{value:?}`."),
+        Err(error) => format!("{error}"),
+    }
+}
+[0m
+[0m$ [0msed -n '1,120p' LIBRARIES.md; git status; git log --oneline -5
+# LIBRARIES.md — what Redblue libraries should be written in Redblue, bound, or not built
+
+**Status**: standing policy. Derived from the ranking in [SURVEY.md](SURVEY.md),
+and older than any one stdlib phase. Read this before adding a module: it decides
+which of the three answers a missing capability gets, so the next phase does not
+have to argue the same question again.
+
+The short version: **write it in Redblue when interpreted speed is irrelevant;
+bind it to a Rust crate when the work is numeric, native or security-sensitive;
+do not build it at all when the only honest implementation is a native engine
+written from scratch.**
+
+## The rule, and the honest speed answer
+
+Redblue's advantage is **readability**, not speed. Its interpreter is slower than Python, and it will stay
+slower: an interpreted tree-walker does more work per
+operation than a bytecode VM with a mature JIT. Speed is therefore not a design
+goal the language should promise, and a library is never chosen for Redblue
+because Redblue would make it fast. Interpreted Redblue **cannot out-run a native library**: when the cost of a task is a native kernel, no amount of Redblue source changes that. The fast path is always a binding.
+
+That has one firm consequence. A PyTorch-equivalent — tensors plus autograd —
+written in Redblue is **not achievable**, not merely a lot of effort. Tensor and
+autograd work is fast because the kernels and memory movement are native; that is
+exactly why NumPy and PyTorch are C/C++ with a Python surface. The numpy-style
+answer is a **binding**: keep the readable Redblue call, put the kernel in Rust
+(or call the crate that already wraps the native engine). Redblue already does
+this with `network.get` wrapping `reqwest` and `files.read` wrapping `std::fs`.
+
+The **native backend** is the only thing that would change the speed answer. It
+is a separate compiler project, not a library, and this policy does not commit
+to building it.
+
+## 1. Written in Redblue
+
+These belong in `modules/*.rb` (or in the language's own tooling) **because** the
+work is control flow, text and data structures over values the interpreter
+already holds. Interpreted speed is irrelevant at the sizes these libraries are
+used, and keeping them in Redblue makes them readable, debuggable and
+self-hosting material.
+
+| Library | Ranking | Why Redblue, not a binding |
+|---|---|---|
+| Collections and higher-order list functions — `filter`, `reduce`, `any`, `all`, `zip`, `chunk`, `group_by`, `sort_by`, `take`, `skip`, `reverse`, `unique` | `SURVEY.md` rank 1 | `map` already calls a Redblue closure and `push` already exists; the missing functions are loops and comparisons, not native kernels. |
+| Record field enumeration — `keys`, `values`, iterating a record | `SURVEY.md` rank 3 | A record is a language value with insertion order; exposing its fields is value semantics, not a numeric kernel. |
+| Data structures — stacks, queues, sets, trees, graphs, priority queues | class — no top-ten entry | These are algorithms over values the interpreter already owns; at script sizes their cost is control flow, not a native kernel, and keeping them in Redblue keeps them inspectable. |
+| Ordering, min/max, sum, mean, median | `SURVEY.md` rank 4 | Sorting and folding are O(n log n) and O(n) over values the interpreter already owns; the readability win is the whole point and a native sort would add a boundary for no practical gain. |
+| Text slicing, searching and padding — `slice`, `index_of`, `pad_left`, `repeat`, `chars` | `SURVEY.md` rank 5 | `length` already counts characters in the interpreter; slicing by character is the same Unicode work, written once in Redblue. |
+| Number formatting and parsing — fixed precision, separators, a stated base | `SURVEY.md` rank 9 | This is presentation over a number Redblue already has; formatting is arithmetic and text building, not a native dependency. |
+| CSV and JSON writers | `SURVEY.md` rank 10 | The readers already produce Redblue lists and records; writing them back out is serialising existing `Value`s, not a new engine. |
+| Parsers, tokenizers and compilers | class — no top-ten entry | Scanning text and building trees is exactly what a readable language is good at; the bootstrap compiler is the standing proof that this is Redblue work. |
+| Servers and HTTP routing | class — no top-ten entry | Once the socket/HTTP client is bound (`reqwest`), routing, headers and JSON handling are control flow over text and records; a server author benefits from readability more than from native dispatch. |
+| Developer tools — formatter, linter, test runner, REPL helpers | class — no top-ten entry | These run at human speed on source files and are the language's own bootstrap surface; writing them in Redblue keeps the tooling honest about the language. |
+| Test frameworks and assertions | class — no top-ten entry | `expect`, test blocks and catchable errors already exist; a richer harness is closures and reporting, not a native engine. |
+
+## 2. Bindings to Rust crates
+
+These must be **bindings**, following the numpy pattern, **because** the work is
+numeric, native, or security-sensitive. The Redblue surface stays small and
+readable; the implementation is a Rust crate behind it, exactly as
+`network.get` wraps `reqwest` and `files.read` wraps `std::fs`. Every crate named
+here either is already a dependency in `Cargo.toml` or exists on crates.io.
+
+| Capability | Ranking | Rust crate | Why it must be a binding |
+|---|---|---|---|
+| Regular expressions | `SURVEY.md` rank 2 | `regex` (already a dependency) | A correct, linear-time regex engine is a specialist native engine; hand-rolling one in Redblue would be slower, buggier and a denial-of-service risk. |
+| Date and time arithmetic | `SURVEY.md` rank 6 | `chrono` (already a dependency) | Calendar arithmetic, leap years and time zones are a correctness problem; `chrono` already backs `time.format` and `time.unix`. |
+| Directories, globbing and stat | `SURVEY.md` rank 7 | `walkdir`, `glob` (crates.io) | Walking the filesystem and matching paths are OS-facing operations with platform edge cases; no amount of Redblue loop removes that. |
+| Encodings and digests | `SURVEY.md` rank 8 | `base64`, `hex`, `percent-encoding`, `sha2` (crates.io) | Bit-level conversion and hashing are native work, and a digest implemented in interpreted code is both slow and easy to get wrong. |
+| HTTP client — `network.get` / `network.post` | precedent | `reqwest` (already a dependency) | The existing numpy-pattern example: readable Redblue call, native TLS and HTTP stack underneath. |
+| File reading and writing — `files.*` | precedent | `std::fs` (Rust standard library) | The other existing example: no reason to reimplement the OS file API in Redblue. |
+| Tensor and autograd | class — not in the survey | `tch` (libtorch bindings) or `candle-core` (crates.io) | Kernels and memory movement must be native; this is the PyTorch case and the reason the answer is a binding, not an implementation. |
+| Matrix and linear algebra | class — not in the survey | `ndarray`, `nalgebra` (crates.io) | Dense numeric loops are exactly where an interpreter loses by orders of magnitude; bind the optimised loop. |
+| Statistics | class — not in the survey | `statrs` (crates.io) | Distributions and special functions are numeric precision work; a Redblue implementation would be slower and less accurate. |
+| Cryptography | class — not in the survey | `ring`, `aes-gcm`, `ed25519-dalek`, `sha2` (crates.io) | Primitives must be audited and constant-time; a readable-language implementation invites timing side channels. Bind, never hand-roll. |
+
+A binding is acceptable only when it keeps the Redblue surface readable: one
+module name and a small set of English-shaped calls, errors caught as Redblue
+errors, and no leak of the crate's types into the language.
+
+## 3. Not built at all
+
+These should not be built, **because** the honest implementation is a native
+engine or a specialist project, and building it here would be both worse than the
+binding and a distraction from the language.
+
+| Not built | Why |
+|---|---|
+| A PyTorch-equivalent tensor/autograd library written in Redblue | Not achievable in interpreted Redblue: tensor and autograd work is fast because it is native, which is why NumPy and PyTorch are C/C++ with a Python surface. Bind `tch` or `candle-core` instead. This is the numpy-style answer, not a compromise. |
+| A regular-expression engine written from scratch | Correctness, linear-time behaviour and security are specialist work. `regex` already exists and is already linked; writing our own would be slower and less safe for no readability gain. |
+| Cryptographic primitives written from scratch | Auditing and constant-time behaviour matter more than readability. Use `ring`, `aes-gcm`, `ed25519-dalek` and `sha2`; do not invent a cipher because it reads nicely. |
+| A GPU runtime or CUDA binding written from scratch | Vendor APIs and kernels are native through and through. Reach a GPU through `tch`/`candle-core`, not by reimplementing the runtime. |
+| A native backend or optimising JIT as a "library" | It is a compiler project, not a library, and it is the only thing that would change the speed answer. This policy does not commit to building one; if it is ever built, it gets its own phase and its own fixed-point gate. |
+| A packaging/distribution ecosystem built before the language can run its own tools | Version resolution, registries and supply-chain policy are not blocked on speed and depend on the language's own tooling maturing first; building them early freezes decisions the language has not earned. Treat as a separate roadmap item, not a library phase. |
+
+## Applying the policy
+
+1. Find the capability in this file. If it is in section 1, write `modules/*.rb`
+   and test it in Redblue. If it is in section 2, add a thin binding and test the
+   Redblue surface plus its failure channel. If it is in section 3, do not build
+   it; bind the crate named above or record the gap in `FINDINGS.md`.
+2. Re-measure against [SURVEY.md](SURVEY.md) when a gap closes. A binding that
+   starts working turns a `binding-required` entry into an existing surface, not
+   into permission to rewrite it in Redblue.
+3. Never trade readability for a speed claim the interpreter cannot keep. The
+   only honest speed claim is that a native backend would change the answer.
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   AGENTS.md
+	modified:   LIBRARIES.md
+	modified:   phases/phase-094/REPORT.md
+	modified:   tests/libraries_policy_test.rs
+
+no changes added to commit (use "git add" and/or "git commit -a")
+14714da rbops: phase-094 (2026-10-25T10:10:10Z)
+7603eb6 rbops: phase-072 (2026-10-25T08:29:23Z)
+6c1e063 rbops: phase-071 (2026-10-25T05:12:38Z)
+b2e9852 docs: add Ipp/InScript REPL visual standards and update deferred phase queue
+2756081 rbops: phase-070 (2026-10-25T01:47:02Z)
+[0m
+[0m$ [0mcat phases/phase-094/REPORT.md; ls phases/phase-094
+# Phase 094 — Write down what Redblue libraries should be written in Redblue, bound, or not built
+
+## Reproduction of the finding
+
+The original finding is an absence: no file said which capabilities belong in
+Redblue, which are Rust bindings, and which should not exist. On this phase's
+base commit the previous attempt had already landed `LIBRARIES.md`, so the
+file-missing form no longer reproduces:
+
+```
+$ test -f LIBRARIES.md; echo "exit=$?"
+exit=0
+```
+
+Re-reading the policy against the phase's definition of done found two clauses
+still not met, and those are what this run fixes:
+
+```
+$ grep -in "cannot out-run a native library" LIBRARIES.md
+(no match)
+
+$ grep -in "data structures" LIBRARIES.md
+(no match)
+```
+
+The document said "slower than Python" but never stated the stronger, honest
+limit that interpreted Redblue cannot out-run a native library at all. It also
+listed collections but not the data-structures class the phase names (stacks,
+queues, sets, trees, graphs, priority queues). Both are real omissions in a
+policy whose job is to decide those questions once.
+
+The new tests were written first. `the_native_speed_limit_is_stated_without_a_promise`
+failed at `LIBRARIES.md never says interpreted Redblue cannot out-run a native
+library` and `edge_data_structures_are_written_in_redblue` failed on the missing
+class; after the two edits both pass, and the existing refusal test still proves
+the binding-required gaps are open.
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| `LIBRARIES.md` | +2 −1 | states that interpreted Redblue cannot out-run a native library; adds the data-structures class (stacks, queues, sets, trees, graphs, priority queues) to the written-in-Redblue section with its reason |
+| `AGENTS.md` | +6 −0 | puts the three-way decision and the "cannot out-run a native library" limit in the Standard Library section, next to the existing `LIBRARIES.md` link |
+| `tests/libraries_policy_test.rs` | +70 −0 | three tests holding the new policy clauses: data structures are decided, the speed limit is stated without a promise, and a binding-required directory call is still a clean refusal |
+
+`must_touch` is satisfied by the changed `AGENTS.md`. The policy itself remains
+the root `LIBRARIES.md` the phase asked for. No file under `src/`, `examples/`,
+`modules/`, `corpus/`, `.github/`, `rbops/` or `.opencode/agent/` was touched.
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| `edge_data_structures_are_written_in_redblue` | **edge_** / missing class — the written-in-Redblue section must name data structures and give a reason, not just a list |
+| `the_native_speed_limit_is_stated_without_a_promise` | boundary / missing claim — "cannot out-run a native library" must be present and the three speed promises must be absent |
+| `edge_binding_required_directory_gap_is_a_clean_refusal` | **edge_** / asserts failure — `files.glob` is still refused cleanly, naming both module and member, so the binding entry describes an open gap |
+
+No `#[ignore]`, no `// skip`, no `allow(clippy::` suppression, and no existing
+test was changed or weakened.
+
+## Edge-case matrix
+
+| Row | Verdict |
+|---|---|
+| empty | covered — `each_section_states_a_reason_not_just_a_list` refuses an empty or purely nominal section body (under 200 bytes). |
+| singleton | covered — `edge_every_ranked_gap_is_decided_in_exactly_one_section` requires exactly one section per rank; zero is an omission and two is a contradiction. |
+| boundary | covered — the rank loop spans 1 and 10, and the new speed test rejects the three promise phrases at the boundary between honest limitation and marketing. |
+| out_of_bounds | N/A — this phase adds no indexing or VM path; the only runtime call is the existing library refusal re-checked by `edge_binding_required_directory_gap_is_a_clean_refusal`. |
+| type_mismatch | N/A — no runtime types or coercions were changed; the document phase does not evaluate Redblue values. |
+| numeric_boundary | N/A — no arithmetic was added or changed; the document contains no computed numeric output. |
+| unicode | N/A — no text handling was changed; the Markdown is read as UTF-8 and contains no program output. |
+| nesting_recursion | N/A — the policy is flat Markdown; the tests slice sections, they do not execute nested code. |
+| duplicate_missing_keys | covered — duplicate rank markers and missing rank markers both fail `edge_every_ranked_gap_is_decided_in_exactly_one_section`; a missing class fails `edge_data_structures_are_written_in_redblue`. |
+| malformed_input | covered — a missing section, a missing heading and a missing file each panic with the document and heading named; the refusal test also covers the clean-error channel. |
+| resource_limit | N/A — the tests read a small Markdown file and loop ten times; there is no unbounded work, network or filesystem outside the checkout. |
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass — exit 0, no diff |
+| `cargo clippy --all-targets -- -D warnings` | pass — exit 0, no warnings |
+| `cargo test --all-targets` | pass — exit 0, **2217 passed, 0 failed, 0 ignored** |
+| `../rbops/verify.sh phase-094` | **pass** — exit 0, `VERIFY PASS — phase-094`; report sections, diff hygiene, must_touch, fmt, clippy, 2217 tests, example sweep, failure assertion (1), test quota (3 rust), edge tests (2) and no new skips all pass |
+
+## Invariants touched
+
+- **None.** No `Value` variant, `Error` variant, grammar production, `.rb`
+  extension, `to … end` / `set x to …` / `say` form, trailing-comma rule or
+  `{interp}` behaviour changed. `examples/`, `modules/` and `corpus/` were not
+  modified.
+
+## Known gaps / follow-ups
+
+- The binding section names crates on crates.io but does not pin versions for the
+  ones that are not dependencies (`walkdir`, `glob`, `base64`, `hex`,
+  `percent-encoding`, `sha2`, `tch`, `ndarray`, `nalgebra`, `statrs`, `ring`,
+  `aes-gcm`, `ed25519-dalek`). Version selection belongs to the phase that adds
+  each binding, not to the policy.
+- A future phase that actually adds a binding must update the refusal tests with
+  the new successful surface rather than deleting them.
+- No native backend was promised or built; the document says it is the only thing
+  that would change the speed answer and that this phase does not commit to it.
+REPORT.md
+[0m
+[0m$ [0mgit diff --stat; git diff -- tests/libraries_policy_test.rs AGENTS.md | head -100
+AGENTS.md                      |   6 ++
+ LIBRARIES.md                   |   3 +-
+ phases/phase-094/REPORT.md     | 124 +++++++++++++++++------------------------
+ tests/libraries_policy_test.rs |  70 +++++++++++++++++++++++
+ 4 files changed, 128 insertions(+), 75 deletions(-)
+diff --git a/AGENTS.md b/AGENTS.md
+index 0360473..cc0f78d 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -143,6 +143,12 @@ Detects: unused variables, style issues
+ 
+ ### Standard Library (Implemented)
+ 
++Before adding a module or builtin, read [LIBRARIES.md](LIBRARIES.md). It decides
++the three answers: write it in Redblue when interpreted speed is irrelevant, bind
++a Rust crate when the work is numeric, native or security-sensitive, or do not
++build it at all. Interpreted Redblue cannot out-run a native library; readability,
++not speed, is the reason to write something here.
++
+ #### Files Module
+ ```redblue
+ files.read("path")     // Read entire file as text
+diff --git a/tests/libraries_policy_test.rs b/tests/libraries_policy_test.rs
+index 731fac9..fddcb1c 100644
+--- a/tests/libraries_policy_test.rs
++++ b/tests/libraries_policy_test.rs
+@@ -191,6 +191,76 @@ fn edge_policy_is_linked_from_readme_and_agents() {
+     }
+ }
+ 
++/// The written-in-Redblue section covers the classes the phase names, including
++/// data structures, and gives each one a reason rather than a bare name.
++#[test]
++fn edge_data_structures_are_written_in_redblue() {
++    let doc = read(POLICY);
++    let body = section(&doc, SECTIONS[0]).expect("the written-in-Redblue section exists");
++
++    for entry in ["Data structures", "stacks", "queues", "trees", "graphs"] {
++        assert!(
++            body.contains(entry),
++            "the written-in-Redblue section never mentions `{entry}`. Data \
++             structures are a class the phase names explicitly; leaving them \
++             out sends the next phase back to arguing the question."
++        );
++    }
++    assert!(
++        body.contains("interpreter already owns") || body.contains("control flow"),
++        "the data-structures entry gives no reason. It has to say why the work \
++         belongs in Redblue rather than in a binding."
++    );
++}
++
++/// The policy says the speed limit out loud: interpreted Redblue cannot out-run
++/// a native library, and only a native backend changes that answer.
++#[test]
++fn the_native_speed_limit_is_stated_without_a_promise() {
++    let doc = read(POLICY).to_lowercase();
++
++    assert!(
++        doc.contains("cannot out-run a native library"),
++        "LIBRARIES.md never says interpreted Redblue cannot out-run a native \
++         library. The honest speed answer has to name the limit, not just say \
++         'slower than Python'."
++    );
++    assert!(
++        doc.contains("only thing") && doc.contains("native backend"),
++        "LIBRARIES.md does not name the native backend as the only thing that \
++         changes the speed answer."
++    );
++    for promise in ["redblue is fast", "as fast as", "out-run python"] {
++        assert!(
++            !doc.contains(promise),
++            "LIBRARIES.md promises `{promise}`. Speed is not a design goal the \
++             language should claim."
++        );
++    }
++}
++
++/// A binding-required capability is still refused cleanly today. The policy is
++/// describing an open gap, not a surface that already exists.
++#[test]
++fn edge_binding_required_directory_gap_is_a_clean_refusal() {
++    let tokens = redblue::lexer::Lexer::tokenize("say files.glob(\"corpus/*.rb\")\n")
++        .expect("the probe program lexes");
++    let ast = redblue::parser::parse(tokens).expect("the probe program parses");
++    let (_vm, result) = redblue::run_isolated(&ast);
++
++    assert!(
++        result.is_err(),
++        "files.glob ran; LIBRARIES.md ranks directories as binding-required, so \
++         the gap must still be open."
++    );
++    let message = format!("{}", result.unwrap_err());
++    assert!(
++        message.contains("files") && message.contains("glob"),
++        "files.glob was refused as `{message}`, which does not name both the \
++         module and the member."
++    );
++}
++
+ /// The premise of the binding section, re-verified on this tree: a program that
+ /// reaches for a binding-required library is refused today. If one of these
+ /// calls started working, the entry would describe a gap that had closed.
+[0m
+[0m← [0mEdit tests/libraries_policy_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/libraries_policy_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/libraries_policy_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/libraries_policy_test.rs
+@@ -197,9 +197,17 @@
+ fn edge_data_structures_are_written_in_redblue() {
+     let doc = read(POLICY);
+     let body = section(&doc, SECTIONS[0]).expect("the written-in-Redblue section exists");
+ 
+-    for entry in ["Data structures", "stacks", "queues", "trees", "graphs"] {
++    for entry in [
++        "Data structures",
++        "stacks",
++        "queues",
++        "sets",
++        "trees",
++        "graphs",
++        "priority queues",
++    ] {
+         assert!(
+             body.contains(entry),
+             "the written-in-Redblue section never mentions `{entry}`. Data \
+              structures are a class the phase names explicitly; leaving them \
+
+[0m
+[0m$ [0mls ../rbops/verify.sh 2>/dev/null; ls rbops 2>/dev/null | head
+../rbops/verify.sh
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 6.03s
+[0m
+[0m$ [0mcargo test --all-targets
+...output truncated...
+
+Full output saved to: /home/runner/.local/share/opencode/tool-output/tool_172eaf58b001ABLTucqyk4sZJi
+
+test common::generator::tests::edge_almost_every_seed_produces_a_program_of_its_own ... ok
+  beta  
+
+test common::generator::tests::edge_every_declared_fault_has_a_tail_that_faults ... ok
+  beta  
+
+  beta  
+
+
+test common::generator::tests::edge_every_declared_fault_is_reachable_from_some_seed ... ok
+90
+90
+
+
+27
+test common::generator::tests::edge_every_kind_is_reachable_and_its_arms_produce_it ... ok
+test common::generator::tests::edge_generated_programs_end_in_a_value_rather_than_in_a_statement ... ok
+test common::generator::tests::edge_the_binders_and_readers_agree ... ok
+delta
+deltadelta
+90
+90
+90
+90
+-80
+test common::generator::tests::edge_the_corpus_holds_every_family_it_lists ... ok
+betabeta
+test a_generated_program_runs_the_same_way_every_time ... ok
+test common::generator::tests::edge_the_generator_emits_every_statement_form_it_lists ... ok
+test common::generator::tests::edge_the_generator_is_a_function_of_nothing ... ok
+test common::rng::tests::edge_a_draw_over_an_empty_table_is_none_and_not_a_panic ... ok
+test common::rng::tests::edge_a_flag_draws_both_answers ... ok
+test common::rng::tests::edge_a_seed_is_replayed_and_a_different_seed_is_not ... ok
+test common::rng::tests::edge_the_bounded_helpers_stay_inside_their_bounds ... ok
+test common::rng::tests::edge_the_default_seed_is_not_zero ... ok
+test common::rng::tests::edge_the_generator_is_the_sequence_splitmix64_publishes ... ok
+-45
+gammaalpha
+test common::generator::tests::edge_the_corpus_is_a_function_of_nothing ... ok
+test common::shrink::tests::edge_a_character_comes_off_a_multibyte_program_at_its_own_boundary ... ok
+test common::shrink::tests::edge_a_line_comes_off_and_a_line_that_is_not_there_does_not ... ok
+test common::shrink::tests::edge_a_reduction_is_reported_with_the_seed_and_the_program_it_reduced ... ok
+test common::shrink::tests::edge_a_reduction_keeps_the_trailing_newline_a_source_has ... ok
+test common::shrink::tests::edge_drop_lines_builds_the_source_the_line_pass_looks_at ... ok
+test common::shrink::tests::edge_the_shrinker_accepts_a_candidate_only_when_it_is_shorter ... ok
+1
+2
+test common::shrink::tests::edge_a_program_that_does_not_diverge_shrinks_to_nothing ... ok
+1
+2
+test common::shrink::tests::edge_the_shrinker_reduces_when_no_line_can_go ... ok
+unreached
+test common::shrink::tests::edge_the_shrinker_never_invents_a_counterexample ... ok
+test common::vm::tests::edge_a_column_only_one_engine_can_name_is_held_to_the_convention ... ok
+1025
+1025
+
+test common::vm::tests::edge_a_failure_carries_the_position_it_happened_at ... ok
+test common::vm::tests::edge_a_failure_renders_with_its_label_message_and_position ... ok
+test common::vm::tests::edge_a_frontend_failure_printed_nothing_on_either_vm ... ok
+test common::vm::tests::edge_a_nested_value_round_trips_through_its_tagged_form ... ok
+test common::vm::tests::edge_a_number_and_the_text_that_spells_it_are_different_outcomes ... ok
+test common::vm::tests::edge_a_number_renders_the_way_the_interpreter_prints_it ... ok
+test common::vm::tests::edge_a_position_is_compared_as_a_whole_not_as_a_line ... ok
+one
+two
+test common::shrink::tests::edge_the_shrinker_stops_only_when_nothing_can_be_removed ... ok
+test common::vm::tests::edge_an_untagged_value_is_rejected_for_a_typed_one ... ok
+test common::vm::tests::edge_one_run_of_a_program_is_all_the_harness_asks_for ... ok
+test common::vm::tests::edge_the_tagged_form_names_the_type_for_every_kind ... ok
+café
+test common::vm::tests::edge_the_two_engines_agree_on_a_failure_and_on_what_was_printed_first ... ok
+test common::vm::tests::edge_a_vm_built_as_a_library_does_not_print_what_the_program_said ... ok
+x
+test common::vm::tests::edge_the_two_halves_of_an_outcome_are_both_recorded ... ok
+after
+test corpus_holds_at_least_two_hundred_programs ... ok
+2
+after
+test edge_a_break_and_a_skip_leave_the_loop_on_both_engines ... ok
+30
+20
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+cafécafé
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+gamma🎉
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+
+test edge_a_call_stack_that_cannot_come_back_is_a_clean_failure ... ok
+test edge_a_corpus_program_whose_expected_file_names_a_failure_reports_a_mismatch ... ok
+1
+test edge_a_deeply_nested_value_is_read_back_on_both_engines ... ok
+test edge_a_generated_program_can_be_seen ... ok
+日本語gamma
+  beta  
+beta日本語
+  beta  
+
+cafécafé
+test a_generated_program_either_completes_or_reports_a_failure ... ok
+[2, 4, 6]
+
+[2, 4, 6]
+[2, 4, 6]
+[2, 4, 6]
+[10, 20, 30]
+1
+2
+[2, 3]
+90
+90
+[[2, 2], [4, 4]]
+[]
+nothing
+[1]
+caught
+after
+27
+delta
+deltadelta
+-80
+betabeta
+-45
+gammaalpha
+1025
+1025
+
+café
+cafécafé
+test edge_a_higher_order_call_answers_the_same_way_on_both_engines ... ok
+test edge_a_mismatch_names_the_program_it_is_about ... ok
+1
+test edge_a_missing_expected_output_file_is_a_runner_failure ... ok
+gamma🎉
+2
+side effect
+7
+1
+1
+nothing
+[1, 2]
+[]
+0
+[1]
+1
+1
+3
+3
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+0
+1
+3
+10
+30
+30
+10
+30
+3
+0
+5
+3
+3
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+30
+30
+after
+once
+
+x
+x
+x
+5
+1
+1
+2
+3
+[1, 2]
+[3, 4]
+1
+2
+3
+4
+two
+  beta  
+beta日本語
+10
+after
+2
+after
+ab
+1
+2
+1
+2
+n
+n
+n
+n
+n
+n
+0
+0
+1
+2
+2
+after
+cafécafé
+[[[[1]]]]
+[[[[[1]]]]]
+{a: {b: {c: {d: 1}}}}
+{a: {b: {c: {d: {e: 1}}}}}
+1
+6
+3
+1
+2
+three
+test edge_a_generated_program_only_faults_on_a_fault_that_was_injected ... ok
+b
+9
+10
+10
+11
+10
+11
+11
+12
+2
+6
+test edge_a_program_that_prints_before_it_faults_is_recorded_not_asserted_away ... ok
+1
+2
+test edge_a_shrunk_program_still_diverges ... ok
+test edge_an_expected_file_naming_the_wrong_label_is_a_comparison_failure ... ok
+30
+20
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+2
+1
+0.30000000000000004
+0.3333333333333333
+0
+2147483648
+2147483647
+-2147483648
+9223372036854776000
+-9223372036854776000
+9007199254740992
+9007199254740992
+9007199254740992
+-3.5
+-3.5
+-1
+1
+0
+0.7999999999999999
+1
+3
+-3
+0.30000000000000004
+{}
+none
+3
+base
+middle
+yes
+{}
+nothing
+nothing
+3
+after inner
+o
+base
+2
+yes
+{a: 1, b: 2}
+yes
+7
+2
+{a: 1, b: x}
+3
+nothing
+nothing
+nothing
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+before
+caught
+after
+yes
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+3
+2
+0
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+hello world
+5
+yes
+
+0
+\
+a
+b
+a	b
+x
+3
+5
+abc
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+yes
+yes
+yes
+yes
+yes
+yes
+[日本, 🎉]
+2
+after a byte order mark
+5
+printed
+1
+2
+a
+b
+test edge_a_column_is_compared_exactly_wherever_both_engines_can_name_one ... ok
+2
+side effect
+7
+test edge_every_recorded_failure_points_at_a_line_of_its_own_program ... ok
+1
+1
+nothing
+[1, 2]
+[]
+0
+[1]
+1
+1
+3
+3
+test edge_every_recorded_failure_records_the_place_it_happened_at ... ok
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+0
+1
+30
+3
+20
+42
+25
+2
+0
+10
+30
+30
+10
+30
+-8
+3
+0
+5
+3
+1
+0.6666666666666666
+0
+1000007
+3
+-12
+yes
+yes
+yes
+yes
+yes
+yes
+16
+1
+yes
+yes
+30
+30
+7
+after
+once
+x
+x
+5
+x
+5
+5
+700
+1
+0.8571428571428571
+1
+2
+3
+[1, 2]
+[3, 4]
+0
+1
+2
+3
+4
+two
+10
+after
+0.30000000000000004
+0.3333333333333333
+0
+2
+after
+2147483648
+2147483647
+ab
+-2147483648
+1
+2
+1
+2
+9223372036854776000
+n
+n
+n
+n
+n
+n
+-9223372036854776000
+0
+9007199254740992
+0
+1
+2
+9007199254740992
+9007199254740992
+2
+-3.5
+-3.5
+after
+-1
+1
+0
+0.7999999999999999
+1
+3
+-3
+[[[[1]]]]
+0.30000000000000004
+hello world
+[[[[[1]]]]]
+{a: {b: {c: {d: 1}}}}
+5
+{a: {b: {c: {d: {e: 1}}}}}
+yes
+1
+
+0
+\
+6
+a
+b
+a	b
+3
+1
+x
+2
+3
+three
+b
+5
+9
+10
+10
+11
+10
+11
+11
+12
+abc
+2
+Hello, World!
+6
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+yes
+yes
+yes
+yes
+yes
+yes
+[日本, 🎉]
+2
+after a byte order mark
+[]
+0
+[1]
+1
+1
+3
+3
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+0
+1
+3
+10
+30
+30
+10
+30
+3
+0
+5
+3
+3
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+30
+30
+{a: 1, b: x}
+3
+nothing
+nothing
+nothing
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+2
+1
+0.30000000000000004
+0.3333333333333333
+0
+2147483648
+2147483647
+-2147483648
+9223372036854776000
+-9223372036854776000
+9007199254740992
+9007199254740992
+9007199254740992
+-3.5
+-3.5
+-1
+1
+0
+0.7999999999999999
+1
+3
+-3
+0.30000000000000004
+{}
+none
+3
+base
+middle
+yes
+{}
+nothing
+nothing
+3
+after inner
+o
+base
+2
+yes
+{a: 1, b: 2}
+yes
+7
+2
+{a: 1, b: x}
+3
+nothing
+nothing
+nothing
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+before
+caught
+after
+yes
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+3
+2
+0
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+hello world
+5
+yes
+
+0
+\
+a
+b
+a	b
+x
+3
+5
+abc
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+2
+𠮷
+1
+side effect
+café
+4
+7
+Ω≈ç√∫
+5
+1
+1
+→∞
+2
+nothing
+yes
+yes
+[1, 2]
+yes
+{}
+yes
+none
+yes
+3
+base
+middle
+yes
+yes
+[日本, 🎉]
+2
+{}
+after a byte order mark
+nothing
+5
+nothing
+3
+after inner
+o
+base
+2
+yes
+{a: 1, b: 2}
+yes
+7
+2
+after
+once
+x
+x
+x
+5
+1
+1
+2
+3
+[1, 2]
+[3, 4]
+1
+2
+3
+4
+two
+10
+after
+2
+after
+ab
+1
+2
+1
+2
+n
+n
+n
+n
+n
+n
+0
+0
+1
+2
+printed
+2
+after
+1
+2
+[[[[1]]]]
+[[[[[1]]]]]
+{a: {b: {c: {d: 1}}}}
+{a: {b: {c: {d: {e: 1}}}}}
+1
+a
+b
+6
+3
+1
+test edge_both_vms_place_every_failure_in_the_same_place ... ok
+2
+three
+b
+9
+10
+10
+11
+10
+11
+11
+12
+2
+6
+test edge_the_control_flow_family_covers_the_if_else_it_has_and_pins_the_else_if_it_does_not ... ok
+日本語gamma
+  beta  
+
+
+90
+90
+27
+delta
+deltadelta
+2
+1
+3
+2
+0
+-80
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+betabeta
+record
+1
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+before
+caught
+after
+yes
+-45
+gammaalpha
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+1025
+1025
+
+café
+5
+printed
+1
+2
+cafécafé
+a
+b
+gamma🎉
+test edge_regenerating_the_corpus_reproduces_the_checked_in_one_byte_for_byte ... ok
+30
+20
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+  beta  
+beta日本語
+cafécafé
+test edge_the_generated_corpus_compares_a_program_s_value_not_only_its_output ... ok
+test every_corpus_program_has_an_expected_output_file ... ok
+30
+20
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+0
+3
+v
+hi world
+8
+6
+8
+10
+test common::generator::tests::edge_every_arm_is_reachable_from_more_than_one_seed ... ok
+second
+second
+test the_checked_in_corpus_is_the_one_the_generator_produces ... ok
+test the_corpus_holds_programs_that_are_worth_something ... ok
+test the_corpus_holds_programs_that_must_fail ... ok
+日本語gamma
+  beta  
+
+
+90
+90
+27
+delta
+deltadelta
+-80
+betabeta
+-45
+gammaalpha
+1025
+1025
+
+2
+side effect
+7
+1
+1
+nothing
+[1, 2]
+[]
+0
+[1]
+1
+1
+3
+3
+café
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+0
+1
+2
+3
+side effect
+7
+1
+1
+nothing
+[1, 2]
+10
+30
+30
+10
+30
+[]
+0
+3
+0
+5
+3
+[1]
+1
+1
+3
+3
+3
+1
+[1, 2, 3]
+3
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+30
+30
+1
+2
+after
+once
+done
+b
+yes
+x
+x
+x
+nothing
+5
+0
+1
+cafécafé
+3
+1
+1
+2
+3
+10
+30
+30
+10
+30
+[1, 2]
+[3, 4]
+3
+0
+5
+3
+1
+2
+3
+4
+two
+10
+3
+after
+2
+after
+yes
+yes
+yes
+yes
+yes
+yes
+ab
+yes
+yes
+30
+30
+gamma🎉
+after
+1
+2
+1
+2
+once
+n
+n
+n
+n
+n
+n
+x
+x
+x
+0
+5
+0
+1
+2
+2
+after
+1
+1
+2
+3
+[1, 2]
+[3, 4]
+1
+2
+3
+4
+[[[[1]]]]
+[[[[[1]]]]]
+two
+{a: {b: {c: {d: 1}}}}
+10
+{a: {b: {c: {d: {e: 1}}}}}
+after
+2
+after
+1
+ab
+6
+1
+2
+1
+2
+3
+1
+n
+n
+n
+n
+n
+n
+0
+2
+0
+1
+2
+three
+2
+after
+b
+9
+10
+10
+11
+10
+11
+11
+12
+2
+6
+[[[[1]]]]
+[[[[[1]]]]]
+{a: {b: {c: {d: 1}}}}
+{a: {b: {c: {d: {e: 1}}}}}
+1
+6
+3
+1
+2
+three
+b
+9
+10
+10
+11
+10
+11
+11
+12
+2
+6
+
+  beta  
+beta日本語
+cafécafé
+test the_two_vms_agree_on_every_generated_program ... ok
+2
+1
+0.30000000000000004
+0.3333333333333333
+0
+2147483648
+2147483647
+-2147483648
+9223372036854776000
+-9223372036854776000
+9007199254740992
+9007199254740992
+9007199254740992
+-3.5
+-3.5
+-1
+1
+0
+0.7999999999999999
+1
+3
+-3
+0.30000000000000004
+{}
+none
+3
+base
+middle
+yes
+{}
+nothing
+nothing
+2
+3
+1
+after inner
+o
+base
+2
+yes
+0.30000000000000004
+{a: 1, b: 2}
+0.3333333333333333
+yes
+0
+2147483648
+7
+2
+2147483647
+-2147483648
+9223372036854776000
+{a: 1, b: x}
+-9223372036854776000
+3
+9007199254740992
+nothing
+9007199254740992
+nothing
+9007199254740992
+nothing
+-3.5
+2
+-3.5
+-1
+1
+2
+yes
+1
+1
+0
+0.7999999999999999
+2
+1
+3
+nothing
+-3
+yes
+5
+0.30000000000000004
+yes
+{}
+none
+yes
+yes
+yes
+3
+yes
+base
+yes
+yes
+middle
+yes
+yes
+yes
+yes
+{}
+yes
+yes
+nothing
+before
+caught
+after
+nothing
+yes
+3
+a
+b
+c
+no
+after inner
+o
+yes
+yes
+base
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+2
+3
+2
+yes
+0
+{a: 1, b: 2}
+yes
+number
+number
+text
+7
+2
+yes/no
+nothing
+list
+list
+{a: 1, b: x}
+record
+3
+record
+nothing
+1
+nothing
+hello world
+nothing
+5
+yes
+2
+
+1
+2
+0
+\
+yes
+a
+b
+1
+a	b
+x
+2
+3
+nothing
+5
+yes
+abc
+5
+Hello, World!
+Hello, World!
+yes
+Hello, World!
+yes
+yes
+1
+yes
+  x  
+
+yes
+a
+yes
+1
+日本語
+yes
+3
+yes
+🎉🎊
+2
+👩‍💻
+3
+yes
+yes
+مرحبا
+5
+𠮷
+1
+yes
+café
+4
+yes
+Ω≈ç√∫
+5
+yes
+→∞
+2
+before
+caught
+after
+yes
+yes
+yes
+yes
+a
+b
+c
+yes
+yes
+yes
+no
+yes
+[日本, 🎉]
+2
+after a byte order mark
+yes
+5
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+3
+2
+0
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+hello world
+printed
+5
+yes
+1
+2
+
+0
+\
+a
+b
+a	b
+x
+3
+a
+b
+5
+abc
+test every_corpus_program_prints_what_its_expected_file_records ... ok
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+yes
+yes
+yes
+yes
+yes
+yes
+[日本, 🎉]
+2
+after a byte order mark
+5
+printed
+1
+2
+a
+b
+test every_corpus_program_agrees_between_the_two_vms ... ok
+test edge_a_program_that_never_ends_is_stopped_rather_than_hanging ... ok
+
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.85s
+
+[1m[92m     Running[0m tests/discovery_test.rs (target/debug/deps/discovery_test-fe59406023b450dd)
+
+running 13 tests
+test edge_discovery_of_empty_and_missing_directory_is_empty ... ok
+test edge_discovery_collects_a_single_rb_file ... ok
+test edge_malformed_rb_test_is_reported_as_a_failure ... ok
+test edge_discovery_never_returns_rust_files ... ok
+test edge_crlf_rb_file_is_discovered_and_executed ... ok
+test edge_discovery_order_is_sorted_and_stable_across_calls ... ok
+test edge_non_utf8_rb_file_is_reported_as_an_io_error ... ok
+test edge_repository_rust_suite_is_never_handed_to_the_harness ... ok
+test edge_nested_discovery_is_globally_sorted ... ok
+test edge_rb_path_with_spaces_is_discovered_and_run ... ok
+test find_test_files_walks_nested_directories ... ok
+test edge_unicode_rb_test_is_discovered_and_asserted ... ok
+still here
+test edge_project_tests_directory_has_no_failures ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+
+running 7 tests
+[1m[92m     Running[0m tests/doc_blocks_test.rs (target/debug/deps/doc_blocks_test-6652bee6aebe4269)
+test edge_a_block_with_no_closing_fence_is_still_extracted ... ok
+test edge_a_document_that_does_not_exist_is_an_error_rather_than_a_panic ... ok
+test edge_a_fence_that_is_not_tagged_redblue_is_ignored ... ok
+test edge_an_empty_block_is_extracted ... ok
+test every_documentation_block_is_classified_exactly_once ... ok
+test edge_a_known_fail_recording_that_is_wrong_is_rejected ... ok
+test running_every_block_agrees_with_the_bucket_it_is_in ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s
+
+
+running 21 tests
+test edge_a_loop_evaluates_every_expect ... ok
+test edge_an_empty_test_body_still_passes ... ok
+test edge_division_by_zero_is_a_runtime_error_not_an_assertion ... ok
+test edge_empty_text_is_not_the_same_as_nothing ... ok
+[1m[92m     Running[0m tests/expect_test.rs (target/debug/deps/expect_test-2b26fa2fa01d2be2)
+test edge_escapes_are_compared_literally ... ok
+test edge_expect_results_are_deterministic_across_runs ... ok
+test edge_empty_values_compare_equal_to_themselves ... ok
+test edge_malformed_expect_is_a_parse_error ... ok
+test edge_index_boundaries_feed_the_actual_value ... ok
+test edge_missing_record_key_differs_from_present_key ... ok
+test edge_normalisation_is_not_applied_to_text_comparison ... ok
+test edge_nested_containers_compare_structurally ... ok
+test edge_singleton_list_compares_elementwise ... ok
+test edge_numeric_boundaries_compare_exactly ... ok
+test expect_match_passes_the_test ... ok
+test expect_inside_a_control_flow_block ... ok
+test expect_matches_a_computed_expression ... ok
+test expect_mismatch_fails_the_test ... ok
+test edge_type_mismatch_fails ... ok
+test expect_tolerates_omitting_be ... ok
+test edge_unicode_compares_by_whole_string ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+
+running 4 tests
+[1m[92m     Running[0m tests/failure_channel_test.rs (target/debug/deps/failure_channel_test-5e089b4bccc50abb)
+test edge_a_program_that_cannot_be_parsed_is_refused_before_it_runs ... ok
+test edge_an_unknown_function_is_refused_by_both_engines ... ok
+test edge_an_index_past_the_end_of_a_list_is_refused ... ok
+test edge_a_builtin_given_the_wrong_type_is_refused_by_the_library ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 31 tests
+0
+3
+6
+9
+12
+15
+18
+1
+2
+3
+4
+5
+1
+2
+7
+0
+3
+6
+9
+12
+15
+18
+test a_range_loop_visits_every_value_in_order ... ok
+test a_range_variable_does_not_collide_with_an_outer_binding ... ok
+test a_range_loop_is_deterministic_across_runs ... ok
+7
+8
+1
+7
+8
+2
+1
+2
+3
+4
+0
+3
+6
+9
+1
+2
+3
+4
+test a_range_loop_nests_and_the_inner_variable_is_its_own ... ok
+test a_step_that_does_not_land_on_the_end_still_stops_at_or_before_it ... ok
+test a_step_of_one_and_an_omitted_step_are_the_same_loop ... ok
+0
+5
+10
+test a_step_of_five_visits_only_the_multiples_of_five ... ok
+1
+2
+test an_integral_counter_renders_without_a_fraction ... ok
+5
+4
+3
+2
+1
+test edge_a_descending_step_counts_down ... ok
+test an_unanalysable_range_bound_is_reported_by_the_analyzer ... ok
+test edge_a_for_each_with_neither_in_nor_from_is_a_parser_error ... ok
+0
+0
+0.25
+0.5
+0.75
+1
+0
+0.1
+0.2
+0.30000000000000004
+0.4
+0.5
+0.6
+0.7
+0.7999999999999999
+0.8999999999999999
+0.9999999999999999
+test edge_a_by_before_the_to_is_a_parser_error ... ok
+test edge_a_descending_step_that_starts_below_its_end_is_empty ... ok
+test edge_a_fractional_step_on_a_whole_number_range ... ok
+test edge_a_fractional_step_that_would_overshoot_still_terminates ... ok
+test edge_a_non_number_by_is_a_runtime_error_naming_by ... ok
+test edge_a_non_number_to_is_a_runtime_error_naming_to ... ok
+test edge_a_non_number_from_is_a_runtime_error_naming_from ... ok
+3
+test edge_a_list_as_a_bound_is_refused_rather_than_skipped ... ok
+test edge_a_range_of_one_visits_exactly_one_value ... ok
+test edge_a_step_missing_its_end_of_the_range_is_a_parser_error ... ok
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+test edge_a_step_that_overflows_the_counter_is_a_runtime_error ... ok
+test edge_a_range_at_exactly_the_iteration_limit_still_finishes ... ok
+0
+test edge_a_range_longer_than_the_iteration_limit_stops_like_a_repeat_does ... ok
+test edge_an_empty_range_visits_nothing_and_does_not_hang ... ok
+test the_analyzer_accepts_a_range_loop_and_its_step ... ok
+test edge_the_loop_variable_is_out_of_scope_after_end ... ok
+0
+5
+10
+100
+100
+100
+100
+99
+test the_linter_analyzes_a_range_loop_body ... ok
+test the_formatter_prints_a_range_loop_and_the_result_still_runs ... ok
+test the_loop_variable_is_a_local_that_does_not_leak ... ok
+[1m[92m     Running[0m tests/for_range_test.rs (target/debug/deps/for_range_test-df3e340306bbb446)
+
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 900000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mcargo test --test libraries_policy_test
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.08s
+[1m[92m     Running[0m tests/libraries_policy_test.rs (target/debug/deps/libraries_policy_test-364478812ddb314d)
+
+running 9 tests
+test binding_entries_name_specific_rust_crates ... ok
+test edge_data_structures_are_written_in_redblue ... ok
+test each_section_states_a_reason_not_just_a_list ... ok
+test edge_binding_required_directory_gap_is_a_clean_refusal ... ok
+test edge_every_ranked_gap_is_decided_in_exactly_one_section ... ok
+test edge_policy_is_linked_from_readme_and_agents ... ok
+test the_native_speed_limit_is_stated_without_a_promise ... ok
+test the_speed_answer_is_stated_plainly_and_not_hedged ... ok
+test binding_required_libraries_are_refused_today ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[0m
