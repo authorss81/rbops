@@ -1,0 +1,5093 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/repl/weight.rs
+[0m→ [0mRead src/interpreter.rs[90m [offset=1700, limit=150][0m
+[0m✱ [0mGrep "enum FunctionBody|pub struct FunctionValue|struct Chunk|pub enum Chunk|enum Instruction|pub enum Op"[90m in src · 4 matches[0m
+[0m✱ [0mGrep "fn call_depth|call_depth|loop_depth"[90m in src/interpreter.rs · 44 matches[0m
+[0m→ [0mRead src/value.rs[90m [offset=1, limit=130][0m
+[0m→ [0mRead src/bytecode/format.rs[90m [offset=230, limit=120][0m
+[0m→ [0mRead src/bytecode/opcode.rs[90m [offset=40, limit=120][0m
+[0m✱ [0mGrep "pub enum Stmt|pub struct Stmt|pub enum Statement|pub struct Instruction|pub enum Constant|pub struct Block|pub struct Span|pub enum Expr"[90m in src · 8 matches[0m
+[0m
+[0m$ [0mgit -C /home/runner/work/rbops/rbops/redblue log --oneline -8 && git -C /home/runner/work/rbops/rbops/redblue status --short
+d9efa52 rbops: phase-069 (2026-10-24T20:50:07Z)
+5b59dab rbops: phase-068 (2026-10-24T16:27:14Z)
+20d44f9 resume phase-068: adopt preserved work
+6bb4432 docs: record future roadmap, real-world apps and deferred OS features
+84a4146 docs: add memory safety, self-hosting and performance roadmap
+25502fb rbops: phase-067 (2026-10-24T06:58:16Z)
+22858d6 rbops: phase-066 (2026-10-24T05:05:08Z)
+4685f5a rbops: phase-065 (2026-10-24T04:12:44Z)
+ M src/interpreter.rs
+ M src/repl/commands.rs
+ M src/repl/mod.rs
+?? src/repl/weight.rs
+[0m
+[0m→ [0mRead src/parser.rs[90m [offset=1, limit=340][0m
+[0m→ [0mRead src/bytecode/format.rs[90m [offset=100, limit=130][0m
+[0m
+[0m$ [0mgit -C /home/runner/work/rbops/rbops/redblue diff --stat && git -C /home/runner/work/rbops/rbops/redblue diff -- src/interpreter.rs | head -200
+src/interpreter.rs   | 137 +++++++++++++++++
+ src/repl/commands.rs |  59 ++++++++
+ src/repl/mod.rs      | 408 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 604 insertions(+)
+diff --git a/src/interpreter.rs b/src/interpreter.rs
+index d2f21db..0d6f68e 100644
+--- a/src/interpreter.rs
++++ b/src/interpreter.rs
+@@ -20,6 +20,7 @@ use crate::value::{
+ use std::collections::{HashMap, HashSet};
+ use std::path::Path;
+ use std::sync::Arc;
++use std::time::Instant;
+ 
+ // The HTTP timeouts belong to the builtin library, which is `runtime`'s; they
+ // are part of this module's public surface because they were declared here
+@@ -493,6 +494,32 @@ pub struct Vm {
+     /// not a failure: it has to unwind past `if` statements and `try` bodies
+     /// that have no idea a loop is around them.
+     loop_control: Option<LoopControl>,
++    /// Per-source-line self time, while `.profile` is measuring a block.
++    ///
++    /// `None` for every ordinary run, so the only cost a program pays for this
++    /// instrument is the branch in [`Vm::execute_statement`].
++    line_timer: Option<LineTimer>,
++}
++
++/// One statement's clock reading, while it is executing.
++///
++/// A frame holds its own start and how much of its elapsed time belongs to
++/// statements nested inside it. Subtracting the child time leaves the statement's
++/// own cost, so a parent and a child on different source lines are not counted
++/// twice in the report.
++struct ActiveLine {
++    line: usize,
++    started: Instant,
++    child_nanos: u128,
++}
++
++/// The per-line totals one profiled block is building.
++#[derive(Default)]
++struct LineTimer {
++    /// Self time by source line, first-completion order. A `Vec` rather than a
++    /// map so two runs of the same block report the same order.
++    totals: Vec<(usize, u128)>,
++    stack: Vec<ActiveLine>,
+ }
+ 
+ /// What a `break` or a `skip` asks the innermost enclosing loop to do.
+@@ -693,6 +720,7 @@ impl Vm {
+             max_iterations: resolve_max_iterations(),
+             loop_depth: 0,
+             loop_control: None,
++            line_timer: None,
+         }
+     }
+ 
+@@ -1696,9 +1724,13 @@ impl Vm {
+         let previous_span = std::mem::replace(&mut self.current_span, stmt.span);
+         self.statement_depth += 1;
+         self.debug_before(stmt.span.line);
++        // Opened before the step charge and before the body, closed on every
++        // path out, so a statement that fails still has its cost recorded.
++        let profile = self.profile_enter(stmt.span.line);
+         let result = self
+             .charge_step()
+             .and_then(|()| self.execute_statement_body(&stmt.statement));
++        self.profile_exit(profile);
+         // Restored on the failing path as well as the succeeding one: a
+         // statement that raised an error still finished, and leaving the counter
+         // raised would make every later statement look nested inside it.
+@@ -1707,6 +1739,70 @@ impl Vm {
+         result
+     }
+ 
++    /// Starts collecting per-source-line self time for the next run.
++    ///
++    /// Only the tree-walker is timed: it is the engine a REPL session runs, and
++    /// `.profile` is a question about the session the user is sitting in. A
++    /// block that binds or reads something changes the session exactly as it
++    /// would without the instrument; the timer only reads the clock.
++    pub fn start_line_profile(&mut self) {
++        self.line_timer = Some(LineTimer::default());
++    }
++
++    /// Stops collecting and answers what was collected, by source line.
++    pub fn take_line_profile(&mut self) -> Option<Vec<(usize, u128)>> {
++        self.line_timer.take().map(|timer| timer.totals)
++    }
++
++    /// Opens a timing frame for `line`, if this statement belongs to the
++    /// program being profiled.
++    ///
++    /// Statements inside a user function call are not timed: their source lines
++    /// belong to the function's declaration, not to the block the user typed, so
++    /// their time stays in the call-site line rather than being attributed to a
++    /// line the block never showed.
++    fn profile_enter(&mut self, line: usize) -> bool {
++        if self.call_depth != 0 {
++            return false;
++        }
++        let Some(timer) = self.line_timer.as_mut() else {
++            return false;
++        };
++        timer.stack.push(ActiveLine {
++            line,
++            started: Instant::now(),
++            child_nanos: 0,
++        });
++        true
++    }
++
++    /// Closes the frame opened by [`Vm::profile_enter`] and books its self time.
++    fn profile_exit(&mut self, entered: bool) {
++        if !entered {
++            return;
++        }
++        let Some(timer) = self.line_timer.as_mut() else {
++            return;
++        };
++        let Some(frame) = timer.stack.pop() else {
++            return;
++        };
++        let elapsed = frame.started.elapsed().as_nanos();
++        let own = elapsed.saturating_sub(frame.child_nanos);
++        if let Some((_, recorded)) = timer
++            .totals
++            .iter_mut()
++            .find(|(line, _)| *line == frame.line)
++        {
++            *recorded += own;
++        } else {
++            timer.totals.push((frame.line, own));
++        }
++        if let Some(parent) = timer.stack.last_mut() {
++            parent.child_nanos += elapsed;
++        }
++    }
++
+     /// Installs the debugger, or takes it away again with `None`.
+     ///
+     /// The hook is asked before every statement and may only answer what to do
+@@ -2845,4 +2941,45 @@ mod tests {
+              restarted with it"
+         );
+     }
++
++    /// A user function's body is not part of the block being profiled, so its
++    /// time belongs to the line that called it. The body's own lines are never
++    /// timed, even though they run inside the call-site statement.
++    #[test]
++    fn profile_keeps_a_user_function_body_at_its_call_site() {
++        let source = "\
++to add_up(n)
++    set total to 0
++    for each i from 1 to n
++        set total to total + i
++    end
++    give back total
++end
++set answer to add_up(20000)
++";
++        let program = crate::lexer::Lexer::tokenize(source)
++            .and_then(|tokens| crate::parser::Parser::new(tokens).parse())
++            .expect("the profiling fixture is a valid program");
++
++        let mut vm = Vm::new();
++        vm.start_line_profile();
++        vm.run(&program).expect("the fixture runs");
++
++        let timings = vm
++            .take_line_profile()
++            .expect("a profile was started and not yet taken");
++        assert!(
++            timings.iter().any(|(line, _)| *line == 8),
++            "the call-site line is timed: {:?}",
++            timings
++        );
++        for body_line in 2..=6 {
++            assert!(
++                !timings.iter().any(|(line, _)| *line == body_line),
++                "line {body_line} is inside the function body and must stay \
++                 attributed to the call site, not itself: {:?}",
++                timings
++            );
++        }
++    }
+ }
+[0m
+[0m$ [0mls /home/runner/work/rbops/rbops/redblue && find /home/runner/work/rbops/rbops/redblue -maxdepth 2 -iname '*phase*' -o -iname '*review*' | head -50
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LICENSE
+MEMORY.md
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+SURVEY.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+opencode.json
+phases
+review_findings.md
+src
+target
+test.redblue
+tests
+tooling
+wasm
+/home/runner/work/rbops/rbops/redblue/phases
+/home/runner/work/rbops/rbops/redblue/phases/phase-018
+/home/runner/work/rbops/rbops/redblue/phases/phase-015
+/home/runner/work/rbops/rbops/redblue/phases/phase-052
+/home/runner/work/rbops/rbops/redblue/phases/phase-019
+/home/runner/work/rbops/rbops/redblue/phases/phase-080
+/home/runner/work/rbops/rbops/redblue/phases/phase-008
+/home/runner/work/rbops/rbops/redblue/phases/phase-084
+/home/runner/work/rbops/rbops/redblue/phases/phase-009
+/home/runner/work/rbops/rbops/redblue/phases/phase-087
+/home/runner/work/rbops/rbops/redblue/phases/phase-039
+/home/runner/work/rbops/rbops/redblue/phases/phase-044
+/home/runner/work/rbops/rbops/redblue/phases/phase-042
+/home/runner/work/rbops/rbops/redblue/phases/phase-058
+/home/runner/work/rbops/rbops/redblue/phases/phase-054
+/home/runner/work/rbops/rbops/redblue/phases/phase-090
+/home/runner/work/rbops/rbops/redblue/phases/phase-041
+/home/runner/work/rbops/rbops/redblue/phases/phase-012
+/home/runner/work/rbops/rbops/redblue/phases/phase-046
+/home/runner/work/rbops/rbops/redblue/phases/phase-016
+/home/runner/work/rbops/rbops/redblue/phases/phase-020
+/home/runner/work/rbops/rbops/redblue/phases/phase-032
+/home/runner/work/rbops/rbops/redblue/phases/phase-047
+/home/runner/work/rbops/rbops/redblue/phases/phase-086
+/home/runner/work/rbops/rbops/redblue/phases/phase-088
+/home/runner/work/rbops/rbops/redblue/phases/phase-056
+/home/runner/work/rbops/rbops/redblue/phases/phase-003
+/home/runner/work/rbops/rbops/redblue/phases/phase-011
+/home/runner/work/rbops/rbops/redblue/phases/phase-059
+/home/runner/work/rbops/rbops/redblue/phases/phase-060
+/home/runner/work/rbops/rbops/redblue/phases/phase-014
+/home/runner/work/rbops/rbops/redblue/phases/phase-063
+/home/runner/work/rbops/rbops/redblue/phases/phase-026
+/home/runner/work/rbops/rbops/redblue/phases/phase-057
+/home/runner/work/rbops/rbops/redblue/phases/phase-037
+/home/runner/work/rbops/rbops/redblue/phases/phase-045
+/home/runner/work/rbops/rbops/redblue/phases/phase-048
+/home/runner/work/rbops/rbops/redblue/phases/phase-093
+/home/runner/work/rbops/rbops/redblue/phases/phase-036
+/home/runner/work/rbops/rbops/redblue/phases/phase-064
+/home/runner/work/rbops/rbops/redblue/phases/phase-081
+/home/runner/work/rbops/rbops/redblue/phases/phase-038
+/home/runner/work/rbops/rbops/redblue/phases/phase-006
+/home/runner/work/rbops/rbops/redblue/phases/phase-043
+/home/runner/work/rbops/rbops/redblue/phases/phase-035
+/home/runner/work/rbops/rbops/redblue/phases/phase-023
+/home/runner/work/rbops/rbops/redblue/phases/phase-021
+/home/runner/work/rbops/rbops/redblue/phases/phase-049
+/home/runner/work/rbops/rbops/redblue/phases/phase-022
+/home/runner/work/rbops/rbops/redblue/phases/phase-067
+[0m
+[0m$ [0mls -la /home/runner/work/rbops/rbops/redblue/phases/phase-070 2>/dev/null; cat /home/runner/work/rbops/rbops/redblue/review_findings.md 2>/dev/null | head -100
+FINDINGS:
+1. [MAJOR] src/interpreter.rs:721 — `observe_bindings` copies only `locals` and `globals` to the scratch VM, but not `qualified_members`, `modules`, `module_aliases`, `declared_modules`, or `objects`. This breaks module member calls (e.g., `files.write()`, `json.parse()`) in `.watch` expressions because `Vm::call_method` checks `qualified_members` to resolve `receiver.method` to the qualified builtin name. Without it, `files.write(...)` fails with "'files' has no method 'write'" instead of reaching the effectful-builtin refusal. The test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` uses `files.write` without `import files`, so it likely fails for the wrong reason (missing method vs. refused effect) — the assertion checks for "files_write" in the refusal text, which would not appear in the actual error. Fix: extend `observe_bindings` to also copy `qualified_members` (and ideally `modules`, `module_aliases`, `declared_modules`, `objects`) from the observed VM.
+
+2. [MAJOR] src/interpreter.rs:721 — The scratch VM's `steps` counter (step budget) is never reset between watch evaluations. `observe_bindings` resets `statement_depth` and drains output but leaves `steps`, `call_depth`, `loop_depth`, `loop_control`, and `assertions_failed` accumulating. With many watches or complex watch expressions (e.g., loops), the shared scratch VM can hit the step limit (default 32M) and cause subsequent watch evaluations to fail with a step-limit error. Fix: reset `steps = 0` (and other per-run counters) in `observe_bindings`, or create a fresh scratch VM per evaluation.
+
+3. [MINOR] src/repl/debug_repl.rs:606 — TOCTOU in `read_argument`: between `read_source(argument)` failing and `std::fs::metadata(argument).is_ok()` check, the filesystem state can change (file created/deleted). If a file is created in this window, a previously-missing `.rb` file is reported as "cannot read" with a stale error; if deleted, a directory may be misclassified as code. Low practical risk for a REPL but a correctness gap. Fix: decide file-vs-code from the single `read_source` result; only fall back to metadata for the `.rb`-suffix rule.
+
+4. [MINOR] src/repl/debug_repl.rs:179 — No limit on number of `.watch` registrations. A user can register unlimited watches, each evaluated at every statement boundary, causing O(watches × statements) work with no bound. Fix: enforce a reasonable cap (e.g., 100 watches) and refuse further registrations.
+
+5. [STYLE] src/repl/debug_repl.rs:122-127 — The debug hook closure returns `DebugAction::Run` but does not catch panics. If `observe` or `evaluate_watches` panics (e.g., due to a bug), the panic propagates out of `Vm::debug_before`, crashing the program being debugged instead of reporting a watch failure. Fix: wrap the hook body in `std::panic::catch_unwind` and report the panic as a watch error.
+
+6. [STYLE] src/repl/mod.rs:3570 — Test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` asserts the watch refusal contains "files_write", but the watch expression `files.write(...)` is used without `import files`. Without the import, `qualified_members` lacks `files_write`, so `call_method` fails with "'files' has no method 'write'" (not a refusal). The test likely passes for the wrong reason or masks finding #1. Fix: either add `import files` to the test setup, or update the assertion to match the actual error (and separately test the refusal path with a proper import).
+
+REVIEW VERDICT: FINDINGS 6
+[0m
+[0m$ [0mfind /home/runner/work/rbops/rbops/redblue/phases/phase-070 -type f -maxdepth 2 -print 2>/dev/null
+(no output)
+[0m
+[0m$ [0mls /home/runner/work/rbops/rbops/redblue/phases | tail -20; cat /home/runner/work/rbops/rbops/redblue/opencode.json
+phase-062
+phase-063
+phase-064
+phase-065
+phase-066
+phase-067
+phase-068
+phase-069
+phase-080
+phase-081
+phase-083
+phase-084
+phase-085
+phase-086
+phase-087
+phase-088
+phase-089
+phase-090
+phase-092
+phase-093
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "reviewer": {
+      "description": "Read-only reviewer for a redblue pipeline phase. Reviews the phase diff and emits findings; may not edit files, run commands, fetch the web, launch subagents, or touch paths outside the checkout.",
+      "mode": "primary",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "task": "deny",
+        "todowrite": "deny",
+        "skill": "deny",
+        "lsp": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "doom_loop": "deny",
+        "external_directory": "deny"
+      }
+    },
+    "verifier": {
+      "description": "Runs a redblue pipeline phase's gates. Needs the toolchain, so it is not read-only.",
+      "mode": "primary",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    }
+  }
+}
+[0m
+[0m$ [0mfind /home/runner/work/rbops/rbops/redblue -maxdepth 2 -type f -newer /home/runner/work/rbops/rbops/redblue/Cargo.toml | head -50
+/home/runner/work/rbops/rbops/redblue/examples/hello.rb
+/home/runner/work/rbops/rbops/redblue/examples/random.rb
+/home/runner/work/rbops/rbops/redblue/examples/test_arithmetic.rb
+/home/runner/work/rbops/rbops/redblue/examples/fizzbuzz.rb
+/home/runner/work/rbops/rbops/redblue/examples/time.rb
+/home/runner/work/rbops/rbops/redblue/examples/files.rb
+/home/runner/work/rbops/rbops/redblue/examples/formats.rb
+/home/runner/work/rbops/rbops/redblue/build.rs
+/home/runner/work/rbops/rbops/redblue/test.redblue
+/home/runner/work/rbops/rbops/redblue/SURVEY.md
+/home/runner/work/rbops/rbops/redblue/.git/opencode
+/home/runner/work/rbops/rbops/redblue/.git/FETCH_HEAD
+/home/runner/work/rbops/rbops/redblue/.git/config
+/home/runner/work/rbops/rbops/redblue/.git/packed-refs
+/home/runner/work/rbops/rbops/redblue/.git/ORIG_HEAD
+/home/runner/work/rbops/rbops/redblue/.git/index
+/home/runner/work/rbops/rbops/redblue/SPEC.md
+/home/runner/work/rbops/rbops/redblue/bootstrap/build.sh
+/home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+/home/runner/work/rbops/rbops/redblue/modules/MathUtils.rb
+/home/runner/work/rbops/rbops/redblue/modules/SuiteKit.rb
+/home/runner/work/rbops/rbops/redblue/wasm/redblue.js
+/home/runner/work/rbops/rbops/redblue/wasm/index.html
+/home/runner/work/rbops/rbops/redblue/wasm/README.md
+/home/runner/work/rbops/rbops/redblue/wasm/check-examples.js
+/home/runner/work/rbops/rbops/redblue/opencode.json
+/home/runner/work/rbops/rbops/redblue/tests/checkpoint_ancestry_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/debugger_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/interpolation_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/unless_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/wasm_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/function_literal_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/stdlib_module_names_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/failure_channel_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/numeric_edge_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/doc_blocks_fragments.txt
+/home/runner/work/rbops/rbops/redblue/tests/loop_bounds_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/phase_088_scanner_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/preflight_assert_failure.rs
+/home/runner/work/rbops/rbops/redblue/tests/stdlib_gap_survey_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/stdlib_module_docs_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/text_length_characters_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/time_builtin_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/comparison_words_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/suite.rb
+/home/runner/work/rbops/rbops/redblue/tests/record_order_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/repl_color_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/for_range_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_ship_test.rs
+[0m
+[0m$ [0mfind /home/runner/work/rbops/rbops/redblue -maxdepth 3 -type f \( -iname '*gate*' -o -iname '*check*' -o -iname '*.sh' \) | head -60
+/home/runner/work/rbops/rbops/redblue/.git/hooks/push-to-checkout.sample
+/home/runner/work/rbops/rbops/redblue/bootstrap/build.sh
+/home/runner/work/rbops/rbops/redblue/wasm/check-examples.js
+/home/runner/work/rbops/rbops/redblue/tests/checkpoint_ancestry_test.rs
+/home/runner/work/rbops/rbops/redblue/tests/checkpoint_ancestry_ack.txt
+/home/runner/work/rbops/rbops/redblue/export.sh
+[0m
+[0m✱ [0mGrep "four gates|gates|cargo fmt|cargo clippy|cargo test"[90m in phases/phase-069 · 3 matches[0m
+[0m
+[0m$ [0msed -n '70,130p' /home/runner/work/rbops/rbops/redblue/phases/phase-069/REPORT.md; ls /home/runner/work/rbops/rbops/redblue/phases/phase-069
+| `search_ranks_an_exact_name_above_a_substring` | boundary/ranking — exact `split` before `splitter` in one fixed query |
+| `search_history_hits_show_the_number_that_recalls_them` | history numbering — lines 1 and 2 carry their own numbers |
+| `edge_search_with_no_matches_names_each_empty_source` | empty — all four sources named empty, including the search line itself |
+| `edge_search_refuses_a_one_character_keyword_and_bare_search` | malformed input / failure — one character and whitespace are refused, bare `.search` is a usage error |
+| `edge_search_treats_regex_characters_literally` | malformed input — `.*` and `[1` are text, not patterns |
+| `edge_search_leaves_the_session_exactly_as_it_was` | state/resource — bindings, history order and last output unchanged |
+| `edge_search_is_case_insensitive_and_carries_unicode` | unicode — `HÉLLO` finds `héllo 😀` and prints it unchanged |
+
+### Mandatory edge-case matrix
+
+| Row | Status |
+|---|---|
+| empty | covered — no-match query names all four sources empty; empty and whitespace-only keywords are refused; a fresh session has no bindings or history |
+| singleton | covered — one exact builtin hit and one binding hit in the ranking test; history numbers are asserted per line |
+| boundary | covered — exact name versus substring ranking, and the two-character minimum versus a one-character refusal |
+| out_of_bounds | N/A — no indexing or positional access is added; history is walked by `0..len` with a `get`, and a missing source is reported empty |
+| type_mismatch | N/A — the argument is always text; there is no typed value to coerce |
+| numeric_boundary | N/A — no arithmetic or numeric formatting is added; history numbers are the session's own `usize` index + 1 |
+| unicode | covered — `edge_search_is_case_insensitive_and_carries_unicode` |
+| nesting_recursion | N/A — no nested structure is walked; the search is four flat scans over the registry, help lines, bindings and history |
+| duplicate_missing_keys | N/A — no keyed collection is added; missing matches are covered by the per-source empty report |
+| malformed_input | covered — bare `.search`, whitespace-only, one-character, `.*` and `[1` |
+| resource_limit | covered — the scans are bounded by the registry, the help table and `HISTORY_LIMIT` (1000); the command allocates a bounded hit list and does not run or recurse |
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass — no diff |
+| `cargo clippy --all-targets -- -D warnings` | pass — zero warnings |
+| `cargo test --all-targets` | 2151 passed, 0 failed, 0 ignored |
+| `../rbops/verify.sh phase-069` | pass — `VERIFY PASS — phase-069` |
+
+## Invariants touched
+
+- None in the language: no grammar, keyword, `Value`/`Error` variant, `.rb`
+  extension or existing test changed.
+- REPL-only: `.search`/`:search` is a new command-table entry, so it is also
+  documented by `:help` and completed by TAB from the same table.
+
+## Known gaps / follow-ups
+
+- None. The four sources the phase names are the four the command reads; it does
+  not index `SPEC.md`, `ROADMAP.md` or example files, which were not part of the
+  finding.
+REPORT.md
+[0m
+[0m$ [0mgrep -rn "cargo fmt --all\|cargo clippy --all-targets\|cargo test --all-targets\|four gates" /home/runner/work/rbops/rbops/redblue/phases/phase-09*/REPORT.md /home/runner/work/rbops/rbops/redblue/phases/phase-08*/REPORT.md 2>/dev/null | tail -30
+/home/runner/work/rbops/rbops/redblue/phases/phase-081/REPORT.md:229:| `cargo fmt --all -- --check` | **pass** |
+/home/runner/work/rbops/rbops/redblue/phases/phase-081/REPORT.md:230:| `cargo clippy --all-targets -- -D warnings` | **pass** — no `allow(` added, no warning |
+/home/runner/work/rbops/rbops/redblue/phases/phase-081/REPORT.md:231:| `cargo test --all-targets` | **pass** — 1544 passed, 0 failed, 0 ignored, across 58 targets |
+/home/runner/work/rbops/rbops/redblue/phases/phase-083/REPORT.md:126:| `cargo fmt --all -- --check` | pass (clean after one `cargo fmt`) |
+/home/runner/work/rbops/rbops/redblue/phases/phase-083/REPORT.md:127:| `cargo clippy --all-targets -- -D warnings` | pass, 0 warnings, no `allow(` added |
+/home/runner/work/rbops/rbops/redblue/phases/phase-083/REPORT.md:128:| `cargo test --all-targets` | **1557 passed, 0 failed, 0 ignored** across 59 test binaries |
+/home/runner/work/rbops/rbops/redblue/phases/phase-084/REPORT.md:171:`cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`
+/home/runner/work/rbops/rbops/redblue/phases/phase-084/REPORT.md:949:The build half — `cargo fmt`, `cargo clippy`, `cargo test --all-targets`,
+/home/runner/work/rbops/rbops/redblue/phases/phase-084/REPORT.md:1350:| `cargo fmt --all -- --check` | pass |
+/home/runner/work/rbops/rbops/redblue/phases/phase-084/REPORT.md:1351:| `cargo clippy --all-targets -- -D warnings` | pass — no `allow(clippy::` was added |
+/home/runner/work/rbops/rbops/redblue/phases/phase-084/REPORT.md:1352:| `cargo test --all-targets` | 1967 passed, 0 failed, 0 ignored |
+/home/runner/work/rbops/rbops/redblue/phases/phase-084/REPORT.md:1358:sum of the `N passed` lines of `cargo test --all-targets` in this checkout,
+/home/runner/work/rbops/rbops/redblue/phases/phase-085/REPORT.md:98:| `cargo fmt --all -- --check` | pass |
+/home/runner/work/rbops/rbops/redblue/phases/phase-085/REPORT.md:99:| `cargo clippy --all-targets -- -D warnings` | pass, no warnings |
+/home/runner/work/rbops/rbops/redblue/phases/phase-085/REPORT.md:100:| `cargo test --all-targets` | 1580 passed, 0 failed |
+/home/runner/work/rbops/rbops/redblue/phases/phase-086/REPORT.md:187:| `cargo fmt --all -- --check` | **pass** (no diff) |
+/home/runner/work/rbops/rbops/redblue/phases/phase-086/REPORT.md:188:| `cargo clippy --all-targets -- -D warnings` | **pass** (exit 0, no warnings) |
+/home/runner/work/rbops/rbops/redblue/phases/phase-086/REPORT.md:189:| `cargo test --all-targets --no-fail-fast` | **1598 passed, 0 failed, 0 ignored** across 61 test binaries |
+/home/runner/work/rbops/rbops/redblue/phases/phase-087/REPORT.md:135:| `cargo fmt --all -- --check` | pass |
+/home/runner/work/rbops/rbops/redblue/phases/phase-087/REPORT.md:136:| `cargo clippy --all-targets -- -D warnings` | pass, 0 warnings |
+/home/runner/work/rbops/rbops/redblue/phases/phase-087/REPORT.md:137:| `cargo test --all-targets` | **1766 passed, 0 failed, 0 ignored** |
+/home/runner/work/rbops/rbops/redblue/phases/phase-087/REPORT.md:194:- `verify.sh` was not run. If it has a check beyond the four gates that this
+/home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md:344:| `cargo fmt --all -- --check` | pass — no diff |
+/home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md:345:| `cargo clippy --all-targets -- -D warnings` | pass — no warnings |
+/home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md:346:| `cargo test --all-targets` | **1992 passed, 0 failed, 0 ignored** across 73 test binaries |
+/home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md:350:$ cargo fmt --all -- --check && echo "FMT OK"
+/home/runner/work/rbops/rbops/redblue/phases/phase-088/REPORT.md:353:$ cargo clippy --all-targets -- -D warnings
+/home/runner/work/rbops/rbops/redblue/phases/phase-089/REPORT.md:133:| `cargo fmt --all -- --check` | pass |
+/home/runner/work/rbops/rbops/redblue/phases/phase-089/REPORT.md:134:| `cargo clippy --all-targets -- -D warnings` | pass, 0 warnings |
+/home/runner/work/rbops/rbops/redblue/phases/phase-089/REPORT.md:135:| `cargo test --all-targets --no-fail-fast` | **1782 passed, 0 failed, 0 ignored** (64 test binaries) |
+[0m
+[0m$ [0mls -la /home/runner/work/rbops/rbops/ | head -40; ls -la /home/runner/work/rbops/rbops/rbops 2>/dev/null | head -40; find /home/runner/work/rbops/rbops -maxdepth 2 -name verify.sh -o -name 'verify*'
+total 108
+drwxr-xr-x   8 runner runner  4096 Oct 24 20:51 .
+drwxr-xr-x   3 runner runner  4096 Oct 24 20:50 ..
+drwxr-xr-x   7 runner runner  4096 Oct 24 20:52 .git
+-rw-r--r--   1 runner runner   308 Oct 24 20:51 .gitattributes
+drwxr-xr-x   3 runner runner  4096 Oct 24 20:51 .github
+-rw-r--r--   1 runner runner  1381 Oct 24 20:51 .gitignore
+-rw-r--r--   1 runner runner 14929 Oct 24 20:51 AGENTS.md
+-rw-r--r--   1 runner runner  5013 Oct 24 20:51 DEFERRED-PHASES.md
+-rw-r--r--   1 runner runner  1074 Oct 24 20:51 LICENSE
+-rw-r--r--   1 runner runner  9421 Oct 24 20:51 README.md
+drwxr-xr-x   2 runner runner 20480 Oct 25 00:18 logs
+-rw-r--r--   1 runner runner 11558 Oct 24 20:51 opencode.json
+drwxr-xr-x 128 runner runner  4096 Oct 24 20:51 phases
+drwxr-xr-x   3 runner runner  4096 Oct 24 20:51 rbops
+drwxr-xr-x  15 runner runner  4096 Oct 25 00:08 redblue
+total 584
+drwxr-xr-x 3 runner runner   4096 Oct 24 20:51 .
+drwxr-xr-x 8 runner runner   4096 Oct 24 20:51 ..
+drwxr-xr-x 2 runner runner   4096 Oct 24 20:51 agents
+-rw-r--r-- 1 runner runner   1956 Oct 24 20:51 baseline.json
+-rwxr-xr-x 1 runner runner  91901 Oct 24 20:51 dispatch.sh
+-rwxr-xr-x 1 runner runner   8908 Oct 24 20:51 gen-prompts.sh
+-rw-r--r-- 1 runner runner 290278 Oct 24 20:51 phases.json
+-rwxr-xr-x 1 runner runner   4795 Oct 24 20:51 progress_watchdog.sh
+-rw-r--r-- 1 runner runner   5607 Oct 24 20:51 setup-deploy-key.ps1
+-rwxr-xr-x 1 runner runner 131478 Oct 24 20:51 smoke.sh
+-rwxr-xr-x 1 runner runner  30678 Oct 24 20:51 verify.sh
+/home/runner/work/rbops/rbops/rbops/verify.sh
+[0m
+[0m$ [0mgrep -rn "value_bytes\|human_bytes\|memory_lines\|profile_lines\|FunctionBody" /home/runner/work/rbops/rbops/redblue/src /home/runner/work/rbops/rbops/redblue/tests | head -80
+/home/runner/work/rbops/rbops/redblue/src/value.rs:43:pub enum FunctionBody {
+/home/runner/work/rbops/rbops/redblue/src/value.rs:61:impl FunctionBody {
+/home/runner/work/rbops/rbops/redblue/src/value.rs:66:            FunctionBody::Statements(_) => None,
+/home/runner/work/rbops/rbops/redblue/src/value.rs:67:            FunctionBody::Block { chunk, path } => Some((chunk, path)),
+/home/runner/work/rbops/rbops/redblue/src/value.rs:91:    pub body: FunctionBody,
+/home/runner/work/rbops/rbops/redblue/src/lib.rs:47:pub use value::{expect_repeat_count, FunctionBody, FunctionValue, Value};
+/home/runner/work/rbops/rbops/redblue/src/repl/introspect.rs:492:/// world actually is. A [`crate::value::FunctionBody`] holds its statements, and
+/home/runner/work/rbops/rbops/redblue/src/repl/render.rs:476:            body: crate::value::FunctionBody::Statements(std::sync::Arc::new(Vec::new())),
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:42:pub fn value_bytes(value: &Value) -> usize {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:103:pub fn human_bytes(bytes: usize) -> String {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:137:pub fn memory_lines(
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:149:            human_bytes(binding_bytes)
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:155:            human_bytes(history_bytes)
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:157:        format!("  heap: {}", human_bytes(binding_bytes)),
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:167:        lines.push(format!("    {:<20}  {}", name, human_bytes(*bytes)));
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:189:pub fn profile_lines(block: &BlockProfile) -> Vec<String> {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:277:    fn edge_human_bytes_names_zero_and_keeps_the_raw_count() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:278:        assert_eq!(human_bytes(0), "0 B (0 B)");
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:279:        assert_eq!(human_bytes(999), "999 B (999 B)");
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:280:        assert_eq!(human_bytes(1024), "1.0 KiB (1024 B)");
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:281:        assert_eq!(human_bytes(10 * 1024), "10.0 KiB (10240 B)");
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:282:        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB (5242880 B)");
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:288:    fn edge_human_bytes_stays_exact_past_the_float_mantissa() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:291:        let rendered = human_bytes(bytes);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:308:        assert_eq!(value_bytes(&Value::Nothing), 0);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:309:        assert_eq!(value_bytes(&text(10)), 10);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:313:        assert_eq!(value_bytes(&list), 7, "both elements are counted");
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:317:        assert_eq!(value_bytes(&Value::record(fields)), 3 + 5);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:322:        assert_eq!(value_bytes(&Value::Number(42.0)), 0);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:323:        assert_eq!(value_bytes(&Value::YesNo(true)), 0);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:324:        assert_eq!(value_bytes(&Value::Builtin("say".to_string())), 3);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:329:            value_bytes(&Value::object("Point".to_string(), object_fields)),
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:338:            body: crate::value::FunctionBody::Statements(std::sync::Arc::new(Vec::new())),
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:342:            value_bytes(&Value::Function(function)),
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:350:    fn edge_value_bytes_measures_a_deep_value_without_recursing() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:356:        assert_eq!(value_bytes(&value), 1);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:363:    fn edge_memory_lines_report_every_zero_on_an_empty_session() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:364:        let lines = memory_lines(&[], 0, 0);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:374:    fn memory_lines_order_the_largest_first_and_stop_at_the_listing_limit() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:380:        let lines = memory_lines(&bindings, 3, 42);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:408:        let lines = profile_lines(&BlockProfile::default());
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:420:    fn profile_lines_are_slowest_first_and_sum_to_the_total() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:430:        let lines = profile_lines(&block);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:456:    fn edge_profile_lines_keep_a_timing_past_the_source() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:462:        let lines = profile_lines(&block);
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:39:use crate::value::{CapturedScope, FunctionBody, Value};
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:3649:            FunctionBody::Statements(body) => Some(body),
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:3655:            FunctionBody::Block { .. } => None,
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:3999:        weight::memory_lines(&bindings, history_entries, history_bytes)
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4012:            .map(|(name, value)| (name.clone(), weight::value_bytes(value)))
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4021:                sizes.push((name, weight::value_bytes(value)));
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4048:            Some(block) => Ok(weight::profile_lines(block)),
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:18:    CapturedScope, Fields, FunctionBody, FunctionValue, Value,
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:879:    pub fn function_body(&self, name: &str) -> Option<&FunctionBody> {
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:1577:            body: FunctionBody::Statements(Arc::new(body.to_vec())),
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:2864:        let FunctionBody::Statements(body) = &function.body else {
+/home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs:59:    CapturedScope, Fields, FunctionBody, FunctionValue, Shared, Value,
+/home/runner/work/rbops/rbops/redblue/src/bytecode/vm.rs:3058:            body: FunctionBody::Block {
+/home/runner/work/rbops/rbops/redblue/tests/closure_capture_test.rs:696:        body: redblue::FunctionBody::Statements(std::sync::Arc::new(body)),
+[0m
+[0m$ [0mgrep -rn "fn .*bytes\|logical.*size\|estimate.*size\|weight" /home/runner/work/rbops/rbops/redblue/src | head -60
+/home/runner/work/rbops/rbops/redblue/src/vfs.rs:64:    pub fn write_bytes(path: &str, content: &[u8]) -> io::Result<()> {
+/home/runner/work/rbops/rbops/redblue/src/vfs.rs:154:    pub fn write_bytes(path: &str, content: &[u8]) -> io::Result<()> {
+/home/runner/work/rbops/rbops/redblue/src/repl/commands.rs:674:        description: "Show binding count, history weight and heap estimate",
+/home/runner/work/rbops/rbops/redblue/src/repl/introspect.rs:1441:    fn edge_type_describes_the_empty_values_and_counts_bytes() {
+/home/runner/work/rbops/rbops/redblue/src/repl/banner.rs:66:/// `#` carries the weight and the gaps stay single spaces, so the two render at
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:8://! Sizes are logical sizes, not allocator sizes. A text costs its own bytes, a
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:42:pub fn value_bytes(value: &Value) -> usize {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:103:pub fn human_bytes(bytes: usize) -> String {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:118:fn human_unit(bytes: usize, unit: usize, name: &str) -> String {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:272:    fn text(bytes: usize) -> Value {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:277:    fn edge_human_bytes_names_zero_and_keeps_the_raw_count() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:288:    fn edge_human_bytes_stays_exact_past_the_float_mantissa() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:307:    fn val_bytes_covers_text_lists_records_and_sharing() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:321:    fn val_bytes_covers_scalars_builtins_objects_and_functions() {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:350:    fn edge_value_bytes_measures_a_deep_value_without_recursing() {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:15:pub mod weight;
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:832:    last_profile: Option<weight::BlockProfile>,
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1957:            self.last_profile = Some(weight::BlockProfile {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1958:                lines: weight::source_lines(&code),
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:2343:    fn exceeds_block_limits(lines: usize, bytes: usize) -> bool {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:3999:        weight::memory_lines(&bindings, history_entries, history_bytes)
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4002:    /// Every binding's logical size, heaviest first.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4012:            .map(|(name, value)| (name.clone(), weight::value_bytes(value)))
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4021:                sizes.push((name, weight::value_bytes(value)));
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4048:            Some(block) => Ok(weight::profile_lines(block)),
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9485:    /// recorded. Nothing here executes code to answer a question about weight.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9486:    mod weight {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9542:                "every weight is labelled: {}",
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9588:        /// A five-megabyte binding is reported by its logical size; the report
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9603:                "the largest binding's logical size is reported: {}",
+/home/runner/work/rbops/rbops/redblue/src/bytecode/format.rs:308:    pub fn decode(bytes: &[u8]) -> Result<Chunk> {
+[0m
+[0m→ [0mRead src/repl/introspect.rs[90m [offset=470, limit=80][0m
+[0m→ [0mRead src/repl/mod.rs[90m [offset=3980, limit=80][0m
+[0m
+[0m$ [0mgrep -rn "phase-070" /home/runner/work/rbops/rbops/rbops/phases.json /home/runner/work/rbops/rbops/logs 2>/dev/null | head -20
+/home/runner/work/rbops/rbops/rbops/phases.json:1633:      "id": "phase-070",
+/home/runner/work/rbops/rbops/rbops/phases.json:1659:        "phase-070"
+/home/runner/work/rbops/rbops/logs/phase-070.fix.3.log:301:[0m$ [0mls -la /home/runner/work/rbops/rbops/redblue/phases/phase-070 2>/dev/null; cat /home/runner/work/rbops/rbops/redblue/review_findings.md 2>/dev/null | head -100
+/home/runner/work/rbops/rbops/logs/phase-070.fix.3.log:317:[0m$ [0mfind /home/runner/work/rbops/rbops/redblue/phases/phase-070 -type f -maxdepth 2 -print 2>/dev/null
+/home/runner/work/rbops/rbops/logs/phase-070.review.1.ctx:1:# Review request - round 1 of phase phase-070
+/home/runner/work/rbops/rbops/logs/phase-070.review.1.ctx:146:## Change set for phase phase-070
+/home/runner/work/rbops/rbops/logs/phase-070.review.1.ctx:662:| ../rbops/verify.sh phase-070 | pass — `VERIFY PASS — phase-070` |
+/home/runner/work/rbops/rbops/logs/audit.log:168:ids: ['phase-001', 'phase-002', 'phase-003', 'phase-004', 'phase-005', 'phase-006', 'phase-007', 'phase-008', 'phase-009', 'phase-010', 'phase-011', 'phase-012', 'phase-013', 'phase-014', 'phase-015', 'phase-016', 'phase-017', 'phase-018', 'phase-019', 'phase-020', 'phase-021', 'phase-022', 'phase-023', 'phase-024', 'phase-025', 'phase-026', 'phase-027', 'phase-028', 'phase-029', 'phase-030', 'phase-031', 'phase-032', 'phase-033', 'phase-034', 'phase-035', 'phase-036', 'phase-037', 'phase-038', 'phase-039', 'phase-040', 'phase-041', 'phase-042', 'phase-043', 'phase-044', 'phase-045', 'phase-046', 'phase-047', 'phase-048', 'phase-049', 'phase-050', 'phase-051', 'phase-052', 'phase-053', 'phase-054', 'phase-055', 'phase-056', 'phase-057', 'phase-058', 'phase-059', 'phase-060', 'phase-061', 'phase-062', 'phase-063', 'phase-064', 'phase-065', 'phase-066', 'phase-067', 'phase-068', 'phase-069', 'phase-070', 'phase-071', 'phase-072', 'phase-073', 'phase-074', 'phase-075', 'phase-076', 'phase-077', 'phase-078', 'phase-079', 'phase-080', 'phase-081', 'phase-082', 'phase-083', 'phase-084', 'phase-085', 'phase-086', 'phase-087', 'phase-088', 'phase-089', 'phase-090', 'phase-091', 'phase-092', 'phase-093', 'phase-094', 'phase-095', 'phase-096', 'phase-097', 'phase-098', 'phase-099', 'phase-100', 'phase-101', 'phase-102', 'phase-103', 'phase-104', 'phase-105', 'phase-106', 'phase-107', 'phase-108', 'phase-109', 'phase-110', 'phase-111', 'phase-112', 'phase-113', 'phase-114', 'phase-115', 'phase-116', 'phase-117', 'phase-118', 'phase-119', 'phase-120', 'phase-121', 'phase-122', 'phase-123', 'phase-124', 'phase-125', 'phase-126']
+/home/runner/work/rbops/rbops/logs/audit.log:2691:phase-070 Weigh the session: `.mem` and `.profile`
+/home/runner/work/rbops/rbops/logs/phase-070.prompt:17:   - ../rbops/verify.sh "phase-070"
+/home/runner/work/rbops/rbops/logs/phase-070.prompt:361:# YOUR PHASE: phase-070
+/home/runner/work/rbops/rbops/logs/phase-070.prompt:365:# phase-070 — Weigh the session: `.mem` and `.profile`
+/home/runner/work/rbops/rbops/logs/phase-070.prompt:412:   ./rbops/verify.sh phase-070
+/home/runner/work/rbops/rbops/logs/phase-070.fix.3.ctx:1:# Fix the review findings for phase phase-070 (round 3)
+/home/runner/work/rbops/rbops/logs/phase-070.fix.1.ctx:1:# Fix the review findings for phase phase-070 (round 1)
+/home/runner/work/rbops/rbops/logs/phase-070.fix.1.log:1037:[0m$ [0mls phases/phase-070; cat phases/phase-070/* 2>/dev/null | head -200
+/home/runner/work/rbops/rbops/logs/phase-070.fix.1.log:1038:ls: cannot access 'phases/phase-070': No such file or directory
+/home/runner/work/rbops/rbops/logs/phase-070.fix.1.log:4194:phase-070.checkpoint.log
+/home/runner/work/rbops/rbops/logs/phase-070.fix.1.log:4195:phase-070.ctx
+/home/runner/work/rbops/rbops/logs/phase-070.fix.1.log:4196:phase-070.fix.1.ctx
+[0m
+[0m$ [0mgrep -n 'phase-070\|"070"' /home/runner/work/rbops/rbops/rbops/phases.json | head -20
+1633:      "id": "phase-070",
+1659:        "phase-070"
+[0m
+[0m$ [0msed -n '361,470p' /home/runner/work/rbops/rbops/logs/phase-070.prompt
+# YOUR PHASE: phase-070
+
+Project root: /home/runner/work/rbops/rbops/redblue
+
+# phase-070 — Weigh the session: `.mem` and `.profile`
+
+<!-- GENERATED by rbops/gen-prompts.sh from rbops/phases.json. DO NOT EDIT. -->
+
+| | |
+|---|---|
+| Severity | `major` |
+| Risk | `medium` |
+| Depends on | phase-069 |
+| Timeout | 120 min |
+| Must change | `src/` |
+
+## You must change `src/`
+
+This phase declares `must_touch: [src/]`. The gate fails the phase unless at
+least one changed file falls under it. Writing tests, documentation or a report
+is not enough — if you finish without touching that area, the phase fails on
+exactly that check.
+
+
+## Evidence — verified finding
+
+```
+`mem` and `profile` are both absent from commands.rs (verified): a session that grows strange — a runaway history, a binding holding megabytes, a line that takes seconds — offers no instrument except leaving and guessing. Ipp's `.mem` (memory usage) and `.profile` (last-command profile) exist because interactive performance questions are REPL-native; redblue's `.time`/`.bench` (phase-057) time expressions but say nothing about where the session's own weight lives.
+```
+
+**Re-verify this before you change anything.** If the finding no longer
+reproduces on `main`, stop and write that to `FINDINGS.md` — a stale phase must
+never be "fixed" by inventing a change.
+
+## Goal
+
+Add `.mem` (bindings count + largest bindings by size, history entries + bytes, VM heap estimate, each labeled) and `.profile` (per-line timing breakdown of the last multiline block, slowest first). Both observe: measuring must not mutate bindings, history, or last-result.
+
+## Method
+
+1. Read `AGENTS.md` in full. Obey every hard rule; they are not negotiable.
+2. Reproduce the finding. Record the exact command and the exact wrong output.
+3. Write the failing test FIRST. Watch it fail. Do not touch production code
+   until you have a red test that fails for the right reason.
+4. Make the smallest change that turns it green.
+5. Run the four gates yourself before claiming anything:
+
+   ```bash
+   cargo fmt --all -- --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test --all-targets
+   ./rbops/verify.sh phase-070
+   ```
+
+6. Write `REPORT.md` in the exact shape required by `AGENTS.md` section 4.
+
+## Definition of done
+
+- [ ] `.mem` after binding a 10KB text reports it as the largest binding with its byte size within 10% (approximate honestly — the test asserts the ranking and the order of magnitude, never an exact allocator number)
+- [ ] `.profile` on a three-line block attributes time per line summing to within 20% of the block total (asserted on the arithmetic relationship, which holds regardless of machine speed)
+- [ ] running `.mem` twice in a row changes neither the binding count nor `_` (observation is side-effect-free, proved by diffing full session state around the command)
+- [ ] sizes render in human units (B/KB/MB) with the raw bytes in parentheses, so small and large sessions read alike
+- [ ] edge_* tests cover `.mem` on a fresh session (zeros named as zeros, never blank), `.profile` with no previous block (names `:history`-visible absence instead of profiling nothing), and a binding holding a 5MB text (reported, session stays responsive — no full clone into the report)
+
+## Test requirements — non-negotiable
+
+From `AGENTS.md` section 3. Tick each row that applies to this change. For
+every row you do NOT cover, write one line in `REPORT.md` saying why.
+
+- [ ] empty — covered / N/A + why
+- [ ] singleton — covered / N/A + why
+- [ ] boundary — covered / N/A + why
+- [ ] out_of_bounds — covered / N/A + why
+- [ ] type_mismatch — covered / N/A + why
+- [ ] numeric_boundary — covered / N/A + why
+- [ ] unicode — covered / N/A + why
+- [ ] nesting_recursion — covered / N/A + why
+- [ ] duplicate_missing_keys — covered / N/A + why
+- [ ] malformed_input — covered / N/A + why
+- [ ] resource_limit — covered / N/A + why
+
+You must also:
+
+- at least 3 new `#[test]` functions (or at least 2 new Redblue `test` blocks).
+  This is a floor, not a target: it catches "no verification at all". Whether
+  your tests COVER the change is judged by the reviewer, and an untested branch
+  is a MAJOR finding that sends the phase back.
+- at least 1 test named `edge_*`
+- at least 1 test that asserts a **failure** is produced, not just a success
+- zero new `#[ignore]`, `// skip`, or `allow(clippy::` suppressions
+- zero newly-failing pre-existing tests
+
+## Constraints
+
+- Do not touch `.github/workflows/`, `rbops/`, `.opencode/agent/`, or
+  `rbops/phases.json`. The gate rejects these paths, and the bot token has no
+  `workflows` scope so a push touching `.github/` is refused by GitHub.
+- Do not weaken, delete or re-scope any existing test.
+- Do not change the language surface listed in `phases/INVARIANTS.md`.
+- Keep the diff on-topic. A refactor smuggled into a bug-fix phase is a
+  review BLOCKER.
+- Do not update README or ROADMAP to claim this works. Update them only when
+  the gate is green and you have run the examples yourself.
+
+## If you are blocked
+
+Do not fake progress. Write what you tried, the exact error, and what you
+believe is required into `FINDINGS.md`, then stop.
+
+A blocked phase with an honest report is worth more than a green phase with a
+[0m
+[0m$ [0msed -n '1,220p' /home/runner/work/rbops/rbops/logs/phase-070.fix.3.ctx
+# Fix the review findings for phase phase-070 (round 3)
+
+Read the reviewer output below and fix every BLOCKER and CRITICAL.
+Do not weaken any gate. Do not add #[ignore], `// skip`, or an allow(clippy:: suppression. Do not delete a test.
+Then re-run the four gates yourself.
+
+## Reviewer output
+
+FINDINGS:
+1. [MAJOR] src/repl/weight.rs:63-75 — `value_bytes` does not account for `FunctionBody` (both `Statements` and `Block` variants). The function body can be large (AST with many statements, or compiled bytecode in `Chunk`), but is completely ignored. The only test (`val_bytes_covers_scalars_builtins_objects_and_functions`, weight.rs:338) uses an empty body (`Arc::new(Vec::new())`), leaving both non-empty AST body and bytecode body branches untested. This is an edge-case gap: a new branch with no test on either side. The `.mem` report will undercount memory for sessions with large function definitions.
+
+2. [MINOR] src/repl/weight.rs:211,222 — `profile_lines` uses `f64` division for display (`total as f64 / scale`, `nanos as f64 / scale`). For nanosecond values exceeding `f64`'s 53-bit mantissa (~9e15 ns ≈ 285 years), the displayed figure loses precision. While impractical for normal runs, the `human_bytes` function (weight.rs:118) correctly uses integer arithmetic for the same problem. The profile display should use integer arithmetic for consistency.
+
+3. [STYLE] src/repl/weight.rs:104-107 — `human_bytes` only scales up to MiB. Values ≥1 GiB display as thousands of MiB (e.g., "1024.0 MiB" for 1 GiB). The module doc acknowledges this is for "memory, not disk" using binary units, but GiB/TiB are standard binary units. This is a usability limitation, not a correctness issue.
+
+4. [MINOR] src/interpreter.rs:1764-1776 — `profile_enter` excludes timing when `call_depth != 0` to attribute user function body time to the call site. However, this also excludes timing for any code running at `call_depth > 0`, including `finally` blocks running during loop unwinding (where `loop_depth` is saved/restored but `call_depth` may be >0). The comment at line 1760-1763 only mentions user function calls, not this edge case.
+
+REVIEW VERDICT: FINDINGS 4
+[0m
+[0m$ [0mls /home/runner/work/rbops/rbops/logs | grep phase-070
+phase-070.checkpoint.log
+phase-070.ctx
+phase-070.fix.1.ctx
+phase-070.fix.1.log
+phase-070.fix.2.ctx
+phase-070.fix.2.log
+phase-070.fix.3.ctx
+phase-070.fix.3.log
+phase-070.log
+phase-070.prompt
+phase-070.review.1.ctx
+phase-070.review.1.log
+phase-070.review.2.ctx
+phase-070.review.2.log
+phase-070.review.3.ctx
+phase-070.review.3.log
+[0m
+[0m$ [0mcat /home/runner/work/rbops/rbops/logs/phase-070.fix.2.ctx
+# Fix the review findings for phase phase-070 (round 2)
+
+Read the reviewer output below and fix every BLOCKER and CRITICAL.
+Do not weaken any gate. Do not add #[ignore], `// skip`, or an allow(clippy:: suppression. Do not delete a test.
+Then re-run the four gates yourself.
+
+## Reviewer output
+
+FINDINGS:
+1. [MAJOR] src/repl/weight.rs:29-62 — `value_bytes`/`value_bytes_seen` has no recursion depth limit, causing stack overflow on deeply nested acyclic data structures — VERIFIED: code inspection shows unbounded recursion
+2. [MAJOR] src/repl/weight.rs:152-162 — `profile_lines` silently drops timings for line numbers > `block.lines.len()`, losing data from the report total — VERIFIED: rows built only for 1..=block.lines.len() with no validation
+3. [MAJOR] src/repl/mod.rs:1957-1960 — `execute_line` uses `code.lines()` for profile source lines, which splits incorrectly on newlines inside string literals, producing wrong source attribution — VERIFIED: str::lines() vs lexer line tracking mismatch
+4. [MINOR] src/repl/weight.rs:82-90 — `human_bytes` uses f64 losing precision for very large byte counts (>9 PB)
+5. [STYLE] src/repl/weight.rs:21 — `MAX_LARGEST_BINDINGS` is public but appears internal
+
+REVIEW VERDICT: FINDINGS 5
+[0m
+[0m$ [0mtail -120 /home/runner/work/rbops/rbops/logs/phase-070.fix.2.log
+@@ -12,6 +12,7 @@ pub mod render;
+ pub mod shell;
+ pub mod style;
+ pub mod transcript;
++pub mod weight;
+ 
+ use std::cell::RefCell;
+ use std::collections::{HashMap, HashSet, VecDeque};
+@@ -825,6 +826,10 @@ pub struct Repl {
+     undo_stack: VecDeque<UndoStep>,
+     /// The states `.redo` can walk forward to, oldest first.
+     redo_stack: VecDeque<UndoStep>,
++    /// The per-line timings the last multiline block left behind, if one has
++    /// run. A single line has one figure and `.time` already answers that
++    /// question; `.profile` is about the block.
++    last_profile: Option<weight::BlockProfile>,
+ }
+ 
+ /// `path` as a session rooted at `dir` means it: a leading `~` expanded, an
+@@ -870,6 +875,7 @@ impl Repl {
+             current_checkpoint: None,
+             undo_stack: VecDeque::new(),
+             redo_stack: VecDeque::new(),
++            last_profile: None,
+         }
+     }
+ 
+@@ -1830,6 +1836,14 @@ impl Repl {
+                 self.print_bench(&expression);
+                 true
+             }
++            ReplCommand::Mem => {
++                self.print_mem();
++                true
++            }
++            ReplCommand::Profile => {
++                self.print_profile();
++                true
++            }
+             ReplCommand::Ast(expr) => {
+                 self.print_ast(&expr);
+                 true
+@@ -1927,10 +1941,24 @@ impl Repl {
+ 
+         let code = std::mem::take(&mut self.multiline_buffer).join("\n");
+         self.in_multiline = false;
++        // A block is the unit `.profile` reports on, so a run that spans more
++        // than one line is timed as it runs. A single line is left alone: it has
++        // one figure and `.time` is the command for that.
++        let profiling = code.contains('\n');
++        if profiling {
++            self.vm.start_line_profile();
++        }
+         // A failure was reported in full by the run itself, with the line that
+         // failed and a caret under it; a line the user typed has nothing to add
+         // to that and nowhere else to put it.
+         let _ = self.execute_code(&code);
++        if profiling {
++            let timings = self.vm.take_line_profile().unwrap_or_default();
++            self.last_profile = Some(weight::BlockProfile {
++                lines: weight::source_lines(&code),
++                timings,
++            });
++        }
+     }
+ 
+     /// `line` as the formatter writes it, or `line` unchanged when the formatter
+@@ -3948,6 +3976,83 @@ impl Repl {
+         Ok(lines)
+     }
+ 
++    /// `.mem` — what the session is carrying, with every figure named.
++    fn print_mem(&self) {
++        for line in self.memory_answer() {
++            println!("{}", line);
++        }
++    }
++
++    /// What `.mem` has to say.
++    ///
++    /// Read-only by construction: the bindings are borrowed for their logical
++    /// size and never cloned, and the history is read by index. A session with a
++    /// five-megabyte text therefore answers without copying it, and asking twice
++    /// cannot change what the second answer sees.
++    fn memory_answer(&self) -> Vec<String> {
++        let bindings = self.binding_sizes();
++        let history_entries = self.history.len();
++        let history_bytes = (0..history_entries)
++            .filter_map(|index| self.history.get(index))
++            .map(|entry| entry.len())
++            .sum();
++        weight::memory_lines(&bindings, history_entries, history_bytes)
++    }
++
++    /// Every binding's logical size, heaviest first.
++    ///
++    /// The session's own map holds `_`; the VM holds every name a `set`, `to` or
++    /// `import` bound. The session's entry wins where both know a name, for the
++    /// reason `:vars` prefers it: the VM holds a `Nothing` for `_`, not the last
++    /// result.
++    fn binding_sizes(&self) -> Vec<(String, usize)> {
++        let mut sizes: Vec<(String, usize)> = self
++            .variables
++            .iter()
++            .map(|(name, value)| (name.clone(), weight::value_bytes(value)))
++            .collect();
++        let known: HashSet<String> = sizes.iter().map(|(name, _)| name.clone()).collect();
++
++        for name in self.vm.user_names() {
++            if known.contains(&name) {
++                continue;
++            }
++            if let Some(value) = self.vm.user_value(&name) {
++                sizes.push((name, weight::value_bytes(value)));
++            }
++        }
+[0m
+Fixed all five findings: iterative depth-safe `value_bytes`, profile rows preserve out-of-range timings, lexer-consistent source-line mapping, integer-precision `human_bytes`, and private `MAX_LARGEST_BINDINGS`. Added regression tests and updated the phase report.
+
+Gates pass: `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets` (2172 passed), and `verify.sh phase-070` (VERIFY PASS).
+[0m
+[0m$ [0mgrep -n "pub fn\|fn format_statement\|impl Formatter" /home/runner/work/rbops/rbops/redblue/src/formatter.rs | head -60
+175:impl Formatter {
+176:    pub fn new() -> Self {
+190:    pub fn format(&mut self, source: &str) -> Result<String, String> {
+235:    fn format_statements(&mut self, body: &[Stmt]) {
+283:    fn format_statement(&mut self, stmt: &Stmt) {
+1026:pub fn needs_reformat(source: &str, formatted: &str) -> bool {
+1030:pub fn format(source: &str) -> Result<String, String> {
+[0m
+[0m$ [0mgrep -rn "encode()\|\.encode\|Chunk::compile\|FunctionBody::Block" /home/runner/work/rbops/rbops/redblue/src/repl /home/runner/work/rbops/rbops/redblue/tests | head -50
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:3655:            FunctionBody::Block { .. } => None,
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_ship_test.rs:113:        decoded.encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_ship_test.rs:170:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_ship_test.rs:240:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_ship_test.rs:275:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_ship_test.rs:686:                .encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs:11://! `compile_source(source).encode()` and nothing else. A stage-2 compiler that
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs:115:        Ok(chunk) => chunk.encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs:874:            .encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs:1575:                    .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs:1606:                    decoded.encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs:1617:                let expected = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs:1820:        decoded.encode(),
+/home/runner/work/rbops/rbops/redblue/tests/typed_catch_test.rs:929:        redblue::bytecode::Chunk::decode(&typed_chunk.encode()).expect("a .rbc decodes");
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_vm_test.rs:2700:        let decoded = redblue::Chunk::decode(&chunk.encode())
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:87:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:95:        decoded.encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:117:        let first = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:120:            .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:129:            decoded.encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:139:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:161:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:177:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:194:    .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:216:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:247:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:267:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:303:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:573:        let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:593:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:726:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:869:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1142:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1161:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1187:        .encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1310:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1313:    assert_eq!(decoded.encode(), bytes, "re-encoding changed the bytes");
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1335:        let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1376:    let bytes = chunk.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1480:                .encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1585:            .encode(),
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1657:        Chunk::decode(&chunk.encode()).expect("should round trip"),
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1713:    let error = Chunk::decode(&chunk.encode())
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1767:            let bytes = chunk.encode().len();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1893:    let decoded = Chunk::decode(&chunk.encode()).expect("this file is well formed");
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1920:        nothing.encode()[10],
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1925:    let mut bad_kind = nothing.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1935:    let mut bad_tag = nothing.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1949:    let mut bad_yesno = yesno.encode();
+/home/runner/work/rbops/rbops/redblue/tests/bytecode_test.rs:1964:        .encode();
+[0m
+[0m$ [0mgrep -n "depth\|MAX_" /home/runner/work/rbops/rbops/redblue/src/parser.rs | head -60
+374:/// unbounded depth turns a long line of source into "has overflowed its stack"
+382:pub const MAX_NESTING_DEPTH: usize = 64;
+390:/// [`MAX_NESTING_DEPTH`] is used, because the same 2 MiB stack has to hold it.
+391:pub const MAX_BLOCK_DEPTH: usize = 64;
+396:    depth: usize,
+397:    block_depth: usize,
+405:    interp_depth: Rc<Cell<usize>>,
+413:            depth: 0,
+414:            block_depth: 0,
+415:            interp_depth: Rc::new(Cell::new(0)),
+469:    /// [`MAX_NESTING_DEPTH`], so a pathological source line is a diagnostic
+472:        self.depth += 1;
+473:        if self.depth > MAX_NESTING_DEPTH {
+475:                format!("Expression nests more than {MAX_NESTING_DEPTH} levels deep"),
+484:        self.depth = self.depth.saturating_sub(count);
+515:        self.block_depth += 1;
+516:        if self.block_depth > MAX_BLOCK_DEPTH {
+518:                format!("Blocks nest more than {MAX_BLOCK_DEPTH} levels deep"),
+526:        self.block_depth = self.block_depth.saturating_sub(1);
+570:        self.depth = 0;
+571:        self.interp_depth.set(0);
+1265:    /// every other `... end` form and cannot nest past [`MAX_BLOCK_DEPTH`].
+2815:            let mut depth = 1usize;
+2817:            while scan < chars.len() && depth > 0 {
+2819:                    '{' => depth += 1,
+2820:                    '}' => depth -= 1,
+2823:                if depth > 0 {
+2869:        let level = self.interp_depth.get();
+2870:        if level >= MAX_NESTING_DEPTH {
+2877:        self.interp_depth.set(level + 1);
+2880:            self.interp_depth.set(level);
+2903:        inner.interp_depth = Rc::clone(&self.interp_depth);
+2910:            Err(_) if self.interp_depth.get() >= MAX_NESTING_DEPTH => {
+2925:            format!("Interpolated expressions nest more than {MAX_NESTING_DEPTH} levels deep"),
+2985:/// One backward walk with a counter: a `}` raises the depth and a `{` spends
+2986:/// one if there is any left, so the `{`s that arrive with the depth at zero
+3000:    let mut depth = 0usize;
+3003:            '}' => depth += 1,
+3004:            '{' if depth > 0 => depth -= 1,
+3020:/// [`open_block_depth`]. Both tables answer the same question for every other
+3053:pub fn open_block_depth(tokens: &[Token]) -> i32 {
+3054:    let mut depth = 0;
+3061:                depth -= 1;
+3068:                depth -= 1;
+3078:                depth += 1;
+3085:    depth
+3107:    fn depth_of(source: &str) -> i32 {
+3109:        open_block_depth(&tokens)
+3113:    /// depth a REPL reads to decide whether the program is finished has to be
+3125:                depth_of(source),
+3132:            depth_of("repeat\nset n to n + 1"),
+3142:    fn open_block_depth_counts_every_block_form() {
+3158:            assert_eq!(depth_of(opener), 1, "{:?} opens exactly one block", opener);
+3160:                depth_of(&format!("{opener}\nend")),
+3172:    fn open_block_depth_ignores_a_to_that_is_not_a_declaration() {
+3174:            depth_of("for each i from 1 to 10"),
+3179:            depth_of("import MathUtils to M"),
+3184:            depth_of("import files, network to N"),
+3188:        assert_eq!(depth_of("set x to 10"), 0);
+3195:    fn open_block_depth_reads_tokens_not_text() {
+[0m
+[0m$ [0mgrep -rn "MAX_.*DEPTH\|max.*depth\|depth.*limit" /home/runner/work/rbops/rbops/redblue/src/parser.rs /home/runner/work/rbops/rbops/redblue/src/analyzer.rs | head -40
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:382:pub const MAX_NESTING_DEPTH: usize = 64;
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:390:/// [`MAX_NESTING_DEPTH`] is used, because the same 2 MiB stack has to hold it.
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:391:pub const MAX_BLOCK_DEPTH: usize = 64;
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:469:    /// [`MAX_NESTING_DEPTH`], so a pathological source line is a diagnostic
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:473:        if self.depth > MAX_NESTING_DEPTH {
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:475:                format!("Expression nests more than {MAX_NESTING_DEPTH} levels deep"),
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:516:        if self.block_depth > MAX_BLOCK_DEPTH {
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:518:                format!("Blocks nest more than {MAX_BLOCK_DEPTH} levels deep"),
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:1265:    /// every other `... end` form and cannot nest past [`MAX_BLOCK_DEPTH`].
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:2870:        if level >= MAX_NESTING_DEPTH {
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:2910:            Err(_) if self.interp_depth.get() >= MAX_NESTING_DEPTH => {
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:2925:            format!("Interpolated expressions nest more than {MAX_NESTING_DEPTH} levels deep"),
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3263:        // A literal rather than `MAX_BLOCK_DEPTH + 1`, so that *raising* the
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3268:            past_budget > MAX_BLOCK_DEPTH,
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3269:            "depth {} is no longer past MAX_BLOCK_DEPTH ({}); re-anchor this test \
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3272:            MAX_BLOCK_DEPTH
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3301:                         {MAX_BLOCK_DEPTH}, so it must be reported rather than parsed \
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3469:        outer.interp_depth.set(MAX_NESTING_DEPTH - 1);
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3481:            MAX_NESTING_DEPTH - 1,
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3487:        outer.interp_depth.set(MAX_NESTING_DEPTH);
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3491:                    message.contains(&MAX_NESTING_DEPTH.to_string()),
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3503:            MAX_NESTING_DEPTH,
+/home/runner/work/rbops/rbops/redblue/src/parser.rs:3508:    /// A source cannot reach [`MAX_NESTING_DEPTH`] — every level of nesting
+[0m
+[0m$ [0mgrep -n "pub enum FailureKind" -A60 /home/runner/work/rbops/rbops/redblue/src/failure.rs
+39:pub enum FailureKind {
+40-    /// `Error` — every kind below. The handler that asks for "whatever this
+41-    /// was", and the typed spelling of what `catch error` already does.
+42-    Any,
+43-    /// `Runtime` — the program's own expression went wrong: a type mismatch, an
+44-    /// index past the end of a list, a division by zero, a name that is not
+45-    /// bound.
+46-    Runtime,
+47-    /// `Io` — the host's filesystem and environment: a file that is not there,
+48-    /// a path that cannot be read, a module file that cannot be loaded.
+49-    Io,
+50-    /// `Limit` — one of the host's resource limits: the step budget, the
+51-    /// call-depth limit, or a loop's iteration cap.
+52-    ///
+53-    /// A kind of its own rather than a `Runtime` that reads like one, because
+54-    /// `might fail` answers differently for the two and a program that has to
+55-    /// tell them apart should not be matching on a message to do it. See
+56-    /// [`Error::is_resource_limit`].
+57-    Limit,
+58-}
+59-
+60-/// The kinds a program may name, in the order [`FailureKind::names`] reports
+61-/// them, and the only kinds the parser will accept after `of`.
+62-pub const KINDS: [FailureKind; 4] = [
+63-    FailureKind::Any,
+64-    FailureKind::Runtime,
+65-    FailureKind::Io,
+66-    FailureKind::Limit,
+67-];
+68-
+69-impl FailureKind {
+70-    /// The name this kind is spelled in a program: `Error`, `Runtime`, `Io` or
+71-    /// `Limit`.
+72-    pub fn name(self) -> &'static str {
+73-        match self {
+74-            FailureKind::Any => "Error",
+75-            FailureKind::Runtime => "Runtime",
+76-            FailureKind::Io => "Io",
+77-            FailureKind::Limit => "Limit",
+78-        }
+79-    }
+80-
+81-    /// The kind `name` names, or `None` for anything else.
+82-    ///
+83-    /// The closed list is enforced here, so an invented kind is refused by the
+84-    /// parser rather than compiled into a handler that matches nothing.
+85-    pub fn from_name(name: &str) -> Option<FailureKind> {
+86-        KINDS.into_iter().find(|kind| kind.name() == name)
+87-    }
+88-
+89-    /// Every name a program may write, joined by `, `.
+90-    ///
+91-    /// The list an unknown-kind error quotes, so the refusal names the kinds
+92-    /// that do exist rather than only the one that does not.
+93-    pub fn names() -> String {
+94-        KINDS
+95-            .iter()
+96-            .map(|kind| kind.name())
+97-            .collect::<Vec<_>>()
+98-            .join(", ")
+99-    }
+[0m
+[0m$ [0mgrep -n "pub use.*bytecode\|pub mod bytecode" /home/runner/work/rbops/rbops/redblue/src/lib.rs /home/runner/work/rbops/rbops/redblue/src/bytecode/mod.rs | head -40
+/home/runner/work/rbops/rbops/redblue/src/lib.rs:3:pub mod bytecode;
+/home/runner/work/rbops/rbops/redblue/src/lib.rs:40:pub use bytecode::{compile_source, Chunk, Opcode};
+[0m
+[0m$ [0mgrep -rn "profile\|Profile" /home/runner/work/rbops/rbops/redblue/tests /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs | grep -i "total:\|µs\|ms\|\.000\|profile" | head -80
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:831:    /// question; `.profile` is about the block.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:832:    last_profile: Option<weight::BlockProfile>,
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:878:            last_profile: None,
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1843:            ReplCommand::Profile => {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1844:                self.print_profile();
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1944:        // A block is the unit `.profile` reports on, so a run that spans more
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1949:            self.vm.start_line_profile();
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1956:            let timings = self.vm.take_line_profile().unwrap_or_default();
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1957:            self.last_profile = Some(weight::BlockProfile {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4029:    /// `.profile` — the last multiline block, one figure per source line.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4030:    fn print_profile(&self) {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4031:        match self.profile_answer() {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4041:    /// What `.profile` has to say, or why there is nothing to say.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4044:    /// for themselves that no multiline block has run: "nothing to profile" with
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4046:    fn profile_answer(&self) -> Result<Vec<String>, String> {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4047:        match &self.last_profile {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4048:            Some(block) => Ok(weight::profile_lines(block)),
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4050:                "No multiline block to profile: :history has no multi-line block that ran."
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9481:    /// `.mem` and `.profile` — the session weighing itself.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9484:    /// than cloning them, and the profile reads timings the block run already
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9616:        /// No block has run, so `.profile` names the absence and where to see
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9619:        fn edge_profile_with_no_previous_block_names_the_history() {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9621:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9622:                .expect_err("a fresh session has no block to profile");
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9634:        fn profile_times_each_line_slowest_first_and_sums_to_the_total() {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9647:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9648:                .expect("the block just ran, so it has a profile");
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9686:        fn profile_quotes_the_line_the_lexer_numbered() {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9691:                .last_profile
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9693:                .expect("the block just ran, so it has a profile");
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9705:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9706:                .expect("the block just ran, so it has a profile");
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9714:        /// `.profile` answers about the block that just ran, not about every
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9719:        fn profile_reports_only_the_last_block_not_the_earlier_one() {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9741:                .last_profile
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9751:                "the profile keeps the last block's source, not the first's"
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9763:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9764:                .expect("the second block just ran, so it has a profile");
+[0m
+[0m$ [0mgrep -rn "duration_scale\|\.profile\|Profile:" /home/runner/work/rbops/rbops/redblue/src /home/runner/work/rbops/rbops/redblue/tests | head -80
+/home/runner/work/rbops/rbops/redblue/src/repl/commands.rs:1327:    /// `.mem` and `.profile` are commands the session answers, under both
+/home/runner/work/rbops/rbops/redblue/src/repl/commands.rs:1336:            (".profile", "Profile"),
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:3://! `.mem` and `.profile` are observations: they read bindings, history and the
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:183:/// The `.profile` report: every line of the last block, slowest first.
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:204:    let (scale, unit) = duration_scale(largest);
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:208:            "Profile: last block, {} line(s), wall time",
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:256:fn duration_scale(nanos: u128) -> (f64, &'static str) {
+/home/runner/work/rbops/rbops/redblue/src/repl/weight.rs:408:        let lines = profile_lines(&BlockProfile::default());
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:831:    /// question; `.profile` is about the block.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:1944:        // A block is the unit `.profile` reports on, so a run that spans more
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4029:    /// `.profile` — the last multiline block, one figure per source line.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4031:        match self.profile_answer() {
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:4041:    /// What `.profile` has to say, or why there is nothing to say.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9481:    /// `.mem` and `.profile` — the session weighing itself.
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9616:        /// No block has run, so `.profile` names the absence and where to see
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9621:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9647:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9705:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9714:        /// `.profile` answers about the block that just ran, not about every
+/home/runner/work/rbops/rbops/redblue/src/repl/mod.rs:9763:                .profile_answer()
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:497:    /// Per-source-line self time, while `.profile` is measuring a block.
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:1729:        let profile = self.profile_enter(stmt.span.line);
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:1733:        self.profile_exit(profile);
+/home/runner/work/rbops/rbops/redblue/src/interpreter.rs:1745:    /// `.profile` is a question about the session the user is sitting in. A
+[0m
+[0m$ [0msed -n '9481,9800p' /home/runner/work/rbops/rbops/redblue/src/repl/mod.rs
+/// `.mem` and `.profile` — the session weighing itself.
+    ///
+    /// Both are observations: the memory report borrows the bindings rather
+    /// than cloning them, and the profile reads timings the block run already
+    /// recorded. Nothing here executes code to answer a question about weight.
+    mod weight {
+        use super::{feed, Repl};
+        use crate::value::Value;
+
+        /// The figure after `label`, as a number in the report's own unit.
+        fn figure(line: &str) -> f64 {
+            line.split_once(':')
+                .map(|(_, rest)| rest.trim())
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|number| number.parse().ok())
+                .unwrap_or_else(|| panic!("{:?} should carry a figure", line))
+        }
+
+        /// A 10 KiB text is the largest binding, named with a human size whose
+        /// raw byte count is within 10% of what was put in.
+        #[test]
+        fn mem_reports_the_largest_binding_and_its_size() {
+            let mut repl = Repl::new();
+            let payload = "x".repeat(10 * 1024);
+            feed(
+                &mut repl,
+                &[
+                    "set small to \"hi\"",
+                    &format!("set payload to \"{payload}\""),
+                ],
+            );
+
+            let lines = repl.memory_answer();
+            let joined = lines.join("\n");
+            let payload_line = lines
+                .iter()
+                .find(|line| line.contains("payload"))
+                .unwrap_or_else(|| panic!("the binding is named: {}", joined));
+
+            assert!(
+                payload_line.contains("10.0 KiB (10240 B)"),
+                "the size is human-readable with raw bytes: {}",
+                payload_line
+            );
+            let payload_index = lines
+                .iter()
+                .position(|line| line.contains("payload"))
+                .unwrap();
+            let small_index = lines
+                .iter()
+                .position(|line| line.contains("small"))
+                .unwrap();
+            assert!(
+                payload_index < small_index,
+                "the largest binding is listed first: {:?}",
+                lines
+            );
+            assert!(
+                joined.contains("bindings:")
+                    && joined.contains("history:")
+                    && joined.contains("heap:"),
+                "every weight is labelled: {}",
+                joined
+            );
+        }
+
+        /// A fresh session answers with zeros, not blanks.
+        #[test]
+        fn edge_mem_on_a_fresh_session_names_every_zero() {
+            let lines = Repl::new().memory_answer();
+            let joined = lines.join("\n");
+
+            assert!(joined.contains("bindings: 0"), "{}", joined);
+            assert!(joined.contains("history: 0 entries"), "{}", joined);
+            assert!(joined.contains("0 B (0 B)"), "{}", joined);
+            assert!(joined.contains("largest bindings: (none)"), "{}", joined);
+        }
+
+        /// Asking twice observes twice: the binding count and `_` are the same
+        /// before the first report and after the second.
+        #[test]
+        fn edge_mem_twice_leaves_bindings_and_last_result_alone() {
+            let mut repl = Repl::new();
+            feed(&mut repl, &["set x to 1", "40 + 2"]);
+
+            let bindings_before = repl.binding_sizes().len();
+            let last_result = repl.lookup("_").cloned();
+            assert_eq!(
+                last_result,
+                Some(Value::Number(42.0)),
+                "the fixture has a last result to preserve"
+            );
+
+            feed(&mut repl, &[".mem", ".mem"]);
+
+            assert_eq!(
+                repl.binding_sizes().len(),
+                bindings_before,
+                "measuring added no binding"
+            );
+            assert_eq!(
+                repl.lookup("_").cloned(),
+                last_result,
+                "and did not replace the last result"
+            );
+        }
+
+        /// A five-megabyte binding is reported by its logical size; the report
+        /// never copies the text to measure it.
+        #[test]
+        fn edge_mem_reports_a_five_megabyte_text_without_copying_it() {
+            let mut repl = Repl::new();
+            let bytes = 5 * 1024 * 1024;
+            repl.variables
+                .insert("huge".to_string(), Value::Text("y".repeat(bytes)));
+
+            let lines = repl.memory_answer();
+            let joined = lines.join("\n");
+
+            assert!(joined.contains("huge"), "{}", joined);
+            assert!(
+                joined.contains("5.0 MiB (5242880 B)"),
+                "the largest binding's logical size is reported: {}",
+                joined
+            );
+            assert_eq!(
+                repl.variables.get("huge").map(|value| match value {
+                    Value::Text(text) => text.len(),
+                    _ => 0,
+                }),
+                Some(bytes),
+                "the binding is still exactly as long as it was"
+            );
+        }
+
+        /// No block has run, so `.profile` names the absence and where to see
+        /// it for oneself rather than printing an empty report.
+        #[test]
+        fn edge_profile_with_no_previous_block_names_the_history() {
+            let message = Repl::new()
+                .profile_answer()
+                .expect_err("a fresh session has no block to profile");
+
+            assert!(
+                message.contains(":history"),
+                "the absence is named against :history: {}",
+                message
+            );
+        }
+
+        /// A three-line block attributes one figure per line, slowest first,
+        /// and the parts sum to the reported total.
+        #[test]
+        fn profile_times_each_line_slowest_first_and_sums_to_the_total() {
+            let mut repl = Repl::new();
+            feed(
+                &mut repl,
+                &[
+                    "set x to 0",
+                    "for each i from 1 to 20000",
+                    "    set x to x + i",
+                    "end",
+                ],
+            );
+
+            let lines = repl
+                .profile_answer()
+                .expect("the block just ran, so it has a profile");
+            assert!(
+                lines[0].contains("3 line(s)"),
+                "the report is about the three-line block: {:?}",
+                lines
+            );
+
+            let total = figure(
+                lines
+                    .iter()
+                    .find(|line| line.trim_start().starts_with("total:"))
+                    .expect("a total is reported"),
+            );
+            let rows: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.trim_start().starts_with("line "))
+                .collect();
+            assert_eq!(rows.len(), 3, "one row per source line: {:?}", lines);
+
+            let sum: f64 = rows.iter().map(|line| figure(line)).sum();
+            assert!(
+                (sum - total).abs() <= total.abs() * 0.2 + 0.01,
+                "the lines sum to the block total: {} vs {} in {:?}",
+                sum,
+                total,
+                lines
+            );
+            let figures: Vec<f64> = rows.iter().map(|line| figure(line)).collect();
+            assert!(
+                figures.windows(2).all(|pair| pair[0] >= pair[1]),
+                "the rows are slowest first: {:?}",
+                rows
+            );
+        }
+
+        /// A newline inside a text literal is still a line the lexer numbers,
+        /// so the statement after it keeps its own source line in the report.
+        #[test]
+        fn profile_quotes_the_line_the_lexer_numbered() {
+            let mut repl = Repl::new();
+            feed(&mut repl, &["say \"first\nsecond\"\nset x to 1"]);
+
+            let block = repl
+                .last_profile
+                .as_ref()
+                .expect("the block just ran, so it has a profile");
+            assert_eq!(
+                block.lines,
+                vec![
+                    "say \"first".to_string(),
+                    "second\"".to_string(),
+                    "set x to 1".to_string(),
+                ],
+                "the source map follows the lexer through the literal"
+            );
+
+            let lines = repl
+                .profile_answer()
+                .expect("the block just ran, so it has a profile");
+            assert!(
+                lines.iter().any(|line| line.contains("set x to 1")),
+                "the later statement is quoted on its own line: {:?}",
+                lines
+            );
+        }
+
+        /// `.profile` answers about the block that just ran, not about every
+        /// block the session has run. A four-line block followed by a
+        /// three-line one reports the second alone: its lines, its timings and
+        /// nothing left over from the first.
+        #[test]
+        fn profile_reports_only_the_last_block_not_the_earlier_one() {
+            let mut repl = Repl::new();
+            feed(
+                &mut repl,
+                &[
+                    "set left to 0",
+                    "for each i from 1 to 3",
+                    "    set left to left + i",
+                    "end",
+                ],
+            );
+            feed(
+                &mut repl,
+                &[
+                    "set right to 7",
+                    "if right is greater than 0 then",
+                    "    set right to right - 1",
+                    "end",
+                ],
+            );
+
+            let block = repl
+                .last_profile
+                .as_ref()
+                .expect("the second block just ran");
+            assert_eq!(
+                block.lines,
+                vec![
+                    "if right is greater than 0 then".to_string(),
+                    "    set right to right - 1".to_string(),
+                    "end".to_string(),
+                ],
+                "the profile keeps the last block's source, not the first's"
+            );
+            assert!(
+                block
+                    .timings
+                    .iter()
+                    .all(|(line, _)| (1..=block.lines.len()).contains(line)),
+                "every timing belongs to a line of the last block: {:?}",
+                block.timings
+            );
+
+            let lines = repl
+                .profile_answer()
+                .expect("the second block just ran, so it has a profile");
+            let joined = lines.join("\n");
+            assert!(
+                lines[0].contains("3 line(s)"),
+                "the report is about the last block: {:?}",
+                lines
+            );
+            assert!(
+                joined.contains("if right is greater than 0 then"),
+                "the last block's source is quoted: {}",
+                joined
+            );
+            assert!(
+                !joined.contains("left"),
+                "nothing from the earlier block survives: {}",
+                joined
+            );
+        }
+    }
+
+    /// A failure a session reports points at the line the user typed.
+    ///
+    /// Every failure already carries a position and [`Error::render`] already
+    /// draws it — label, location, the offending source line and a caret under
+    /// the column. A session used to print only the first two of those through
+    /// [`std::fmt::Display`], so the same program showed more at `rb run` than
+    /// at the prompt, and the one place a reader can try a line and see what it
+    /// does was the one place that refused to show them which part of it was
+    /// wrong.
+    ///
+    /// The properties pinned here are the ones a REPL reader depends on: the
+    /// line and caret are there, they are the language's own rendering rather
+    /// than a second format, they are positioned by the buffer and not by the
+    /// history, and a failure with no position renders as the message alone
+    /// rather than reaching for a line that is not there.
+    mod error_rendering {
+        use super::Repl;
+[0m
+[0m$ [0msed -n '1,90p' /home/runner/work/rbops/rbops/redblue/src/error.rs; grep -n "fn unknown\|impl Default for Span\|pub struct Span" -A20 /home/runner/work/rbops/rbops/redblue/src/error.rs | head -60
+use std::fmt;
+
+/// The most terminal cells of one drawn source line.
+///
+/// A drawn line is a line the reader can read, not the whole of an input file:
+/// `rb run` renders whatever `fs::read_to_string` handed it
+/// (`src/lib.rs`), so a file with a megabyte-long line would otherwise be drawn
+/// a megabyte at a time. Past the limit the line is cut and marked with `…`, so
+/// a diagnostic is bounded by this constant rather than by the program's input.
+const MAX_DRAWN_CELLS: usize = 1024;
+
+/// The most source lines one drawn range covers.
+///
+/// The counterpart to [`MAX_DRAWN_CELLS`] along the other axis: an unterminated
+/// string runs to end of input, so without a limit its range is as long as the
+/// file is.
+const MAX_DRAWN_LINES: usize = 10;
+
+/// The marker left where a drawn line or range was cut short.
+const ELLIPSIS: char = '\u{2026}';
+
+/// A source position: a 1-based line and a 1-based **character** column.
+///
+/// Columns count characters, not bytes, so a line that starts with an emoji
+/// reports the column the caret is drawn at — and [`display_width`] is what
+/// turns that character column into the cell the caret is *drawn* at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub line: usize,
+    pub column: usize,
+    /// Where the offending thing stops, when it covers more than one line.
+    ///
+    /// A span that covers one line records no end, so a span and its position
+    /// are the same value and everything that compared the two keeps meaning
+    /// what it meant. Only a range — an unterminated string, which runs to the
+    /// end of the file — records one, because only a range has to be *drawn*.
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+impl Span {
+    pub fn new(line: usize, column: usize) -> Self {
+        Self {
+            line,
+            column,
+            end_line: line,
+            end_column: column,
+        }
+    }
+
+    /// This span, extended to cover up to `end_line:end_column`.
+    ///
+    /// An end that is not past the start is dropped: a span that covers one line
+    /// is drawn as one line, with the same caret it has always been drawn with.
+    pub fn extended_to(self, end_line: usize, end_column: usize) -> Self {
+        if end_line <= self.line {
+            return self;
+        }
+
+        Self {
+            line: self.line,
+            column: self.column,
+            end_line,
+            end_column,
+        }
+    }
+
+    /// Whether this span covers more than one line, and so has to be rendered as
+    /// several.
+    pub fn is_multiline(&self) -> bool {
+        self.end_line > self.line
+    }
+
+    /// A position that is not attached to any source text. Only for failures
+    /// that happen before a token exists, such as a module file that cannot be
+    /// read.
+    pub fn unknown() -> Self {
+        Self {
+            line: 0,
+            column: 0,
+            end_line: 0,
+            end_column: 0,
+        }
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.line > 0
+    }
+}
+
+28:pub struct Span {
+29-    pub line: usize,
+30-    pub column: usize,
+31-    /// Where the offending thing stops, when it covers more than one line.
+32-    ///
+33-    /// A span that covers one line records no end, so a span and its position
+34-    /// are the same value and everything that compared the two keeps meaning
+35-    /// what it meant. Only a range — an unterminated string, which runs to the
+36-    /// end of the file — records one, because only a range has to be *drawn*.
+37-    pub end_line: usize,
+38-    pub end_column: usize,
+39-}
+40-
+41-impl Span {
+42-    pub fn new(line: usize, column: usize) -> Self {
+43-        Self {
+44-            line,
+45-            column,
+46-            end_line: line,
+47-            end_column: column,
+48-        }
+--
+77:    pub fn unknown() -> Self {
+78-        Self {
+79-            line: 0,
+80-            column: 0,
+81-            end_line: 0,
+82-            end_column: 0,
+83-        }
+84-    }
+85-
+86-    pub fn is_known(&self) -> bool {
+87-        self.line > 0
+88-    }
+89-}
+90-
+91-impl fmt::Display for Span {
+92-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+93-        write!(f, "{}:{}", self.line, self.column)
+94-    }
+95-}
+96-
+97-#[derive(Debug, Clone)]
+[0m
+[0m$ [0mgrep -n "pub fn compile_source\|fn compile" /home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs /home/runner/work/rbops/rbops/redblue/src/bytecode/mod.rs | head -20; grep -n "pub mod\|pub use" /home/runner/work/rbops/rbops/redblue/src/bytecode/mod.rs | head -40
+/home/runner/work/rbops/rbops/redblue/src/bytecode/codegen.rs:32:pub fn compile(program: &Program) -> Result<Chunk> {
+26:pub mod vm;
+28:pub use codegen::compile as compile_program;
+29:pub use disasm::render as disassemble;
+30:pub use disasm::render_compact as disassemble_compact;
+31:pub use format::{
+35:pub use opcode::Opcode;
+36:pub use opcode::END_TRY_MARKER;
+37:pub use opcode::MIGHT_FAIL_END_MARKER;
+38:pub use opcode::STATEMENT_MARKER;
+[0m
+[0m$ [0msed -n '1000,1120p' /home/runner/work/rbops/rbops/redblue/src/interpreter.rs; sed -n '2800,2895p' /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+if *loop_iterations >= self.max_iterations {
+            return Err(Error::Limit(
+                format!(
+                    "Maximum of {} iterations reached in a '{}' loop",
+                    self.max_iterations, kind
+                ),
+                self.span(),
+            ));
+        }
+        *loop_iterations += 1;
+        self.charge_step()
+    }
+
+    /// Runs one iteration of a loop: binds `variable` to `value` in a fresh
+    /// scope, runs `body`, and reports the [`LoopControl`] the body raised.
+    ///
+    /// The scope and [`Vm::loop_depth`] are released on every path out,
+    /// including the failing one, so an error that a `try` inside the body
+    /// catches does not leave the depth raised and make a later `break` — one
+    /// written outside every loop — look legal.
+    ///
+    /// Stops at the first `break` or `skip` in the body rather than running the
+    /// statements after it, and hands the signal to the caller, which is the
+    /// only place that knows whether it leaves the loop or goes round again.
+    /// A `break` therefore leaves the innermost loop and only that one: the
+    /// enclosing loop never sees the signal, because this call already took it.
+    fn run_iteration(
+        &mut self,
+        variable: Option<&str>,
+        value: Option<Value>,
+        body: &[Stmt],
+    ) -> Result<Option<LoopControl>> {
+        self.loop_depth += 1;
+        let outcome = self.run_iteration_body(variable, value, body);
+        self.loop_depth -= 1;
+        if outcome.is_err() {
+            // A turn that failed is unwinding out of the loop on its own, so a
+            // signal it raised before failing — a `break` inside a `try` body
+            // whose `finally` then failed — has no loop left to act on. Left
+            // pending it would be handed to the next loop in the program, which
+            // would end one turn early for a `break` it never contained.
+            self.loop_control = None;
+        }
+        outcome
+    }
+
+    /// The body half of [`Vm::run_iteration`], run with the scope and the loop
+    /// depth already raised.
+    fn run_iteration_body(
+        &mut self,
+        variable: Option<&str>,
+        value: Option<Value>,
+        body: &[Stmt],
+    ) -> Result<Option<LoopControl>> {
+        let scope_base = self.locals.len();
+        self.push_scope();
+        let bound = match variable {
+            Some(variable) => {
+                self.declare(variable);
+                self.set_var(variable, value.unwrap_or(Value::Nothing))
+            }
+            None => Ok(()),
+        };
+        let outcome = bound.and_then(|()| self.run_block(body));
+        // Truncated rather than popped, so the stack is balanced even when the
+        // turn failed part way through: a scope left behind keeps the loop's
+        // variable alive for the rest of the program, and it is a different
+        // variable for every one of those turns.
+        self.locals.truncate(scope_base);
+        let signal = outcome?;
+        // The signal was this turn's loop to act on and it has been handed over,
+        // so nothing outside this turn may find it still pending.
+        self.loop_control = None;
+        Ok(signal)
+    }
+
+    /// Runs `statements` and reports the [`LoopControl`] one of them raised,
+    /// leaving the signal in place for the loop that owns it.
+    ///
+    /// Every block in the language runs its statements through here or through
+    /// [`Vm::execute_statements`], because a `break` or a `skip` has to stop the
+    /// block it was written in as well as the loop: `if c then break say "x" end`
+    /// must not run the `say`, and the statements after a `break` inside a
+    /// `try` body must not run either. A block that kept going would leave the
+    /// signal raised while the program ran on past the loop, and the next loop
+    /// to reach a `break` of its own would find it already set.
+    fn run_block(&mut self, statements: &[Stmt]) -> Result<Option<LoopControl>> {
+        self.execute_statements(statements)?;
+        Ok(self.loop_control)
+    }
+
+    /// The signal a `break` or a `skip` raises in the innermost enclosing loop,
+    /// or a [`Error::Runtime`] when there is no loop to raise it in.
+    ///
+    /// The refusal is the point: a `break` in no loop is a mistake in the
+    /// program, and a mistake that runs to completion reporting success is
+    /// worse than one that stops with a message naming the statement.
+    fn raise_loop_control(&mut self, keyword: &str, signal: LoopControl) -> Result<()> {
+        if self.loop_depth == 0 {
+            return Err(Error::Runtime(
+                format!("'{keyword}' is only valid inside a loop"),
+                self.span(),
+            ));
+        }
+        self.loop_control = Some(signal);
+        Ok(())
+    }
+
+    /// Takes the structured failure from the most recent failed `expect`, so a
+    /// caller such as the test harness can report expected and actual values
+    /// instead of only a rendered message.
+    pub fn take_expectation_failure(
+        &mut self,
+    ) -> Option<crate::testing::assertions::TestAssertionError> {
+        self.expectation_failure.take()
+    }
+
+    /// Takes the lines `say` produced, for a caller that wants them rather than
+    /// the printing.
+    ///
+    /// The printing happens in [`Vm::run`], so this is only useful afterwards.
+        // enclosing scope, in order, and after the type is registered, so a
+        // nested `object` in the body may extend this one.
+        self.run_block(&rest)?;
+
+        Ok(Value::Nothing)
+    }
+
+    fn call_user_function(
+        &mut self,
+        name: &str,
+        function: &FunctionValue,
+        args: &[Value],
+    ) -> Result<Value> {
+        if self.call_depth >= self.max_call_depth {
+            return Err(Error::Limit(
+                format!(
+                    "Maximum call depth of {} reached while calling '{}'",
+                    self.max_call_depth, name
+                ),
+                self.span(),
+            ));
+        }
+
+        // The captured scopes go on the stack *above* the caller's frames, and
+        // the parameters above those, so the body reads its own environment
+        // rather than a same-named binding of whoever called it, and a
+        // parameter shadows what it captured.
+        let caller_depth = self.locals.len();
+        for scope in function.captured.iter() {
+            self.locals.push(scope.clone());
+        }
+        // Where this frame's own scopes begin: above the captured ones it
+        // dragged in, so `.locals` inside the frame lists the frame's bindings
+        // and not its caller's world. Saved and restored with the frame.
+        let caller_scope_base = self.frame_scope_base;
+        self.frame_scope_base = self.locals.len();
+        self.push_scope();
+        for (index, param) in function.params.iter().enumerate() {
+            let value = args.get(index).cloned().unwrap_or(Value::Nothing);
+            self.declare(param);
+            self.set_var(param, value)?;
+        }
+        // The frame is on the stack while its body runs and only then: every
+        // statement the body evaluates sees it, and the caller's statements
+        // before the call and after the return do not. Both lists pop on every
+        // path out of the call, including the failing one.
+        self.call_stack.push(name.to_string());
+        self.frame_writes.push(HashSet::new());
+        self.call_depth += 1;
+        // A function body is not lexically inside the caller's loop, so a
+        // `break` written there has no loop of its own and must be refused
+        // rather than reaching out and ending the caller's iteration. The
+        // depth is restored on the way out, including the failing path.
+        //
+        // The pending signal is saved with it: a call made while a `break` or a
+        // `skip` is raised — from a `finally` running on the way out of a loop —
+        // is still inside the region that raised it, so the signal belongs to
+        // the loop's caller and the call must not touch it.
+        let caller_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        let caller_loop_control = self.loop_control.take();
+        // A function value the bytecode VM built names a compiled block instead
+        // of statements, and cannot be run by this walker. `rb run` only ever
+        // builds statements itself, so reaching this is a caller mixing the two
+        // VMs rather than a program that did something.
+        let FunctionBody::Statements(body) = &function.body else {
+            self.call_depth -= 1;
+            self.loop_depth = caller_loop_depth;
+            self.loop_control = caller_loop_control;
+            self.locals.truncate(caller_depth);
+            self.frame_scope_base = caller_scope_base;
+            self.frame_writes.pop();
+            self.call_stack.pop();
+            return Err(Error::Runtime(
+                format!(
+                    "'{}' has a compiled body, which only `rb vm` can run",
+                    function.name
+                ),
+                self.span(),
+            ));
+        };
+        let result = self.execute_statements(body);
+        self.call_depth -= 1;
+        self.loop_depth = caller_loop_depth;
+        self.loop_control = caller_loop_control;
+        // Truncated rather than popped one at a time, so the stack is balanced
+        // even when the body failed part way through and left a scope behind.
+        self.locals.truncate(caller_depth);
+        self.frame_scope_base = caller_scope_base;
+        self.frame_writes.pop();
+        self.call_stack.pop();
+
+        result
+    }
+}
+
+impl Default for Vm {
+[0m
+[0m$ [0mgrep -n "finally_body\|LoopControl\|loop_control\|execute_finally\|run_finally" /home/runner/work/rbops/rbops/redblue/src/interpreter.rs | head -80
+359:    /// [`Vm::loop_control_counts`].
+496:    loop_control: Option<LoopControl>,
+527:enum LoopControl {
+722:            loop_control: None,
+809:        self.loop_control = None;
+1014:    /// scope, runs `body`, and reports the [`LoopControl`] the body raised.
+1031:    ) -> Result<Option<LoopControl>> {
+1041:            self.loop_control = None;
+1053:    ) -> Result<Option<LoopControl>> {
+1072:        self.loop_control = None;
+1076:    /// Runs `statements` and reports the [`LoopControl`] one of them raised,
+1086:    fn run_block(&mut self, statements: &[Stmt]) -> Result<Option<LoopControl>> {
+1088:        Ok(self.loop_control)
+1097:    fn raise_loop_control(&mut self, keyword: &str, signal: LoopControl) -> Result<()> {
+1104:        self.loop_control = Some(signal);
+1165:    /// [`crate::bytecode::vm::BytecodeVm::loop_control_counts`].
+1166:    pub fn loop_control_counts(&self) -> (usize, usize) {
+1452:            if self.loop_control.is_some() {
+1472:        if failure.is_none() && self.loop_control.is_none() {
+1491:        if self.loop_control.is_some() {
+1945:                            == Some(LoopControl::Break)
+1985:                        == Some(LoopControl::Break)
+2006:                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+2031:                        Some(LoopControl::Break) => break,
+2032:                        Some(LoopControl::Skip) => continue,
+2045:                    if self.run_iteration(None, None, body)? == Some(LoopControl::Break) {
+2053:                self.raise_loop_control("break", LoopControl::Break)?;
+2058:                self.raise_loop_control("skip", LoopControl::Skip)?;
+2091:                finally_body,
+2119:                    // does, and returning above `run_finally_body` skipped it on
+2127:                        self.run_finally_body(finally_body)?;
+2140:                        if self.loop_control.is_none() {
+2148:                self.run_finally_body(finally_body)?;
+2291:    fn run_finally_body(&mut self, finally_body: &[Stmt]) -> Result<()> {
+2292:        let pending = self.loop_control.take();
+2293:        let outcome = self.run_block(finally_body);
+2297:        self.loop_control = self.loop_control.or(pending);
+2306:    /// loop is. The signal is reported through [`Vm::loop_control`] for the
+2313:            if self.loop_control.is_some() {
+2409:                        if self.loop_control.is_some()
+2859:        let caller_loop_control = self.loop_control.take();
+2867:            self.loop_control = caller_loop_control;
+2883:        self.loop_control = caller_loop_control;
+[0m
+[0m$ [0msed -n '2080,2160p' /home/runner/work/rbops/rbops/redblue/src/interpreter.rs; sed -n '2280,2310p' /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+)),
+            Statement::Object {
+                name,
+                extends,
+                body,
+            } => self.declare_object(name, extends.as_ref(), body),
+            Statement::Try {
+                body,
+                catch_var,
+                catch_kind,
+                catch_body,
+                finally_body,
+            } => {
+                // All three of the protected code, the catch and the finally run
+                // through `run_block`, so a `break` or a `skip` written in any of
+                // them stops the rest of that block. An abrupt exit from the
+                // protected region is not a failure: the catch does not run, the
+                // finally does, and the signal stays pending for the loop.
+                let failure = self.run_block(body).err();
+
+                // A catch is PRESENT whenever the parser saw one, which is not the
+                // same as catch_var being Some: `catch` with no name binding parses
+                // to catch_var == None with a non-empty body. Testing the Option
+                // therefore (a) never ran a bare catch and (b) fell through to
+                // `Ok(Value::Nothing)` below, silently swallowing the error. A
+                // swallowed error is the interpreter lying about what happened.
+                let has_catch = catch_var.is_some() || !catch_body.is_empty();
+
+                if let Some(failure) = failure {
+                    // A typed handler is a handler only for the kinds it names.
+                    // One that does not match is not a handler at all, and the
+                    // failure it declined belongs to whatever is written around
+                    // it — which is the same road a `try` with no `catch` hands
+                    // it down, and the same road both engines walk it.
+                    let declined = catch_kind.is_some_and(|kind| !kind.matches(&failure));
+
+                    // No catch to handle it, or one that declined it. The
+                    // `finally` is owed anyway: a
+                    // `try ... finally` promises its cleanup whatever the region
+                    // does, and returning above `run_finally_body` skipped it on
+                    // exactly the path where the cleanup is wanted — the region
+                    // failing is what left the thing to clean up. The failure is
+                    // propagated *after* the cleanup rather than instead of it,
+                    // which is also what an enclosing `try` written around this
+                    // one expects: `?` hands the failure to it, and it is the
+                    // `catch` there that decides what the program does next.
+                    if !has_catch || declined {
+                        self.run_finally_body(finally_body)?;
+                        // A cleanup that left the region abruptly is the way the
+                        // region was left, so the failure is not the one leaving
+                        // it and there is nothing for an enclosing `catch` to
+                        // handle — propagating it would run that handler *after*
+                        // being told to go, which is what the bytecode VM does
+                        // not do and what the two engines disagreed about. This
+                        // is the replacement a failing cleanup already makes
+                        // ("a failing finally still leaves the outer try to catch
+                        // the failure", `tests/test_control_flow.rb`), with an
+                        // abrupt exit in place of a failure: the signal is
+                        // pending exactly when the cleanup raised one, because a
+                        // body that raised one instead of failing never got here.
+                        if self.loop_control.is_none() {
+                            return Err(failure);
+                        }
+                        return Ok(Value::Nothing);
+                    }
+                    self.run_catch_body(*catch_kind, catch_var.as_deref(), &failure, catch_body)?;
+                }
+
+                self.run_finally_body(finally_body)?;
+
+                Ok(Value::Nothing)
+            }
+            Statement::Import(items) => {
+                for item in items {
+                    if self.importing.iter().any(|name| name == &item.name) {
+                        // A module reaching itself is a cycle, and saying so is
+                        // the difference between a clean error and a walk that
+                        // never ends. The scan is over the chain of imports
+                        // currently being loaded, which is as deep as the
+                        // chain of module files — a bounded walk, not a walk
+                        // that grows with the program.
+    /// region was left — by its own end, by a failure its `catch` handled, or by
+    /// a `break` or a `skip` passing through it.
+    ///
+    /// A pending signal is *held* across the body rather than left in place while
+    /// it runs. Two things depend on that. The cleanup is owed, so every
+    /// statement of it runs: a field left pending would stop the block after its
+    /// first statement, which is a `finally` that cleans up one thing and not the
+    /// other. And the `finally` is a block in its own right, so a `break` written
+    /// in it ends *it* — the statements after it in the same block — and names
+    /// the loop the signal already named, which is then still that loop's to
+    /// consume.
+    fn run_finally_body(&mut self, finally_body: &[Stmt]) -> Result<()> {
+        let pending = self.loop_control.take();
+        let outcome = self.run_block(finally_body);
+        // A signal the `finally` raised replaces the one it was holding rather
+        // than joining it: there is one loop to act on it, and the nearest
+        // statement to it asked for that.
+        self.loop_control = self.loop_control.or(pending);
+        outcome?;
+        Ok(())
+    }
+
+    /// Runs `statements` and answers what the last of them produced.
+    ///
+    /// Stops at the first `break` or a `skip` one of them raises and leaves the
+    /// signal pending, because the block is not the thing that consumes it — the
+    /// loop is. The signal is reported through [`Vm::loop_control`] for the
+    /// caller to hand over, rather than returned here, so that every block in
+    /// the language stops at one and none of them can swallow it.
+    fn execute_statements(&mut self, statements: &[Stmt]) -> Result<Value> {
+        let mut result = Value::Nothing;
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -11,9 +11,10 @@
+ //! an estimate: no test asserts an allocator's exact figure.
+ 
+ use std::collections::HashSet;
+ 
+-use crate::value::Value;
++use crate::parser::{Expr, Statement, Stmt};
++use crate::value::{FunctionBody, Value};
+ 
+ /// How many bindings the largest-first listing names.
+ ///
+ /// A listing is an answer, not a dump. Ten is enough to show what a session is
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -29,8 +29,10 @@
+ /// before it can print a single byte count.
+ enum Pending<'a> {
+     Value(&'a Value),
+     Fields(&'a std::sync::Arc<crate::value::Fields>),
++    Statement(&'a Stmt),
++    Expression(&'a Expr),
+ }
+ 
+ /// The logical bytes a value holds.
+ ///
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -65,8 +65,23 @@
+ }
+ Pending::Value(Value::Function(function)) => {
+     bytes +=
+         function.name.len() + function.params.iter().map(String::len).sum::<usize>();
++    match &function.body {
++        FunctionBody::Statements(body) => {
++            let address = std::sync::Arc::as_ptr(body) as *const () as usize;
++            if seen.insert(address) {
++                pending.extend(body.iter().map(Pending::Statement));
++            }
++        }
++        FunctionBody::Block { chunk, path } => {
++            bytes += path.len() * std::mem::size_of::<u32>();
++            let address = std::sync::Arc::as_ptr(chunk) as *const () as usize;
++            if seen.insert(address) {
++                bytes += chunk.encode().len();
++            }
++        }
++    }
+     let address = std::sync::Arc::as_ptr(&function.captured) as *const () as usize;
+     if seen.insert(address) {
+         for scope in function.captured.iter() {
+             for (name, value) in scope {
+@@ -75,8 +90,192 @@
+             }
+         }
+     }
+ }
++Pending::Statement(statement) => {
++    bytes += std::mem::size_of::<Stmt>();
++    match &statement.statement {
++        Statement::Say(expr) | Statement::Expr(expr) | Statement::Print(expr) => {
++            pending.push(Pending::Expression(expr));
++        }
++        Statement::Set { name, value } | Statement::Constant { name, value } => {
++            bytes += name.len();
++            pending.push(Pending::Expression(value));
++        }
++        Statement::SetProperty {
++            object,
++            property,
++            value,
++        } => {
++            bytes += object.len() + property.len();
++            pending.push(Pending::Expression(value));
++        }
++        Statement::If {
++            condition,
++            then_branch,
++            else_branch,
++        } => {
++            pending.push(Pending::Expression(condition));
++            pending.extend(then_branch.iter().map(Pending::Statement));
++            pending.extend(else_branch.iter().map(Pending::Statement));
++        }
++        Statement::Unless { condition, body } => {
++            pending.push(Pending::Expression(condition));
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::ForEach {
++            variable,
++            iterable,
++            body,
++        } => {
++            bytes += variable.len();
++            pending.push(Pending::Expression(iterable));
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::ForRange {
++            variable,
++            start,
++            end,
++            step,
++            body,
++        } => {
++            bytes += variable.len();
++            pending.push(Pending::Expression(start));
++            pending.push(Pending::Expression(end));
++            if let Some(step) = step {
++                pending.push(Pending::Expression(step));
++            }
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::Repeat { count, body } => {
++            pending.push(Pending::Expression(count));
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::RepeatUntil { body, condition, .. } => {
++            pending.push(Pending::Expression(condition));
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::While { condition, body } => {
++            pending.push(Pending::Expression(condition));
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::Break | Statement::Skip => {}
++        Statement::Return(value) | Statement::GiveBack(value) => {
++            if let Some(value) = value {
++                pending.push(Pending::Expression(value));
++            }
++        }
++        Statement::Function { name, params, body }
++        | Statement::Method { name, params, body } => {
++            bytes +=
++                name.len() + params.iter().map(String::len).sum::<usize>();
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::Has { name, default } => {
++            bytes += name.len();
++            if let Some(default) = default {
++                pending.push(Pending::Expression(default));
++            }
++        }
++        Statement::Object {
++            name,
++            extends,
++            body,
++        } => {
++            bytes += name.len();
++            if let Some(extends) = extends {
++                bytes += extends.len();
++            }
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::Try {
++            body,
++            catch_var,
++            catch_kind: _,
++            catch_body,
++            finally_body,
++        } => {
++            if let Some(catch_var) = catch_var {
++                bytes += catch_var.len();
++            }
++            pending.extend(body.iter().map(Pending::Statement));
++            pending.extend(catch_body.iter().map(Pending::Statement));
++            pending.extend(finally_body.iter().map(Pending::Statement));
++        }
++        Statement::Import(items) => {
++            for item in items {
++                bytes += item.name.len();
++                if let Some(alias) = &item.alias {
++                    bytes += alias.len();
++                }
++            }
++        }
++        Statement::Module { name, body } => {
++            bytes += name.len();
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Statement::Export { names, .. } => {
++            bytes += names.iter().map(String::len).sum::<usize>();
++        }
++        Statement::Test { name, body } => {
++            bytes += name.len();
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++    }
++}
++Pending::Expression(expression) => {
++    bytes += std::mem::size_of::<Expr>();
++    match expression {
++        Expr::Number(_) | Expr::YesNo(_) | Expr::Nothing => {}
++        Expr::Text(text) => bytes += text.len(),
++        Expr::Variable(name, _) => bytes += name.len(),
++        Expr::Binary { left, right, .. } => {
++            pending.push(Pending::Expression(right));
++            pending.push(Pending::Expression(left));
++        }
++        Expr::Unary { expr, .. } => pending.push(Pending::Expression(expr)),
++        Expr::Call { name, args } => {
++            bytes += name.len();
++            pending.extend(args.iter().map(Pending::Expression));
++        }
++        Expr::Property { object, property } => {
++            bytes += property.len();
++            pending.push(Pending::Expression(object));
++        }
++        Expr::MethodCall {
++            receiver,
++            method,
++            args,
++        } => {
++            bytes += method.len();
++            pending.push(Pending::Expression(receiver));
++            pending.extend(args.iter().map(Pending::Expression));
++        }
++        Expr::Index { object, index } => {
++            pending.push(Pending::Expression(index));
++            pending.push(Pending::Expression(object));
++        }
++        Expr::InterpolatedText(parts) => {
++            pending.extend(parts.iter().map(Pending::Expression));
++        }
++        Expr::List(items) => pending.extend(items.iter().map(Pending::Expression)),
++        Expr::Record(fields) => {
++            for (name, value) in fields {
++                bytes += name.len();
++                pending.push(Pending::Expression(value));
++            }
++        }
++        Expr::FunctionLiteral { params, body } => {
++            bytes += params.iter().map(String::len).sum::<usize>();
++            pending.extend(body.iter().map(Pending::Statement));
++        }
++        Expr::Expect { actual, expected } => {
++            pending.push(Pending::Expression(expected));
++            pending.push(Pending::Expression(actual));
++        }
++        Expr::MightFail(expr) => pending.push(Pending::Expression(expr)),
++    }
++}
+ Pending::Fields(fields) => {
+     let address = std::sync::Arc::as_ptr(fields) as *const () as usize;
+     if seen.insert(address) {
+         for (name, value) in fields.iter() {
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -289,45 +289,72 @@
+ 
+     bytes
+ }
+ 
++/// The binary units, largest first, as `(bytes per unit, name)`.
++///
++/// `EiB` is the largest that fits a 64-bit `usize`, and every unit down to
++/// `KiB` is here so a count is never expressed as thousands of the next unit
++/// down (`1024.0 MiB` for a gibibyte).
++const HUMAN_UNITS: [(u128, &str); 6] = [
++    (1u128 << 60, "EiB"),
++    (1u128 << 50, "PiB"),
++    (1u128 << 40, "TiB"),
++    (1u128 << 30, "GiB"),
++    (1u128 << 20, "MiB"),
++    (1u128 << 10, "KiB"),
++];
++
+ /// A byte count in human units, with the raw count in parentheses.
+ ///
+ /// The raw count is always present so a small session and a large one read
+ /// alike: `0 B (0 B)`, `512 B (512 B)`, `10.0 KiB (10240 B)` and
+ /// `5.0 MiB (5242880 B)` each say exactly what they mean. Base 1024, because a
+ /// reader comparing this to what they typed is comparing memory, not disk, so
+-/// the units are the binary ones: `KiB` and `MiB`, not the decimal `KB`/`MB`.
++/// the units are the binary ones: `KiB`, `MiB`, `GiB`, `TiB`, `PiB` and `EiB`,
++/// not the decimal `KB`/`MB`.
+ ///
+ /// The one decimal is computed with integer arithmetic. Casting the count to
+ /// `f64` first would round any value past its 53-bit mantissa (about 9 PiB), so
+ /// a session holding an exabyte would report a unit figure that is not its own
+ /// truncated quotient. The raw count in parentheses is exact either way.
+ pub fn human_bytes(bytes: usize) -> String {
+-    if bytes >= 1024 * 1024 {
+-        human_unit(bytes, 1024 * 1024, "MiB")
+-    } else if bytes >= 1024 {
+-        human_unit(bytes, 1024, "KiB")
+-    } else {
+-        format!("{} B ({} B)", bytes, bytes)
++    for (unit, name) in HUMAN_UNITS {
++        if bytes as u128 >= unit {
++            return human_unit(bytes, unit, name);
++        }
+     }
++    format!("{} B ({} B)", bytes, bytes)
+ }
+ 
+ /// `bytes` as a count of `unit` bytes, rounded to one decimal place.
+ ///
+ /// The division and the rounding are done in `u128` so neither the quotient nor
+ /// `remainder * 10` can overflow, and so the printed whole part is the exact
+ /// quotient rather than an `f64` approximation of it.
+-fn human_unit(bytes: usize, unit: usize, name: &str) -> String {
+-    let unit = unit as u128;
+-    let mut whole = bytes as u128 / unit;
+-    let remainder = bytes as u128 % unit;
+-    let mut tenths = (remainder * 10 + unit / 2) / unit;
+-    if tenths == 10 {
++fn human_unit(bytes: usize, unit: u128, name: &str) -> String {
++    format!(
++        "{} {name} ({} B)",
++        decimal_quotient(bytes as u128, unit, 1),
++        bytes
++    )
++}
++
++/// `value / unit` to `places` decimal places, rounded half up.
++///
++/// Integer arithmetic throughout, for the same reason [`human_unit`] uses it:
++/// an `f64` division would round a value past the mantissa's exact range, and a
++/// profile or a report should print the quotient the integers gave.
++fn decimal_quotient(value: u128, unit: u128, places: u32) -> String {
++    let factor = 10u128.pow(places);
++    let mut whole = value / unit;
++    let remainder = value % unit;
++    let mut fraction = (remainder * factor + unit / 2) / unit;
++    if fraction == factor {
+         whole += 1;
+-        tenths = 0;
++        fraction = 0;
+     }
+-    format!("{whole}.{tenths} {name} ({} B)", bytes)
++    format!("{whole}.{fraction:0width$}", width = places as usize)
+ }
+ 
+ /// The `.mem` report: bindings, history and heap, each named, then the largest
+ /// bindings from heaviest to lightest.
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -436,9 +436,13 @@
+     format!(
+         "Profile: last block, {} line(s), wall time",
+         block.lines.len()
+     ),
+-    format!("  total: {:.3} {}", total as f64 / scale, unit),
++    format!(
++        "  total: {} {}",
++        decimal_quotient(total, scale, 3),
++        unit
++    ),
+ ];
+ 
+ for (number, nanos) in rows {
+     let source = number
+@@ -446,10 +450,10 @@
+         .and_then(|index| block.lines.get(index))
+         .map(|line| line.trim())
+         .unwrap_or("");
+     lines.push(format!(
+-        "  line {number}: {:.3} {unit}  {source}",
+-        nanos as f64 / scale
++        "  line {number}: {} {unit}  {source}",
++        decimal_quotient(nanos, scale, 3)
+     ));
+ }
+ 
+ lines
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -485,17 +485,17 @@
+ 
+ /// The divisor and unit the largest line figure should be read in, so that the
+ /// slowest line is at least one of the unit and no line prints as `0 ns` unless
+ /// it really took no time the clock could see.
+-fn duration_scale(nanos: u128) -> (f64, &'static str) {
++fn duration_scale(nanos: u128) -> (u128, &'static str) {
+     if nanos >= 1_000_000_000 {
+-        (1_000_000_000.0, "s")
++        (1_000_000_000, "s")
+     } else if nanos >= 1_000_000 {
+-        (1_000_000.0, "ms")
++        (1_000_000, "ms")
+     } else if nanos >= 1_000 {
+-        (1_000.0, "µs")
++        (1_000, "µs")
+     } else {
+-        (1.0, "ns")
++        (1, "ns")
+     }
+ }
+ 
+ #[cfg(test)]
+
+[0m
+[0m→ [0mRead src/repl/weight.rs[90m [offset=400, limit=120][0m
+[0m→ [0mRead src/repl/weight.rs[90m [offset=509, limit=225][0m
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -505,24 +505,41 @@
+ fn text(bytes: usize) -> Value {
+     Value::Text("x".repeat(bytes))
+ }
+ 
++fn function_with_body(body: FunctionBody) -> Value {
++    Value::Function(crate::value::FunctionValue {
++        name: "f".to_string(),
++        params: vec!["a".to_string()],
++        body,
++        captured: std::sync::Arc::new(Vec::new()),
++    })
++}
++
+ #[test]
+ fn edge_human_bytes_names_zero_and_keeps_the_raw_count() {
+     assert_eq!(human_bytes(0), "0 B (0 B)");
+     assert_eq!(human_bytes(999), "999 B (999 B)");
+     assert_eq!(human_bytes(1024), "1.0 KiB (1024 B)");
+     assert_eq!(human_bytes(10 * 1024), "10.0 KiB (10240 B)");
+     assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB (5242880 B)");
++    assert_eq!(
++        human_bytes(1024 * 1024 * 1024),
++        "1.0 GiB (1073741824 B)"
++    );
++    assert_eq!(
++        human_bytes(2 * 1024 * 1024 * 1024 * 1024),
++        "2.0 TiB (2199023255552 B)"
++    );
+ }
+ 
+ /// Past `f64`'s exact-integer range the human figure must still be the
+ /// integer quotient, not the mantissa-rounded approximation.
+ #[test]
+ fn edge_human_bytes_stays_exact_past_the_float_mantissa() {
+     let unit = 1024 * 1024;
+     let bytes = usize::MAX - (usize::MAX % unit);
+-    let rendered = human_bytes(bytes);
++    let rendered = human_unit(bytes, unit as u128, "MiB");
+     let whole = bytes as u128 / unit as u128;
+ 
+     assert!(
+         rendered.ends_with(&format!("({} B)", bytes)),
+@@ -533,8 +550,23 @@
+         rendered.starts_with(&format!("{whole}.")),
+         "the unit figure is the exact quotient: {}",
+         rendered
+     );
++
++    let (top_unit, _) = HUMAN_UNITS[0];
++    let bytes = usize::MAX - (usize::MAX % top_unit as usize);
++    let rendered = human_bytes(bytes);
++    let whole = bytes as u128 / top_unit;
++    assert!(
++        rendered.ends_with(&format!("({} B)", bytes)),
++        "the largest unit keeps the raw count exact: {}",
++        rendered
++    );
++    assert!(
++        rendered.starts_with(&format!("{whole}.")),
++        "the largest unit is the exact quotient: {}",
++        rendered
++    );
+ }
+ 
+ #[test]
+ fn val_bytes_covers_text_lists_records_and_sharing() {
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -608,8 +608,68 @@
+         "f".len() + "a".len() + "bb".len() + "x".len() + 5
+     );
+ }
+ 
++/// A function body held as statements is part of what the function value
++/// keeps alive, so its statements and the text they name are measured, not
++/// only the name, parameters and captured scopes.
++#[test]
++fn val_bytes_covers_a_statements_function_body() {
++    let empty = function_with_body(FunctionBody::Statements(std::sync::Arc::new(Vec::new())));
++    let body = vec![
++        crate::parser::Stmt {
++            span: crate::error::Span::new(1, 1),
++            statement: crate::parser::Statement::Say(crate::parser::Expr::Text(
++                "hello".to_string(),
++            )),
++        },
++        crate::parser::Stmt {
++            span: crate::error::Span::new(2, 1),
++            statement: crate::parser::Statement::Break,
++        },
++    ];
++    let filled = function_with_body(FunctionBody::Statements(std::sync::Arc::new(body)));
++
++    let empty_bytes = value_bytes(&empty);
++    let filled_bytes = value_bytes(&filled);
++
++    assert!(
++        filled_bytes > empty_bytes,
++        "a non-empty body adds weight: {filled_bytes} vs {empty_bytes}"
++    );
++    assert!(
++        filled_bytes - empty_bytes >= "hello".len(),
++        "the body's text is counted: {filled_bytes} vs {empty_bytes}"
++    );
++}
++
++/// A function body held as a compiled block keeps the whole chunk alive, so
++/// the measurement counts the chunk's encoded bytes and the path that names
++/// the block rather than stopping at the function's name.
++#[test]
++fn val_bytes_covers_a_compiled_block_function_body() {
++    let chunk = crate::Chunk::compile(
++        "to add(a, b)\n    give back a + b\nend\nsay add(1, 2)\n",
++    )
++    .expect("the fixture compiles");
++    let encoded = chunk.encode().len();
++    let path = vec![0u32, 1u32];
++
++    let bytes = value_bytes(&function_with_body(FunctionBody::Block {
++        chunk: std::sync::Arc::new(chunk),
++        path: path.clone(),
++    }));
++
++    assert_eq!(
++        bytes,
++        "f".len()
++            + "a".len()
++            + path.len() * std::mem::size_of::<u32>()
++            + encoded,
++        "the compiled body's chunk and path are both counted"
++    );
++}
++
+ /// A deep acyclic value is measured without touching the process stack.
+ /// The walk is iterative, so the text at the bottom is still counted.
+ #[test]
+ fn edge_value_bytes_measures_a_deep_value_without_recursing() {
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -798,8 +798,41 @@
+         joined
+     );
+ }
+ 
++/// A profile figure is printed by integer division, so a timing past the
++/// `f64` mantissa's exact-integer range is still the quotient the integers
++/// gave rather than the nearest float.
++#[test]
++fn edge_profile_stays_exact_past_the_float_mantissa() {
++    let nanos = (1u128 << 80) + 12_345;
++    let block = BlockProfile {
++        lines: vec!["slow".to_string()],
++        timings: vec![(1, nanos)],
++    };
++    let unit = 1_000_000_000u128;
++    let mut whole = nanos / unit;
++    let mut fraction = ((nanos % unit) * 1000 + unit / 2) / unit;
++    if fraction == 1000 {
++        whole += 1;
++        fraction = 0;
++    }
++    let expected = format!("{whole}.{fraction:03} s");
++
++    let joined = profile_lines(&block).join("\n");
++
++    assert!(
++        joined.contains(&format!("total: {expected}")),
++        "the total is the integer quotient: {}",
++        joined
++    );
++    assert!(
++        joined.contains(&format!("line 1: {expected}")),
++        "the row is the same integer quotient: {}",
++        joined
++    );
++}
++
+ /// The source map uses the lexer's line increments, including a newline
+ /// inside a text literal, so every recorded span names the line it meant.
+ #[test]
+ fn edge_source_lines_match_the_lexers_line_numbers() {
+
+[0m
+[0m← [0mEdit src/interpreter.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
++++ /home/runner/work/rbops/rbops/redblue/src/interpreter.rs
+@@ -1759,9 +1759,14 @@
+ ///
+ /// Statements inside a user function call are not timed: their source lines
+ /// belong to the function's declaration, not to the block the user typed, so
+ /// their time stays in the call-site line rather than being attributed to a
+-/// line the block never showed.
++/// line the block never showed. That is every statement at `call_depth > 0`,
++/// not only the body's direct statements: a `catch` or `finally` body that
++/// runs inside the call has declaration lines too, even when it is unwinding
++/// a loop, because saving and restoring `loop_depth` around the call does not
++/// change which frame the code belongs to. A `finally` that unwinds a loop at
++/// the top level is still at depth zero and is timed like any other statement.
+ fn profile_enter(&mut self, line: usize) -> bool {
+     if self.call_depth != 0 {
+         return false;
+     }
+
+[0m
+[0m$ [0mcargo fmt --all && cargo check --all-targets
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 4.90s
+[0m
+[0m$ [0mcargo test --lib repl::weight -- --nocapture
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 4.96s
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-0b6bed5357e25827)
+
+running 14 tests
+test repl::weight::tests::edge_memory_lines_report_every_zero_on_an_empty_session ... ok
+test repl::weight::tests::edge_human_bytes_names_zero_and_keeps_the_raw_count ... ok
+test repl::weight::tests::edge_human_bytes_stays_exact_past_the_float_mantissa ... ok
+test repl::weight::tests::edge_profile_stays_exact_past_the_float_mantissa ... ok
+test repl::weight::tests::edge_profile_lines_keep_a_timing_past_the_source ... ok
+test repl::weight::tests::edge_source_lines_match_the_lexers_line_numbers ... ok
+test repl::weight::tests::edge_profile_on_an_empty_block_still_names_a_zero_total ... ok
+test repl::weight::tests::memory_lines_order_the_largest_first_and_stop_at_the_listing_limit ... ok
+test repl::weight::tests::profile_lines_are_slowest_first_and_sum_to_the_total ... ok
+test repl::weight::tests::val_bytes_covers_a_compiled_block_function_body ... ok
+test repl::weight::tests::val_bytes_covers_a_statements_function_body ... ok
+test repl::weight::tests::val_bytes_covers_scalars_builtins_objects_and_functions ... ok
+test repl::weight::tests::val_bytes_covers_text_lists_records_and_sharing ... ok
+test repl::weight::tests::edge_value_bytes_measures_a_deep_value_without_recursing ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 470 filtered out; finished in 0.07s
+[0m
+[0m$ [0mcargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 5.69s
+[0m
+[0m$ [0mcargo test --all-targets --no-fail-fast
+...output truncated...
+
+Full output saved to: /home/runner/.local/share/opencode/tool-output/tool_1707354f6001Sh4wrzJ9Jq7qmX
+
+test common::generator::tests::edge_almost_every_seed_produces_a_program_of_its_own ... ok
+  beta  
+
+test common::generator::tests::edge_every_declared_fault_has_a_tail_that_faults ... ok
+test common::generator::tests::edge_every_declared_fault_is_reachable_from_some_seed ... ok
+  beta  
+
+
+  beta  
+
+90
+90
+
+
+test common::generator::tests::edge_every_kind_is_reachable_and_its_arms_produce_it ... ok
+test common::generator::tests::edge_generated_programs_end_in_a_value_rather_than_in_a_statement ... ok
+test common::generator::tests::edge_the_binders_and_readers_agree ... ok
+27
+delta
+deltadelta
+90
+90
+90
+90
+test common::generator::tests::edge_the_corpus_holds_every_family_it_lists ... ok
+-80
+betabeta
+test a_generated_program_runs_the_same_way_every_time ... ok
+test common::generator::tests::edge_the_generator_emits_every_statement_form_it_lists ... ok
+test common::generator::tests::edge_the_generator_is_a_function_of_nothing ... ok
+test common::rng::tests::edge_a_draw_over_an_empty_table_is_none_and_not_a_panic ... ok
+test common::rng::tests::edge_a_flag_draws_both_answers ... ok
+test common::rng::tests::edge_a_seed_is_replayed_and_a_different_seed_is_not ... ok
+test common::rng::tests::edge_the_bounded_helpers_stay_inside_their_bounds ... ok
+test common::rng::tests::edge_the_default_seed_is_not_zero ... ok
+test common::rng::tests::edge_the_generator_is_the_sequence_splitmix64_publishes ... ok
+test common::shrink::tests::edge_a_character_comes_off_a_multibyte_program_at_its_own_boundary ... ok
+test common::shrink::tests::edge_a_line_comes_off_and_a_line_that_is_not_there_does_not ... ok
+test common::shrink::tests::edge_a_program_that_does_not_diverge_shrinks_to_nothing ... ok
+test common::shrink::tests::edge_a_reduction_is_reported_with_the_seed_and_the_program_it_reduced ... ok
+test common::shrink::tests::edge_a_reduction_keeps_the_trailing_newline_a_source_has ... ok
+test common::shrink::tests::edge_drop_lines_builds_the_source_the_line_pass_looks_at ... ok
+test common::shrink::tests::edge_the_shrinker_accepts_a_candidate_only_when_it_is_shorter ... ok
+1
+2
+1
+2
+test common::shrink::tests::edge_the_shrinker_never_invents_a_counterexample ... ok
+test common::shrink::tests::edge_the_shrinker_reduces_when_no_line_can_go ... ok
+unreached
+test common::generator::tests::edge_the_corpus_is_a_function_of_nothing ... ok
+test common::vm::tests::edge_a_column_only_one_engine_can_name_is_held_to_the_convention ... ok
+-45
+gammaalpha
+test common::vm::tests::edge_a_failure_carries_the_position_it_happened_at ... ok
+test common::vm::tests::edge_a_failure_renders_with_its_label_message_and_position ... ok
+test common::vm::tests::edge_a_frontend_failure_printed_nothing_on_either_vm ... ok
+test common::vm::tests::edge_a_nested_value_round_trips_through_its_tagged_form ... ok
+test common::vm::tests::edge_a_number_and_the_text_that_spells_it_are_different_outcomes ... ok
+test common::vm::tests::edge_a_number_renders_the_way_the_interpreter_prints_it ... ok
+test common::vm::tests::edge_a_position_is_compared_as_a_whole_not_as_a_line ... ok
+one
+two
+test common::shrink::tests::edge_the_shrinker_stops_only_when_nothing_can_be_removed ... ok
+test common::vm::tests::edge_an_untagged_value_is_rejected_for_a_typed_one ... ok
+1025
+1025
+
+test common::vm::tests::edge_one_run_of_a_program_is_all_the_harness_asks_for ... ok
+test common::vm::tests::edge_the_tagged_form_names_the_type_for_every_kind ... ok
+test common::vm::tests::edge_a_vm_built_as_a_library_does_not_print_what_the_program_said ... ok
+x
+test common::vm::tests::edge_the_two_halves_of_an_outcome_are_both_recorded ... ok
+test common::vm::tests::edge_the_two_engines_agree_on_a_failure_and_on_what_was_printed_first ... ok
+test corpus_holds_at_least_two_hundred_programs ... ok
+after
+2
+after
+test edge_a_break_and_a_skip_leave_the_loop_on_both_engines ... ok
+30
+20
+café
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+cafécafé
+after
+gamma🎉
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+
+  beta  
+beta日本語
+test edge_a_call_stack_that_cannot_come_back_is_a_clean_failure ... ok
+test edge_a_corpus_program_whose_expected_file_names_a_failure_reports_a_mismatch ... ok
+1
+test edge_a_deeply_nested_value_is_read_back_on_both_engines ... ok
+test edge_a_generated_program_can_be_seen ... ok
+日本語gamma
+cafécafé
+  beta  
+
+
+test a_generated_program_either_completes_or_reports_a_failure ... ok
+[2, 4, 6]
+[2, 4, 6]
+[2, 4, 6]
+[2, 4, 6]
+[10, 20, 30]
+1
+2
+[2, 3]
+[[2, 2], [4, 4]]
+[]
+nothing
+[1]
+caught
+after
+90
+90
+27
+delta
+deltadelta
+-80
+betabeta
+-45
+gammaalpha
+1025
+1025
+
+test edge_a_higher_order_call_answers_the_same_way_on_both_engines ... ok
+test edge_a_mismatch_names_the_program_it_is_about ... ok
+café
+1
+test edge_a_missing_expected_output_file_is_a_runner_failure ... ok
+cafécafé
+2
+side effect
+7
+1
+1
+gamma🎉
+nothing
+[1, 2]
+[]
+0
+[1]
+1
+1
+3
+3
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+0
+1
+3
+10
+30
+30
+10
+30
+3
+0
+5
+3
+3
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+30
+30
+after
+once
+x
+x
+x
+5
+1
+1
+2
+3
+[1, 2]
+[3, 4]
+1
+2
+3
+4
+two
+10
+after
+2
+after
+ab
+1
+2
+1
+2
+n
+n
+n
+n
+n
+n
+0
+0
+1
+2
+2
+after
+[[[[1]]]]
+[[[[[1]]]]]
+{a: {b: {c: {d: 1}}}}
+{a: {b: {c: {d: {e: 1}}}}}
+1
+6
+3
+1
+2
+
+three
+b
+9
+10
+10
+11
+10
+11
+11
+12
+2
+6
+  beta  
+beta日本語
+cafécafé
+test edge_a_generated_program_only_faults_on_a_fault_that_was_injected ... ok
+test edge_a_program_that_prints_before_it_faults_is_recorded_not_asserted_away ... ok
+1
+2
+test edge_a_shrunk_program_still_diverges ... ok
+test edge_an_expected_file_naming_the_wrong_label_is_a_comparison_failure ... ok
+30
+20
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+2
+1
+0.30000000000000004
+0.3333333333333333
+0
+2147483648
+2147483647
+-2147483648
+9223372036854776000
+-9223372036854776000
+9007199254740992
+9007199254740992
+9007199254740992
+-3.5
+-3.5
+-1
+1
+0
+0.7999999999999999
+1
+3
+-3
+0.30000000000000004
+{}
+none
+3
+base
+middle
+yes
+{}
+nothing
+nothing
+3
+after inner
+o
+base
+2
+yes
+{a: 1, b: 2}
+yes
+7
+2
+{a: 1, b: x}
+3
+nothing
+nothing
+nothing
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+before
+caught
+after
+yes
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+3
+2
+0
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+hello world
+5
+yes
+
+0
+\
+a
+b
+a	b
+x
+3
+5
+abc
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+yes
+yes
+yes
+yes
+yes
+yes
+[日本, 🎉]
+2
+after a byte order mark
+5
+printed
+1
+2
+2
+side effect
+7
+1
+1
+nothing
+a
+b
+[1, 2]
+[]
+0
+[1]
+1
+test edge_a_column_is_compared_exactly_wherever_both_engines_can_name_one ... ok
+1
+3
+3
+test edge_every_recorded_failure_points_at_a_line_of_its_own_program ... ok
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+test edge_every_recorded_failure_records_the_place_it_happened_at ... ok
+0
+1
+3
+10
+30
+30
+10
+30
+3
+0
+5
+3
+3
+yes
+yes
+yes
+yes
+yes
+yes
+30
+20
+yes
+yes
+30
+30
+after
+once
+x
+x
+x
+5
+42
+25
+2
+0
+1
+-8
+1
+2
+3
+1
+[1, 2]
+[3, 4]
+0.6666666666666666
+1
+2
+3
+4
+0
+two
+1000007
+10
+-12
+after
+2
+after
+ab
+16
+1
+2
+1
+2
+1
+7
+5
+5
+700
+0.8571428571428571
+n
+n
+n
+n
+n
+n
+0
+0
+0
+1
+2
+0.30000000000000004
+2
+0.3333333333333333
+0
+2147483648
+2147483647
+after
+-2147483648
+9223372036854776000
+-9223372036854776000
+9007199254740992
+[[[[1]]]]
+9007199254740992
+[[[[[1]]]]]
+9007199254740992
+{a: {b: {c: {d: 1}}}}
+-3.5
+{a: {b: {c: {d: {e: 1}}}}}
+-3.5
+1
+-1
+6
+1
+3
+1
+0
+2
+0.7999999999999999
+1
+3
+-3
+three
+0.30000000000000004
+hello world
+5
+yes
+b
+
+9
+10
+10
+11
+10
+11
+11
+12
+0
+2
+\
+6
+a
+b
+a	b
+x
+3
+5
+abc
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+yes
+yes
+yes
+yes
+yes
+yes
+[日本, 🎉]
+2
+after a byte order mark
+[]
+0
+[1]
+1
+1
+3
+3
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+0
+1
+3
+10
+30
+30
+10
+30
+3
+0
+5
+3
+3
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+30
+30
+{a: 1, b: x}
+3
+nothing
+nothing
+nothing
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+2
+1
+0.30000000000000004
+0.3333333333333333
+0
+2147483648
+2147483647
+-2147483648
+9223372036854776000
+-9223372036854776000
+9007199254740992
+9007199254740992
+9007199254740992
+-3.5
+-3.5
+-1
+1
+0
+0.7999999999999999
+1
+3
+-3
+0.30000000000000004
+{}
+none
+3
+base
+middle
+yes
+{}
+nothing
+nothing
+3
+after inner
+o
+base
+2
+yes
+{a: 1, b: 2}
+yes
+7
+2
+{a: 1, b: x}
+3
+nothing
+nothing
+nothing
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+before
+caught
+after
+yes
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+3
+2
+0
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+hello world
+5
+yes
+
+0
+\
+a
+b
+a	b
+x
+3
+5
+abc
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+2
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+side effect
+yes
+7
+yes
+1
+1
+yes
+nothing
+yes
+yes
+[1, 2]
+yes
+[日本, 🎉]
+2
+{}
+none
+3
+after a byte order mark
+base
+middle
+5
+yes
+{}
+nothing
+nothing
+3
+after inner
+o
+base
+2
+yes
+{a: 1, b: 2}
+yes
+7
+2
+after
+once
+x
+x
+x
+5
+1
+1
+2
+3
+[1, 2]
+[3, 4]
+1
+2
+3
+4
+two
+10
+after
+printed
+2
+after
+ab
+1
+2
+1
+2
+n
+n
+n
+n
+n
+n
+1
+2
+0
+0
+1
+2
+2
+after
+[[[[1]]]]
+[[[[[1]]]]]
+{a: {b: {c: {d: 1}}}}
+a
+b
+{a: {b: {c: {d: {e: 1}}}}}
+1
+6
+test edge_both_vms_place_every_failure_in_the_same_place ... ok
+3
+1
+2
+three
+b
+9
+10
+10
+11
+10
+11
+11
+12
+2
+6
+test edge_the_control_flow_family_covers_the_if_else_it_has_and_pins_the_else_if_it_does_not ... ok
+日本語gamma
+  beta  
+
+
+90
+90
+27
+delta
+deltadelta
+2
+1
+-80
+3
+2
+0
+number
+number
+betabeta
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+-45
+gammaalpha
+yes
+yes
+yes
+before
+caught
+after
+yes
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+1025
+1025
+
+café
+5
+cafécafé
+gamma🎉
+printed
+1
+2
+a
+b
+test edge_regenerating_the_corpus_reproduces_the_checked_in_one_byte_for_byte ... ok
+30
+20
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+both
+either
+not
+
+after
+a
+deep
+5
+text
+after
+nothing
+  beta  
+beta日本語
+b
+b
+b1
+after
+cafécafé
+0
+3
+test edge_the_generated_corpus_compares_a_program_s_value_not_only_its_output ... ok
+v
+hi world
+8
+6
+8
+10
+second
+second
+test every_corpus_program_has_an_expected_output_file ... ok
+30
+20
+42
+25
+2
+0
+-8
+1
+0.6666666666666666
+0
+1000007
+-12
+16
+1
+7
+5
+5
+700
+0.8571428571428571
+0
+yes
+no
+after
+both
+either
+not
+after
+a
+deep
+5
+text
+after
+nothing
+b
+b
+b1
+after
+0
+3
+v
+hi world
+8
+6
+8
+10
+second
+second
+2
+side effect
+test common::generator::tests::edge_every_arm_is_reachable_from_more_than_one_seed ... ok
+7
+1
+1
+nothing
+[1, 2]
+[]
+0
+[1]
+1
+1
+3
+3
+1
+[1, 2, 3]
+3
+yes
+1
+2
+done
+b
+yes
+nothing
+0
+1
+3
+10
+30
+30
+10
+30
+3
+0
+5
+3
+3
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+30
+30
+after
+once
+x
+x
+x
+5
+1
+1
+2
+3
+[1, 2]
+[3, 4]
+test the_checked_in_corpus_is_the_one_the_generator_produces ... ok
+1
+2
+3
+4
+two
+10
+after
+2
+after
+ab
+1
+2
+1
+2
+n
+n
+n
+n
+n
+n
+0
+0
+1
+2
+2
+after
+[[[[1]]]]
+[[[[[1]]]]]
+{a: {b: {c: {d: 1}}}}
+{a: {b: {c: {d: {e: 1}}}}}
+1
+6
+3
+1
+2
+three
+b
+9
+10
+10
+11
+10
+11
+11
+12
+2
+6
+test the_corpus_holds_programs_that_are_worth_something ... ok
+2
+side effect
+test the_corpus_holds_programs_that_must_fail ... ok
+日本語gamma
+7
+1
+1
+nothing
+[1, 2]
+[]
+0
+[1]
+1
+1
+3
+3
+1
+[1, 2, 3]
+3
+yes
+1
+2
+  beta  
+
+done
+b
+yes
+nothing
+0
+1
+3
+
+10
+30
+30
+10
+30
+3
+0
+5
+3
+90
+90
+3
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+30
+30
+after
+once
+x
+x
+x
+5
+1
+27
+1
+2
+3
+[1, 2]
+[3, 4]
+1
+2
+3
+4
+two
+10
+after
+2
+after
+ab
+1
+2
+1
+2
+n
+n
+n
+n
+n
+n
+delta
+deltadelta
+0
+0
+1
+2
+2
+after
+-80
+[[[[1]]]]
+[[[[[1]]]]]
+2
+{a: {b: {c: {d: 1}}}}
+1
+{a: {b: {c: {d: {e: 1}}}}}
+1
+6
+3
+1
+2
+0.30000000000000004
+three
+0.3333333333333333
+b
+0
+9
+10
+10
+11
+10
+11
+11
+12
+2147483648
+2147483647
+2
+-2147483648
+betabeta
+9223372036854776000
+-9223372036854776000
+9007199254740992
+6
+9007199254740992
+9007199254740992
+-3.5
+-3.5
+-1
+1
+0
+0.7999999999999999
+1
+3
+-3
+0.30000000000000004
+{}
+none
+3
+base
+middle
+yes
+{}
+nothing
+nothing
+3
+after inner
+o
+base
+-45
+gammaalpha
+2
+yes
+{a: 1, b: 2}
+yes
+7
+2
+{a: 1, b: x}
+3
+1025
+1025
+
+nothing
+nothing
+nothing
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+yes
+café
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+before
+caught
+after
+yes
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+3
+2
+0
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+hello world
+5
+yes
+
+0
+\
+a
+b
+a	b
+x
+3
+5
+abc
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+cafécafé
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+gamma🎉
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+yes
+yes
+yes
+yes
+yes
+yes
+[日本, 🎉]
+2
+after a byte order mark
+5
+printed
+1
+2
+a
+b
+test every_corpus_program_prints_what_its_expected_file_records ... ok
+2
+1
+0.30000000000000004
+0.3333333333333333
+0
+2147483648
+2147483647
+-2147483648
+9223372036854776000
+-9223372036854776000
+9007199254740992
+9007199254740992
+9007199254740992
+-3.5
+-3.5
+-1
+1
+0
+0.7999999999999999
+
+1
+3
+-3
+0.30000000000000004
+{}
+none
+3
+base
+middle
+yes
+{}
+  beta  
+beta日本語
+nothing
+nothing
+3
+after inner
+o
+base
+2
+yes
+{a: 1, b: 2}
+yes
+cafécafé
+7
+2
+{a: 1, b: x}
+3
+nothing
+nothing
+nothing
+test the_two_vms_agree_on_every_generated_program ... ok
+2
+1
+2
+yes
+1
+2
+nothing
+yes
+5
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+yes
+before
+caught
+after
+yes
+a
+b
+c
+no
+yes
+yes
+yes
+Runtime
+record
+Runtime
+cleanup
+yes
+3
+2
+0
+number
+number
+text
+yes/no
+nothing
+list
+list
+record
+record
+1
+hello world
+5
+yes
+
+0
+\
+a
+b
+a	b
+x
+3
+5
+abc
+Hello, World!
+Hello, World!
+Hello, World!
+yes
+1
+  x  
+
+a
+1
+日本語
+3
+🎉🎊
+2
+👩‍💻
+3
+مرحبا
+5
+𠮷
+1
+café
+4
+Ω≈ç√∫
+5
+→∞
+2
+yes
+yes
+yes
+yes
+yes
+yes
+[日本, 🎉]
+2
+after a byte order mark
+5
+printed
+1
+2
+a
+b
+test every_corpus_program_agrees_between_the_two_vms ... ok
+test edge_a_program_that_never_ends_is_stopped_rather_than_hanging ... ok
+
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.06s
+
+[1m[92m     Running[0m tests/discovery_test.rs (target/debug/deps/discovery_test-fe59406023b450dd)
+
+running 13 tests
+test edge_discovery_of_empty_and_missing_directory_is_empty ... ok
+test edge_discovery_collects_a_single_rb_file ... ok
+test edge_malformed_rb_test_is_reported_as_a_failure ... ok
+test edge_crlf_rb_file_is_discovered_and_executed ... ok
+test edge_discovery_never_returns_rust_files ... ok
+test edge_non_utf8_rb_file_is_reported_as_an_io_error ... ok
+test edge_discovery_order_is_sorted_and_stable_across_calls ... ok
+test edge_nested_discovery_is_globally_sorted ... ok
+test edge_repository_rust_suite_is_never_handed_to_the_harness ... ok
+test edge_rb_path_with_spaces_is_discovered_and_run ... ok
+test find_test_files_walks_nested_directories ... ok
+test edge_unicode_rb_test_is_discovered_and_asserted ... ok
+still here
+test edge_project_tests_directory_has_no_failures ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+
+running 7 tests
+[1m[92m     Running[0m tests/doc_blocks_test.rs (target/debug/deps/doc_blocks_test-6652bee6aebe4269)
+test edge_a_block_with_no_closing_fence_is_still_extracted ... ok
+test edge_an_empty_block_is_extracted ... ok
+test edge_a_document_that_does_not_exist_is_an_error_rather_than_a_panic ... ok
+test edge_a_fence_that_is_not_tagged_redblue_is_ignored ... ok
+test every_documentation_block_is_classified_exactly_once ... ok
+test edge_a_known_fail_recording_that_is_wrong_is_rejected ... ok
+test running_every_block_agrees_with_the_bucket_it_is_in ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+[1m[92m     Running[0m tests/expect_test.rs (target/debug/deps/expect_test-2b26fa2fa01d2be2)
+
+running 21 tests
+test edge_an_empty_test_body_still_passes ... ok
+test edge_a_loop_evaluates_every_expect ... ok
+test edge_division_by_zero_is_a_runtime_error_not_an_assertion ... ok
+test edge_empty_text_is_not_the_same_as_nothing ... ok
+test edge_escapes_are_compared_literally ... ok
+test edge_malformed_expect_is_a_parse_error ... ok
+test edge_empty_values_compare_equal_to_themselves ... ok
+test edge_index_boundaries_feed_the_actual_value ... ok
+test edge_expect_results_are_deterministic_across_runs ... ok
+test edge_missing_record_key_differs_from_present_key ... ok
+test edge_nested_containers_compare_structurally ... ok
+test edge_numeric_boundaries_compare_exactly ... ok
+test edge_normalisation_is_not_applied_to_text_comparison ... ok
+test edge_singleton_list_compares_elementwise ... ok
+test expect_match_passes_the_test ... ok
+test expect_inside_a_control_flow_block ... ok
+test expect_mismatch_fails_the_test ... ok
+test expect_matches_a_computed_expression ... ok
+test edge_type_mismatch_fails ... ok
+test expect_tolerates_omitting_be ... ok
+test edge_unicode_compares_by_whole_string ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+[1m[92m     Running[0m tests/failure_channel_test.rs (target/debug/deps/failure_channel_test-5e089b4bccc50abb)
+
+running 4 tests
+test edge_a_program_that_cannot_be_parsed_is_refused_before_it_runs ... ok
+test edge_an_unknown_function_is_refused_by_both_engines ... ok
+test edge_an_index_past_the_end_of_a_list_is_refused ... ok
+test edge_a_builtin_given_the_wrong_type_is_refused_by_the_library ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 31 tests
+0
+3
+6
+9
+12
+15
+18
+1
+7
+8
+1
+7
+8
+2
+0
+3
+6
+9
+12
+1
+15
+2
+18
+7
+test a_range_loop_nests_and_the_inner_variable_is_its_own ... 2
+3
+4
+5
+ok
+test a_range_loop_is_deterministic_across_runs ... ok
+0
+5
+10
+1
+2
+3
+4
+1
+2
+3
+4
+test a_range_variable_does_not_collide_with_an_outer_binding ... ok
+test a_range_loop_visits_every_value_in_order ... ok
+test a_step_of_five_visits_only_the_multiples_of_five ... ok
+test a_step_of_one_and_an_omitted_step_are_the_same_loop ... ok
+0
+1
+2
+3
+6
+9
+test an_unanalysable_range_bound_is_reported_by_the_analyzer ... ok
+test an_integral_counter_renders_without_a_fraction ... ok
+test a_step_that_does_not_land_on_the_end_still_stops_at_or_before_it ... ok
+test edge_a_by_before_the_to_is_a_parser_error ... ok
+test edge_a_for_each_with_neither_in_nor_from_is_a_parser_error ... ok
+0
+test edge_a_descending_step_that_starts_below_its_end_is_empty ... ok
+5
+4
+3
+2
+1
+0
+0.25
+0.5
+0.75
+1
+test edge_a_descending_step_counts_down ... ok
+0
+0.1
+0.2
+0.30000000000000004
+0.4
+0.5
+0.6
+0.7
+0.7999999999999999
+0.8999999999999999
+0.9999999999999999
+test edge_a_fractional_step_on_a_whole_number_range ... ok
+test edge_a_fractional_step_that_would_overshoot_still_terminates ... ok
+test edge_a_non_number_by_is_a_runtime_error_naming_by ... ok
+test edge_a_non_number_from_is_a_runtime_error_naming_from ... ok
+test edge_a_non_number_to_is_a_runtime_error_naming_to ... ok
+test edge_a_list_as_a_bound_is_refused_rather_than_skipped ... ok
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+70
+71
+72
+73
+74
+75
+76
+77
+78
+79
+80
+81
+82
+83
+84
+85
+86
+87
+88
+89
+90
+91
+92
+93
+94
+95
+96
+97
+98
+99
+100
+3
+test edge_a_range_at_exactly_the_iteration_limit_still_finishes ... ok
+test edge_a_range_of_one_visits_exactly_one_value ... ok
+test edge_a_step_missing_its_end_of_the_range_is_a_parser_error ... ok
+test edge_a_step_that_overflows_the_counter_is_a_runtime_error ... ok
+test edge_a_range_longer_than_the_iteration_limit_stops_like_a_repeat_does ... ok
+0
+test edge_the_loop_variable_is_out_of_scope_after_end ... ok
+test edge_an_empty_range_visits_nothing_and_does_not_hang ... ok
+test the_analyzer_accepts_a_range_loop_and_its_step ... ok
+0
+5
+10
+test the_linter_analyzes_a_range_loop_body ... ok
+test the_formatter_prints_a_range_loop_and_the_result_still_runs ... ok
+100
+100
+100
+100
+99
+test the_loop_variable_is_a_local_that_does_not_leak ... ok
+[1m[92m     Running[0m tests/for_range_test.rs (target/debug/deps/for_range_test-df3e340306bbb446)
+
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 900000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mcargo test --all-targets > /tmp/opencode/phase070-cargo-test.log 2>&1; status=$?; tail -n 40 /tmp/opencode/phase070-cargo-test.log; exit $status
+test edge_a_repair_that_lands_after_the_attempts_are_spent_is_accepted ... ok
+test edge_the_history_repair_is_driven_by_the_depth_and_not_by_the_fetch ... ok
+test edge_the_refusal_names_the_last_attempts_failure_and_not_a_stale_one ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+[1m[92m     Running[0m tests/wasm_test.rs (target/debug/deps/wasm_test-9fab7fb9fae9d9b1)
+
+running 28 tests
+test a_malformed_program_is_reported_and_is_not_output ... ok
+test edge_a_run_that_cannot_be_given_its_stack_is_refused_rather_than_run_unprotected ... ok
+test edge_a_failure_keeps_the_output_written_before_it ... ok
+test edge_abi_refuses_a_negative_length ... ok
+test a_runtime_failure_is_reported_rather_than_panicking ... ok
+test edge_an_allocation_is_released_by_its_own_address_and_only_once ... ok
+test edge_abi_rejects_bytes_that_are_not_utf8 ... ok
+test bytes_write_and_files_read_agree_on_where_the_bytes_went ... ok
+test edge_an_allocation_past_the_source_limit_is_refused_before_anything_is_allocated ... ok
+test edge_bytes_that_are_not_text_say_the_same_thing_in_both_builds ... ok
+test edge_empty_and_whitespace_only_programs_produce_no_output ... ok
+test edge_print_is_immediate_and_say_flushes_at_the_end ... ok
+test edge_an_allocation_stays_put_however_many_programs_follow_it ... ok
+test edge_recursion_beyond_the_call_depth_is_a_clean_error_not_an_abort ... ok
+test edge_reading_a_file_that_was_never_written_is_a_catchable_error ... ok
+test edge_the_in_memory_filesystem_answers_for_directories_too ... ok
+test edge_an_error_too_long_for_its_buffer_is_truncated_and_says_so ... ok
+test edge_say_output_is_bounded_while_it_is_still_buffered ... ok
+test edge_the_platform_builtins_still_answer_natively ... ok
+test edge_unicode_survives_the_boundary_intact ... ok
+test the_in_memory_filesystem_behaves_like_the_one_it_replaces ... ok
+test edge_output_past_the_playground_limit_is_reported_not_truncated ... ok
+test wasm_example_corpus_is_exactly_the_deterministic_examples ... ok
+test wasm_module_reports_its_version_and_keywords ... ok
+test files_reads_back_what_it_wrote_in_a_temp_dir ... ok
+test wasm_run_reproduces_the_native_output_of_every_example ... ok
+test edge_the_output_is_copied_out_under_the_lock_rather_than_read_through_a_pointer ... ok
+test wasm_abi_round_trips_source_and_output ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.58s
+[0m
+[0m$ [0mif grep -q "FAILED\|error: test failed\|test result: FAILED" /tmp/opencode/phase070-cargo-test.log; then grep -n "FAILED\|error: test failed\|failures:" /tmp/opencode/phase070-cargo-test.log | head -40; else echo "NO FAILURES"; fi; grep -c "test result: ok" /tmp/opencode/phase070-cargo-test.log; grep -o "test result: ok\. [0-9]* passed" /tmp/opencode/phase070-cargo-test.log | awk '{s+=$4} END {print "passed:", s}'
+NO FAILURES
+75
+passed: 2175
+[0m
+[0m$ [0m../rbops/verify.sh phase-070
+[1m== manifest[0m
+  [32mPASS[0m phase phase-070 is declared in /home/runner/work/rbops/rbops/rbops/phases.json
+  [32mPASS[0m dep phase-069 done
+
+[1m== report[0m
+  [32mPASS[0m /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md exists
+  [32mPASS[0m section: What changed
+  [32mPASS[0m section: Tests added
+  [32mPASS[0m section: Gates
+  [32mPASS[0m section: Known gaps
+  [32mPASS[0m report has at least one real evidence row
+
+[1m== diff hygiene[0m
+  [32mPASS[0m forbidden-path scan done
+  [32mPASS[0m no gate-weakening constructs added
+  [32mPASS[0m no scratch files
+  [32mPASS[0m diff substance: +1457 -0 (min +5)
+  [32mPASS[0m implementation touched src/ (must_touch: src/)
+
+[1m== cargo fmt[0m
+  [32mPASS[0m cargo fmt --check
+
+[1m== cargo clippy[0m
+  [32mPASS[0m cargo clippy -D warnings
+
+[1m== cargo test[0m
+  [32mPASS[0m cargo test: 2175 passed, 0 failed
+
+[1m== doc tests[0m
+  [32mPASS[0m runs: examples/files.rb
+  [32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [32mPASS[0m failure-asserting test present: 1
+  [32mPASS[0m test quota met: 10 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 4
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [33mWARN[0m report claims 2172 passing, actual run has 2175 — under-claimed, fix the number
+  [32mPASS[0m reported test count (2172) does not exceed actual (2175)
+
+[32m╔══════════════════════════════════════╗[0m
+[32m║ VERIFY PASS — phase-070                ║[0m
+[32m╚══════════════════════════════════════╝[0m
+[0m
+[0m$ [0mgrep -n "2172\|2175\|Tests added\|What changed\|Gates\|Known gaps" /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md | head -40
+31:## What changed
+56:## Tests added
+96:## Gates
+102:| cargo test --all-targets | 2172 passed, 0 failed, 0 ignored |
+110:## Known gaps / follow-ups
+[0m
+[0m→ [0mRead /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+[0m
+[0m$ [0mwc -l /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs; git -C /home/runner/work/rbops/rbops/redblue diff --stat; git -C /home/runner/work/rbops/rbops/redblue status --short
+848 /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+ src/interpreter.rs   | 142 ++++++++++++++++++
+ src/repl/commands.rs |  59 ++++++++
+ src/repl/mod.rs      | 408 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 609 insertions(+)
+ M src/interpreter.rs
+ M src/repl/commands.rs
+ M src/repl/mod.rs
+?? src/repl/weight.rs
+[0m
+[0m← [0mEdit /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+Index: /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
++++ /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+@@ -33,9 +33,9 @@
+ | File | Lines | What |
+ |---|---|---|
+ | `src/repl/commands.rs` | +59 −0 | `ReplCommand::Mem`, `ReplCommand::Profile`, their `COMMAND_TABLE` rows (`:mem`/`:memory`, `:profile`, so `:help`, completion and parsing share one source), and the parse test |
+ | `src/repl/mod.rs` | +408 −0 | dispatch for both commands, `memory_answer`/`binding_sizes`, `profile_answer`/`print_profile`, `last_profile` session state filled by `execute_line` for a multiline block, and the eight session tests |
+-| `src/repl/weight.rs` | new, 500 | the read-only arithmetic: logical `value_bytes` (cycle-safe, shared storage walked once), `human_bytes` (B/KiB/MiB with raw bytes), `memory_lines`, `BlockProfile`/`profile_lines`, and eleven unit tests |
++| `src/repl/weight.rs` | new, 848 | the read-only arithmetic: logical `value_bytes` (cycle-safe, shared storage walked once, function bodies measured as statements or compiled chunks), `human_bytes` (B through EiB with raw bytes), `memory_lines`, `BlockProfile`/`profile_lines` (integer division), and fourteen unit tests |
+ | `src/interpreter.rs` | +137 −0 | an optional per-statement `LineTimer`; `start_line_profile`/`take_line_profile`, self-time accounting that subtracts nested statement time, call-depth filtering so a called function's body time stays on the call-site line, and the test that pins it |
+ 
+ `.mem` reports the binding count and their logical bytes, the history entry count
+ and bytes, a heap estimate (the sum of binding bytes), and the ten largest
+
+[0m
+[0m← [0mEdit /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+Index: /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
++++ /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+@@ -47,9 +47,11 @@
+ with the total being the sum of the line figures. The timer records a statement's
+ own time (elapsed minus nested statements), so parts add up instead of
+ double-counting a loop body inside its loop. Statements inside a user-function
+ call are not attributed to the function's declaration line; their time remains on
+-the call-site line the block actually showed.
++the call-site line the block actually showed. The same rule covers a `catch` or
++`finally` body running in that call, while a top-level `finally` is timed
++normally.
+ 
+ Both commands only observe: bindings are borrowed for sizing, never cloned, and
+ neither history nor `_` is written.
+ 
+
+[0m
+[0m← [0mEdit /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+Index: /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
++++ /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+@@ -67,11 +67,14 @@
+ | `profile_times_each_line_slowest_first_and_sums_to_the_total` (repl/mod.rs) | boundary — three-line block has three rows, ordered slowest first, parts within 20% of total |
+ | `profile_reports_only_the_last_block_not_the_earlier_one` (repl/mod.rs) | state — a second block replaces the first block's source and timings |
+ | `profile_quotes_the_line_the_lexer_numbered` (repl/mod.rs) | boundary — a newline inside a text literal keeps the following statement on its own source line |
+ | `mem_and_profile_are_commands` (commands.rs) | malformed input — both sigils and `:memory` parse as commands that take no argument |
+-| `edge_human_bytes_names_zero_and_keeps_the_raw_count` (weight.rs) | empty / boundary — 0 B, byte boundary, KiB and MiB |
++| `edge_human_bytes_names_zero_and_keeps_the_raw_count` (weight.rs) | empty / boundary — 0 B, byte boundary, KiB, MiB, GiB and TiB |
+ | `val_bytes_covers_text_lists_records_and_sharing` (weight.rs) | nesting — text, shared list storage counted once, record keys plus values |
+ | `val_bytes_covers_scalars_builtins_objects_and_functions` (weight.rs) | type coverage — number, yes/no, builtin, object and function sizes |
++| `val_bytes_covers_a_statements_function_body` (weight.rs) | coverage — a non-empty statements body's nodes and text are measured, not ignored |
++| `val_bytes_covers_a_compiled_block_function_body` (weight.rs) | coverage — a compiled block's chunk bytes and path are measured |
++| `edge_profile_stays_exact_past_the_float_mantissa` (weight.rs) | numeric_boundary — a timing past `f64`'s exact-integer range keeps its integer quotient in both the total and the row |
+ | `profile_keeps_a_user_function_body_at_its_call_site` (interpreter.rs) | nesting / recursion — a called function's body is not timed as its own lines |
+ | `edge_memory_lines_report_every_zero_on_an_empty_session` (weight.rs) | empty — every figure named at zero |
+ | `memory_lines_order_the_largest_first_and_stop_at_the_listing_limit` (weight.rs) | boundary — heaviest first and the top-ten cap holds |
+ | `edge_profile_on_an_empty_block_still_names_a_zero_total` (weight.rs) | empty — no block still prints a zero total, not a blank page |
+
+[0m
+[0m← [0mEdit /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+Index: /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
++++ /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+@@ -90,9 +90,9 @@
+ - **singleton** — covered: one 10 KiB binding is the one largest entry; one history entry has the singular spelling.
+ - **boundary** — covered: the 1024-byte unit boundary, the top-ten listing cap, and a three-line profile whose parts sum to the total.
+ - **out_of_bounds** — covered: a timing whose line is past the quoted source keeps its own row and is still part of the total, and the source lookup uses a checked subtraction.
+ - **type_mismatch** — N/A: both commands accept no argument and every `Value` variant has a defined logical size (untyped values are not an error here).
+-- **numeric_boundary** — covered: sizes are byte counts and timings elapsed nanoseconds; integer arithmetic keeps a count past `f64`'s 53-bit mantissa exact, and the 5 MiB case pins the large end.
++- **numeric_boundary** — covered: sizes are byte counts and timings elapsed nanoseconds; integer arithmetic keeps both a count and a profile timing past `f64`'s 53-bit mantissa exact, and the 5 MiB case pins the large end.
+ - **unicode** — covered indirectly by `value_bytes`, which counts UTF-8 bytes; no new text transformation was added, and history/profile source text is already UTF-8.
+ - **nesting_recursion** — covered: `value_bytes` walks nested lists/records/functions with an explicit stack and an `Arc`-address visited set, so shared storage is counted once, a cycle cannot loop forever, and deep acyclic data cannot overflow the process stack.
+ - **duplicate_missing_keys** — N/A: no new keyed collection; record keys are summed in `value_bytes` and a missing field is not reachable from a value.
+ - **malformed_input** — covered: `.mem`/`.profile` take no argument, so no malformed argument path exists; the parse test pins that both are commands rather than unknown words.
+
+[0m
+[0m← [0mEdit /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+Index: /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
++++ /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md
+@@ -103,9 +103,9 @@
+ | Gate | Result |
+ |---|---|
+ | cargo fmt --all -- --check | pass |
+ | cargo clippy --all-targets -- -D warnings | pass |
+-| cargo test --all-targets | 2172 passed, 0 failed, 0 ignored |
++| cargo test --all-targets | 2175 passed, 0 failed, 0 ignored |
+ | ../rbops/verify.sh phase-070 | pass — `VERIFY PASS — phase-070` |
+ 
+ ## Invariants touched
+ 
+
+[0m
+[0m← [0mEdit src/repl/weight.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
++++ /home/runner/work/rbops/rbops/redblue/src/repl/weight.rs
+@@ -644,9 +644,9 @@
+ let chunk =
+     crate::Chunk::compile("to add(a, b)\n    give back a + b\nend\nsay add(1, 2)\n")
+         .expect("the fixture compiles");
+ let encoded = chunk.encode().len();
+-let path = vec![0u32, 1u32];
++let path = vec![0u32];
+ 
+ let bytes = value_bytes(&function_with_body(FunctionBody::Block {
+     chunk: std::sync::Arc::new(chunk),
+     path: path.clone(),
+
+[0m
+[0m$ [0mcargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test --lib repl::weight
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 5.61s
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 5.08s
+[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-0b6bed5357e25827)
+
+running 14 tests
+test repl::weight::tests::edge_human_bytes_names_zero_and_keeps_the_raw_count ... ok
+test repl::weight::tests::edge_human_bytes_stays_exact_past_the_float_mantissa ... ok
+test repl::weight::tests::edge_memory_lines_report_every_zero_on_an_empty_session ... ok
+test repl::weight::tests::edge_source_lines_match_the_lexers_line_numbers ... ok
+test repl::weight::tests::edge_profile_lines_keep_a_timing_past_the_source ... ok
+test repl::weight::tests::edge_profile_on_an_empty_block_still_names_a_zero_total ... ok
+test repl::weight::tests::edge_profile_stays_exact_past_the_float_mantissa ... ok
+test repl::weight::tests::memory_lines_order_the_largest_first_and_stop_at_the_listing_limit ... ok
+test repl::weight::tests::profile_lines_are_slowest_first_and_sum_to_the_total ... ok
+test repl::weight::tests::val_bytes_covers_a_compiled_block_function_body ... ok
+test repl::weight::tests::val_bytes_covers_a_statements_function_body ... ok
+test repl::weight::tests::val_bytes_covers_scalars_builtins_objects_and_functions ... ok
+test repl::weight::tests::val_bytes_covers_text_lists_records_and_sharing ... ok
+test repl::weight::tests::edge_value_bytes_measures_a_deep_value_without_recursing ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 470 filtered out; finished in 0.07s
+[0m
+[0m$ [0m../rbops/verify.sh phase-070
+[1m== manifest[0m
+  [32mPASS[0m phase phase-070 is declared in /home/runner/work/rbops/rbops/rbops/phases.json
+  [32mPASS[0m dep phase-069 done
+
+[1m== report[0m
+  [32mPASS[0m /home/runner/work/rbops/rbops/phases/phase-070/REPORT.md exists
+  [32mPASS[0m section: What changed
+  [32mPASS[0m section: Tests added
+  [32mPASS[0m section: Gates
+  [32mPASS[0m section: Known gaps
+  [32mPASS[0m report has at least one real evidence row
+
+[1m== diff hygiene[0m
+  [32mPASS[0m forbidden-path scan done
+  [32mPASS[0m no gate-weakening constructs added
+  [32mPASS[0m no scratch files
+  [32mPASS[0m diff substance: +1457 -0 (min +5)
+  [32mPASS[0m implementation touched src/ (must_touch: src/)
+
+[1m== cargo fmt[0m
+  [32mPASS[0m cargo fmt --check
+
+[1m== cargo clippy[0m
+  [32mPASS[0m cargo clippy -D warnings
+
+[1m== cargo test[0m
+  [32mPASS[0m cargo test: 2175 passed, 0 failed
+
+[1m== doc tests[0m
+  [32mPASS[0m runs: examples/files.rb
+  [32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [32mPASS[0m failure-asserting test present: 1
+  [32mPASS[0m test quota met: 10 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 4
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [32mPASS[0m reported test count (2175) matches actual (2175)
+
+[32m╔══════════════════════════════════════╗[0m
+[32m║ VERIFY PASS — phase-070                ║[0m
+[32m╚══════════════════════════════════════╝[0m
+[0m
+Fixed all four findings:
+- `value_bytes` now measures both function-body forms (AST statements and compiled chunks), with new branch tests.
+- Profile and human-size rendering use integer arithmetic; byte units now extend through EiB.
+- Clarified the call-frame timing rule in `profile_enter`.
+
+Gates: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --all-targets` (2175 passed), and `verify.sh phase-070` all pass.
