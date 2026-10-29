@@ -26,6 +26,32 @@ phase-062 was blocked on a BLOCKER claiming that `:break`, `:step`, `:next` and
 test asserting that a breakpoint in a loop fires on every iteration. The test was
 right there in the repository and the finding was still reported.
 
+## Tool Budget and Gradual Findings (CRITICAL: PREVENT TIMEOUTS)
+
+The pipeline enforces a hard wall-clock timeout. If you spend too long in open-ended
+exploration without emitting findings, you will be forcibly terminated, leaving an
+invalid review that wastes hours. You MUST obey these strict efficiency rules:
+
+1. **Tool Budget (Max 12 Calls)**: You have a hard budget of **at most 12 tool calls**
+   (Read, Grep, Glob) for the entire review session.
+   - Do NOT perform unbounded codebase exploration or search unrelated modules.
+   - Restrict your reads strictly to the files listed in the phase change set and their
+     immediate test files.
+2. **Gradual Finding Emission**:
+   - As you inspect each file, write down your suspected defect or concern immediately
+     into your output stream as you find it. Do not wait until you have read every file
+     before beginning to write.
+   - Incremental progress guarantees that your observations are captured even if turns run out.
+3. **Turn Discipline & Synthesis**:
+   - Once you have completed at most 10–12 tool calls (or earlier if the diff is understood),
+     STOP calling tools.
+   - Immediately synthesize your observations into the mandatory `FINDINGS:` list and the
+     final `REVIEW VERDICT:` line.
+4. **Mandatory Verdict Line**:
+   - You must NEVER end your turn without outputting the final line:
+     `REVIEW VERDICT: FINDINGS <count>` or `REVIEW VERDICT: CLEAN`.
+   - Any output missing this exact verdict line is treated as an invalid review by the pipeline.
+
 ## A BLOCKER must be VERIFIED
 
 A BLOCKER says the phase cannot ship. A BLOCKER nobody checked is a guess, and

@@ -1292,6 +1292,9 @@ local rctx="$LOG_DIR/$phase.review.$round.ctx"
     {
       printf '# Review request - round %s of phase %s\n\n' "$round" "$phase"
       printf 'The gate is green. Your job is to find what is still wrong.\n'
+      printf 'CRITICAL EFFICIENCY REQUIREMENT: You have a hard budget of at most 12 tool calls.\n'
+      printf 'Do NOT explore unrelated modules. Gradually emit your findings as you inspect files.\n'
+      printf 'You MUST finish and emit the final "REVIEW VERDICT:" line before ending your session.\n\n'
       printf 'The contract below is authoritative and is inlined here on purpose:\n'
       printf 'dispatch runs you with --dir pointing at the redblue checkout, which ships\n'
       printf 'its own opencode.json at the checkout root. opencode merges the project\n'
