@@ -1,23 +1,32 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "collections"[90m in src/stdlib.rs · 100 matches[0m
-[0m✱ [0mGrep "collections|collection_|group_value_hash|deque|namedtuple"[90m in src/runtime.rs · 100 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=1690, limit=280][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2155, limit=280][0m
-[0m→ [0mRead tests/collections_test.rs[90m [offset=1, limit=200][0m
-[0m✱ [0mGrep "pub enum Value|pub type Fields|struct Fields|Rc<|Arc<|IndexMap|impl Clone for Value"[90m in src/value.rs · 34 matches[0m
-[0m→ [0mRead src/value.rs[90m [offset=380, limit=50][0m
-[0m→ [0mRead tests/collections_test.rs[90m [offset=200, limit=152][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=60, limit=45][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=415, limit=35][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=1270, limit=40][0m
-[0m→ [0mRead phases/phase-099/REPORT.md[90m [offset=95, limit=51][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1840, limit=280][0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=340, limit=200][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=250, offset=1595][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=330, offset=2420][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=245, offset=2175][0m
+[0m✱ [0mGrep "collections"[90m in tests · 100 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=150, offset=55][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [limit=140, offset=700][0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs[90m [limit=40, offset=1245][0m
+[0m✱ [0mGrep "collections|phase-099"[90m in tests · 0 matches[0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=120][0m
+[0m→ [0mRead tests/collections_test.rs[90m [limit=340][0m
+[0m✱ [0mGlob "tests/doc_blocks*.txt"[90m 3 matches[0m
+[0m✱ [0mGrep "collections"[90m in tests/doc_blocks_runs.txt · 100 matches[0m
+[0m✱ [0mGrep "collections"[90m in tests/doc_blocks_fragments.txt · 100 matches[0m
+[0m→ [0mRead tests/doc_blocks_runs.txt[90m [limit=160][0m
+[0m→ [0mRead tests/doc_blocks_fragments.txt[90m [limit=160][0m
+[0m→ [0mRead tests/doc_blocks_known_fail.txt[90m [limit=60][0m
+[0m→ [0mRead tests/doc_blocks_test.rs[90m [limit=120, offset=1][0m
 FINDINGS:
-1. [MAJOR] phases/phase-099/REPORT.md:124 — the test gate is recorded as the literal placeholder `TOTAL_PASSED passed, 0 failed, 0 ignored`, and line 125 as `VERIFY_RESULT` — the report asserts the gate is green without recording any actual result, so the phase ships on an unsubstantiated claim — replace both with the real numbers and verify output. 
-2. [MAJOR] src/runtime.rs:1881 — a deque is represented as a record chain of `{value, next}` nodes built at line 1900, so an n-element deque is an n-deep nested `Value::Record`; `collections.deque(big_list)` creates that depth in one call, and any recursive consumer (`Value` Display/PartialEq/hash, or `Arc` drop at scope exit) recurses n times and can abort the process — represent the ends with an indexed/arena structure or cap traversal depth — VERIFIED by tracing `deque_node`/`deque_value` (src/runtime.rs:1881-1905); a program that says or compares a very large deque would demonstrate it.
-3. [MAJOR] src/runtime.rs:1895 — `deque_parts` supplies `Value::Nothing` for a missing `front`/`back`, so `{}` is accepted as a valid empty deque: `collections.pop_left({})` silently returns `{value: nothing, deque: ...}` and `collections.push_left({}, 1)` mints a deque instead of refusing — this contradicts “a deque is … made by collections.deque” and the reported malformed-input coverage, whose test (`tests/collections_test.rs:264`) only exercises a non-record — require both fields to be present and reject a record that was not made by the module.
-4. [MINOR] tests/collections_test.rs:346 — the gate asserts `deque_time * 2 < list_time` on wall-clock measurements, which is nondeterministic: a loaded or slow CI host can fail a correct implementation, and a fast host can pass a secretly quadratic one — make this a benchmark/`#[ignore]` test or assert structural behaviour rather than elapsed time.
-5. [MINOR] src/runtime.rs:1826 — `counter_parts` defaults a missing `missing` field to `0`, so `collections.count({counts: []}, 1)` silently succeeds on a record this module never made, contrary to the documented record contract and the claim that malformed counters are refused — require the field and refuse its absence.
+1. [MAJOR] tests/collections_test.rs:518 — the new `edge_a_deque_beats_a_list_work_queue_at_the_front` gates on wall-clock ratios (`deque_time * 2 < list_time`, `shift_time * 8 < list_time`) measured from `Instant::elapsed` at lines 495-497 and 518-527 — this is nondeterministic: a loaded or differently-optimized runner can flip either comparison even when the implementation is correct, and the REPORT itself admits the times “change with the machine.” The test also runs the quadratic list program three times. Fix: replace the timing assertions with a deterministic structural/operation-count assertion, or move the measurement to a benchmark outside `cargo test`.
 
-REVIEW VERDICT: FINDINGS 5
+2. [MAJOR] src/runtime.rs:2360-2367 — `collections.count` returns `found.unwrap_or(missing)` without applying `counter_number` (defined at 1835-1843), while `collections.most_common` validates every count at 2379 — so `collections.count({counts: [[1, -1]], missing: 0}, 1)` answers `-1`, and `{counts: [["a", "lots"]], ...}` answers `"lots"`, contradicting the phase's own new negative-count guarantee and the REPORT's numeric_boundary claim; the new test only exercises `most_common`. Fix: validate the found count with `counter_number` before returning it (or validate once in `counter_parts`). If a forged non-numeric count is intentionally allowed through `count`, say so and add a test; the current split behavior is untested.
+
+3. [MINOR] tests/doc_blocks_runs.txt:28-29 and tests/doc_blocks_known_fail.txt:25-26 — the hand-written COUNTS do not match the entries in the same files: `doc_blocks_runs.txt` lists 41 `SPEC.md` entries (59 total) while its header says 39/57, and `doc_blocks_known_fail.txt` lists only 4 `HANDOUT.md` entries (12 total) while its header says 6/14. The phase updated the denominator to 108, but the three buckets sum to 110, so the REPORT's `doc_blocks_*` count evidence is wrong. Fix: recount and correct the headers, or make `doc_blocks_test.rs` parse the COUNTS lines and assert them against the actual entries.
+
+4. [MINOR] src/runtime.rs:2088-2097 (with 2075 and 2047) — `deque_reverse` is not “linear once” as the comment at 2454 claims: each `stack_uncons` clones the current spine (`trees.iter().skip(1).cloned().collect(...)`) and each `stack_cons` clones the whole tree vector, so reversing an n-item end is O(n log n), and the first `pop_left` after `collections.deque(list)` pays it. Fix the comment/REPORT claim or implement a genuinely linear reverse; since the phase sells the constructor as linear, pin it with deterministic operation counts rather than wall-clock.
+
+REVIEW VERDICT: FINDINGS 4
