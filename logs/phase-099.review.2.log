@@ -1,21 +1,24 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "fn (collection_pairs|counter_|defaultdict_|deque_|stack_|validate_stack_tree|named_|collection_)|collections\.|group_value_hash|value_hash"[90m in src/runtime.rs · 70 matches[0m
-[0m✱ [0mGrep "collections|counter|deque|namedtuple|defaultdict"[90m in tests/collections_test.rs · 100 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=1680, limit=540][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2380, limit=330][0m
-[0m→ [0mRead tests/collections_test.rs[90m [offset=280, limit=480][0m
-[0m✱ [0mGrep "enum Value|struct Fields|pub type Fields|impl PartialEq|derive\(.*PartialEq|Value::Record|Value::List"[90m in src/value.rs · 100 matches[0m
-[0m→ [0mRead src/value.rs[90m [offset=180, limit=340][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=55, limit=115][0m
+[0m✱ [0mGrep "collections|deque|MAX_DEQUE_ITEMS|json_stringify|collection_pairs|stack_from_values|deque_rebalance|deque_value|deque_parts|validate_stack_tree|stack_cons"[90m in src/runtime.rs · 100 matches[0m
+[0m✱ [0mGrep "collections|deque|json_stringify|MAX_DEQUE"[90m in src/stdlib.rs · 100 matches[0m
+[0m✱ [0mGrep "fn .*deque|deque|json|collections|budget|MAX_DEQUE"[90m in tests/collections_test.rs · 100 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1770, limit=700][0m
+[0m✱ [0mGrep ""collections_|fn json_stringify|Value::Object|MAX_DEQUE_ITEMS|deque_parts|stack_cons|deque_rebalance|stack_from_values"[90m in src/runtime.rs · 96 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2480, limit=300][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3900, limit=90][0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=1, limit=120][0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=320, limit=520][0m
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead src/stdlib.rs[90m [offset=1230, limit=150][0m
-[0m→ [0mRead tests/collections_test.rs[90m [offset=1, limit=60][0m
-[0m✱ [0mGrep "fn builtin\(|pub fn builtin|fn module_has_member|module_member_name|BUILTIN_SIGNATURES|collections_"[90m in src/stdlib.rs · 76 matches[0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=840, limit=90][0m
+[0m✱ [0mGrep "Value::object\(|fn object\(|Object\("[90m in src · 22 matches[0m
 FINDINGS:
-1. [BLOCKER] src/runtime.rs:2038 — `validate_stack_tree` pushes both children onto its worklist with no visited-node set, so a forged self-consistent tree that reuses one child under both branches is walked exponentially. `collections.namedtuple` clones a `Value::Record` by cloning its `Arc`, so a Redblue program can build a valid-looking tree of depth ~53 with only 53 physical records; `collections.pop_left` then validates it through `deque_parts` at src/runtime.rs:1929 and visits ~2^53 logical nodes before hanging. — Track `Arc` identities or a hard node budget in `validate_stack_tree` and in `stack_pop_order`, and reject repeated nodes or over-budget trees before traversal; add a test with a valid shared-child DAG. — VERIFIED: traced `collections.namedtuple` at src/runtime.rs:2664 cloning shared `Value` storage, `validate_stack_tree` at src/runtime.rs:2038-2039 pushing both children without deduplication, and `deque_parts` calling it before every pop at src/runtime.rs:1929-1930.
 
-2. [MAJOR] src/runtime.rs:1929 — every deque push/pop validates every node in both ends, making each legitimate operation O(n) and n operations O(n²); this undercuts the work-queue advantage claimed by `tests/collections_test.rs:525`, since `skip` is also O(n) per removal. The existing resource test only checks tree-node sharing, so it cannot detect the cost. — Validate on construction/ingestion with an internal integrity marker or budget, or at minimum test operation complexity and document the deque as O(n) per operation. — VERIFIED: `deque_parts` loops over every tree and calls `stack_tree_parts` -> `validate_stack_tree`; every push/pop path reaches it at src/runtime.rs:2570, 2581, 2592 and 2616.
+1. [MAJOR] src/runtime.rs:2643 — `collections.push_left`/`push_right` enforce the item cap only by re-running `deque_parts` on the updated value, but no test exercises that refusal; `tests/collections_test.rs:900` tests only the constructor. SPEC.md's new promise is "the constructor **and every push** refuse a larger one", and the REPORT's `resource_limit` matrix names only the constructor-budget refusal. So the push-at-cap branch (`src/runtime.rs:1955`, reached via 2643/2656) has no test on either side. Add a test that fills a deque to `MAX_DEQUE_ITEMS` and asserts the next push is refused, and one that a forged record already at the cap is refused. — VERIFIED: read the full test file (lines 1–120, 320–927) and the REPORT's test table; neither contains a push-at-cap case.
 
-REVIEW VERDICT: FINDINGS 2
+2. [MINOR] src/runtime.rs:1892 — `deque_error` always says `"a value made by collections.deque"`, so the constructor refusal at `src/runtime.rs:2624` tells a user who passed a **list of 1,000,001 items** that their value is not a deque, and a push at the cap says the same. The message does not name the `MAX_DEQUE_ITEMS` limit or the actual length, so it is not actionable. `tests/collections_test.rs:908` pins exactly this unhelpful substring. Use a dedicated budget error that names the limit and the supplied length (and keep `deque_error` for malformed values).
+
+3. [MINOR] src/runtime.rs:1918 — the trusted `Value::Object` branch trusts any object whose name is `"deque"` without checking its `kind` field, while the record branch at 1928–1932 requires `kind == "deque"`. Trust is therefore keyed on an object name alone. Today only `deque_value` (line 1905) constructs such an object, so it is not reachable from source, but any future builtin returning `Value::object("deque", …)` would be silently trusted and skip `validate_stack_tree`. Require the `kind` field on the object path too (or make the trust marker a field only `deque_value` sets and check it).
+
+REVIEW VERDICT: FINDINGS 3

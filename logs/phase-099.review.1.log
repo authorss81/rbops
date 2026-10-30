@@ -1,34 +1,31 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "collections"[90m 55 matches[0m
-[0m✱ [0mGrep "collections|deque_|counter_|defaultdict|namedtuple|collection_pairs|stack_from_values"[90m 100 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=1770, limit=400][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2370, limit=320][0m
-[0m✱ [0mGrep "fn both|fn both_refuse|fn run_both|run_source_value|bytecode"[90m 15 matches[0m
-[0m→ [0mRead tests/collections_test.rs[90m [limit=120][0m
-[0m→ [0mRead tests/collections_test.rs[90m [offset=400, limit=335][0m
-[0m→ [0mRead tests/collections_test.rs[90m [offset=121, limit=280][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=15, limit=120][0m
-[0m✱ [0mGrep "type Fields|pub type Fields|struct Fields|use indexmap|IndexMap"[90m 6 matches[0m
-[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=1, limit=60][0m
-[0m✱ [0mGrep "collections|counter|deque|namedtuple"[90m 28 matches[0m
-[0m✱ [0mGrep "fn .*answerable|fn rows|KNOWN|answerable|builtin_names|every"[90m 27 matches[0m
-[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=1110, limit=130][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=1640, limit=135][0m
-[0m✱ [0mGrep "collections"[90m 3 matches[0m
+[0m✱ [0mGrep "fn deque_parts|fn deque_value|fn validate_stack_tree|fn stack_from_values|fn deque_error|fn collection_pairs|fn collection_.*builtin|fn collections_|fn deque_rebalance|MAX_DEQUE|Value::object|fn object"[90m in . · 44 matches[0m
+I'll inspect the core implementation and its trust boundary first.
+[0m→ [0mRead src/runtime.rs[90m [offset=1820, limit=420][0m
+[0m→ [0mRead src/value.rs[90m [offset=390, limit=120][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2240, limit=360][0m
+[0m✱ [0mGrep "Value::object\(|Object\(name|Object\(type_name|new_object|instantiate"[90m in src · 11 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2599, limit=340][0m
+[0m✱ [0mGrep "::Object\("[90m in src · 16 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1690, limit=130][0m
+[0m✱ [0mGrep "Object|object"[90m in src · 78 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2040, limit=110][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2780, limit=140][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1, limit=210][0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=600, limit=291][0m
+[0m→ [0mRead tests/doc_blocks_runs.txt
+[0m→ [0mRead src/stdlib.rs[90m [offset=1240, limit=140][0m
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m✱ [0mGrep "#\[test\]"[90m 27 matches[0m
-[0m✱ [0mGrep "collections|Counter|deque|defaultdict|namedtuple"[90m 0 matches[0m
-[0m→ [0mRead tests/doc_blocks_runs.txt[90m [limit=40][0m
-[0m→ [0mRead tests/doc_blocks_runs.txt[90m [offset=41, limit=56][0m
-[0m✱ [0mGlob "tests/doc_blocks_*"[90m 4 matches[0m
-[0m→ [0mRead README.md[90m [offset=205, limit=65][0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=1, limit=120][0m
+[0m→ [0mRead src/value.rs[90m [offset=540, limit=53][0m
+[0m✱ [0mGrep "^#\[test\]"[90m in tests · 33 matches[0m
 FINDINGS:
-1. [MAJOR] src/runtime.rs:1992 — `stack_tree_parts` validates only a node's *immediate* children: it reads `left_size = stack_tree_size(span, left)?` and `right_size = stack_tree_size(span, right)?` and checks `size == left_size + right_size + 1`, but never recurses into `left`/`right`. A deque tree whose root is self-consistent but whose child claims a size that disagrees with the child's own children is therefore accepted by `deque_parts` (src/runtime.rs:1925-1932). `collections.pop_left` then returns a value and a malformed deque; only the *next* operation refuses. That contradicts the malformed-input refusal this phase advertises. Fix: recurse with `stack_tree_parts` on `left`/`right` (and require a `value` field on each child), not just `stack_tree_size`. VERIFIED: traced the exact path in src/runtime.rs:1925-1932, 1974-2007, 2546-2564 — `deque_parts` calls `stack_tree_parts(root)` once; the `(Some(left), Some(right))` arm returns after comparing the children's `size` fields without descending, and `stack_uncons` (2083-2102) only revalidates a child when it is popped next.
+1. [MAJOR] src/runtime.rs:2619 — `collections.deque(list)` builds a deque of any length without checking `MAX_DEQUE_ITEMS`, but every later operation goes through `deque_parts` (src/runtime.rs:1950-1965), which rejects a total over 1,000,000. So a deque of 1,000,001 items can be constructed and then every `pop_*`/`push_*` refuses it with the misleading "a deque is a record made by collections.deque" error; likewise `push_right` at exactly the cap returns an out-of-budget deque. Enforce the same budget in the constructor and after push, or make the cap validation-only so a legitimate large deque is never created unusable. VERIFIED: traced `collections_deque` → `stack_from_values`/`deque_value` with no budget check, then `collections_pop_left` → `deque_parts` → `total > MAX_DEQUE_ITEMS` → `deque_error`.
+2. [MINOR] src/runtime.rs:1892 — `deque_error` still says "a deque is a record made by collections.deque", but deques are now `Value::Object` (src/runtime.rs:1908) and a hand-written record is the untrusted path. The message names the representation the module now refuses; reword to "a value made by collections.deque" (and update the `"deque is a record"` assertion needles in tests).
+3. [MINOR] src/runtime.rs:2151 — the `stack_cons` doc comment still claims "Validation of the whole deque still reads every physical node before the structural change", but the resume made module deques skip `validate_stack_tree` in `deque_parts`. The comment describes the old O(n) behaviour and hides the trust boundary; update it to say only the spine's top trees are checked.
+4. [MINOR] SPEC.md (uncommitted, collections/deque paragraph) — "a hand-written record with the same fields is still read" omits that the record must also carry `kind: "deque"`; `deque_parts` refuses a record with `front`/`back` but no/other `kind` (src/runtime.rs:1930-1936). Name the marker as REPORT.md does.
+5. [MINOR] src/runtime.rs:1908 / src/runtime.rs:3935 — deques are now the first source-reachable `Value::Object`, and `json.stringify` renders `Value::Object` as `"null"` (line observed via grep). That means stringifying a record containing a deque silently drops it rather than refusing. Not verified end-to-end; confirm the silent null is intended and document it, or make JSON refuse an opaque deque.
 
-2. [MINOR] tests/collections_test.rs:721 — `edge_a_forged_deque_tree_with_a_wrong_size_is_refused` only forges a root-level mismatch (`size: 4` with two `size: 1` leaves, expected 3), so it passes on the one-level check and cannot detect the recursive gap in finding 1. Add a case where the root's sizes are self-consistent (`size: 7` with two children claiming `size: 3`) but the children are leaves, and assert the *first* `pop_left` refuses rather than answering a value.
-
-3. [MINOR] src/runtime.rs:2410 / src/runtime.rs:2467 — `collections.count` and `collections.get` both linear-scan the `[[key, value], ...]` list on every call, so a Counter/defaultdict used for n distinct keys is O(n²) over n reads — the nested-scan shape the phase was written to remove. SPEC/README do not promise constant-time lookup, so this is not a correctness break, but the report's "linear rather than a nested scan" claim covers only construction; either state the lookup cost in SPEC.md or add a hash index to the record.
-
-REVIEW VERDICT: FINDINGS 3
+REVIEW VERDICT: FINDINGS 5
