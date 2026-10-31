@@ -1,31 +1,26 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "fn deque_parts|fn deque_value|fn validate_stack_tree|fn stack_from_values|fn deque_error|fn collection_pairs|fn collection_.*builtin|fn collections_|fn deque_rebalance|MAX_DEQUE|Value::object|fn object"[90m in . · 44 matches[0m
-I'll inspect the core implementation and its trust boundary first.
-[0m→ [0mRead src/runtime.rs[90m [offset=1820, limit=420][0m
-[0m→ [0mRead src/value.rs[90m [offset=390, limit=120][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2240, limit=360][0m
-[0m✱ [0mGrep "Value::object\(|Object\(name|Object\(type_name|new_object|instantiate"[90m in src · 11 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2599, limit=340][0m
-[0m✱ [0mGrep "::Object\("[90m in src · 16 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=1690, limit=130][0m
-[0m✱ [0mGrep "Object|object"[90m in src · 78 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2040, limit=110][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2780, limit=140][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=1, limit=210][0m
-[0m→ [0mRead tests/collections_test.rs[90m [offset=600, limit=291][0m
-[0m→ [0mRead tests/doc_blocks_runs.txt
-[0m→ [0mRead src/stdlib.rs[90m [offset=1240, limit=140][0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m✱ [0mGrep "fn group_value_hash|fn collection_pairs|fn collection_|MAX_DEQUE_ITEMS|fn deque_|fn stack_"[90m in src/runtime.rs · 28 matches[0m
+[0m✱ [0mGrep "collections|collection_pairs"[90m in src/runtime.rs · 100 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1690, limit=330][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2500, limit=320][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2020, limit=320][0m
 [0m→ [0mRead tests/collections_test.rs[90m [offset=1, limit=120][0m
-[0m→ [0mRead src/value.rs[90m [offset=540, limit=53][0m
-[0m✱ [0mGrep "^#\[test\]"[90m in tests · 33 matches[0m
+[0m✱ [0mGrep "counts:|entries:|duplicate key|most_common"[90m in tests · 51 matches[0m
+[0m✱ [0mGrep "collections|MODULES|module_members|MODULE_MEMBERS"[90m in tests/stdlib_module_names_test.rs · 100 matches[0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=700, limit=140][0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=560, limit=120][0m
+[0m✱ [0mGrep "fn json_stringify|json_stringify|deque"[90m in src/runtime.rs · 100 matches[0m
+[0m→ [0mRead tests/collections_test.rs[90m [offset=680, limit=160][0m
+[0m→ [0mRead SPEC.md[90m [offset=1390, limit=190][0m
+[0m→ [0mRead tests/doc_blocks_runs.txt[90m [offset=50, limit=40][0m
+[0m✱ [0mGrep "impl PartialEq for Value|fn eq\(&self, other: &Value\)|Value::Object|Value::Record"[90m in src/value.rs · 52 matches[0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs[90m [offset=1, limit=160][0m
 FINDINGS:
-1. [MAJOR] src/runtime.rs:2619 — `collections.deque(list)` builds a deque of any length without checking `MAX_DEQUE_ITEMS`, but every later operation goes through `deque_parts` (src/runtime.rs:1950-1965), which rejects a total over 1,000,000. So a deque of 1,000,001 items can be constructed and then every `pop_*`/`push_*` refuses it with the misleading "a deque is a record made by collections.deque" error; likewise `push_right` at exactly the cap returns an out-of-budget deque. Enforce the same budget in the constructor and after push, or make the cap validation-only so a legitimate large deque is never created unusable. VERIFIED: traced `collections_deque` → `stack_from_values`/`deque_value` with no budget check, then `collections_pop_left` → `deque_parts` → `total > MAX_DEQUE_ITEMS` → `deque_error`.
-2. [MINOR] src/runtime.rs:1892 — `deque_error` still says "a deque is a record made by collections.deque", but deques are now `Value::Object` (src/runtime.rs:1908) and a hand-written record is the untrusted path. The message names the representation the module now refuses; reword to "a value made by collections.deque" (and update the `"deque is a record"` assertion needles in tests).
-3. [MINOR] src/runtime.rs:2151 — the `stack_cons` doc comment still claims "Validation of the whole deque still reads every physical node before the structural change", but the resume made module deques skip `validate_stack_tree` in `deque_parts`. The comment describes the old O(n) behaviour and hides the trust boundary; update it to say only the spine's top trees are checked.
-4. [MINOR] SPEC.md (uncommitted, collections/deque paragraph) — "a hand-written record with the same fields is still read" omits that the record must also carry `kind: "deque"`; `deque_parts` refuses a record with `front`/`back` but no/other `kind` (src/runtime.rs:1930-1936). Name the marker as REPORT.md does.
-5. [MINOR] src/runtime.rs:1908 / src/runtime.rs:3935 — deques are now the first source-reachable `Value::Object`, and `json.stringify` renders `Value::Object` as `"null"` (line observed via grep). That means stringifying a record containing a deque silently drops it rather than refusing. Not verified end-to-end; confirm the silent null is intended and document it, or make JSON refuse an opaque deque.
 
-REVIEW VERDICT: FINDINGS 5
+1. [MAJOR] src/runtime.rs:1921-1931 — A deque is stored as `Value::Object("deque", {kind, front, back})` whose `front`/`back` are the internal tree lists. `Value` has no manual `PartialEq` in `src/value.rs`, so the derived equality compares those internal fields structurally. The same sequence therefore has different equality depending on how it was built: `collections.deque([1,2,3,4])` stores `back = [tree(4,left=3,right=2), leaf(1)]` via `stack_from_values` (runtime.rs:2151-2177), while `push_right` four times stores `back = [leaf(4), node(3,left=2,right=1)]` via `stack_cons` (runtime.rs:2184-2208). Both pop `4,3,2,1`, and `tests/collections_test.rs:608-643` treats both as equivalent deques, but `values_equal` (runtime.rs:1598-1605) will answer `no`, and using two such deques as Counter/defaultdict keys yields two entries. SPEC.md:1447 says a program can "compare" a large deque, and no test pins this either way. Fix: define deque equality by logical contents (or explicitly document representation-based equality and add a test comparing a pushed deque with a constructor-built one); as written the opaque type leaks its construction history into `is`, `==`, Counter keys and `collections.get`.
+2. [MINOR] src/runtime.rs:1788-1803 — The duplicate check keeps `HashMap<u64, Vec<usize>>` and scans the whole bucket for each new pair, so its cost is O(bucket), not linear; a cluster of distinct keys sharing `group_value_hash` makes `collection_pairs` quadratic. The added comment (runtime.rs:1786-1787) and REPORT ("keeps the check linear") overstate this as linear, and the tests only exercise non-colliding keys. Fix: state it is expected-linear, or use a collision-resistant value index / cap the bucket, and add a test with two distinct equal-hash keys to prove they are not falsely refused.
+3. [STYLE] src/runtime.rs:2165-2166 — The comment on `stack_from_values` says "Each tree still validates through the same `validate_stack_tree` a pushed stack does", but the function never calls `validate_stack_tree`; it only builds trees from trusted values, and `deque_parts` later trusts the `Object` path without walking it. Fix: reword the comment to say the constructor's trees are trusted because source cannot construct the `Object`, rather than claiming a validation that does not occur.
+
+REVIEW VERDICT: FINDINGS 3
