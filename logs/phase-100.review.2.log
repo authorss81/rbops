@@ -1,5 +1,29 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/path.rs[90m [offset=230, limit=200][0m
+[0m→ [0mRead src/path.rs
 [0m→ [0mRead src/vfs.rs
+[0m✱ [0mGrep "path_|path\.|path::|read_dir|bytes_write|bytes\.write"[90m in tests · 100 matches[0m
+[0m✱ [0mGrep "type Fields|pub fn object|struct Fields|fn object"[90m in src/value.rs · 9 matches[0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1020, limit=360][0m
+[0m→ [0mRead tests/wasm_test.rs
+[0m→ [0mRead tests/wasm_test.rs[90m [offset=1184, limit=120][0m
+[0m✱ [0mGrep "OBJECT_NAME|path::|Text_FIELD|TEXT_FIELD"[90m in src · 82 matches[0m
+[0m→ [0mRead src/value.rs[90m [limit=60, offset=460][0m
+[0m→ [0mRead wasm/check-examples.js
+[0m→ [0mRead src/runtime.rs[90m [limit=80, offset=55][0m
+[0m✱ [0mGrep "runtime::property|fn property|GetProperty|Property|module_builtin|module_member|fn call_module|module_function"[90m in src · 78 matches[0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [limit=120][0m
+FINDINGS:
+1. [BLOCKER] src/vfs.rs:281 — `memory::read_dir` returns `NotFound` whenever it collects no names (`if names.is_empty() { return Err(not_found(path)); }`), and `directory_prefix(".")`/`("./")` deliberately maps to the empty prefix at src/vfs.rs:317-319. On `wasm32`, `path.list(".")` in a fresh playground therefore throws `IoError`, while native `std::fs::read_dir` on an empty directory returns `Ok([])`. This contradicts SPEC.md's "an empty directory is an empty list rather than an error" and the module's own cross-engine contract. `edge_the_in_memory_filesystem_lists_the_current_directory` only lists after writing files, so nothing pins the empty case. — Fix: treat the empty prefix (`.` and `./`) as an existing directory and return `Ok(Vec::new())` when no keys match; keep `NotFound` only for a non-existent named subdirectory. — VERIFIED: traced `read_dir(".")` → `directory_prefix` returns `Some("")` (src/vfs.rs:317-319) → loop over an empty store adds nothing → src/vfs.rs:281-283 returns `not_found(".")`. Missing test: `edge_the_in_memory_filesystem_lists_an_empty_current_directory`.
+
+2. [MINOR] src/vfs.rs:296 — the in-memory `not_found` embeds the path in the `io::Error` text (`format!("No such file or directory (os error 2): {path}")`), while `path::builtin` also prefixes the path at src/path.rs:324 (`Failed to list '{text}': {error}`). The same failing `path.list` prints the path twice in the playground and once natively, because `std::fs::read_dir`'s error text on Linux carries no path. This is the exact divergence the comment at src/vfs.rs:149-156 says was already fixed for `read_to_string`. — Fix: have `memory::read_dir` return `io::Error` messages without the path (or stop prefixing in `path::builtin`), matching the native channel. Not run; traced from the two format sites.
+
+3. [MAJOR] src/path.rs:115 — `join_with_separator` clears `joined` for any part `is_absolute_with` calls absolute, and `is_absolute_with` treats a leading `\` as absolute at src/path.rs:164. On Windows this loses the drive for a root-relative part: `path.join("C:\\base", "\\other")` (and `path.join("C:\\base", "/other")` after the `/`→`\` fold at line 99) yields `"\other"` instead of `"C:\other"`. `std::path::PathBuf::push` keeps the existing prefix for a root-without-prefix component, so the module does not actually follow the host rule it claims to follow. The existing test at tests/stdlib_modules_test.rs:1108 only covers the no-drive case `["a", "\\b"]`. — Fix: when a part is rooted but has no drive/UNC prefix, replace only the components after the earlier prefix rather than clearing `joined`; add a Windows-gated `path.join("C:\\base", "\\other") == "C:\\other"` test. Not runnable on this POSIX host; traced against `PathBuf`'s documented push semantics.
+
+4. [MINOR] src/path.rs:369 — `edge_resolve_removes_dot_segments` asserts `!resolved.contains("/./")` and `!resolved.contains("/../")`. On Windows the separator is `\`, so those checks are vacuously true even if normalization left `.\`/`..\` in place; the only remaining assertion is `ends_with("c")`, which a no-op normalizer also satisfies. The test silently stops testing resolution on the platform the module exists for. — Fix: assert against `std::path::MAIN_SEPARATOR`-built substrings or compare to `normalize` of a hard-coded absolute path.
+
+5. [MINOR] src/path.rs:233 — the wasm `resolve` returns `Unsupported`, but SPEC.md's new `path` section documents `path.resolve` unconditionally ("makes a path absolute against the working directory and removes `.` and `..` segments") and README.md's example says the same, with no playground caveat. A reader copying the documented example in the playground gets a refusal the documents never mention. — Fix: add the wasm exception to SPEC.md/README.md, or provide a defined virtual working directory so the documented behavior holds.
+
+REVIEW VERDICT: FINDINGS 5
