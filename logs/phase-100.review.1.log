@@ -1,0 +1,37 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/path.rs
+[0m→ [0mRead src/vfs.rs
+[0m→ [0mRead src/value.rs
+[0m✱ [0mGrep "path|is_path|text_of|Hash|hash"[90m in src/runtime.rs · 100 matches[0m
+[0m✱ [0mGrep "path|Path"[90m in src/stdlib.rs · 100 matches[0m
+[0m✱ [0mGrep "path_|is_path|path::text_of|path::is_path|fn hash_value|impl Hash"[90m 12 matches[0m
+[0m✱ [0mGrep "path"[90m 38 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3060, limit=180][0m
+[0m✱ [0mGrep "fn hash_value|Value::Object\(name|OBJECT_NAME|TEXT_FIELD"[90m 32 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=60, limit=60][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1700, limit=70][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1980, limit=40][0m
+[0m✱ [0mGrep "path|listing|directory|read_dir"[90m 100 matches[0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs
+[0m→ [0mRead tests/stdlib_module_names_test.rs
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=985, limit=260][0m
+[0m✱ [0mGrep "read_dir|memory::|path_list|path.list"[90m 93 matches[0m
+[0m→ [0mRead tests/doc_blocks_runs.txt
+[0m→ [0mRead tests/doc_blocks_fragments.txt
+[0m→ [0mRead tests/doc_blocks_known_fail.txt
+[0m✱ [0mGrep "HASH_TEXT|fn .*hash|Value::Object"[90m 20 matches[0m
+[0m✱ [0mGrep "OBJECT_NAME|path::|Value::Object"[90m 0 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1580, limit=60][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=4240, limit=30][0m
+FINDINGS:
+1. [BLOCKER] src/vfs.rs:263 — the in-memory filesystem answers `Ok([])` for any path with no stored entries, so on wasm `path.list("does/not/exist")` returns an empty list instead of an `IoError`, contradicting SPEC.md's new statement that a missing directory is an `IoError` and diverging from native `read_dir` at src/vfs.rs:73-80, which propagates `std::fs::read_dir`'s error. Nothing in `tests/wasm_test.rs` exercises `read_dir`, so the suite cannot see it. Fix: after building `prefix`, if no stored key matches it return `Err(not_found(path))` (a flat map cannot represent an empty existing directory anyway), and add a `memory::read_dir` test for a missing directory and a populated one. VERIFIED: traced src/vfs.rs:255-279; `directory_prefix` at src/vfs.rs:306-315 returns `Some` for every non-empty path, the loop at 267-278 finds no `strip_prefix` match, and line 279 returns `Ok(names)`.
+
+2. [MAJOR] src/path.rs:89 — `join_with_separator` strips trailing separators before the root special case, so on Windows `path.join("C:\\")` (and `path.join("C:\\", "")`) returns `"C:"`; `path.is_absolute` then reports that result as relative, and `path.filename`/`parent` lose the root. The root branch at src/path.rs:93 only recognises a bare `"\\"`, not a drive root. No test covers joining a drive root. Fix: detect a prefix+root before trimming and preserve its separator (or re-append it), and add a unit test for `join_with_separator(&["C:\\"], '\\')`. Traced from the code; not executed on Windows.
+
+3. [MINOR] tests/doc_blocks_fragments.txt:66 — the new SPEC path examples were appended to the existing files block at SPEC.md:1314, which is classified as a fragment, so `doc_blocks_test` never runs any of the new `path.*` calls; a typo or behaviour drift in the documentation is invisible to the gate. Fix: give the path example its own ```redblue block and list it in `tests/doc_blocks_runs.txt`, or add a targeted documentation test.
+
+4. [MINOR] src/runtime.rs:4256 — `json.stringify(path.join("a", "b"))` returns `"null"` because path values are `Value::Object` and the generic object fallback is null, even though the same value prints as `a/b`; the report's "record-shaped object" wording is inaccurate (a record would serialise). Fix: special-case `crate::path::OBJECT_NAME` in `json_stringify` to emit its text, or state explicitly that JSON loses path values.
+
+REVIEW VERDICT: FINDINGS 4
