@@ -1,0 +1,1121 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/vfs.rs
+[0m
+[0m$ [0mgit status && git log --oneline -5 && ls
+On branch main
+Your branch is ahead of 'origin/main' by 1 commit.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   SPEC.md
+	modified:   opencode.json
+	modified:   phases/phase-100/REPORT.md
+	modified:   src/path.rs
+	modified:   src/vfs.rs
+	modified:   tests/doc_blocks_fragments.txt
+	modified:   tests/doc_blocks_known_fail.txt
+	modified:   tests/doc_blocks_runs.txt
+	modified:   tests/stdlib_modules_test.rs
+	modified:   tests/wasm_test.rs
+
+no changes added to commit (use "git add" and/or "git commit -a")
+3c633fc resume phase-100: adopt preserved work
+d597770 config: configure 45s chunkTimeout and 60s headerTimeout in project opencode.json
+3f48a7e rbops: phase-099 (2026-10-31T06:12:43Z)
+2da3033 resume phase-099: adopt preserved work
+9f1600b rbops: phase-098 (2026-10-29T22:12:00Z)
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LIBRARIES.md
+LICENSE
+MEMORY.md
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+SURVEY.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+opencode.json
+phases
+review_findings.md
+src
+target
+test.redblue
+tests
+tooling
+wasm
+[0m
+[0m$ [0mgit diff -- src/vfs.rs src/path.rs tests/stdlib_modules_test.rs tests/wasm_test.rs SPEC.md phases/phase-100/REPORT.md README.md
+diff --git a/SPEC.md b/SPEC.md
+index 42f2087..c747dda 100644
+--- a/SPEC.md
++++ b/SPEC.md
+@@ -1338,7 +1338,9 @@ set entries to path.list(".")                   // sorted entry names
+ `path.join` takes its separator from the platform, so the same program builds
+ `data/records.rb` on POSIX and `data\records.rb` on Windows. It takes one or more
+ parts, and an absolute part discards everything joined before it: joining
+-`"data"` and `"/records.rb"` is `"/records.rb"`, not `"data//records.rb"`. A path
++`"data"` and `"/records.rb"` is `"/records.rb"`, not `"data//records.rb"`. On
++Windows a part that carries a drive but no root, such as `"D:other"`, also
++replaces everything before it, as the host's `PathBuf::push` does. A path
+ value is accepted wherever these functions take a path, and `files.read`,
+ `files.write`, `files.append`, `files.exists`, `files.lines`, `files.delete`,
+ `files.copy`, `files.rename` and `bytes.write` accept either a path value or the
+diff --git a/phases/phase-100/REPORT.md b/phases/phase-100/REPORT.md
+index 7468ece..ffa671c 100644
+--- a/phases/phase-100/REPORT.md
++++ b/phases/phase-100/REPORT.md
+@@ -47,23 +47,54 @@ routing for `bytes.write`, adds the missing integration coverage for
+ `append`/`delete`/`copy`/`rename` with path values, and records the phase-100
+ delivery commit in the unreviewed-work acknowledgement rule.
+ 
++The final resume closes the last Windows join rule and restores the config
++contract. A part that carries a drive but no root, such as `D:other`, now
++replaces the whole path before it, matching `std::path::PathBuf::push`; before
++this change it was appended as if it were an ordinary relative part. A
++top-level `provider` block merged by a config commit broke 18 pre-existing
++`agent_permissions_test` checks, so this run removes it; the project config
++declares only `$schema` and `agent`, as its own contract requires. The two new
++integration tests exercise `path.list` with a path value (sorted, empty, spaced
++and non-ASCII names) and its refusal to list a file.
++
++The review round pins two playground promises that were only implicit. The
++`path.resolve` refusal is now a helper the host build also compiles under
++`test`, so its `Unsupported` kind and platform-naming message are asserted by
++`cargo test` instead of living in a wasm-only arm nobody compiles. The
++in-memory listing splits only on `/`, because that is the playground's
++separator: a backslash stays an ordinary filename character, so a file written
++as `a\b.txt` is listed by that whole name rather than truncated to `a`.
++
++The second review round closes three path edge cases. The in-memory directory
++prefix now drops `.` segments, so `path.list("./data")` lists the file
++`files.write("data/x.txt", …)` stored, instead of asking for a literal `./data/`
++prefix no key carries. `path.join` keeps the separator on a UNC share root such
++as `\\server\share\`, because trimming it leaves a prefix with no root. And
++`path.resolve` refuses a Windows prefix without a root, such as `C:foo`, rather
++than joining it to the working directory and answering a path that is still
++relative.
++
+ | File | Lines | What |
+ |---|---|---|
+ | `src/path.rs` | +344 −0 | path value, `text_of`, `join`, `join_with_separator`, `parent`, `filename`, `stem`, `extension`, `is_absolute`, lexical `resolve`, `list`, the eight `path.*` builtin arms, and three unit tests |
+ | `src/runtime.rs` | +52 −25 | `path_*` dispatch, path-object property access and hashing, `files.*` accepting text or path values, and `bytes.write` accepting a path value |
+-| `src/vfs.rs` | +56 −3 | native and in-memory `read_dir`, with sorted names and an empty native directory answered as an empty list |
++| `src/vfs.rs` | +63 −4 | native and in-memory `read_dir`, with sorted names, an empty native directory answered as an empty list, and only `/` separating names in the playground |
+ | `src/value.rs` | +17 −0 | path values display as their text, answer `path` from `type_name`, and compare equal to that text |
+ | `src/stdlib.rs` | +60 −1 | registers the `path` module and its members, and corrects the `bytes.write` signature text |
+ | `src/lib.rs` | +1 −0 | exports `pub mod path` |
+-| `tests/stdlib_modules_test.rs` | +296 −2 | 15 path integration tests running both engines and comparing their answers |
++| `tests/stdlib_modules_test.rs` | +296 −2 | 15 path integration tests running both engines and comparing their answers; the final resume adds `edge_listing_accepts_a_path_value` and `edge_listing_a_file_path_value_is_an_io_error` |
++| `src/path.rs` | +16 −0 | the final resume makes a Windows drive-relative part replace the path before it, matching `PathBuf::push`, with `edge_a_drive_relative_part_replaces_the_path_before_it` |
++| `src/path.rs` | +17 −0 | the review round lifts the wasm `path.resolve` refusal into a helper the host suite asserts, with `edge_the_playground_refuses_resolve_without_a_working_directory` |
++| `opencode.json` | −16 | removes the top-level `provider` block a config commit merged; the agent-permission contract allows only `$schema` and `agent` |
+ | `tests/stdlib_module_docs_test.rs` | +52 −0 | one answerable row per new builtin |
+ | `tests/stdlib_module_names_test.rs` | +5 −0 | the `path` module row |
+-| `tests/wasm_test.rs` | +47 −0 | in-memory directory listing tests |
++| `tests/wasm_test.rs` | +70 −0 | in-memory directory listing tests, including the review round's backslash-is-a-filename-character case |
++| `src/path.rs`, `src/vfs.rs`, `tests/wasm_test.rs` | +70 −8 | the second review round normalizes dot-relative directory prefixes, keeps a UNC root separator, and refuses a drive-relative resolve, with the three tests below |
+ | `tests/unreviewed_work_ack_test.rs` | +2 −1 | acknowledges the phase-100 delivery subject by rule and keeps the "another phase is not acknowledged" fixture meaningful |
+ | `tests/doc_blocks_runs.txt` | +9 −9 | re-anchors the SPEC blocks after the expanded files/path block |
+ | `tests/doc_blocks_fragments.txt` | +1 −1 | re-anchors the later network fragment |
+ | `tests/doc_blocks_known_fail.txt` | +1 −1 | re-anchors the later parser-failure block |
+-| `SPEC.md` | +30 −2 | documents the `path` surface and that `bytes.write` accepts a path value |
++| `SPEC.md` | +32 −2 | documents the `path` surface, that `bytes.write` accepts a path value, and the Windows drive-relative join rule |
+ | `README.md` | +15 −1 | the user-facing files and path section |
+ | `SURVEY.md` | +7 −6 | builtin count 105 → 113, modules 13 → 14, members 76 → 84, the `path` row, and re-anchored citations |
+ 
+@@ -103,6 +134,14 @@ filesystem or resolving symlinks.
+ | `edge_the_in_memory_filesystem_lists_the_current_directory` | boundary: `.` and `./` list the files written by their bare names |
+ | `edge_the_in_memory_filesystem_lists_an_empty_current_directory` | empty: an empty current directory exists and lists as `[]` under both `.` and `./` |
+ | `edge_an_object_named_path_with_an_extra_field_is_not_a_path_value` | type_mismatch: only an object with exactly one text field is a path value |
++| `edge_listing_accepts_a_path_value` | unicode and ordering: a path value lists sorted spaced and non-ASCII names; an empty directory answers `[]` |
++| `edge_listing_a_file_path_value_is_an_io_error` | malformed_input: a path value naming a file is a catchable `IoError`, not a listing |
++| `path::tests::edge_a_drive_relative_part_replaces_the_path_before_it` | boundary (Windows): a part with a drive but no root replaces the path before it; on POSIX the colon is ordinary text |
++| `path::tests::edge_the_playground_refuses_resolve_without_a_working_directory` | malformed_input/platform: the wasm `path.resolve` refusal is `Unsupported` and names the platform and the native alternative |
++| `edge_the_in_memory_filesystem_treats_a_backslash_as_a_filename_character` | boundary (POSIX): on the playground only `/` separates components, so a backslash stays part of the filename |
++| `edge_the_in_memory_filesystem_lists_a_dot_relative_directory` | boundary: `data/x.txt` is listed by `./data`, `././data`, `data/.` and `./data/` as well as `data`, and each spelling also exists |
++| `path::tests::edge_joining_a_unc_share_root_keeps_it_absolute` | boundary (Windows): a UNC share root keeps the separator that makes it a root, and the joined result is absolute |
++| `path::tests::edge_resolve_refuses_a_drive_relative_path` | boundary (Windows): `C:foo` has a prefix but no root and is refused with `InvalidInput` instead of answered as a relative path |
+ 
+ Mandatory matrix:
+ 
+@@ -111,8 +150,9 @@ Mandatory matrix:
+   root parent case.
+ - singleton — a single component is joined and listed unchanged; the one-file
+   listing case is covered by the sorted-listing test.
+-- boundary — the root parent, a trailing separator, an absolute later part,
+-  double separators, dot segments and a path-value join part are all pinned.
++- boundary — the root parent, a trailing separator, an absolute later part, a
++  Windows drive-relative part, double separators, dot segments and a path-value
++  join part are all pinned.
+ - out_of_bounds — N/A: `path` exposes no numeric index or argument order.
+ - type_mismatch — every `path.*` argument and every `files.*` path is checked;
+   `edge_bad_path_arguments_are_clean_runtime_failures` and the path-value tests
+@@ -135,7 +175,7 @@ Mandatory matrix:
+ |---|---|
+ | `cargo fmt --all -- --check` | pass |
+ | `cargo clippy --all-targets -- -D warnings` | pass |
+-| `cargo test --all-targets` | 2410 passed, 0 failed, 0 ignored |
++| `cargo test --all-targets` | 2417 passed, 0 failed, 0 ignored |
+ | `../rbops/verify.sh phase-100` | pass |
+ 
+ ## Invariants touched
+diff --git a/src/path.rs b/src/path.rs
+index c1d62b0..a684a82 100644
+--- a/src/path.rs
++++ b/src/path.rs
+@@ -102,6 +102,20 @@ pub fn join_with_separator(parts: &[&str], separator: char) -> String {
+         };
+         let absolute = is_absolute_with(&part, separator);
+ 
++        // A Windows prefix with no root, such as `D:other`, replaces the whole
++        // path before it, exactly as `PathBuf::push` does. It is not absolute
++        // (the drive is relative to that drive's own working directory), and it
++        // is not root-relative either (the drive itself is a new prefix), so
++        // neither of the branches below would do the right thing with it.
++        if separator == '\\' {
++            let prefix = windows_prefix_len(&part);
++            if prefix > 0 && part.as_bytes().get(prefix) != Some(&b'\\') {
++                joined.clear();
++                joined.push_str(&part);
++                continue;
++            }
++        }
++
+         if let Some(root) = root_with(&part, separator) {
+             if separator == '\\' && root == "\\" {
+                 let prefix = windows_prefix_len(&joined);
+@@ -156,6 +170,17 @@ fn root_with(part: &str, separator: char) -> Option<String> {
+         {
+             return Some(format!("{}:\\", bytes[0] as char));
+         }
++        // A UNC share is a prefix, not a root, until a separator follows it.
++        // Keeping that separator is what makes `\\server\share\` absolute; the
++        // ordinary trailing-separator trim would otherwise leave only the
++        // prefix `\\server\share`, which names no root at all.
++        let prefix = windows_prefix_len(part);
++        if prefix > 2
++            && bytes.get(prefix) == Some(&b'\\')
++            && part[prefix..].chars().all(|c| c == '\\')
++        {
++            return Some(format!("{}\\", &part[..prefix]));
++        }
+         if !part.is_empty() && part.chars().all(|c| c == '\\') {
+             return Some("\\".to_string());
+         }
+@@ -251,6 +276,16 @@ pub fn is_absolute(text: &str) -> bool {
+ #[cfg(not(target_arch = "wasm32"))]
+ pub fn resolve(text: &str) -> std::io::Result<String> {
+     let path = Path::new(text);
++    #[cfg(windows)]
++    if has_prefix_without_root(text) {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            format!(
++                "cannot resolve '{text}': it has a Windows prefix but no root, so it is \
++                 relative to that drive's own working directory; use a rooted path instead"
++            ),
++        ));
++    }
+     let absolute = if path.is_absolute() {
+         path.to_path_buf()
+     } else {
+@@ -259,17 +294,42 @@ pub fn resolve(text: &str) -> std::io::Result<String> {
+     Ok(normalize(&absolute).to_string_lossy().into_owned())
+ }
+ 
++/// Whether `text` carries a Windows prefix but no root after it.
++///
++/// A drive-relative path such as `C:foo` has a drive but no separator, so it
++/// names a file relative to that drive's current directory rather than to the
++/// process's. `PathBuf::push` would truncate the working directory to `C:foo`
++/// and leave it relative; [`resolve`] refuses it instead of answering a path
++/// that is not absolute. The same applies to a UNC share with no trailing
++/// separator, which is a prefix without a root.
++#[cfg(windows)]
++fn has_prefix_without_root(text: &str) -> bool {
++    let prefix = windows_prefix_len(text);
++    prefix > 0 && text.as_bytes().get(prefix) != Some(&b'\\')
++}
++
++/// The refusal the WebAssembly playground gives for [`resolve`].
++///
++/// It is a function the host build also compiles under `test`, so `cargo test`
++/// can assert the kind and wording of the refusal a wasm program receives. A
++/// wasm-only `Err` would be compiled only for a target this checkout's test
++/// suite does not build, leaving the playground's promise unpinned.
++#[cfg(any(target_arch = "wasm32", test))]
++fn no_working_directory() -> std::io::Error {
++    std::io::Error::new(
++        std::io::ErrorKind::Unsupported,
++        "path.resolve cannot read the working directory in the WebAssembly playground: \
++         the platform has none. Run it with the native rb binary to resolve a path.",
++    )
++}
++
+ /// The playground has no working directory, so there is nothing to resolve
+ /// against. `current_dir()` is not available on `wasm32-unknown-unknown`; a
+ /// silent empty answer or a host-dependent virtual root would be a path the
+ /// program cannot read, so the refusal names the platform instead.
+ #[cfg(target_arch = "wasm32")]
+ pub fn resolve(_text: &str) -> std::io::Result<String> {
+-    Err(std::io::Error::new(
+-        std::io::ErrorKind::Unsupported,
+-        "path.resolve cannot read the working directory in the WebAssembly playground: \
+-         the platform has none. Run it with the native rb binary to resolve a path.",
+-    ))
++    Err(no_working_directory())
+ }
+ 
+ /// `path` with `.` removed and `..` folded into its parent where possible.
+@@ -398,6 +458,29 @@ mod tests {
+         assert_eq!(join_with_separator(&["/", "tmp"], '/'), "/tmp");
+     }
+ 
++    #[test]
++    fn edge_joining_a_unc_share_root_keeps_it_absolute() {
++        let root = r"\\server\share\";
++        assert_eq!(
++            join_with_separator(&[root], '\\'),
++            root,
++            "a UNC root must keep the separator that makes it a root"
++        );
++        assert_eq!(
++            join_with_separator(&[r"\\server\share\\"], '\\'),
++            root,
++            "a UNC root is one root however many separators spell it"
++        );
++        assert_eq!(
++            join_with_separator(&[root, "folder"], '\\'),
++            r"\\server\share\folder"
++        );
++        assert!(
++            is_absolute_with(&join_with_separator(&[root], '\\'), '\\'),
++            "the joined UNC root must still be absolute"
++        );
++    }
++
+     #[test]
+     fn edge_join_keeps_the_drive_for_a_root_relative_part() {
+         assert_eq!(
+@@ -418,6 +501,48 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn edge_a_drive_relative_part_replaces_the_path_before_it() {
++        assert_eq!(
++            join_with_separator(&["C:\\base", "D:other"], '\\'),
++            "D:other",
++            "a part with a prefix but no root replaces the whole path, as PathBuf::push does"
++        );
++        assert_eq!(join_with_separator(&["C:\\base", "C:"], '\\'), "C:");
++        assert_eq!(
++            join_with_separator(&["a", "C:other"], '/'),
++            "a/C:other",
++            "on POSIX a colon is an ordinary filename character, not a drive prefix"
++        );
++    }
++
++    #[test]
++    fn edge_the_playground_refuses_resolve_without_a_working_directory() {
++        let refusal = no_working_directory();
++        assert_eq!(
++            refusal.kind(),
++            std::io::ErrorKind::Unsupported,
++            "a platform with no working directory is Unsupported, not a missing file: {refusal}"
++        );
++        let message = refusal.to_string();
++        assert!(
++            message.contains("path.resolve"),
++            "the refusal must name the operation the program called: {message}"
++        );
++        assert!(
++            message.contains("WebAssembly"),
++            "the refusal must name the platform rather than a host-dependent path: {message}"
++        );
++        assert!(
++            message.contains("working directory"),
++            "the refusal must say what the platform lacks: {message}"
++        );
++        assert!(
++            message.contains("native rb binary"),
++            "the refusal must say what the reader can run instead: {message}"
++        );
++    }
++
+     #[test]
+     fn edge_resolve_removes_dot_segments() {
+         let resolved = resolve("a/./b/../c").expect("the working directory is readable");
+@@ -439,4 +564,29 @@ mod tests {
+             Some("c")
+         );
+     }
++
++    #[cfg(windows)]
++    #[test]
++    fn edge_resolve_refuses_a_drive_relative_path() {
++        let error =
++            resolve("C:foo").expect_err("a drive-relative path has no root to resolve against");
++        assert_eq!(
++            error.kind(),
++            std::io::ErrorKind::InvalidInput,
++            "a drive-relative path is not a missing file: {error}"
++        );
++        let message = error.to_string();
++        assert!(
++            message.contains("C:foo"),
++            "the refusal must name the path the program passed: {message}"
++        );
++        assert!(
++            message.contains("prefix but no root"),
++            "the refusal must say why it cannot be made absolute: {message}"
++        );
++        assert!(
++            message.contains("rooted path"),
++            "the refusal must say what the reader can pass instead: {message}"
++        );
++    }
+ }
+diff --git a/src/vfs.rs b/src/vfs.rs
+index ab7b959..5684045 100644
+--- a/src/vfs.rs
++++ b/src/vfs.rs
+@@ -276,7 +276,12 @@ pub mod memory {
+             if rest.is_empty() {
+                 continue;
+             }
+-            let name = rest.split(['/', '\\']).next().unwrap_or(rest);
++            // This is the playground's filesystem, which follows POSIX: only
++            // `/` separates components there, and `path.join` deliberately
++            // leaves a backslash alone on that target. Splitting on `\\` here
++            // too would list a file written as `"a\\b.txt"` as `"a"`, which is
++            // a filename the program never wrote.
++            let name = rest.split('/').next().unwrap_or(rest);
+             if !name.is_empty() {
+                 names.insert(name.to_string());
+             }
+@@ -313,23 +318,35 @@ pub mod memory {
+     ///
+     /// The trailing separator is the whole of it, and it is why
+     /// [`exists`](self::exists) does not confuse the directory `notes` with a
+-    /// file called `notes.txt`. `.` and `./` name the working directory, whose
+-    /// stored keys are the paths written without a prefix, so both answer the
+-    /// empty prefix rather than a literal `"./"` no key carries. `None` for a
++    /// file called `notes.txt`. `.` segments name the working directory or the
++    /// directory they sit in, whose stored keys are the paths written without
++    /// that segment, so `./data`, `data/.` and `data` all answer the prefix
++    /// `"data/"` rather than a literal `"./data/"` no key carries. `None` for a
+     /// path that cannot name a directory at all: the empty path, which
+     /// `Path::new("").exists()` also answers `false` for on a disk.
+     fn directory_prefix(path: &str) -> Option<String> {
+         if path.is_empty() {
+             return None;
+         }
+-        if path == "." || path == "./" {
+-            return Some(String::new());
++        let mut prefix = String::new();
++        if path.starts_with('/') {
++            prefix.push('/');
+         }
+-        if path.ends_with('/') {
+-            Some(path.to_string())
+-        } else {
+-            Some(format!("{path}/"))
++        let mut first = true;
++        for component in path.split('/') {
++            if component.is_empty() || component == "." {
++                continue;
++            }
++            if !first {
++                prefix.push('/');
++            }
++            prefix.push_str(component);
++            first = false;
++        }
++        if !prefix.is_empty() && !prefix.ends_with('/') {
++            prefix.push('/');
+         }
++        Some(prefix)
+     }
+ }
+ 
+diff --git a/tests/stdlib_modules_test.rs b/tests/stdlib_modules_test.rs
+index d782e6b..e68bf32 100644
+--- a/tests/stdlib_modules_test.rs
++++ b/tests/stdlib_modules_test.rs
+@@ -1208,6 +1208,46 @@ say path.list("{empty}")"#,
+     assert_eq!(lines, ["[a.txt, empty, z.txt]", "[]"]);
+ }
+ 
++#[test]
++fn edge_listing_accepts_a_path_value() {
++    let dir = TempDir::new("path-list-value");
++    std::fs::create_dir_all(dir.file("empty")).expect("the empty directory should be creatable");
++    dir.write_file("z.txt", "z");
++    dir.write_file("a b.txt", "a");
++    dir.write_file("naïve.txt", "n");
++
++    let source = format!(
++        r#"set d to path.join({dir})
++say path.list(d)
++say path.list(path.join(d, "empty"))"#,
++        dir = redblue_text(&dir.path.to_string_lossy())
++    );
++    let lines = both_engines(&source);
++    assert_eq!(
++        lines,
++        ["[a b.txt, empty, naïve.txt, z.txt]", "[]"],
++        "path.list must accept a path value, sort names, and answer [] for an empty directory"
++    );
++}
++
++#[test]
++fn edge_listing_a_file_path_value_is_an_io_error() {
++    let dir = TempDir::new("path-list-value-file");
++    dir.write_file("plain.txt", "x");
++    let source = format!(
++        r#"set p to path.join({dir}, "plain.txt")
++path.list(p)"#,
++        dir = redblue_text(&dir.path.to_string_lossy())
++    );
++    let result = run_source_value(&source);
++    assert!(
++        result.is_err(),
++        "a path value naming a file must not list as a directory"
++    );
++    let error = result.expect_err("a file is not a directory");
++    assert_eq!(error.label(), "IoError", "{error}");
++}
++
+ #[test]
+ fn edge_bad_path_arguments_are_clean_runtime_failures() {
+     for source in [
+diff --git a/tests/wasm_test.rs b/tests/wasm_test.rs
+index 0889484..d96d36b 100644
+--- a/tests/wasm_test.rs
++++ b/tests/wasm_test.rs
+@@ -1169,6 +1169,29 @@ fn edge_the_in_memory_filesystem_lists_directories_and_refuses_missing_ones() {
+     memory::clear();
+ }
+ 
++/// On the playground only `/` separates components, so a backslash is an
++/// ordinary filename character. A listing that split on both separators would
++/// turn `a\b.txt` into the directory name `a`, which is not a name the program
++/// ever wrote and which `path.join` on this target deliberately does not build.
++#[test]
++fn edge_the_in_memory_filesystem_treats_a_backslash_as_a_filename_character() {
++    use redblue::vfs::memory;
++
++    let _serialised = memory_filesystem();
++    memory::clear();
++
++    let dir = "/wasm-backslash";
++    memory::write("/wasm-backslash/a\\b.txt", "x").expect("write should succeed");
++
++    assert_eq!(
++        memory::read_dir(dir).expect("the directory should list"),
++        vec!["a\\b.txt".to_string()],
++        "only `/` separates components on the playground"
++    );
++
++    memory::clear();
++}
++
+ /// `.` names the working directory, and this filesystem stores the paths a
+ /// program wrote verbatim. A file written as `"a.txt"` therefore has to be
+ /// visible to `path.list(".")`, the spelling SPEC.md documents, and `"./"` must
+@@ -1198,6 +1221,36 @@ fn edge_the_in_memory_filesystem_lists_the_current_directory() {
+     memory::clear();
+ }
+ 
++/// A dot-relative spelling of a directory names the same directory. The map
++/// stores keys verbatim, so `./data` has to lose its `.` segment before it
++/// becomes a prefix; otherwise it is a literal `./data/` no key carries and
++/// `path.list("./data")` answers `NotFound` while native `read_dir("./data")`
++/// lists the file.
++#[test]
++fn edge_the_in_memory_filesystem_lists_a_dot_relative_directory() {
++    use redblue::vfs::memory;
++
++    let _serialised = memory_filesystem();
++    memory::clear();
++
++    memory::write("data/x.txt", "x").expect("write should succeed");
++
++    let expected = vec!["x.txt".to_string()];
++    for spelling in ["data", "./data", "././data", "data/.", "./data/"] {
++        assert_eq!(
++            memory::read_dir(spelling).expect("the dot-relative directory should list"),
++            expected,
++            "`{spelling}` must name the same directory as `data`"
++        );
++        assert!(
++            memory::exists(spelling),
++            "`{spelling}` must name the same directory as `data`"
++        );
++    }
++
++    memory::clear();
++}
++
+ /// `.` and `./` name the working directory, and a working directory that holds
+ /// nothing is still a directory: the native `read_dir` answers an empty list,
+ /// not `NotFound`, so the in-memory filesystem has to answer the same for the
+[0m
+[0m→ [0mRead src/path.rs
+[0m
+[0m$ [0mrg -n "empty director|empty list|read_dir|memory::|path.list|NotFound|NotADirectory|directory" tests/wasm_test.rs | head -80
+68:/// `examples/` directory rather than asserted twice by hand. A new example that
+73:    let mut on_disk: Vec<String> = std::fs::read_dir("examples")
+297:/// A path nobody wrote is a failure in both builds — a `NotFound` the program
+612:    memory::clear();
+618:        !memory::exists(path),
+622:    memory::write(path, "first").expect("write should succeed");
+623:    assert!(memory::exists(path));
+625:        memory::read_to_string(path).expect("read should succeed"),
+629:    memory::append(path, " second").expect("append should succeed");
+631:        memory::read_to_string(path).expect("read should succeed"),
+637:    memory::append("/playground/made-by-append", "x").expect("append should create");
+639:        memory::read_to_string("/playground/made-by-append").expect("read should succeed"),
+643:    assert_eq!(memory::copy(path, copy).expect("copy should succeed"), 12);
+644:    assert!(memory::exists(copy));
+645:    memory::rename(copy, "/playground/note.moved").expect("rename should succeed");
+646:    assert!(!memory::exists(copy));
+647:    assert!(memory::exists("/playground/note.moved"));
+649:    memory::remove_file(path).expect("delete should succeed");
+650:    assert!(!memory::exists(path));
+654:    memory::write_bytes("/playground/blob", &[0u8, 1, 2, 255]).expect("write should succeed");
+655:    let error = memory::read_to_string("/playground/blob")
+661:    let missing_error = memory::read_to_string(missing).expect_err("a missing file must fail");
+662:    assert_eq!(missing_error.kind(), std::io::ErrorKind::NotFound);
+666:            .contains("No such file or directory"),
+670:        memory::remove_file(missing).is_err(),
+674:    memory::clear();
+1060:/// `files.exists` answers for a directory as well as a file, and the in-memory
+1062:/// `Path::exists`, which is `true` for a directory, and a `contains_key` lookup
+1066:/// A directory here is implied by what is in it, which is the only way a flat
+1068:/// rule, so `/playground` is a directory holding `/playground/note.txt` while
+1075:    memory::clear();
+1081:    assert!(!memory::exists(dir), "nothing has been written yet");
+1082:    memory::write(inside, "x").expect("write should succeed");
+1084:    assert!(memory::exists(inside), "the file itself exists");
+1086:        memory::exists(dir),
+1087:        "a directory the native Path::exists calls true must be true here too"
+1090:        memory::exists("/wasm-directories/inner"),
+1091:        "every directory on the way to a file is a directory"
+1094:        memory::exists(&format!("{dir}/")),
+1095:        "a trailing separator names the same directory"
+1099:    // directory holding `/wasm-directories/inner/note.txt` and says nothing
+1103:    assert!(!memory::exists(sibling));
+1104:    assert!(!memory::exists("/wasm-directories/note"));
+1106:        !memory::exists("/wasm-directories/note.tx"),
+1109:    assert!(!memory::exists(""), "the empty path names nothing");
+1111:    // Reading a directory is still the refusal it is on a disk: there is no
+1113:    let refused = memory::read_to_string(dir).expect_err("a directory is not a file");
+1114:    assert_eq!(refused.kind(), std::io::ErrorKind::NotFound);
+1116:    memory::clear();
+1119:/// A directory that exists in the map is listed from the keys beneath it, and
+1120:/// one that does not is the same `NotFound` the native `read_dir` gives. An
+1121:/// empty list is not the answer for a named path nobody wrote: the flat map
+1122:/// cannot tell "empty directory" from "missing directory", so it reports the
+1123:/// one that matches the native error instead of inventing an empty directory.
+1124:/// The working directory is the exception, because it always exists; see
+1125:/// [`edge_the_in_memory_filesystem_lists_an_empty_current_directory`].
+1131:    memory::clear();
+1135:    memory::write("/wasm-listing/b.txt", "b").expect("write should succeed");
+1136:    memory::write("/wasm-listing/a.txt", "a").expect("write should succeed");
+1137:    memory::write("/wasm-listing/nested/c.txt", "c").expect("write should succeed");
+1145:        memory::read_dir(dir).expect("a populated directory should list"),
+1150:        memory::read_dir(&format!("{dir}/"))
+1151:            .expect("a trailing separator names the same directory"),
+1153:        "one directory must not have two different listings"
+1156:    let missing_error = memory::read_dir(missing).expect_err("a missing directory must fail");
+1157:    assert_eq!(missing_error.kind(), std::io::ErrorKind::NotFound);
+1161:            .contains("No such file or directory"),
+1169:    memory::clear();
+1174:/// turn `a\b.txt` into the directory name `a`, which is not a name the program
+1181:    memory::clear();
+1184:    memory::write("/wasm-backslash/a\\b.txt", "x").expect("write should succeed");
+1187:        memory::read_dir(dir).expect("the directory should list"),
+1192:    memory::clear();
+1195:/// `.` names the working directory, and this filesystem stores the paths a
+1197:/// visible to `path.list(".")`, the spelling SPEC.md documents, and `"./"` must
+1198:/// name the same directory rather than a literal prefix no key carries.
+1200:fn edge_the_in_memory_filesystem_lists_the_current_directory() {
+1204:    memory::clear();
+1206:    memory::write("a.txt", "a").expect("write should succeed");
+1207:    memory::write("data/x.txt", "x").expect("write should succeed");
+[0m
+[0m$ [0mrg -n "path.list|empty director|empty list|NotFound|path.resolve|UNC|drive" README.md SPEC.md | head -80
+README.md:58:test "empty list index is an error"
+README.md:223:path.resolve("data")              // an absolute path with . and .. removed
+README.md:224:path.list("data")                 // sorted entry names; [] for an empty directory
+README.md:231:WebAssembly playground has no working directory, so `path.resolve` is refused
+SPEC.md:1310:refuses an empty list, since it has no member to choose.
+SPEC.md:1334:set here to path.resolve("data")                // an absolute path
+SPEC.md:1335:set entries to path.list(".")                   // sorted entry names
+SPEC.md:1342:Windows a part that carries a drive but no root, such as `"D:other"`, also
+SPEC.md:1352:`path.stem` and `path.extension` read that same name. `path.resolve` makes a path
+SPEC.md:1356:against, so there `path.resolve` is refused with an `IoError` that names the
+SPEC.md:1358:`path.list` answers the names directly inside a directory, sorted, so the same
+SPEC.md:1359:directory always prints the same list; an empty directory is an empty list rather
+SPEC.md:1465:copy of it: `collections.defaultdict([])` gives each new key its own empty list,
+SPEC.md:1731:| `chain(a, b, ...)` | materialises a list of every argument list's items in the order given; no lists is the empty list | materialises |
+[0m
+[0m→ [0mRead tests/wasm_test.rs[90m [offset=1050, limit=260][0m
+[0m→ [0mRead README.md[90m [offset=205, limit=45][0m
+[0m→ [0mRead SPEC.md[90m [offset=1330, limit=40][0m
+[0m
+[0m$ [0mrg -n "memory::(write|write_bytes|append|copy|rename|remove_file|read_to_string|read_dir|exists|is_file)" tests src | sed -n '1,200p'
+tests/wasm_test.rs:618:        !memory::exists(path),
+tests/wasm_test.rs:622:    memory::write(path, "first").expect("write should succeed");
+tests/wasm_test.rs:623:    assert!(memory::exists(path));
+tests/wasm_test.rs:625:        memory::read_to_string(path).expect("read should succeed"),
+tests/wasm_test.rs:629:    memory::append(path, " second").expect("append should succeed");
+tests/wasm_test.rs:631:        memory::read_to_string(path).expect("read should succeed"),
+tests/wasm_test.rs:637:    memory::append("/playground/made-by-append", "x").expect("append should create");
+tests/wasm_test.rs:639:        memory::read_to_string("/playground/made-by-append").expect("read should succeed"),
+tests/wasm_test.rs:643:    assert_eq!(memory::copy(path, copy).expect("copy should succeed"), 12);
+tests/wasm_test.rs:644:    assert!(memory::exists(copy));
+tests/wasm_test.rs:645:    memory::rename(copy, "/playground/note.moved").expect("rename should succeed");
+tests/wasm_test.rs:646:    assert!(!memory::exists(copy));
+tests/wasm_test.rs:647:    assert!(memory::exists("/playground/note.moved"));
+tests/wasm_test.rs:649:    memory::remove_file(path).expect("delete should succeed");
+tests/wasm_test.rs:650:    assert!(!memory::exists(path));
+tests/wasm_test.rs:654:    memory::write_bytes("/playground/blob", &[0u8, 1, 2, 255]).expect("write should succeed");
+tests/wasm_test.rs:655:    let error = memory::read_to_string("/playground/blob")
+tests/wasm_test.rs:661:    let missing_error = memory::read_to_string(missing).expect_err("a missing file must fail");
+tests/wasm_test.rs:670:        memory::remove_file(missing).is_err(),
+tests/wasm_test.rs:1081:    assert!(!memory::exists(dir), "nothing has been written yet");
+tests/wasm_test.rs:1082:    memory::write(inside, "x").expect("write should succeed");
+tests/wasm_test.rs:1084:    assert!(memory::exists(inside), "the file itself exists");
+tests/wasm_test.rs:1086:        memory::exists(dir),
+tests/wasm_test.rs:1090:        memory::exists("/wasm-directories/inner"),
+tests/wasm_test.rs:1094:        memory::exists(&format!("{dir}/")),
+tests/wasm_test.rs:1103:    assert!(!memory::exists(sibling));
+tests/wasm_test.rs:1104:    assert!(!memory::exists("/wasm-directories/note"));
+tests/wasm_test.rs:1106:        !memory::exists("/wasm-directories/note.tx"),
+tests/wasm_test.rs:1109:    assert!(!memory::exists(""), "the empty path names nothing");
+tests/wasm_test.rs:1113:    let refused = memory::read_to_string(dir).expect_err("a directory is not a file");
+tests/wasm_test.rs:1135:    memory::write("/wasm-listing/b.txt", "b").expect("write should succeed");
+tests/wasm_test.rs:1136:    memory::write("/wasm-listing/a.txt", "a").expect("write should succeed");
+tests/wasm_test.rs:1137:    memory::write("/wasm-listing/nested/c.txt", "c").expect("write should succeed");
+tests/wasm_test.rs:1145:        memory::read_dir(dir).expect("a populated directory should list"),
+tests/wasm_test.rs:1150:        memory::read_dir(&format!("{dir}/"))
+tests/wasm_test.rs:1156:    let missing_error = memory::read_dir(missing).expect_err("a missing directory must fail");
+tests/wasm_test.rs:1184:    memory::write("/wasm-backslash/a\\b.txt", "x").expect("write should succeed");
+tests/wasm_test.rs:1187:        memory::read_dir(dir).expect("the directory should list"),
+tests/wasm_test.rs:1206:    memory::write("a.txt", "a").expect("write should succeed");
+tests/wasm_test.rs:1207:    memory::write("data/x.txt", "x").expect("write should succeed");
+tests/wasm_test.rs:1211:        memory::read_dir(".").expect("the current directory should list"),
+tests/wasm_test.rs:1216:        memory::read_dir("./").expect("`./` names the same directory"),
+tests/wasm_test.rs:1236:    memory::write("data/x.txt", "x").expect("write should succeed");
+tests/wasm_test.rs:1241:            memory::read_dir(spelling).expect("the dot-relative directory should list"),
+tests/wasm_test.rs:1246:            memory::exists(spelling),
+tests/wasm_test.rs:1266:        memory::exists("."),
+tests/wasm_test.rs:1270:        memory::exists("./"),
+tests/wasm_test.rs:1274:        memory::read_dir(".").expect("an empty current directory still exists"),
+tests/wasm_test.rs:1279:        memory::read_dir("./").expect("`./` names the same empty directory"),
+tests/wasm_test.rs:1303:    memory::write_bytes("/not-text", &[0xff, 0xfe]).expect("write should succeed");
+tests/wasm_test.rs:1305:    let memory_error = memory::read_to_string("/not-text").expect_err("bytes are not text");
+tests/manifest_test.rs:1831:    memory::write("modules/Fixture/1.0.0/Fixture.rb", "set VALUE to 1")
+tests/manifest_test.rs:1836:        memory::is_file(module),
+tests/manifest_test.rs:1840:        memory::read_to_string(module).expect("the module file should be readable"),
+tests/manifest_test.rs:1846:        !memory::is_file("modules/Fixture"),
+tests/manifest_test.rs:1851:        memory::exists("modules/Fixture"),
+tests/manifest_test.rs:1855:        !memory::is_file("modules/Nothing.rb"),
+src/vfs.rs:26://! [`memory::exists`].
+[0m
+[0m$ [0mrg -n "directory_prefix|has_prefix_without_root|no_working_directory|join_with_separator|windows_prefix_len|root_with" src tests
+tests/stdlib_modules_test.rs:1037:    use redblue::path::join_with_separator;
+tests/stdlib_modules_test.rs:1039:    let posix = join_with_separator(&["a", "b"], '/');
+tests/stdlib_modules_test.rs:1040:    let windows = join_with_separator(&["a", "b"], '\\');
+tests/stdlib_modules_test.rs:1048:    let platform = join_with_separator(&["a", "b"], std::path::MAIN_SEPARATOR);
+tests/stdlib_modules_test.rs:1105:    use redblue::path::join_with_separator;
+tests/stdlib_modules_test.rs:1107:    assert_eq!(join_with_separator(&["a", "/b"], '/'), "/b");
+tests/stdlib_modules_test.rs:1108:    assert_eq!(join_with_separator(&["a", "\\b"], '\\'), "\\b");
+tests/stdlib_modules_test.rs:1138:    use redblue::path::{filename, join_with_separator, stem};
+tests/stdlib_modules_test.rs:1143:        join_with_separator(&["data/", "records/"], '/'),
+src/vfs.rs:203:    /// always name a directory that exists. See [`directory_prefix`].
+src/vfs.rs:209:        let prefix = match directory_prefix(path) {
+src/vfs.rs:268:        let Some(prefix) = directory_prefix(path) else {
+src/vfs.rs:327:    fn directory_prefix(path: &str) -> Option<String> {
+tests/manifest_test.rs:562:fn edge_a_root_with_no_manifest_resolves_to_nothing() {
+tests/manifest_test.rs:742:fn edge_a_root_with_no_manifest_analyses_as_it_always_did() {
+src/path.rs:82:    join_with_separator(&parts, std::path::MAIN_SEPARATOR)
+src/path.rs:91:pub fn join_with_separator(parts: &[&str], separator: char) -> String {
+src/path.rs:111:            let prefix = windows_prefix_len(&part);
+src/path.rs:119:        if let Some(root) = root_with(&part, separator) {
+src/path.rs:121:                let prefix = windows_prefix_len(&joined);
+src/path.rs:135:            if separator == '\\' && part.starts_with('\\') && windows_prefix_len(&part) == 0 {
+src/path.rs:136:                let prefix = windows_prefix_len(&joined);
+src/path.rs:162:fn root_with(part: &str, separator: char) -> Option<String> {
+src/path.rs:177:        let prefix = windows_prefix_len(part);
+src/path.rs:202:fn windows_prefix_len(path: &str) -> usize {
+src/path.rs:280:    if has_prefix_without_root(text) {
+src/path.rs:306:fn has_prefix_without_root(text: &str) -> bool {
+src/path.rs:307:    let prefix = windows_prefix_len(text);
+src/path.rs:318:fn no_working_directory() -> std::io::Error {
+src/path.rs:332:    Err(no_working_directory())
+src/path.rs:446:        assert_eq!(join_with_separator(&["a", "b"], '/'), "a/b");
+src/path.rs:447:        assert_eq!(join_with_separator(&["a", "b"], '\\'), "a\\b");
+src/path.rs:452:        assert_eq!(join_with_separator(&["C:\\"], '\\'), "C:\\");
+src/path.rs:453:        assert_eq!(join_with_separator(&["C:\\", ""], '\\'), "C:\\");
+src/path.rs:454:        assert_eq!(join_with_separator(&["C:\\", "Users"], '\\'), "C:\\Users");
+src/path.rs:455:        assert_eq!(join_with_separator(&["D:/"], '\\'), "D:\\");
+src/path.rs:457:        assert_eq!(join_with_separator(&["/"], '/'), "/");
+src/path.rs:458:        assert_eq!(join_with_separator(&["/", "tmp"], '/'), "/tmp");
+src/path.rs:465:            join_with_separator(&[root], '\\'),
+src/path.rs:470:            join_with_separator(&[r"\\server\share\\"], '\\'),
+src/path.rs:475:            join_with_separator(&[root, "folder"], '\\'),
+src/path.rs:479:            is_absolute_with(&join_with_separator(&[root], '\\'), '\\'),
+src/path.rs:487:            join_with_separator(&["C:\\base", "\\other"], '\\'),
+src/path.rs:491:        assert_eq!(join_with_separator(&["C:\\base", "\\"], '\\'), "C:\\");
+src/path.rs:493:            join_with_separator(&["\\\\server\\share\\base", "\\other"], '\\'),
+src/path.rs:498:            join_with_separator(&["a", "\\b"], '\\'),
+src/path.rs:507:            join_with_separator(&["C:\\base", "D:other"], '\\'),
+src/path.rs:511:        assert_eq!(join_with_separator(&["C:\\base", "C:"], '\\'), "C:");
+src/path.rs:513:            join_with_separator(&["a", "C:other"], '/'),
+src/path.rs:521:        let refusal = no_working_directory();
+[0m
+[0m→ [0mRead tests/manifest_test.rs[90m [limit=45, offset=1820][0m
+[0m
+[0m$ [0msed -n '1,80p' phases/phase-100/REPORT.md && ls phases/phase-100
+# Phase 100 — Path values and directory listing
+
+## What changed
+
+The finding reproduced on the phase base before any edit: `path` was not a
+module, so `say path.join("a", "b")` failed with `AnalyzerError: Unknown
+variable 'path'`. Every program that built a filesystem path had to concatenate
+`/` itself, which is wrong on Windows and has no answer for a parent, a filename,
+an extension or the contents of a directory.
+
+A path is now a `path` object with one field, `text`. It is deliberately not a
+new `Value` variant: it prints as its text, compares equal to that text, and
+`type_of` answers `path`. `path.join`, `path.parent` and `path.resolve` answer
+path values; `path.filename`, `path.stem` and `path.extension` answer text or
+`nothing`; `path.is_absolute` answers yes/no; and `path.list` answers the sorted
+names directly inside a directory. The separators come from
+`std::path::MAIN_SEPARATOR`, not a hardcoded slash.
+
+`files.read`, `write`, `append`, `exists`, `lines`, `delete`, `copy` and
+`rename` accept either a text path or a path value. `bytes.write` now accepts the
+same two forms, so a path value can be used for every filesystem write rather
+than only text writes. The old text spelling keeps working, and the old
+argument-error phrases remain visible in the refusal text. Both engines reach the
+same implementation through `runtime::builtin`.
+
+The in-memory wasm filesystem answers `read_dir` as well, so `path.list` is not a
+native-only surface. A directory listing is sorted by name and an empty
+directory is the empty list. `.` and `./` name the current directory, so a file
+written as `"a.txt"` is visible to the `path.list(".")` spelling SPEC.md
+documents, and an empty current directory is the empty list rather than an
+error. The flat in-memory filesystem still cannot distinguish a named empty
+directory from a missing one; it reports `NotFound` for a named path with no
+contents, the same answer a native `read_dir` gives for a missing directory.
+`path.join` also keeps the drive or UNC prefix when a later part is rooted but
+has no prefix of its own, matching `std::path::PathBuf::push`. The in-memory
+filesystem's missing-path errors carry no path in their own text, because the
+caller prefixes it once; the same sentence therefore reads the same in both
+builds.
+
+`path.resolve` needs a working directory, which `wasm32-unknown-unknown` does
+not have. The playground refuses it with an `IoError` that names the platform
+rather than answering a path that depends on a host it cannot see; the native
+build is unchanged.
+
+This run is the resumed continuation of that work. It finishes the path-value
+routing for `bytes.write`, adds the missing integration coverage for
+`append`/`delete`/`copy`/`rename` with path values, and records the phase-100
+delivery commit in the unreviewed-work acknowledgement rule.
+
+The final resume closes the last Windows join rule and restores the config
+contract. A part that carries a drive but no root, such as `D:other`, now
+replaces the whole path before it, matching `std::path::PathBuf::push`; before
+this change it was appended as if it were an ordinary relative part. A
+top-level `provider` block merged by a config commit broke 18 pre-existing
+`agent_permissions_test` checks, so this run removes it; the project config
+declares only `$schema` and `agent`, as its own contract requires. The two new
+integration tests exercise `path.list` with a path value (sorted, empty, spaced
+and non-ASCII names) and its refusal to list a file.
+
+The review round pins two playground promises that were only implicit. The
+`path.resolve` refusal is now a helper the host build also compiles under
+`test`, so its `Unsupported` kind and platform-naming message are asserted by
+`cargo test` instead of living in a wasm-only arm nobody compiles. The
+in-memory listing splits only on `/`, because that is the playground's
+separator: a backslash stays an ordinary filename character, so a file written
+as `a\b.txt` is listed by that whole name rather than truncated to `a`.
+
+The second review round closes three path edge cases. The in-memory directory
+prefix now drops `.` segments, so `path.list("./data")` lists the file
+`files.write("data/x.txt", …)` stored, instead of asking for a literal `./data/`
+prefix no key carries. `path.join` keeps the separator on a UNC share root such
+as `\\server\share\`, because trimming it leaves a prefix with no root. And
+`path.resolve` refuses a Windows prefix without a root, such as `C:foo`, rather
+than joining it to the working directory and answering a path that is still
+relative.
+
+| File | Lines | What |
+|---|---|---|
+| `src/path.rs` | +344 −0 | path value, `text_of`, `join`, `join_with_separator`, `parent`, `filename`, `stem`, `extension`, `is_absolute`, lexical `resolve`, `list`, the eight `path.*` builtin arms, and three unit tests |
+| `src/runtime.rs` | +52 −25 | `path_*` dispatch, path-object property access and hashing, `files.*` accepting text or path values, and `bytes.write` accepting a path value |
+REPORT.md
+[0m
+[0m$ [0mrg -n "fn both_engines|struct TempDir|impl TempDir|fn run_source_value|fn redblue_text|fn memory_filesystem" tests/stdlib_modules_test.rs tests/wasm_test.rs tests/common -g '*.rs'
+tests/stdlib_modules_test.rs:20:struct TempDir {
+tests/stdlib_modules_test.rs:24:impl TempDir {
+tests/stdlib_modules_test.rs:104:fn redblue_text(value: &str) -> String {
+tests/stdlib_modules_test.rs:1007:fn both_engines(source: &str) -> Vec<String> {
+tests/wasm_test.rs:1361:fn memory_filesystem() -> std::sync::MutexGuard<'static, ()> {
+[0m
+[0m$ [0msed -n '1,160p' tests/stdlib_modules_test.rs
+//! The `files`, `json`, `csv` and `network` modules must be testable and total.
+//!
+//! Every filesystem test runs against a temp directory of its own under
+//! `target/tmp`, so the suite is deterministic and never writes outside the
+//! checkout. Nothing here performs a successful network request: the one test
+//! that opens a socket asserts the *absence of a hang*, and the rest check
+//! argument handling, which never reaches the network.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use redblue::bytecode::compile_source;
+use redblue::bytecode::vm::BytecodeVm;
+use redblue::{run_source_value, Error, Value, NETWORK_CONNECT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS};
+
+/// One test's private directory under `target/tmp/phase014`.
+///
+/// Removed before it is created, so a directory left behind by an interrupted
+/// run cannot make the next run of the same test see stale files.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    #[track_caller]
+    fn new(name: &str) -> TempDir {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp/phase014")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|e| panic!("{} should be creatable: {}", path.display(), e));
+        TempDir { path }
+    }
+
+    /// A path inside this directory. The name is used verbatim, so a test can
+    /// ask for a name with a space in it.
+    fn file(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+
+    /// The path as a Redblue text literal.
+    fn literal(&self, name: &str) -> String {
+        redblue_text(&self.file(name).to_string_lossy())
+    }
+
+    /// Writes `content` to `name` and returns the path.
+    #[track_caller]
+    fn write_file(&self, name: &str, content: &str) -> PathBuf {
+        let path = self.file(name);
+        std::fs::write(&path, content)
+            .unwrap_or_else(|e| panic!("{} should be writable: {}", path.display(), e));
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Lexes and parses `source`.
+#[track_caller]
+fn parse(source: &str) -> redblue::parser::Program {
+    let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
+    redblue::parser::parse(tokens).expect("source should parse")
+}
+
+/// Runs `source` and returns the value of its last statement, which is why
+/// every source below ends in a bare expression and never in `say`.
+#[track_caller]
+fn eval(source: &str) -> Value {
+    let (_vm, result) = redblue::run_isolated(&parse(source));
+    result.unwrap_or_else(|error| panic!("source should have run, failed with {:?}", error))
+}
+
+/// Runs `source` and returns the error it produced.
+#[track_caller]
+fn eval_err(source: &str) -> Error {
+    let (_vm, result) = redblue::run_isolated(&parse(source));
+    result.expect_err("source should have failed")
+}
+
+/// Asserts `source` fails with a `Runtime` error whose message contains `part`.
+#[track_caller]
+fn assert_runtime_error(source: &str, part: &str) {
+    match eval_err(source) {
+        Error::Runtime(message, span) => {
+            assert!(
+                message.contains(part),
+                "expected a message containing `{}`, got `{}`",
+                part,
+                message
+            );
+            assert!(span.is_known(), "failed without a source span");
+        }
+        other => panic!("expected a Runtime error, got {:?}", other),
+    }
+}
+
+/// A Redblue text literal holding `value`, with `\` and `"` escaped for the
+/// lexer, so a path with a space or a quote in it is still one literal.
+fn redblue_text(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A list of text cells, for comparing what `csv.parse` produced.
+fn cells(fields: &[&str]) -> Value {
+    Value::list(
+        fields
+            .iter()
+            .map(|f| Value::Text((*f).to_string()))
+            .collect(),
+    )
+}
+
+/// Rows of cells, for comparing what `csv.parse` produced.
+fn rows(expected: &[&[&str]]) -> Value {
+    Value::list(expected.iter().map(|r| cells(r)).collect())
+}
+
+// ---------------------------------------------------------------- files
+
+/// `files.write` then `files.read` against a temp directory: the round trip
+/// returns what was written, and the file is on disk.
+#[test]
+fn files_write_then_read_round_trips_in_a_temp_dir() {
+    let dir = TempDir::new("files-round-trip");
+    assert_eq!(
+        eval(&format!(
+            "files.write({}, {})",
+            dir.literal("note.txt"),
+            redblue_text("hello\nworld")
+        )),
+        Value::Nothing,
+        "files.write answers nothing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.file("note.txt")).expect("file should exist"),
+        "hello\nworld",
+        "files.write must write exactly its argument"
+    );
+    assert_eq!(
+        eval(&format!("files.read({})", dir.literal("note.txt"))),
+        Value::Text("hello\nworld".to_string()),
+        "files.read must read back what files.write wrote"
+    );
+}
+
+/// An empty file is an empty text, not a missing file and not an error.
+[0m
+[0m$ [0msed -n '990,1060p' tests/stdlib_modules_test.rs
+);
+}
+
+// The `path` module, kept beside the `files` tests it has to agree with.
+
+/// The text a value prints as, which is how a path value is read at the
+/// language boundary.
+fn text(value: Value) -> String {
+    value.to_string()
+}
+
+/// Runs `source` and answers the value it handed back.
+fn answered(source: &str) -> Value {
+    run_source_value(source).unwrap_or_else(|error| panic!("{source}: {error}"))
+}
+
+/// Runs `source` on both engines and asserts they printed the same lines.
+fn both_engines(source: &str) -> Vec<String> {
+    let (mut walker, outcome) = redblue::run_isolated(
+        &redblue::parser::parse(
+            redblue::lexer::Lexer::tokenize(source).unwrap_or_else(|e| panic!("{source}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("{source}: {e}")),
+    );
+    outcome.unwrap_or_else(|e| panic!("the walker refused:\n{source}\n{e}"));
+
+    let chunk = compile_source(source).unwrap_or_else(|e| panic!("{source}: {e}"));
+    let mut vm = BytecodeVm::new();
+    vm.set_echo(false);
+    vm.run(&chunk)
+        .unwrap_or_else(|e| panic!("the bytecode VM refused:\n{source}\n{e}"));
+
+    let walked = walker.take_output();
+    let compiled = vm.take_output();
+    assert_eq!(walked, compiled, "the two engines disagree:\n{source}");
+    walked
+}
+
+#[test]
+fn path_join_uses_the_platform_separator() {
+    let expected = format!("a{}b", std::path::MAIN_SEPARATOR);
+    let value = answered(r#"path.join("a", "b")"#);
+    assert_eq!(text(value), expected);
+}
+
+#[test]
+fn edge_the_separator_is_the_platforms_not_a_hardcoded_slash() {
+    use redblue::path::join_with_separator;
+
+    let posix = join_with_separator(&["a", "b"], '/');
+    let windows = join_with_separator(&["a", "b"], '\\');
+    assert_eq!(posix, "a/b");
+    assert_eq!(windows, "a\\b");
+    assert_ne!(
+        posix, windows,
+        "a test that cannot tell the two separators apart cannot catch a Windows path bug"
+    );
+
+    let platform = join_with_separator(&["a", "b"], std::path::MAIN_SEPARATOR);
+    assert_eq!(
+        platform,
+        format!("a{}b", std::path::MAIN_SEPARATOR),
+        "the join did not take its separator from the platform"
+    );
+    assert_eq!(
+        text(answered(r#"path.join("a", "b")"#)),
+        platform,
+        "the language's join does not use the platform separator"
+    );
+}
+[0m

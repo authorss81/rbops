@@ -1,0 +1,27 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/path.rs
+[0m→ [0mRead src/vfs.rs
+[0m✱ [0mGrep "path|Path|OBJECT_NAME|type_name|type_of|hash"[90m in src · 100 matches[0m
+[0m✱ [0mGrep "path|Path|type_name|fn equals|fn hash|Object"[90m in src · 22 matches[0m
+[0m→ [0mRead src/value.rs[90m [offset=380, limit=260][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=70, limit=40][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3075, limit=150][0m
+[0m✱ [0mGrep "path_|path\.|path::|path value|path_value|drive_relative|unc|resolve|list"[90m in tests · 100 matches[0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1, limit=80][0m
+[0m✱ [0mGrep "fn (path_|edge_|files_)|path\.|path::"[90m in tests · 100 matches[0m
+[0m✱ [0mGrep "fn |path\.|resolve|list"[90m in tests · 75 matches[0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1029, limit=320][0m
+FINDINGS:
+1. [MAJOR] src/vfs.rs:289 — the in-memory `read_dir` returns `NotFound` whenever the key prefix yields no names, so a directory that became logically empty (write a file, then `files.delete` it, then `path.list("data")`) is reported as missing, while the native filesystem still has the directory and returns `[]`; this directly contradicts the new SPEC.md/README promise that "an empty directory is an empty list rather than an error" and the report's claim that both engines answer alike. Traced: `directory_prefix("data")` returns `"data/"`, `names.is_empty() && !prefix.is_empty()` then hits `Err(not_found())`. Fix: remember directory names in the memory store (or a directory marker) so an emptied directory still exists, and add the write→delete→list test; otherwise narrow SPEC.md and README.md to state the playground reports `NotFound` there. VERIFIED: traced `src/vfs.rs:268-291` and the report's own "Known gaps" admission.
+
+2. [MAJOR] src/vfs.rs:327-350 — `directory_prefix` drops only `"."` components, not `".."`, and `memory::write`/`write_bytes` (src/vfs.rs:160-171) store the raw spelling, so the playground's listing/existence disagrees with native for normal host paths: after `files.write("data/x.txt", …)`, `path.list("data/../data")` is `NotFound` in the playground but lists `x.txt` natively; after `files.write("data//x.txt", …)`, `path.list("data")` is `NotFound` because `rest` is `"/x.txt"` and `split('/').next()` is `""` (src/vfs.rs:273-286), while native collapses the double separator and lists `x.txt`. The module header at src/vfs.rs:118-120 claims the two builds "agree by construction", and the report's matrix claims dot segments are pinned, but only `"."` and `path.resolve` are tested. Fix: normalize both stored keys and query prefixes (`.`/`..`, duplicate, and trailing separators) or explicitly reject those spellings, then add `..` and doubled-separator listing tests.
+
+3. [MINOR] src/vfs.rs:262 — the memory filesystem decides "file, not directory" only by an exact key match (`files.contains_key(path)`), so a file addressed as `"data/"` or `"./data"` produces `NotFound` instead of the native `NotADirectory`; `edge_listing_a_file_path_value_is_an_io_error` (tests/stdlib_modules_test.rs:1234) asserts only `error.label() == "IoError"`, so this divergence is unpinned. Fix: resolve the same prefix for the file check and assert the `NotADirectory` kind for the trailing-separator spelling, or document that only the error class is promised.
+
+4. [MINOR] src/path.rs:305-333 — the new Windows-only refusal path is not exercised on the gate platform: `has_prefix_without_root` and its `#[cfg(windows)]` test never compile on Linux, and `edge_the_playground_refuses_resolve_without_a_working_directory` calls `no_working_directory()` directly instead of asserting that the wasm `resolve` arm returns it. The claim in REPORT.md that `cargo test` asserts the playground's promise therefore covers the message helper, not the wiring. Fix: extract a target-independent `resolve_with(text, is_absolute, current_dir)` seam (or test the stale-prefix predicate with a simulated separator) so both the refusal and its use are runnable on the host.
+
+5. [STYLE] src/path.rs:75-79,105-117 — the doc comment still says only "an absolute part discards everything joined before it", but the new branch also clears the joined path for a Windows prefix-without-root part (`D:other`, and `\\server\share`), which is not absolute; SPEC.md's added sentence names only the drive form, not the UNC form the code implements, and the module header example `path.join("a", "b") is "a/b"` (src/path.rs:14) is POSIX-only on a module whose whole point is platform awareness. Fix: state the prefix-without-root rule in both places and make the example separator-neutral.
+
+REVIEW VERDICT: FINDINGS 5
