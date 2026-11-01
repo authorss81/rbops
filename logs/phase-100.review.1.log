@@ -3,22 +3,24 @@
 [0m
 [0m→ [0mRead src/path.rs
 [0m→ [0mRead src/vfs.rs
-I'll inspect the core new files and the config/test that the phase claims justify the config change.
-[0m→ [0mRead opencode.json
 [0m→ [0mRead src/value.rs
-[0m✱ [0mGrep "path|Path|text_of|hash|Hash|Ord|PartialEq"[90m in src/runtime.rs · 100 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=200][0m
-[0m✱ [0mGrep "path_|text_of|is_path|OBJECT_NAME|Value::Object|hash|Hash|BTreeMap|IndexMap"[90m 100 matches[0m
-[0m→ [0mRead tests/agent_permissions_test.rs
-[0m→ [0mRead src/runtime.rs[90m [offset=3060, limit=180][0m
-[0m✱ [0mGrep "provider|headerTimeout|chunkTimeout|baseURL|OPENCODE_API_KEY"[90m 4 matches[0m
-[0m→ [0mRead tests/doc_blocks_test.rs[90m [limit=220][0m
-[0m→ [0mRead tests/doc_blocks_runs.txt[90m [offset=55, limit=30][0m
+[0m✱ [0mGrep "path|text_of|is_path|bytes_write|files_"[90m 63 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3070, limit=150][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=4200, limit=90][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=40, offset=70][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=60, offset=1710][0m
+[0m✱ [0mGrep "fn hash|impl Hash|hasher|value_hash|hash_value"[90m 10 matches[0m
+[0m✱ [0mGrep "fn edge_|fn .*path|assert|expect|\.\.|IsADirectory|NotADirectory"[90m 100 matches[0m
+[0m✱ [0mGrep "fn .*path|fn edge_|path\.list|assert!|assert_eq!"[90m 100 matches[0m
+[0m→ [0mRead tests/wasm_test.rs[90m [offset=600, limit=400][0m
+[0m→ [0mRead tests/wasm_test.rs[90m [limit=340, offset=1226][0m
+[0m✱ [0mGrep "fn (path|edge_).*path|fn edge_listing|fn edge_the_in_memory|fn files_accept|fn edge_bytes_write|fn path_"[90m 15 matches[0m
 FINDINGS:
-1. [MAJOR] tests/doc_blocks_runs.txt:65 — The uncommitted SPEC edit adds two net lines (`SPEC.md:1338-1342`, the new Windows drive-relative sentence) *before* every SPEC block anchored from `SPEC.md:1370` onward, but no uncommitted change re-anchors `tests/doc_blocks_runs.txt`, `doc_blocks_fragments.txt`, or `doc_blocks_known_fail.txt`. The harness keys blocks by the current opening-fence line (`tests/doc_blocks_test.rs:92-94`) and matches rows by `doc:line` (`tests/doc_blocks_test.rs:14`), so those rows now point at prose rather than a fence and the later blocks become unclassified. This contradicts the REPORT's "2413 passed" gate claim. Note the committed anchors also look suspicious: the committed SPEC inserts ~33 lines yet the committed data-file anchors move by only +2, so even HEAD may be mis-anchored. Fix: regenerate/re-anchor all three data files against the working tree (or fold the new sentence into existing lines), then actually run `tests/doc_blocks_test.rs`. VERIFIED: traced the insertion location and the exact-key match; not executed, and the +33-vs-+2 anomaly is what would settle whether HEAD or only the working tree is wrong.
 
-2. [MAJOR] src/path.rs:280-287 — The `#[cfg(target_arch = "wasm32")]` `resolve` refusal (the `IoError` that "names the platform") has no test. `cargo test --all-targets` on the host compiles only the non-wasm arm, and the REPORT's wasm test list covers only directory listing. The playground behavior that SPEC.md now promises is therefore unpinned and could fail to compile on wasm without any gate noticing. Fix: add a wasm-target test (or a cfg-independent helper asserted natively) for the refusal text/kind, plus a wasm compile gate.
+1. [MAJOR] src/vfs.rs:366 — `file_key` accepts any normalized non-empty key, so a directory spelling such as `data/.` or `data/sub/..` normalizes to the implied-directory key `data` and is written as a file; native `std::fs::write("data/.", …)` returns `EISDIR`/`ENOENT`. `REPORT.md` claims such spellings are refused, but the only test (`tests/wasm_test.rs:1362`) exercises `data/..`, which normalizes to empty, not `data/.`. — Fix: after `normalize`, reject a key that is an implied directory (any stored key starts with `key + "/"`), or reject spellings whose final component is `.`/`..` and collapses onto a directory; add a `memory::write("data/.", …)` `IsADirectory` test. — Traced: `normalize` (src/vfs.rs:340-352) returns `"data"`, and `file_key` (src/vfs.rs:367-374) only rejects `""` and `"/"`.
 
-3. [MINOR] src/vfs.rs:279 — The in-memory `read_dir` splits the first path component on both `'/'` and `'\\'` on every target. On wasm the separator is `'/'` and `path.join` deliberately does not fold backslashes there (`src/path.rs:98-102`), so a file written as `"a\\b.txt"` is listed as `"a"` instead of `"a\\b.txt"`. Fix: split only on the platform separator (or `MAIN_SEPARATOR`) so a backslash remains an ordinary filename character on wasm, matching the module's own documented POSIX rule.
+2. [MAJOR] src/path.rs:207 — `windows_prefix_len` detects a UNC prefix only when the text starts with two backslashes (`strip_prefix("\\\\")`), so a forward-slash UNC spelling like `//server/share` is treated as having no prefix. `has_prefix_without_root` (src/path.rs:312-315) therefore returns false, and on Windows `resolve` (src/path.rs:280-293) falls through to `current_dir().join(...)`, returning a path that is still relative instead of the documented `InvalidInput` refusal. The new test at src/path.rs:555-563 asserts `!has_prefix_without_root("//server/share")`, pinning the wrong expectation: on Windows `Path::new("//server/share").is_absolute()` is false because it is a prefix without a root. — Fix: recognize UNC prefixes with either separator in `windows_prefix_len` and correct that test. — Not run on Windows; traced through the exact functions.
+
+3. [MINOR] src/vfs.rs:343-349 — a leading `..` on a relative path is pushed literally, so `files.write("../x", …)` stores key `"../x"`, and `path.list(".")` then reports `".."` as an entry (src/vfs.rs:293), which native `read_dir(".")` never does. `REPORT.md`'s known gap says a leading `..` “names nothing,” but it is writable and observable in a listing. — Fix: refuse a leading `..` on the flat filesystem or exclude `..` from listing names, and add a test.
 
 REVIEW VERDICT: FINDINGS 3

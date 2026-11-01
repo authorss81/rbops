@@ -2,23 +2,5 @@
 > reviewer · deepseek-v4.1-flash-free
 [0m
 [0m→ [0mRead src/path.rs
+I'll inspect the key changed files, starting with the new path module and the vfs changes.
 [0m→ [0mRead src/vfs.rs
-[0m✱ [0mGrep "path|object_text|text_of|is_path"[90m in src/runtime.rs · 100 matches[0m
-[0m✱ [0mGrep "OBJECT_NAME|type_name|object_text|fn eq|fn hash|Value::Object"[90m in src/value.rs · 71 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=60, limit=60][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=1590, limit=180][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=4225, limit=70][0m
-[0m→ [0mRead src/value.rs[90m [offset=400, limit=240][0m
-[0m✱ [0mGrep "path\.|path_|edge_listing|files_accept|bytes_write|path::"[90m in tests/stdlib_modules_test.rs · 100 matches[0m
-[0m✱ [0mGrep "path|MODULES|MODULE_MEMBERS|bytes.write|bytes_write"[90m in src/stdlib.rs · 100 matches[0m
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [limit=260, offset=1020][0m
-[0m✱ [0mGrep "path|read_dir|listing|backslash|empty"[90m in tests/wasm_test.rs · 100 matches[0m
-FINDINGS:
-
-1. [MAJOR] src/vfs.rs:326 — `directory_prefix` special-cases only the exact strings `.` and `./`; any other dot-relative spelling is used literally as a key prefix. So after `files.write("data/x.txt", "x")` in the wasm playground, `path.list("./data")` takes the prefix `"./data/"` at src/vfs.rs:333, matches no stored key at src/vfs.rs:273, and falls into the `names.is_empty() && !prefix.is_empty()` branch at src/vfs.rs:289 returning `NotFound`, while native `read_dir("./data")` lists `x.txt` and `files.exists("./data")` is true natively. This contradicts the module's own note at src/vfs.rs:97-101 that `./modules/Foo.rb` "is a second name for that same file which the map has never heard of" and that `rooted` strips `./`; `path::list` (src/path.rs:321) passes the raw text straight to `vfs::read_dir`. Fix: normalize a leading `./` (and `.` segments) in `memory::directory_prefix`, or route `path.list` through the same normalization as `vfs::rooted`, and add a wasm test writing `data/x.txt` then listing `./data`. Checked by tracing `read_dir`/`directory_prefix`; I did not run the wasm target.
-
-2. [MINOR] src/path.rs:162 — `root_with` recognises a drive root (`C:\`) and a bare separator run, but not a UNC share root. `join_with_separator(&["\\\\server\\share\\"], '\\')` misses the drive-relative branch (the byte after the UNC prefix is `\`), misses `root_with`, then the trailing-separator trim at src/path.rs:130-132 removes the final `\`, so the result is `"\\\\server\\share"` — a prefix with no root — and `path.is_absolute` of the result answers `no` even though the input was absolute. Drive roots are preserved (src/path.rs:416-424 tests only that case), so this is an untested asymmetry. Fix: add a UNC-root arm to `root_with` that keeps the trailing separator, plus a unit test.
-
-3. [MINOR] src/path.rs:266 — `resolve` documents "Makes `text` absolute against the working directory", but a Windows drive-relative input such as `"C:foo"` is not made absolute: `Path::new("C:foo").is_absolute()` is false, so it goes through `std::env::current_dir()?.join(path)` at src/path.rs:271; `PathBuf::push` sees the `C:` prefix and truncates to `"C:foo"`, and `normalize` (src/path.rs:302-318) preserves it, so `path.is_absolute(path.resolve("C:foo"))` is `no`. Fix: detect a prefix-without-root (reuse `windows_prefix_len`) and either resolve it against that drive's working directory or refuse it with a clear error; add a `cfg(windows)` test.
-
-REVIEW VERDICT: FINDINGS 3
