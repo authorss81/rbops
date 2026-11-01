@@ -1,25 +1,23 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/vfs.rs
 [0m→ [0mRead src/path.rs
-[0m✱ [0mGrep "path|OBJECT_NAME|object_text|text_of"[90m in src/runtime.rs · 100 matches[0m
-[0m✱ [0mGrep "path"[90m in src/value.rs · 100 matches[0m
-[0m✱ [0mGrep "path_join|OBJECT_NAME|object_text|is_path|path::"[90m in src/runtime.rs · 93 matches[0m
-[0m✱ [0mGrep "OBJECT_NAME|object_text|path::|type_name"[90m in src/value.rs · 100 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3070, limit=220][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=1715, limit=60][0m
-[0m→ [0mRead src/value.rs[90m [offset=300, limit=140][0m
-[0m→ [0mRead src/value.rs[90m [offset=520, limit=120][0m
-[0m✱ [0mGrep "fn edge_the_in_memory_filesystem_refuses_a_file_named_through_dot_segments_as_a_directory|fn edge_a_trailing_separator_names_a_directory_for_files|fn edge_the_in_memory_filesystem_folds_dot_and_parent_segments_for_files"[90m in tests/wasm_test.rs · 3 matches[0m
-[0m✱ [0mGrep "files\.write\(\"[^\"]*/\.[^\"]*\"|\./\"|note/\.|data/\.|sub/\.\.|/\.\""[90m in tests/wasm_test.rs · 19 matches[0m
-[0m→ [0mRead tests/wasm_test.rs[90m [offset=1335, limit=55][0m
+[0m→ [0mRead src/vfs.rs
+[0m✱ [0mGrep "path_normalize|path\.normalize|normalize"[90m in src · 57 matches[0m
+[0m✱ [0mGrep "path_normalize|path\.normalize|normalize"[90m in tests · 21 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=125, limit=30][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3060, limit=45][0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1300, limit=85][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=20, offset=520][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=20, offset=1343][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=18, offset=1618][0m
+[0m→ [0mRead tests/doc_blocks_runs.txt
+[0m→ [0mRead tests/doc_blocks_known_fail.txt
+[0m→ [0mRead tests/doc_blocks_fragments.txt
+[0m→ [0mRead opencode.json
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [limit=70, offset=900][0m
 FINDINGS:
+1. [MINOR] tests/stdlib_modules_test.rs:1322 — `path_normalize_keeps_a_relative_path_relative` hardcodes `"a/c"` as the expected answer to `path.normalize("a/./b/../c")`, but the implementation (`src/path.rs:373-383`, via `Path::components`/`to_string_lossy`) emits the platform separator. On Windows the same call answers `a\c`, so this new test fails on a platform the phase explicitly claims to support; the sibling tests at lines 1339-1343 and 1361-1364 correctly use `MAIN_SEPARATOR`, which shows the intent. Fix: build the expected text with `std::path::MAIN_SEPARATOR`. Could not run (read-only), but the output spelling is fixed by `Path::components` + `to_string_lossy`.
+2. [MINOR] tests/stdlib_modules_test.rs:1349-1356 — `edge_normalize_a_parent_segment_above_a_root_stays_at_the_root` passes only the bare root (`"/"` or `"C:\"`) to `path.normalize`, with no `..` anywhere in the input. It therefore pins nothing about `..` climbing above a root, despite its name and the REPORT's test table claiming it does. The behavior is only covered by the unit test at `src/path.rs:664-668`, not by the both-engines integration path this test is meant to exercise. Fix: pass `format!("{root}..")` (and assert the result equals `root`).
 
-1. [BLOCKER] src/vfs.rs:382 — `file_key` decides a path “names a directory” only from `path.ends_with('/')`, so a dot-spelled directory on a file is lost by `normalize` and the operation lands on the file. `files.write("note/.", …)` overwrites `note`, `files.read("note/.")` reads it, and `files.delete("note/.")` deletes it; a native `std::fs` call with the same text is `NotADirectory`. The same fall-through affects `append`, `copy` and `rename` because they all share `file_key`. — Why it matters: this is silent data replacement/deletion in the playground for a spelling native rejects, contradicting the phase’s central “both builds agree” invariant, and it is exactly the trailing-separator class the resume claims to close. — Fix: have `file_key` detect that the original path ended in `.`/`..` (or that `normalize` dropped a final component), and treat that as `names_directory` just like a trailing `/`; add a test `note/.` on an existing file for read/write/delete/copy/rename. — VERIFIED: traced `normalize` at src/vfs.rs:349-370 (folds `note/.` to `note`) and `file_key` at src/vfs.rs:380-403 (`names_directory = path.ends_with('/')` at 382, then falls through to `Ok(key)` at 402); native `std::fs::write("note/.")` returns ENOTDIR/`NotADirectory`.
-
-2. [MAJOR] src/vfs.rs:212 and src/vfs.rs:235 — `exists` and `is_file` have the same gap: they only consult `path.ends_with('/')`, so `files.exists("file.txt/.")` returns `yes` and `is_file("file.txt/.")` returns `yes`, while native `Path::exists` and `Path::is_file` return false because `file.txt` is not a directory. — Why it matters: programs branch on these predicates, and the two builds now disagree for a spelling the phase explicitly normalized for. — Fix: distinguish “the original path asked for a directory” (trailing `/` or a final `.`/`..`) in one helper used by `exists`, `is_file`, and `file_key`; add the missing cases to `edge_a_trailing_separator_does_not_name_a_file`. — Checked by reading src/vfs.rs:208-242; no existing test pins the dot-spelled case (the test at tests/wasm_test.rs:1362 uses `data/.` only when `data` is an implied directory).
-
-3. [MINOR] src/vfs.rs:306 — the in-memory `read_dir` treats `/` like any named directory: an empty store (or a store holding only relative keys) makes `path.list("/")` return `NotFound`, while the native `read_dir("/")` succeeds because the root always exists. The working directory was special-cased (`.`, `./`), but the root was not. — Why it matters: `path.list` is the new surface, and this is an uncovered platform divergence in an edge case the report’s matrix claims is handled. — Fix: return the listing (or an empty listing) for key `/` rather than `NotFound`, and add a wasm test for `path.list("/")` on an empty store.
-
-REVIEW VERDICT: FINDINGS 3
+REVIEW VERDICT: FINDINGS 2
