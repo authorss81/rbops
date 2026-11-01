@@ -2,5 +2,24 @@
 > reviewer · deepseek-v4.1-flash-free
 [0m
 [0m→ [0mRead src/path.rs
-I'll inspect the key changed files, starting with the new path module and the vfs changes.
+I'll inspect the core new code and the in-memory filesystem changes first.
 [0m→ [0mRead src/vfs.rs
+[0m✱ [0mGrep "path|text_of|is_path|OBJECT_NAME"[90m in . · 57 matches[0m
+[0m✱ [0mGrep "path|type_name|Object"[90m in . · 22 matches[0m
+[0m✱ [0mGrep "fn edge_|fn path_|fn files_|read_dir|note/\.\.|\.\."[90m in . · 84 matches[0m
+[0m→ [0mRead tests/wasm_test.rs[90m [offset=1440, limit=300][0m
+[0m→ [0mRead tests/wasm_test.rs[90m [limit=130, offset=1330][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=160, offset=3070][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=80, offset=3640][0m
+[0m→ [0mRead src/value.rs[90m [limit=235, offset=415][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=55, offset=1715][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=55, offset=4235][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=25, offset=78][0m
+[0m✱ [0mGrep "path|MODULES|MODULE_MEMBERS|BUILTIN_NAMES"[90m in . · 74 matches[0m
+[0m→ [0mRead tests/wasm_test.rs[90m [limit=55, offset=1252][0m
+FINDINGS:
+1. [BLOCKER] src/vfs.rs:293 — `read_dir` never validates a `..` component before folding it. `normalize` at :294 rewrites `missing/..` to `""` and `file.txt/..` to the parent key, then :302–:324 lists whatever sits under that key. So in the playground `path.list("missing/..")` returns the current directory (or `[]`) instead of `NotFound`, and `path.list("file.txt/..")` returns the parent's entries instead of `NotADirectory`. Native `std::fs::read_dir("file.txt/..")` returns `ENOTDIR` and `read_dir("missing/..")` returns `ENOENT`. This is exactly the traversal check that `exists` (:214) and `file_key` (:421) were given, but `read_dir` was missed, so the two engines disagree for a user-reachable `path.list` spelling. — VERIFIED: traced `read_dir` at :293; `normalize` :358–386 pops `missing`/`file.txt` on `..`; the loop at :304–:319 has no `parent_before_final_dotdot` guard, unlike `exists` :214 and `file_key` :421. Concrete fix: call the same `parent_before_final_dotdot`/implied-directory check in `read_dir` before building the prefix, returning `not_found()`/`not_a_directory()` as `file_key` does.
+
+2. [MAJOR] src/vfs.rs:418 — `file_key` only checks the component before a *final* `..` (`parent_before_final_dotdot` at :421); `normalize` at :419 folds every `..` lexically. A spelling such as `files.write("data/top.txt/../x.txt", …)` where `data/top.txt` is a file therefore writes `data/x.txt`, while native `std::fs` refuses the path with `ENOTDIR` because `top.txt` is not a directory. The same applies to `read_to_string`, `remove_file`, `copy`, `rename`, and to `exists` (:209/:214), which answers `yes` for `data/top.txt/../x.txt` when `data/x.txt` exists even though native `Path::exists` is false. This is a silent-success/parity regression, not merely a lexical difference, and no test in `tests/wasm_test.rs` covers a `..` that traverses a stored *file* (the folding tests at :1260/:1305 traverse implied directories). — Concrete fix: validate every original component preceding a `..` (not just the last one) against the store, returning `not_a_directory()` when it is a stored file and `not_found()` when it has no children. What would settle it: a native test asserting `std::fs` returns `NotADirectory` for a file-intermediate `..` on the CI platform.
+
+REVIEW VERDICT: FINDINGS 2
