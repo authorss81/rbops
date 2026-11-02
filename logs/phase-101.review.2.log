@@ -1,30 +1,30 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "fn (text_utility_builtin|text_utility_width|wrap_text|unified_diff|dedent_text|template_text|pad_text|align_text|diff_line|text_utility_error)"[90m 10 matches[0m
-[0m✱ [0mGrep "TEXT_UTILITY|MAX_|1_000_000|4_000_000|try_reserve"[90m 9 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=960, limit=620][0m
-[0m✱ [0mGrep "module_has_member|format!\("\{\}_\{\}"|text_wrap|builtin\(|Value::Builtin"[90m 100 matches[0m
-[0m→ [0mRead tests/text_utilities_test.rs
-[0m→ [0mRead src/stdlib.rs[90m [offset=1760, limit=300][0m
+[0m✱ [0mGrep "fn text_(wrap|diff|dedent|template|pad|align)|is_module_only_builtin|MODULE_ONLY|text_wrap|text_diff"[90m in src/stdlib.rs · 13 matches[0m
+[0m✱ [0mGlob "tests/text_utilities_test.rs"[90m 1 match[0m
+[0m✱ [0mGrep "fn (wrap_text|diff_text|dedent_text|template_text|pad_text|align_text|text_wrap|text_diff)|wrap_text|diff_text|dedent_text|template_text|pad_text|align_text"[90m in src/stdlib.rs · 10 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=960, limit=80][0m
+[0m✱ [0mGrep "fn unified_diff|fn text_utility_width|fn text_utility_error|fn diff_lines|MAX_|4_000_000|1_000_000"[90m in src/stdlib.rs · 100 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1040, limit=120][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1157, limit=280][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1340, limit=240][0m
+[0m→ [0mRead tests/text_utilities_test.rs[90m [limit=800][0m
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead tests/stdlib_gap_survey_test.rs
-[0m✱ [0mGrep "text_wrap|text_diff|text_dedent|text_template|text_pad|text_align"[90m 6 matches[0m
-[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=640, limit=110][0m
-[0m✱ [0mGrep "fn (format_value|display|to_string)|impl .*Display for Value|Value::Text\(text\) =>"[90m 2 matches[0m
-[0m✱ [0mGrep "is_alphanumeric|'_'|underscore|is_identifier"[90m 2 matches[0m
+[0m✱ [0mGrep "text_utility_builtin|is_module_only_builtin|BUILTIN_NAMES|fn module_has_member|text_utility"[90m in src · 43 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1780, limit=100][0m
+[0m✱ [0mGrep "Value::Builtin|fn is_builtin|fn builtin\(|is_builtin\("[90m in src/interpreter.rs · 99 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1755, limit=30][0m
+[0m✱ [0mGrep "text_(wrap|diff|dedent|template|pad|align)"[90m in tests · 14 matches[0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=655, limit=75][0m
 FINDINGS:
 
-1. [BLOCKER] src/stdlib.rs:1192 — `text.diff` refuses two **identical** texts when they exceed the cell cap, instead of answering the empty text that SPEC.md promises. `unified_diff` builds the line table and returns `Err` at the `if cells > MAX_DIFF_CELLS` check (line 1192) **before** it reaches the identical-text shortcut at line 1238 (`if steps.iter().all(... Equal ...) { return Ok(String::new()); }`). `text.diff(old, old)` with 3000 identical lines gives `cells = 3001*3001 = 9_006_001 > 4_000_000`, so it errors. SPEC.md:1277 says "Identical texts answer the empty text" with no size exception. Fix: compare `old == new` and return `Ok(String::new())` at the top of `unified_diff`, before the cap check. — VERIFIED: traced `src/stdlib.rs:1184-1201` (cap returns `Err`) against `src/stdlib.rs:1238-1240` (equality shortcut), and computed `cells` for 3000 lines each.
+1. [MAJOR] src/interpreter.rs:2666 (and src/bytecode/vm.rs:2886) — the new gate `if !from_module && stdlib::is_module_only_builtin(name)` runs before any user-function lookup, and `is_module_only_builtin` (src/stdlib.rs:1790) is an unconditional match on `text_wrap`/`text_diff`/`text_dedent`/`text_template`/`text_pad`/`text_align`. A user program that declares `to text_wrap(...)` (these are legal identifiers, like the existing `starts_with`/`random_seed` names) can no longer call it: the call is refused as `Unknown function 'text_wrap'` even though the declaration exists. Before phase-101 those names were not reserved, so this is a regression in the user-name surface introduced solely by the internal storage name. Fix: give the six internal builtins unspellable names (the existing `LRU_CACHE_DECLARE`/`\0` convention in src/stdlib.rs:1859) or have the gate run only after confirming no declared function/binding of that name exists. VERIFIED: traced the path — `Vm::call` reaches the guard at interpreter.rs:2666 before `builtin`/user-function resolution, and `is_module_only_builtin` has no declaration check.
 
-2. [MAJOR] src/stdlib.rs:1876 — The SPEC's "These six are spelled as module members only" is false: `text_wrap`, `text_diff`, `text_dedent`, `text_template`, `text_pad` and `text_align` are added to `BUILTIN_NAMES` (lines 1876-1881) and to the global table (lines 421-428). The lexer accepts `_` in identifiers (`src/lexer.rs:392`), and the analyzer accepts any `is_builtin` name (`src/analyzer.rs:217`), so a program can write `text_wrap("the quick brown fox", 9)` as a bare call and it reaches the dispatcher. That is a spelling the language now has, contradicting SPEC.md § text ("module members only"). Fix: keep these out of the user-spellable `BUILTIN_NAMES`/global surface (or give them a NUL-prefixed internal name like `LRU_CACHE_DECLARE`) and dispatch module calls without registering a bare identifier. — traced, not run.
+2. [MINOR] src/stdlib.rs:1876 / 1897 and src/stdlib.rs:1777 — the six module-only names are inserted into the public `BUILTIN_NAMES` table and therefore `stdlib::is_builtin("text_wrap")` returns true. That makes `analyzer.rs:217` accept a bare `text_wrap` as a builtin name, the REPL completer/highlighter/introspection (repl/completer.rs:717, repl/highlight.rs:200, repl/introspect.rs:127) advertise it, and `set f to text_wrap` evaluate to `Value::Builtin("text_wrap")` — while both engines refuse to call it. The registry now advertises six names the language refuses, and SURVEY's "120 builtins" count includes them. Fix: keep these internal names out of the user-facing table (as the NUL-prefixed internal names already are) or filter them in `is_builtin` and the REPL surface queries.
 
-3. [MAJOR] src/stdlib.rs:1456 — `padded_text` reserves `(left + right) * fill.len()` bytes, where `fill.len()` is the byte length of the **whole fill string**, not the bytes of the characters actually cycled. A legal call with a long fill and a large width can therefore reserve an arbitrarily huge amount and fail `try_reserve_exact` with "too large to allocate", even though the real output is small: e.g. `text.pad("x", 1_000_000, <a 1 KB fill>)` reserves ~1 GB (or more) to write at most ~4 MB. SPEC.md only says widths past 1,000,000 are refused and a fill of one or more characters is valid, so this is a spurious refusal. Fix: reserve at most `text.len() + (left + right) * 4` (max UTF-8 char width), or drop the pre-reservation and let `push` grow. — traced, not run.
+3. [MINOR] src/stdlib.rs:1110 — `wrap_text` uses `line.split_whitespace()`, so it silently collapses runs of horizontal whitespace, converts tabs and other Unicode whitespace to a single space, and treats a bare `\r` as a separator. SPEC.md §text documents only that "existing newlines start a new line, CRLF is read as a line ending"; it never says horizontal whitespace is normalized. The behaviour is pinned by tests/text_utilities_test.rs:685 but not documented, so `text.wrap("a\tb", 10)` answering `["a b"]` is spec drift a reader cannot predict. Fix: either preserve horizontal whitespace (split on spaces only) or state the normalization rule in SPEC.md and README.md.
 
-4. [MINOR] src/stdlib.rs:1188 — The diff cap is documented as "texts whose line counts multiply past 4,000,000" (SPEC.md:1280), but the code computes `(old_len + 1) * (new_len + 1)`. Two 2000-line texts have a line-count product of exactly 4,000,000 (not "past"), yet `2001 * 2001 = 4,004,001` is refused. The boundary is also untested: `edge_text_diff_refuses_a_line_table_past_the_documented_limit_on_both_engines` only tries 3000 lines. Fix: either change the spec to say the `(old+1)*(new+1)` table is capped, or compare `old_len * new_len`; add a test at the exact boundary. — traced from `src/stdlib.rs:1188-1192` and the SPEC hunk.
+4. [MINOR] tests/text_utilities_test.rs:562 — REPORT.md's test matrix claims type-mismatch coverage includes "a non-text fill", but the type-mismatch test only exercises a non-numeric width for `pad` (`text.pad("x", "five", "-")`) and never a non-text fill such as `text.pad("x", 3, 1)`. The `Value::Text(fill)` arm in the `text_pad` destructuring (src/stdlib.rs:1014) is therefore untested on either engine. Add the non-text-fill case to the `both_refuse` loop, or correct the REPORT claim.
 
-5. [MINOR] src/stdlib.rs:1203 — The comment at lines 1054-1060 and REPORT.md describe the 4,000,000-cell cap as "about 32 MiB", but the table is `vec![vec![0usize; new_len + 1]; old_len + 1]`, i.e. one separate heap `Vec` per row. A permitted `old_len = 3_999_999, new_len = 0` input (`cells = 4_000_000`) allocates ~4 million inner `Vec`s, which is far more than 32 MiB once allocator metadata is counted. The cap is still bounded, but the documented memory figure is wrong and the worst case is the one not tested. Fix: use a single flat `Vec<usize>` of `cells` entries, or document the real worst case.
-
-6. [MINOR] tests/text_utilities_test.rs:480 — The two "past the limit" and "invalid width/side" tests assert only `is_err()` on each engine (`lines 480-491` and `546-558`). They cannot distinguish the documented catchable `RuntimeError` that names `wrap`/`pad`/`align` from any other runtime failure. The other negative test (`both_refuse(..., "wrap")` at lines 444-461) does check the name, but only for width `0` and type mismatches; the `> 1_000_000` path and the `pad`/`align` cap path are never checked for the promised message. Fix: use `both_refuse(source, "wrap")`, `"pad"`, `"align"` for these cases.
-
-REVIEW VERDICT: FINDINGS 6
+REVIEW VERDICT: FINDINGS 4
