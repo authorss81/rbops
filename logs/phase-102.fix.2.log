@@ -1,0 +1,3210 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0mgit status && git log --oneline -10
+On branch main
+Your branch is ahead of 'origin/main' by 1 commit.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   phases/phase-102/REPORT.md
+	modified:   src/cli.rs
+	modified:   src/stdlib.rs
+	modified:   tests/module_system_test.rs
+	modified:   tests/unreviewed_work_ack_test.rs
+
+no changes added to commit (use "git add" and/or "git commit -a")
+160eee1 resume phase-102: adopt preserved work
+a585ead rbops: phase-101 (2026-11-02T11:09:05Z)
+833bea4 resume phase-101: adopt preserved work
+16612b9 rbops: phase-100 (2026-11-01T13:55:19Z)
+8f9fa6a resume phase-100: adopt preserved work
+d597770 config: configure 45s chunkTimeout and 60s headerTimeout in project opencode.json
+3f48a7e rbops: phase-099 (2026-10-31T06:12:43Z)
+2da3033 resume phase-099: adopt preserved work
+9f1600b rbops: phase-098 (2026-10-29T22:12:00Z)
+f36b2cf resume phase-098: adopt preserved work
+[0m
+[0m$ [0msed -n '1,220p' src/cli.rs
+//! Declared command-line flags, parsed from the arguments a program was given.
+//!
+//! `sys.argv()` answers the raw arguments, so every command-line program used to
+//! hand-roll the same loop: find a flag, check the next element exists, convert
+//! it, complain if it does not, and print usage text that drifts from what the
+//! code accepts. This module is the declaration that replaces that loop.
+//!
+//! A declaration is a list of flag records:
+//!
+//! ```redblue
+//! set options to [
+//!     {name: "output", type: "text", default: "out.txt", help: "where to write"},
+//!     {name: "count", type: "number", required: yes},
+//!     {name: "verbose", type: "yes/no"}
+//! ]
+//! ```
+//!
+//! `sys.parse(options)` reads `sys.argv()` and answers a record holding one
+//! field per flag, plus `arguments` (the positionals) and `help`/`usage` (the
+//! generated help text). A flag's `type` is `text`, `number`, `yes/no` or
+//! `path`; `takes_value` defaults to no for a `yes/no` flag and yes for every
+//! other type. A declaration error, an unknown flag, a missing required flag and
+//! a value of the wrong type are all catchable `Runtime` failures naming the
+//! flag.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::error::{Error, Result, Span};
+use crate::value::{Fields, Value};
+
+/// The field holding the positional arguments a parse did not consume.
+pub const ARGUMENTS_FIELD: &str = "arguments";
+
+/// The field saying whether `--help` was asked for.
+pub const HELP_FIELD: &str = "help";
+
+/// The field holding the usage text generated from the declaration.
+pub const USAGE_FIELD: &str = "usage";
+
+/// The type a flag's value has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Number,
+    YesNo,
+    Path,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Text => "text",
+            Kind::Number => "number",
+            Kind::YesNo => "yes/no",
+            Kind::Path => "path",
+        }
+    }
+}
+
+/// One declared flag.
+struct Flag {
+    name: String,
+    kind: Kind,
+    takes_value: bool,
+    default: Option<Value>,
+    required: bool,
+    help: String,
+}
+
+/// Parses `argv` against `declaration`.
+///
+/// `--help` and `-h` answer the generated usage without enforcing a required
+/// flag: help is a request about the declaration, not a request to run with it.
+pub fn parse(declaration: &Value, argv: &[String], span: Span) -> Result<Value> {
+    let flags = read_declaration(declaration, span)?;
+    let usage = usage_text(&flags);
+
+    let mut given: HashMap<String, Value> = HashMap::new();
+    let mut positionals: Vec<String> = Vec::new();
+    let mut index = 0;
+
+    while index < argv.len() {
+        let token = &argv[index];
+
+        if token == "--" {
+            positionals.extend(argv[index + 1..].iter().cloned());
+            break;
+        }
+        if token == "--help" || token == "-h" {
+            return build_record(&flags, &given, positionals, true, &usage, span, false);
+        }
+
+        if let Some(rest) = token.strip_prefix("--") {
+            let (name, inline) = match rest.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (rest, None),
+            };
+            let flag = flags
+                .iter()
+                .find(|flag| flag.name == name)
+                .ok_or_else(|| Error::Runtime(format!("Unknown flag '--{name}'"), span))?;
+
+            if flag.takes_value {
+                let text = match inline {
+                    Some(value) => value.to_string(),
+                    None => {
+                        index += 1;
+                        let next = argv
+                            .get(index)
+                            .cloned()
+                            .ok_or_else(|| missing_value(flag, span))?;
+                        // Help is a request about the declaration, even when
+                        // it appears where a value was expected: `--count
+                        // --help` answers the generated usage rather than
+                        // complaining that count is missing.
+                        if next == "--help" || next == "-h" {
+                            return build_record(
+                                &flags,
+                                &given,
+                                positionals,
+                                true,
+                                &usage,
+                                span,
+                                false,
+                            );
+                        }
+                        // A flag's value is the next token even when it starts
+                        // with `-`, so a negative number still parses. What is
+                        // not a value is another flag: `--count --verbose`
+                        // should say the count is missing, not that
+                        // `--verbose` is not a number.
+                        if next == "--" || names_declared_flag(&next, &flags) {
+                            return Err(missing_value(flag, span));
+                        }
+                        next
+                    }
+                };
+                let value = from_text(flag, &text, span)?;
+                given.insert(flag.name.clone(), value);
+            } else {
+                if inline.is_some() {
+                    return Err(Error::Runtime(
+                        format!("Flag '--{}' does not take a value", flag.name),
+                        span,
+                    ));
+                }
+                given.insert(flag.name.clone(), Value::YesNo(true));
+            }
+
+            index += 1;
+            continue;
+        }
+
+        if token.starts_with('-') && token != "-" {
+            return Err(Error::Runtime(format!("Unknown flag '{token}'"), span));
+        }
+
+        positionals.push(token.clone());
+        index += 1;
+    }
+
+    build_record(&flags, &given, positionals, false, &usage, span, true)
+}
+
+/// Reads and validates a declaration.
+fn read_declaration(declaration: &Value, span: Span) -> Result<Vec<Flag>> {
+    let Value::List(items) = declaration else {
+        return Err(Error::Runtime(
+            format!(
+                "sys.parse expects a list of flag declarations, but was given {}",
+                declaration.type_name()
+            ),
+            span,
+        ));
+    };
+
+    let mut flags = Vec::with_capacity(items.len());
+    let mut names = HashSet::new();
+
+    for (position, item) in items.iter().enumerate() {
+        let Value::Record(fields) = item else {
+            return Err(Error::Runtime(
+                format!(
+                    "flag declaration {} must be a record, but was given {}",
+                    position + 1,
+                    item.type_name()
+                ),
+                span,
+            ));
+        };
+
+        let name = match fields.get("name") {
+            Some(Value::Text(name)) => name.clone(),
+            Some(other) => {
+                return Err(Error::Runtime(
+                    format!(
+                        "flag declaration {} has a {} name where text belongs",
+                        position + 1,
+                        other.type_name()
+                    ),
+                    span,
+                ))
+            }
+            None => {
+                return Err(Error::Runtime(
+                    format!("flag declaration {} has no name", position + 1),
+                    span,
+                ))
+            }
+        };
+        validate_name(&name, span)?;
+        if !names.insert(name.clone()) {
+            return Err(Error::Runtime(
+                format!("Flag '--{name}' is declared twice"),
+                span,
+            ));
+        }
+
+        let kind = match fields.get("type") {
+            Some(Value::Text(kind)) => parse_kind(kind).ok_or_else(|| {
+[0m
+[0m$ [0msed -n '360,760p' tests/module_system_test.rs
+assert_runtime_error(
+        "module M\n    to twice(n)\n        give back n * 2\n    end\n    export missing, twice\nend",
+        "Module 'M' exports 'missing', which it does not define",
+    );
+}
+
+/// The old `to` spelling of the alias is still accepted, so a program written
+/// before `as` existed keeps running.
+#[test]
+fn import_alias_accepts_the_older_to_spelling() {
+    assert_eq!(
+        eval("import json to J\nJ.stringify(2)"),
+        Value::Text("2".to_string()),
+        "`import json to J` should still bind the alias"
+    );
+    assert_eq!(
+        eval("import files, json as J\nJ.stringify(3)"),
+        Value::Text("3".to_string()),
+        "a multi-import with an alias on the second name should resolve both"
+    );
+}
+
+/// Declared command-line flags: `sys.parse` and the `Cli` module.
+///
+/// `sys.argv()` was the whole of the command-line surface, so every program
+/// that wanted a flag wrote the same loop and its own usage text. `sys.parse`
+/// takes a list of flag records, reads `sys.argv()` (or an explicit argument
+/// list), and answers a record of typed fields. The declaration is the only
+/// place a flag is named, so the parser and the usage text cannot disagree.
+mod cli_flags {
+    use std::path::Path;
+
+    use super::*;
+
+    fn cli_root() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// What both engines made of a program: the value or failure, and the lines
+    /// printed. Every CLI case runs through this, so a tree-walking answer that
+    /// the bytecode VM does not share fails the test rather than passing half
+    /// the contract.
+    struct CliRun {
+        result: Result<Value, Error>,
+        output: Vec<String>,
+    }
+
+    #[track_caller]
+    fn cli_ran(source: &str) -> CliRun {
+        let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
+        let ast = redblue::parser::parse(tokens).expect("source should parse");
+        redblue::analyzer::analyze_in(&ast, cli_root()).expect("source should analyze");
+
+        let (mut walker, walked) = redblue::run_isolated_in(&ast, cli_root());
+        let walked_output = walker.take_output();
+
+        let chunk = redblue::bytecode::compile_program(&ast)
+            .unwrap_or_else(|error| panic!("`{source}` should compile, failed with {error:?}"));
+        let mut vm = redblue::bytecode::vm::BytecodeVm::new_in(cli_root());
+        vm.set_echo(false);
+        let compiled = vm.run(&chunk);
+        let compiled_output = vm.take_output();
+
+        match (&walked, &compiled) {
+            (Ok(walked_value), Ok(compiled_value)) => assert_eq!(
+                walked_value, compiled_value,
+                "the two engines answered differently for `{source}`"
+            ),
+            (Err(walked_error), Err(compiled_error)) => assert_eq!(
+                format!("{}: {}", walked_error.label(), walked_error.message()),
+                format!("{}: {}", compiled_error.label(), compiled_error.message()),
+                "the two engines failed differently for `{source}`"
+            ),
+            _ => panic!(
+                "the two engines disagree about `{source}`: walked {walked:?}, compiled {compiled:?}"
+            ),
+        }
+        assert_eq!(
+            walked_output, compiled_output,
+            "the two engines printed different lines for `{source}`"
+        );
+
+        CliRun {
+            result: walked,
+            output: walked_output,
+        }
+    }
+
+    #[track_caller]
+    fn cli_eval(source: &str) -> Value {
+        cli_ran(source)
+            .result
+            .unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"))
+    }
+
+    #[track_caller]
+    fn cli_eval_err(source: &str) -> Error {
+        cli_ran(source)
+            .result
+            .expect_err("`source` should have failed")
+    }
+
+    #[track_caller]
+    fn cli_assert_runtime_error(source: &str, expected: &str) {
+        match cli_eval_err(source) {
+            Error::Runtime(message, span) => {
+                assert_eq!(
+                    message, expected,
+                    "`{source}` failed with the wrong message"
+                );
+                assert!(span.is_known(), "`{source}` failed without a source span");
+            }
+            other => panic!("`{source}` should fail with a Runtime error, got {other:?}"),
+        }
+    }
+
+    /// Runs `source` and answers the lines it printed, asserting the run succeeded.
+    #[track_caller]
+    fn cli_output(source: &str) -> Vec<String> {
+        let run = cli_ran(source);
+        run.result
+            .unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"));
+        run.output
+    }
+
+    #[track_caller]
+    fn cli_field<'a>(record: &'a Value, name: &str) -> &'a Value {
+        let Value::Record(fields) = record else {
+            panic!("expected a record, got {}", record.type_name());
+        };
+        fields
+            .get(name)
+            .unwrap_or_else(|| panic!("the record should have a `{name}` field"))
+    }
+
+    /// The headline claim: one declaration gives typed, defaulted fields, and
+    /// the parser handles a repeated flag (last wins) and a flag after a
+    /// positional.
+    #[test]
+    fn declared_flags_parse_into_a_typed_record() {
+        let parsed = cli_eval(
+            "set options to [{name: \"output\", type: \"text\", default: \"out.txt\"}, {name: \"count\", type: \"number\", required: yes}, {name: \"verbose\", type: \"yes/no\"}]\n\
+             set parsed to sys.parse(options, [\"first\", \"--count\", \"1\", \"--verbose\", \"--count=3\", \"--output\", \"x\"])\n\
+             give back parsed",
+        );
+
+        assert_eq!(cli_field(&parsed, "count"), &Value::Number(3.0));
+        assert_eq!(cli_field(&parsed, "verbose"), &Value::YesNo(true));
+        assert_eq!(cli_field(&parsed, "output"), &Value::Text("x".to_string()));
+        assert_eq!(cli_field(&parsed, "help"), &Value::YesNo(false));
+        assert_eq!(
+            cli_field(&parsed, "arguments"),
+            &Value::list(vec![Value::Text("first".to_string())]),
+            "a flag after a positional and the positional itself should both survive"
+        );
+        assert!(
+            cli_field(&parsed, "usage")
+                .to_string()
+                .contains("--count <number> (required)"),
+            "usage should be generated from the declaration"
+        );
+    }
+
+    /// A path flag is a path value, not merely the text a path is made of.
+    #[test]
+    fn edge_path_flags_are_path_values_and_defaults_fill_in() {
+        let parsed = cli_eval(
+            "set options to [{name: \"where\", type: \"path\", default: \"out.txt\"}, {name: \"flag\", type: \"yes/no\"}]\n\
+             set parsed to sys.parse(options)\n\
+             give back parsed",
+        );
+
+        let where_value = cli_field(&parsed, "where");
+        assert_eq!(where_value.type_name(), "path");
+        assert_eq!(
+            redblue::path::text_of(where_value),
+            Some("out.txt"),
+            "the default path should carry its text"
+        );
+        assert_eq!(
+            cli_field(&parsed, "flag"),
+            &Value::YesNo(false),
+            "an absent boolean flag is no, not nothing"
+        );
+    }
+
+    /// The empty string is a value, `--flag=value` is a spelling, and no
+    /// arguments at all still produces the record.
+    #[test]
+    fn edge_flag_value_forms_cover_equals_empty_and_no_arguments() {
+        let parsed = cli_eval(
+            "set options to [{name: \"name\", type: \"text\"}]\n\
+             give back sys.parse(options, [\"--name=\", \"--name\", \"value\"])",
+        );
+        assert_eq!(
+            cli_field(&parsed, "name"),
+            &Value::Text("value".to_string())
+        );
+
+        let empty = cli_eval(
+            "set options to [{name: \"name\", type: \"text\"}]\n\
+             give back sys.parse(options, [\"--name=\", \"after\"])",
+        );
+        assert_eq!(
+            cli_field(&empty, "name"),
+            &Value::Text(String::new()),
+            "an explicitly empty value is a value, not a missing one"
+        );
+        assert_eq!(
+            cli_field(&empty, "arguments"),
+            &Value::list(vec![Value::Text("after".to_string())])
+        );
+
+        let none = cli_eval(
+            "set options to [{name: \"name\", type: \"text\", default: \"fallback\"}]\n\
+             give back sys.parse(options, [])",
+        );
+        assert_eq!(
+            cli_field(&none, "name"),
+            &Value::Text("fallback".to_string()),
+            "no arguments should leave the default in place"
+        );
+    }
+
+    /// Help is a request about the declaration, not a run with it: a required
+    /// flag that was not given is not an error, and `--` ends flag parsing.
+    #[test]
+    fn edge_help_skips_required_flags_and_double_dash_ends_flags() {
+        let parsed = cli_eval(
+            "set options to [{name: \"count\", type: \"number\", required: yes}]\n\
+             give back sys.parse(options, [\"--help\"])",
+        );
+        assert_eq!(cli_field(&parsed, "help"), &Value::YesNo(true));
+        assert_eq!(
+            cli_field(&parsed, "count"),
+            &Value::Nothing,
+            "help answers the declaration with no required-flag failure"
+        );
+
+        let after = cli_eval(
+            "set options to [{name: \"count\", type: \"number\"}]\n\
+             give back sys.parse(options, [\"--\", \"--count\", \"3\"])",
+        );
+        assert_eq!(
+            cli_field(&after, "arguments"),
+            &Value::list(vec![
+                Value::Text("--count".to_string()),
+                Value::Text("3".to_string())
+            ]),
+            "everything after `--` is positional, even text that looks like a flag"
+        );
+    }
+
+    /// Unknown, missing and wrongly typed values are catchable failures naming
+    /// the flag, rather than a silent `nothing` that travels on as a value.
+    #[test]
+    fn failures_name_the_flag_that_was_wrong() {
+        cli_assert_runtime_error(
+            "set options to [{name: \"count\", type: \"number\", required: yes}]\n\
+             sys.parse(options, [\"--count\", \"three\"])",
+            "Flag '--count' expects a number, but 'three' is not a number",
+        );
+        cli_assert_runtime_error(
+            "set options to [{name: \"count\", type: \"number\", required: yes}]\n\
+             sys.parse(options, [])",
+            "Missing required flag '--count'",
+        );
+        cli_assert_runtime_error(
+            "set options to [{name: \"count\", type: \"number\"}]\n\
+             sys.parse(options, [\"--nope\", \"1\"])",
+            "Unknown flag '--nope'",
+        );
+        cli_assert_runtime_error(
+            "set options to [{name: \"name\"}]\n\
+             sys.parse(options, [])",
+            "Flag '--name' has no type",
+        );
+    }
+
+    /// The `Cli` module prints the generated usage and does not call the body
+    /// when help was asked for; without help the body is called.
+    #[test]
+    fn cli_module_prints_usage_and_skips_the_body_for_help() {
+        let help = "import Cli\n\
+                    set options to [{name: \"count\", type: \"number\", required: yes}]\n\
+                    Cli.run_with(options, to(parsed)\n\
+                        say \"body ran\"\n\
+                    end, [\"--help\"])";
+        let lines = cli_output(help);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("--count <number> (required)")),
+            "help should print the declaration's usage, got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("--help, -h")),
+            "help should mention the help flag itself, got {lines:?}"
+        );
+
+        let run = "import Cli\n\
+                   set options to [{name: \"count\", type: \"number\", required: yes}]\n\
+                   Cli.run_with(options, to(parsed)\n\
+                       say \"body ran\"\n\
+                   end, [\"--count\", \"1\"])";
+        assert_eq!(
+            cli_output(run),
+            vec!["body ran".to_string()],
+            "without help the body is called"
+        );
+
+        let through_argv = "import Cli\n\
+                            set options to [{name: \"count\", type: \"number\", default: 2}]\n\
+                            Cli.run(options, to(parsed)\n\
+                                say parsed.count\n\
+                            end)";
+        assert_eq!(
+            cli_output(through_argv),
+            vec!["2".to_string()],
+            "the two-argument form reads sys.argv(), empty in this harness"
+        );
+    }
+
+    /// A value-taking flag followed by another flag is a missing value, not a
+    /// wrong-type value that quotes the other flag's spelling back at the user.
+    #[test]
+    fn edge_missing_value_before_another_flag_names_the_flag_and_type() {
+        let source = "set options to [{name: \"count\", type: \"number\"}, {name: \"verbose\", type: \"yes/no\"}]\n\
+                      sys.parse(options, [\"--count\", \"--verbose\"])";
+        let outcome = redblue::run_source_value_in(source, cli_root());
+        assert!(outcome.is_err(), "a missing value should be a failure");
+        match outcome {
+            Err(Error::Runtime(message, span)) => {
+                assert!(
+                    message.contains("--count"),
+                    "the failure should name the flag, got {message:?}"
+                );
+                assert!(
+                    message.contains("number"),
+                    "the failure should name the expected type, got {message:?}"
+                );
+                assert!(span.is_known(), "the failure should carry a source span");
+            }
+            other => panic!("expected a Runtime error, got {other:?}"),
+        }
+
+        let ended = "set options to [{name: \"count\", type: \"number\"}]\n\
+                     sys.parse(options, [\"--count\", \"--\"])";
+        let outcome = redblue::run_source_value_in(ended, cli_root());
+        assert!(
+            outcome.is_err(),
+            "`--` is not a value for `--count`, so this should fail"
+        );
+        match outcome {
+            Err(Error::Runtime(message, _)) => assert!(
+                message.contains("--count") && message.contains("number"),
+                "the failure should still name the flag and its type, got {message:?}"
+            ),
+            other => panic!("expected a Runtime error, got {other:?}"),
+        }
+    }
+
+    /// The usage text is derived from the declaration, so adding a flag to the
+    /// declaration is enough to add it to help.
+    #[test]
+    fn edge_usage_lists_a_flag_added_to_the_declaration() {
+        let before = cli_eval(
+            "set options to [{name: \"output\", type: \"text\", help: \"where to write\"}]\n\
+             give back sys.parse(options, []).usage",
+        );
+        let after = cli_eval(
+            "set options to [{name: \"output\", type: \"text\", help: \"where to write\"}, \
+             {name: \"colour\", type: \"text\", default: \"auto\", help: \"when to colour\"}]\n\
+             give back sys.parse(options, []).usage",
+        );
+
+        let before_text = match before {
+            Value::Text(text) => text,
+            other => panic!("usage should be text, got {}", other.type_name()),
+        };
+        let after_text = match after {
+            Value::Text(text) => text,
+            other => panic!("usage should be text, got {}", other.type_name()),
+        };
+
+        assert!(
+            before_text.contains("--output <text>"),
+            "the original declaration should be in help, got {before_text:?}"
+        );
+        assert!(
+            !before_text.contains("--colour"),
+            "the flag was not declared yet, so help should not invent it"
+        );
+        assert!(
+            after_text.contains("--colour <text> (default: auto)  when to colour"),
+            "a newly declared flag should appear in help with its value type, default and help text, got {after_text:?}"
+        );
+        assert!(
+            after_text.contains("--help, -h"),
+            "help should always describe its own flag, got {after_text:?}"
+        );
+[0m
+[0m$ [0msed -n '220,460p' src/cli.rs
+Some(Value::Text(kind)) => parse_kind(kind).ok_or_else(|| {
+                Error::Runtime(
+                    format!(
+                        "Flag '--{name}' has unknown type '{kind}'; expected text, number, yes/no or path"
+                    ),
+                    span,
+                )
+            })?,
+            Some(other) => {
+                return Err(Error::Runtime(
+                    format!(
+                        "Flag '--{name}' has a {} type where text belongs",
+                        other.type_name()
+                    ),
+                    span,
+                ))
+            }
+            None => {
+                return Err(Error::Runtime(
+                    format!("Flag '--{name}' has no type"),
+                    span,
+                ))
+            }
+        };
+
+        let takes_value = match fields.get("takes_value") {
+            Some(Value::YesNo(takes)) => *takes,
+            Some(other) => {
+                return Err(Error::Runtime(
+                    format!(
+                        "Flag '--{name}' has a {} takes_value where yes/no belongs",
+                        other.type_name()
+                    ),
+                    span,
+                ))
+            }
+            None => kind != Kind::YesNo,
+        };
+        if !takes_value && kind != Kind::YesNo {
+            return Err(Error::Runtime(
+                format!(
+                    "Flag '--{name}' is {} and takes no value, but only a yes/no flag may take no value",
+                    kind.name()
+                ),
+                span,
+            ));
+        }
+
+        let required = match fields.get("required") {
+            Some(Value::YesNo(required)) => *required,
+            Some(other) => {
+                return Err(Error::Runtime(
+                    format!(
+                        "Flag '--{name}' has a {} required where yes/no belongs",
+                        other.type_name()
+                    ),
+                    span,
+                ))
+            }
+            None => false,
+        };
+
+        let help = match fields.get("help") {
+            Some(Value::Text(help)) => help.clone(),
+            Some(other) => {
+                return Err(Error::Runtime(
+                    format!(
+                        "Flag '--{name}' has a {} help where text belongs",
+                        other.type_name()
+                    ),
+                    span,
+                ))
+            }
+            None => String::new(),
+        };
+
+        let default = match fields.get("default") {
+            Some(Value::Nothing) | None => None,
+            Some(value) => Some(from_default(&name, kind, value, span)?),
+        };
+        if required && default.is_some() {
+            return Err(Error::Runtime(
+                format!("Flag '--{name}' cannot be required and have a default"),
+                span,
+            ));
+        }
+
+        for key in fields.keys() {
+            if !matches!(
+                key.as_str(),
+                "name" | "type" | "takes_value" | "default" | "required" | "help"
+            ) {
+                return Err(Error::Runtime(
+                    format!("Flag '--{name}' has an unknown field '{key}'"),
+                    span,
+                ));
+            }
+        }
+
+        flags.push(Flag {
+            name,
+            kind,
+            takes_value,
+            default,
+            required,
+            help,
+        });
+    }
+
+    Ok(flags)
+}
+
+/// Refuses a flag name that cannot be written back as `--name`.
+fn validate_name(name: &str, span: Span) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::Runtime(
+            "a flag name cannot be empty".to_string(),
+            span,
+        ));
+    }
+    if name.starts_with('-') || name.contains('=') || name.chars().any(char::is_whitespace) {
+        return Err(Error::Runtime(
+            format!("'{name}' is not a usable flag name"),
+            span,
+        ));
+    }
+    if matches!(name, ARGUMENTS_FIELD | HELP_FIELD | USAGE_FIELD) {
+        return Err(Error::Runtime(
+            format!("'{name}' is a field sys.parse reserves, so it cannot name a flag"),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn parse_kind(kind: &str) -> Option<Kind> {
+    match kind {
+        "text" => Some(Kind::Text),
+        "number" => Some(Kind::Number),
+        "yes/no" | "boolean" => Some(Kind::YesNo),
+        "path" => Some(Kind::Path),
+        _ => None,
+    }
+}
+
+/// Converts the text a flag was given.
+fn from_text(flag: &Flag, text: &str, span: Span) -> Result<Value> {
+    match flag.kind {
+        Kind::Text => Ok(Value::Text(text.to_string())),
+        Kind::Number => {
+            let number = text.trim().parse::<f64>().map_err(|_| {
+                Error::Runtime(
+                    format!(
+                        "Flag '--{}' expects a number, but '{text}' is not a number",
+                        flag.name
+                    ),
+                    span,
+                )
+            })?;
+            let number = crate::value::finite_number(number, span).map_err(|_| {
+                Error::Runtime(
+                    format!(
+                        "Flag '--{}' expects a number, but '{text}' is not a finite number",
+                        flag.name
+                    ),
+                    span,
+                )
+            })?;
+            Ok(Value::Number(number))
+        }
+        Kind::YesNo => match text.trim().to_ascii_lowercase().as_str() {
+            "yes" | "true" => Ok(Value::YesNo(true)),
+            "no" | "false" => Ok(Value::YesNo(false)),
+            _ => Err(Error::Runtime(
+                format!(
+                    "Flag '--{}' expects yes/no, but '{text}' is neither",
+                    flag.name
+                ),
+                span,
+            )),
+        },
+        Kind::Path => Ok(crate::path::value(text)),
+    }
+}
+
+/// Converts the value a declaration wrote as a default.
+fn from_default(name: &str, kind: Kind, value: &Value, span: Span) -> Result<Value> {
+    let converted = match kind {
+        Kind::Text => match value {
+            Value::Text(text) => Value::Text(text.clone()),
+            _ => return Err(default_error(name, kind, value, span)),
+        },
+        Kind::Number => match value {
+            Value::Number(number) => Value::Number(*number),
+            _ => return Err(default_error(name, kind, value, span)),
+        },
+        Kind::YesNo => match value {
+            Value::YesNo(answer) => Value::YesNo(*answer),
+            _ => return Err(default_error(name, kind, value, span)),
+        },
+        Kind::Path => match crate::path::text_of(value) {
+            Some(text) => crate::path::value(text),
+            None => return Err(default_error(name, kind, value, span)),
+        },
+    };
+    Ok(converted)
+}
+
+fn default_error(name: &str, kind: Kind, value: &Value, span: Span) -> Error {
+    Error::Runtime(
+        format!(
+            "Flag '--{name}' has a {} default where {} belongs",
+            value.type_name(),
+            kind.name()
+        ),
+        span,
+    )
+}
+
+/// The failure for a value-taking flag with no value after it.
+fn missing_value(flag: &Flag, span: Span) -> Error {
+    Error::Runtime(
+        format!(
+            "Flag '--{}' needs a value of type {}",
+            flag.name,
+            flag.kind.name()
+        ),
+        span,
+    )
+}
+
+/// Whether `token` is `--name` or `--name=value` for a flag in the declaration.
+fn names_declared_flag(token: &str, flags: &[Flag]) -> bool {
+    let Some(rest) = token.strip_prefix("--") else {
+        return false;
+    };
+    let name = rest.split_once('=').map(|(name, _)| name).unwrap_or(rest);
+    flags.iter().any(|flag| flag.name == name)
+}
+
+/// Builds the record a program receives.
+[0m
+[0m$ [0msed -n '760,860p' tests/module_system_test.rs
+);
+    }
+
+    /// A boolean flag may take an explicit yes/no value, and Unicode text and
+    /// path values survive unchanged.
+    #[test]
+    fn edge_boolean_values_and_unicode_survive_the_parse() {
+        let parsed = cli_eval(
+            "set options to [{name: \"enabled\", type: \"yes/no\", takes_value: yes}, \
+             {name: \"name\", type: \"text\"}, {name: \"where\", type: \"path\"}]\n\
+             give back sys.parse(options, [\"--enabled\", \"false\", \"--name\", \"héllo 🌍\", \"--where\", \"dír/文件\"])",
+        );
+
+        assert_eq!(cli_field(&parsed, "enabled"), &Value::YesNo(false));
+        assert_eq!(
+            cli_field(&parsed, "name"),
+            &Value::Text("héllo 🌍".to_string())
+        );
+        assert_eq!(
+            redblue::path::text_of(cli_field(&parsed, "where")),
+            Some("dír/文件"),
+            "a path flag should keep its Unicode text"
+        );
+
+        let yes = cli_eval(
+            "set options to [{name: \"enabled\", type: \"yes/no\", takes_value: yes}]\n\
+             give back sys.parse(options, [\"--enabled=yes\"])",
+        );
+        assert_eq!(cli_field(&yes, "enabled"), &Value::YesNo(true));
+    }
+
+    /// The parse failures are ordinary catchable failures in Redblue, not a
+    /// process abort, so a program can print its own message and carry on.
+    #[test]
+    fn edge_parse_failures_are_catchable_in_redblue() {
+        let lines = cli_output(
+            "set options to [{name: \"count\", type: \"number\", required: yes}]\n\
+             set caught to no\n\
+             try\n\
+                 sys.parse(options, [\"--count\", \"three\"])\n\
+             catch error problem\n\
+                 set caught to yes\n\
+             end\n\
+             say caught\n\
+             say \"after\"",
+        );
+        assert_eq!(
+            lines,
+            vec!["yes".to_string(), "after".to_string()],
+            "the wrong-type failure should be caught and execution should continue"
+        );
+    }
+
+    /// A declaration is a list of records with known fields, and a shape that
+    /// is not one is refused before any argument is read.
+    #[test]
+    fn declaration_shape_failures_name_the_declaration() {
+        cli_assert_runtime_error(
+            "sys.parse(\"not a list\", [])",
+            "sys.parse expects a list of flag declarations, but was given text",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([\"not a record\"], [])",
+            "flag declaration 1 must be a record, but was given text",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{type: \"text\"}], [])",
+            "flag declaration 1 has no name",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: 5, type: \"text\"}], [])",
+            "flag declaration 1 has a number name where text belongs",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\"}], [])",
+            "Flag '--count' has no type",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: 5}], [])",
+            "Flag '--count' has a number type where text belongs",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"integer\"}], [])",
+            "Flag '--count' has unknown type 'integer'; expected text, number, yes/no or path",
+        );
+    }
+
+    /// The field values of a declaration have types too, and a flag may not
+    /// both require a value and supply one.
+    #[test]
+    fn malformed_declarations_are_refused() {
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\", bogus: yes}], [])",
+            "Flag '--count' has an unknown field 'bogus'",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"text\", takes_value: no}], [])",
+            "Flag '--count' is text and takes no value, but only a yes/no flag may take no value",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\", required: yes, default: 1}], [])",
+[0m
+[0m$ [0mgrep -rn "boolean\|yes/no\|sys.parse\|names_declared_flag" SPEC.md README.md src/cli.rs phases/phase-102/REPORT.md | head -80
+SPEC.md:182:| `yes/no` | Boolean values | `yes`, `no` |
+SPEC.md:1563:set parsed to sys.parse(options)
+SPEC.md:1571:them. `sys.parse(declaration)` reads those arguments against a list of flag
+SPEC.md:1573:and `usage`; `sys.parse(declaration, arguments)` reads an explicit list instead.
+SPEC.md:1574:A flag has a `name`, a `type` (`text`, `number`, `yes/no` or `path`), and
+SPEC.md:1878:| yes/no | Boolean literals |
+README.md:299:sys.parse(declaration) // Parse those arguments into a record of typed flags
+README.md:300:sys.parse(declaration, arguments)
+README.md:365:regex.is_match(text, pattern)          // yes/no, searching anywhere
+src/cli.rs:14://!     {name: "verbose", type: "yes/no"}
+src/cli.rs:18://! `sys.parse(options)` reads `sys.argv()` and answers a record holding one
+src/cli.rs:20://! generated help text). A flag's `type` is `text`, `number`, `yes/no` or
+src/cli.rs:21://! `path`; `takes_value` defaults to no for a `yes/no` flag and yes for every
+src/cli.rs:54:            Kind::YesNo => "yes/no",
+src/cli.rs:132:                        if next == "--" || names_declared_flag(&next, &flags) {
+src/cli.rs:170:                "sys.parse expects a list of flag declarations, but was given {}",
+src/cli.rs:223:                        "Flag '--{name}' has unknown type '{kind}'; expected text, number, yes/no or path"
+src/cli.rs:250:                        "Flag '--{name}' has a {} takes_value where yes/no belongs",
+src/cli.rs:261:                    "Flag '--{name}' is {} and takes no value, but only a yes/no flag may take no value",
+src/cli.rs:273:                        "Flag '--{name}' has a {} required where yes/no belongs",
+src/cli.rs:348:            format!("'{name}' is a field sys.parse reserves, so it cannot name a flag"),
+src/cli.rs:359:        "yes/no" | "boolean" => Some(Kind::YesNo),
+src/cli.rs:395:                    "Flag '--{}' expects yes/no, but '{text}' is neither",
+src/cli.rs:452:fn names_declared_flag(token: &str, flags: &[Flag]) -> bool {
+phases/phase-102/REPORT.md:6:`argv`, so `sys.parse([])` failed with
+phases/phase-102/REPORT.md:10:`sys.parse(declaration)` now reads `sys.argv()` against a list of flag records
+phases/phase-102/REPORT.md:12:`usage`. `sys.parse(declaration, arguments)` reads an explicit list instead.
+phases/phase-102/REPORT.md:13:A flag declaration has `name` and `type` (`text`, `number`, `yes/no` or `path`)
+phases/phase-102/REPORT.md:14:and may add `takes_value`, `default`, `required` and `help`. A `yes/no` flag
+phases/phase-102/REPORT.md:40:| `src/runtime.rs` | +40 | `sys_parse` dispatcher arm reading `sys.argv()` or an explicit text list |
+phases/phase-102/REPORT.md:41:| `src/stdlib.rs` | +27 −12 | the `sys.parse` member and the module-only spelling that keeps bare `sys_parse` off the flat surface |
+phases/phase-102/REPORT.md:45:| `SPEC.md` | +13 −1 | documents `sys.parse`, the declaration fields and the `Cli` wrapper |
+phases/phase-102/REPORT.md:46:| `README.md` | +2 | lists `sys.parse` |
+phases/phase-102/REPORT.md:47:| `SURVEY.md` | +9 −8 | member count 91 → 92, the `sys` row, module-only `sys.parse`, re-anchored registry lines |
+phases/phase-102/REPORT.md:51:| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
+phases/phase-102/REPORT.md:52:| `src/stdlib.rs` (review) | +4 | a `sys_parse` shape so `:sighelp sys.parse` answers like the other module-only members |
+phases/phase-102/REPORT.md:60:| declared_flags_parse_into_a_typed_record | string, number and boolean flags; repeated flag (last wins); flag after a positional; generated usage |
+phases/phase-102/REPORT.md:61:| edge_path_flags_are_path_values_and_defaults_fill_in | path value type; default applied; absent boolean is `no` |
+phases/phase-102/REPORT.md:68:| edge_boolean_values_and_unicode_survive_the_parse | unicode / type mismatch: explicit `yes`/`false` for a boolean, Unicode text and Unicode path values |
+phases/phase-102/REPORT.md:71:| malformed_declarations_are_refused | malformed input: unknown field, `takes_value: no` on a non-boolean, required with default, wrong-typed `takes_value`/`required`/`help` |
+phases/phase-102/REPORT.md:72:| defaults_must_have_the_declared_type | type mismatch: a text, number, yes/no or path default of the wrong type |
+phases/phase-102/REPORT.md:80:printed lines, so `sys.parse`, `Cli.run` and the failure paths are exercised on
+phases/phase-102/REPORT.md:89:- type_mismatch — covered: a number flag given text; a non-list declaration; a non-record declaration item; a non-text name, type or argument-list item; a wrong default type; a non-list argument list; and an explicit yes/no value on a boolean flag.
+phases/phase-102/REPORT.md:94:- malformed_input — covered: unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default, and wrong-typed `takes_value`/`required`/`help` fields.
+phases/phase-102/REPORT.md:118:- `sys.parse` is reachable only as `sys.parse`; the bare name `sys_parse` is
+[0m
+[0m$ [0mgrep -rn 'type: "boolean"\|"boolean"\|boolean' tests src SPEC.md README.md phases/phase-102 | head -50
+tests/unless_test.rs:143:    // Comparisons, membership, boolean operators and unary `not` all reach the
+tests/text_split_join_test.rs:1213:    // either: the separator here is a boolean, so `split` refuses it by name.
+tests/test_control_flow.rb:161:test "control: an if can branch on a boolean variable"
+tests/comparison_lex_test.rs:369:fn edge_a_chained_ordering_comparison_fails_on_the_boolean_left_operand() {
+tests/comparison_lex_test.rs:767:    // `edge_a_chained_ordering_comparison_fails_on_the_boolean_left_operand`
+tests/bootstrap_selfhost_test.rs:405:/// and `length(xs is 3)` — an index by a boolean and a measurement of a
+tests/module_system_test.rs:542:            "an absent boolean flag is no, not nothing"
+tests/module_system_test.rs:763:    /// A boolean flag may take an explicit yes/no value, and Unicode text and
+tests/module_system_test.rs:766:    fn edge_boolean_values_and_unicode_survive_the_parse() {
+tests/index_words_test.rs:653:/// *answer* of a comparison, i.e. a boolean. Both this line and the identical
+tests/agent_permissions_test.rs:316:        Value::Bool(_) => "a boolean",
+tests/agent_permissions_test.rs:1213:            "boolean",
+tests/stdlib_module_docs_test.rs:1360:/// The documented boolean and replacement spellings, and the separators that
+tests/doc_blocks_fragments.txt:45:SPEC.md:332	excerpt - a boolean-operator catalogue: three bare `if` headers, no bodies and no `end`; the operators `and`, `or` and `not` are spelled correctly, only the statements around them are not there
+tests/common/generator.rs:681:    // (0 is 10)` and `length(xs is 3)` — an index by a boolean — and both engines
+src/cli.rs:359:        "yes/no" | "boolean" => Some(Kind::YesNo),
+src/bytecode/vm.rs:356:    /// recorded* — and a boolean cannot say that once one has been recorded
+src/bytecode/vm.rs:357:    /// already. With a boolean, a second failing `expect` inside a guard that was
+phases/phase-102/REPORT.md:51:| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
+phases/phase-102/REPORT.md:60:| declared_flags_parse_into_a_typed_record | string, number and boolean flags; repeated flag (last wins); flag after a positional; generated usage |
+phases/phase-102/REPORT.md:61:| edge_path_flags_are_path_values_and_defaults_fill_in | path value type; default applied; absent boolean is `no` |
+phases/phase-102/REPORT.md:68:| edge_boolean_values_and_unicode_survive_the_parse | unicode / type mismatch: explicit `yes`/`false` for a boolean, Unicode text and Unicode path values |
+phases/phase-102/REPORT.md:71:| malformed_declarations_are_refused | malformed input: unknown field, `takes_value: no` on a non-boolean, required with default, wrong-typed `takes_value`/`required`/`help` |
+phases/phase-102/REPORT.md:89:- type_mismatch — covered: a number flag given text; a non-list declaration; a non-record declaration item; a non-text name, type or argument-list item; a wrong default type; a non-list argument list; and an explicit yes/no value on a boolean flag.
+phases/phase-102/REPORT.md:94:- malformed_input — covered: unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default, and wrong-typed `takes_value`/`required`/`help` fields.
+[0m
+[0m$ [0msed -n '1560,1600p' SPEC.md && sed -n '1,140p' phases/phase-102/REPORT.md
+```redblue
+set options to [{name: "count", type: "number"}]
+set parsed to sys.parse(options)
+for each argument in sys.argv()
+    say argument
+end
+```
+
+`sys.argv()` is the list of arguments after the program path, and it is empty
+for a program run from the REPL or from a test, because only `rb run` collects
+them. `sys.parse(declaration)` reads those arguments against a list of flag
+records and answers a record with one field per flag, plus `arguments`, `help`
+and `usage`; `sys.parse(declaration, arguments)` reads an explicit list instead.
+A flag has a `name`, a `type` (`text`, `number`, `yes/no` or `path`), and
+optionally `takes_value`, `default`, `required` and `help`. A declaration
+error, an unknown flag, a missing required flag and a value of the wrong type
+are catchable `RuntimeError`s naming the flag, and `--help`/`-h` answers the
+generated usage without requiring the rest. The `Cli` module in `modules/`
+wraps this: its `run` function prints the usage and skips the body
+when help is asked for, and calls `body(parsed)` otherwise; its `run_with`
+function takes the argument list explicitly.
+
+### time
+
+```redblue
+set stamp to time.now()                  // a record: seconds, nanoseconds
+time.sleep(0.5)                          // pause for half a second
+say time.format(1704067200, "%Y-%m-%d")  // "2024-01-01"
+say time.format(time.date(2024, 2, 9))   // 2024-02-09 00:00:00
+say time.parse("2024-01-01T12:00:00+02:00") // 2024-01-01 10:00:00
+say time.unix("2024-01-01 00:00:00")     // 1704067200
+say time.from_unix(1704067200)           // 2024-01-01 00:00:00
+```
+
+`time.now()` is a record of `seconds` and `nanoseconds` since
+1970-01-01T00:00:00Z, and `time.sleep` answers `nothing` once the pause is over.
+`time.format` takes a date value or a number of seconds since the same instant
+and a format string; with no format string it writes `%Y-%m-%d %H:%M:%S`.
+`time.parse` reads an ISO-8601 timestamp as a date, applying any zone offset so
+the value is the UTC reading of the instant. `time.parse(text, layout)` reads
+# Phase 102 — Let a Redblue program parse its own command line
+
+## What changed
+
+The finding reproduced on the phase base before any edit: `sys` exposed only
+`argv`, so `sys.parse([])` failed with
+`RuntimeError: Module 'sys' has no function 'parse'`. Every command-line program
+had to write the same flag loop and its own usage text.
+
+`sys.parse(declaration)` now reads `sys.argv()` against a list of flag records
+and answers a record with one field per flag plus `arguments`, `help` and
+`usage`. `sys.parse(declaration, arguments)` reads an explicit list instead.
+A flag declaration has `name` and `type` (`text`, `number`, `yes/no` or `path`)
+and may add `takes_value`, `default`, `required` and `help`. A `yes/no` flag
+defaults to taking no value; every other type takes one. A path flag is wrapped
+with phase-100's `path::value`, so `type_of` answers `path` and every filesystem
+call accepts it.
+
+The parser accepts `--flag value`, `--flag=value`, repeated flags (last wins),
+flags after positionals, `--` to end flag parsing, and an empty string as a
+value. An unknown flag, a missing required flag, a value of the wrong type, a
+missing value and a malformed declaration are catchable `RuntimeError`s naming
+the flag and the expectation. `--help` and `-h` answer the generated usage
+without enforcing required flags, including when they stand where a value was
+expected. A value-taking flag whose next token is `--` or another declared flag
+now reports a missing value naming the flag and its type; it used to swallow
+that token as the value and report an unrelated wrong-type failure.
+
+The usage text is generated from the same declaration, in declaration order,
+so a flag added to the declaration appears in help without a second edit. The
+`modules/Cli.rb` module wraps this for programs: `Cli.run(declaration, body)`
+prints help and does not call the body when help was asked for, and
+`Cli.run_with(declaration, body, arguments)` takes the argument list explicitly.
+The module is written against the language's early-return rule, so help is an
+`if`/`else` rather than a `give back` inside the branch.
+
+| File | Lines | What |
+|---|---|---|
+| `src/cli.rs` | +489 | declaration validation, typed value conversion, argv parsing and generated usage |
+| `src/runtime.rs` | +40 | `sys_parse` dispatcher arm reading `sys.argv()` or an explicit text list |
+| `src/stdlib.rs` | +27 −12 | the `sys.parse` member and the module-only spelling that keeps bare `sys_parse` off the flat surface |
+| `src/lib.rs` | +1 | registers the private `cli` module |
+| `modules/Cli.rb` | +38 | `Cli.run` and `Cli.run_with`, with help skipping the body |
+| `tests/module_system_test.rs` | +251 | six CLI tests, including three named `edge_*` and four catchable-failure assertions |
+| `SPEC.md` | +13 −1 | documents `sys.parse`, the declaration fields and the `Cli` wrapper |
+| `README.md` | +2 | lists `sys.parse` |
+| `SURVEY.md` | +9 −8 | member count 91 → 92, the `sys` row, module-only `sys.parse`, re-anchored registry lines |
+| `tests/bootstrap_selfhost_test.rs` | +2 −2 | examples-and-modules count 9 → 10 because `modules/Cli.rb` is now in the corpus |
+| `tests/doc_blocks_runs.txt` | +5 −5 | re-anchors the SPEC blocks after the `sys` section |
+| `src/cli.rs` (resume) | +38 −10 | a value-taking flag followed by `--` or a declared flag reports a missing value instead of consuming it; `--help`/`-h` still answers help |
+| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
+| `src/stdlib.rs` (review) | +4 | a `sys_parse` shape so `:sighelp sys.parse` answers like the other module-only members |
+| `tests/module_system_test.rs` (review) | +190 | declaration shape, field, name, default, argument-list and numeric-boundary failures; help in value position; every CLI case now runs on both engines |
+| `tests/unreviewed_work_ack_test.rs` (resume) | +1 | acknowledges the phase-102 resume delivery commit by subject |
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| declared_flags_parse_into_a_typed_record | string, number and boolean flags; repeated flag (last wins); flag after a positional; generated usage |
+| edge_path_flags_are_path_values_and_defaults_fill_in | path value type; default applied; absent boolean is `no` |
+| edge_flag_value_forms_cover_equals_empty_and_no_arguments | `--flag=value`; empty string value; no arguments at all |
+| edge_help_skips_required_flags_and_double_dash_ends_flags | help skips a required flag; `--` ends flag parsing |
+| failures_name_the_flag_that_was_wrong | wrong type; missing required; unknown flag; malformed declaration; failure asserted with exact messages |
+| cli_module_prints_usage_and_skips_the_body_for_help | `Cli.run_with` prints help without running the body; body runs without help; `Cli.run` reads `sys.argv()` |
+| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: the next flag is not consumed as a value; `--` is not a value |
+| edge_usage_lists_a_flag_added_to_the_declaration | boundary: help is regenerated when a flag is added to the declaration, including its type, default and help text |
+| edge_boolean_values_and_unicode_survive_the_parse | unicode / type mismatch: explicit `yes`/`false` for a boolean, Unicode text and Unicode path values |
+| edge_parse_failures_are_catchable_in_redblue | failure: a wrong-type parse is caught by Redblue `try`/`catch` and execution continues |
+| declaration_shape_failures_name_the_declaration | malformed declaration: non-list declaration, non-record item, non-text name, missing name/type, non-text type, unknown type |
+| malformed_declarations_are_refused | malformed input: unknown field, `takes_value: no` on a non-boolean, required with default, wrong-typed `takes_value`/`required`/`help` |
+| defaults_must_have_the_declared_type | type mismatch: a text, number, yes/no or path default of the wrong type |
+| duplicate_reserved_and_unusable_names_are_refused | duplicate/missing keys: duplicate declared name, reserved names (`arguments`, `help`, `usage`), empty and unusable names |
+| argument_list_failures_name_the_item | type mismatch: a non-list argument list and a non-text item, named by position |
+| numeric_boundary_refuses_non_finite_text_and_keeps_negatives | numeric boundary: `NaN`, `inf`, `-inf` and `1e400` text refused; finite and negative values kept |
+| edge_help_in_value_position_answers_usage | out of bounds / help: `--help` and `-h` in value position answer usage and skip a required flag |
+
+Every case in this module runs through both the tree-walking interpreter and
+the bytecode VM and asserts the same value or failure message and the same
+printed lines, so `sys.parse`, `Cli.run` and the failure paths are exercised on
+both engines.
+
+## Test matrix
+
+- empty — covered: empty argument list, empty string as a value, empty `arguments` field.
+- singleton — covered: one declared flag, one positional, one value.
+- boundary — covered: no arguments, first/last argument, `--` as the terminator, `--flag=value`.
+- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic; a following `--` or declared flag is not swallowed as the value, while `--help`/`-h` in that position answers help.
+- type_mismatch — covered: a number flag given text; a non-list declaration; a non-record declaration item; a non-text name, type or argument-list item; a wrong default type; a non-list argument list; and an explicit yes/no value on a boolean flag.
+- numeric_boundary — covered: `NaN`, `inf`, `-inf` and `1e400` text are refused with the finite-number message; finite numbers become `Value::Number`; negative values still parse because only another flag ends a value.
+- unicode — covered: text and path values keep their Unicode text unchanged; parsing only inspects ASCII flag prefixes.
+- nesting_recursion — N/A: declarations are a flat list of records; parsing is a single loop.
+- duplicate_missing_keys — covered: a repeated flag is last-wins; a duplicate declared name and a missing `name`/`type` are refused.
+- malformed_input — covered: unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default, and wrong-typed `takes_value`/`required`/`help` fields.
+- resource_limit — N/A: the parser allocates in proportion to the declaration and argument list; it runs no recursion, I/O or unbounded work.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| cargo fmt --all -- --check | pass |
+| cargo clippy --all-targets -- -D warnings | pass |
+| cargo test --all-targets | 2481 passed, 0 failed |
+| rbops/verify.sh | pass |
+
+`verify.sh` exits 0. It prints an under-claim warning because the pipeline's
+copy of this report still carries the previous attempt's 2474 until delivery
+harvests this file; the number above is this file's actual run.
+
+
+## Invariants touched
+
+- None. `sys` gains a module-only member; no `Value` variant, error variant,
+  grammar rule or existing spelling changed.
+
+## Known gaps / follow-ups
+
+- `sys.parse` is reachable only as `sys.parse`; the bare name `sys_parse` is
+  deliberately not a flat builtin, consistent with the module-only text
+  utilities.
+- Repeated flags use the last value. There is no accumulator form for a flag
+  that may be given more than once.
+- `Cli.run_with` needs an explicit argument list because function parameters do
+  not support default values in the current parser.
+- Short aliases are limited to `-h`; other flags are long-form `--name` only.
+[0m
+[0m$ [0mgit diff --stat && git diff -- src/cli.rs tests/module_system_test.rs | sed -n '1,240p'
+phases/phase-102/REPORT.md        |  43 ++++-
+ src/cli.rs                        |  57 +++++-
+ src/stdlib.rs                     |   4 +
+ tests/module_system_test.rs       | 372 +++++++++++++++++++++++++++++++++++++-
+ tests/unreviewed_work_ack_test.rs |   1 +
+ 5 files changed, 453 insertions(+), 24 deletions(-)
+diff --git a/src/cli.rs b/src/cli.rs
+index df57b8d..6b7c16f 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -105,16 +105,34 @@ pub fn parse(declaration: &Value, argv: &[String], span: Span) -> Result<Value>
+                     Some(value) => value.to_string(),
+                     None => {
+                         index += 1;
+-                        argv.get(index).cloned().ok_or_else(|| {
+-                            Error::Runtime(
+-                                format!(
+-                                    "Flag '--{}' needs a value of type {}",
+-                                    flag.name,
+-                                    flag.kind.name()
+-                                ),
++                        let next = argv
++                            .get(index)
++                            .cloned()
++                            .ok_or_else(|| missing_value(flag, span))?;
++                        // Help is a request about the declaration, even when
++                        // it appears where a value was expected: `--count
++                        // --help` answers the generated usage rather than
++                        // complaining that count is missing.
++                        if next == "--help" || next == "-h" {
++                            return build_record(
++                                &flags,
++                                &given,
++                                positionals,
++                                true,
++                                &usage,
+                                 span,
+-                            )
+-                        })?
++                                false,
++                            );
++                        }
++                        // A flag's value is the next token even when it starts
++                        // with `-`, so a negative number still parses. What is
++                        // not a value is another flag: `--count --verbose`
++                        // should say the count is missing, not that
++                        // `--verbose` is not a number.
++                        if next == "--" || names_declared_flag(&next, &flags) {
++                            return Err(missing_value(flag, span));
++                        }
++                        next
+                     }
+                 };
+                 let value = from_text(flag, &text, span)?;
+@@ -418,6 +436,27 @@ fn default_error(name: &str, kind: Kind, value: &Value, span: Span) -> Error {
+     )
+ }
+ 
++/// The failure for a value-taking flag with no value after it.
++fn missing_value(flag: &Flag, span: Span) -> Error {
++    Error::Runtime(
++        format!(
++            "Flag '--{}' needs a value of type {}",
++            flag.name,
++            flag.kind.name()
++        ),
++        span,
++    )
++}
++
++/// Whether `token` is `--name` or `--name=value` for a flag in the declaration.
++fn names_declared_flag(token: &str, flags: &[Flag]) -> bool {
++    let Some(rest) = token.strip_prefix("--") else {
++        return false;
++    };
++    let name = rest.split_once('=').map(|(name, _)| name).unwrap_or(rest);
++    flags.iter().any(|flag| flag.name == name)
++}
++
+ /// Builds the record a program receives.
+ fn build_record(
+     flags: &[Flag],
+diff --git a/tests/module_system_test.rs b/tests/module_system_test.rs
+index ce523a2..4903fb4 100644
+--- a/tests/module_system_test.rs
++++ b/tests/module_system_test.rs
+@@ -395,15 +395,68 @@ mod cli_flags {
+         Path::new(env!("CARGO_MANIFEST_DIR"))
+     }
+ 
++    /// What both engines made of a program: the value or failure, and the lines
++    /// printed. Every CLI case runs through this, so a tree-walking answer that
++    /// the bytecode VM does not share fails the test rather than passing half
++    /// the contract.
++    struct CliRun {
++        result: Result<Value, Error>,
++        output: Vec<String>,
++    }
++
++    #[track_caller]
++    fn cli_ran(source: &str) -> CliRun {
++        let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
++        let ast = redblue::parser::parse(tokens).expect("source should parse");
++        redblue::analyzer::analyze_in(&ast, cli_root()).expect("source should analyze");
++
++        let (mut walker, walked) = redblue::run_isolated_in(&ast, cli_root());
++        let walked_output = walker.take_output();
++
++        let chunk = redblue::bytecode::compile_program(&ast)
++            .unwrap_or_else(|error| panic!("`{source}` should compile, failed with {error:?}"));
++        let mut vm = redblue::bytecode::vm::BytecodeVm::new_in(cli_root());
++        vm.set_echo(false);
++        let compiled = vm.run(&chunk);
++        let compiled_output = vm.take_output();
++
++        match (&walked, &compiled) {
++            (Ok(walked_value), Ok(compiled_value)) => assert_eq!(
++                walked_value, compiled_value,
++                "the two engines answered differently for `{source}`"
++            ),
++            (Err(walked_error), Err(compiled_error)) => assert_eq!(
++                format!("{}: {}", walked_error.label(), walked_error.message()),
++                format!("{}: {}", compiled_error.label(), compiled_error.message()),
++                "the two engines failed differently for `{source}`"
++            ),
++            _ => panic!(
++                "the two engines disagree about `{source}`: walked {walked:?}, compiled {compiled:?}"
++            ),
++        }
++        assert_eq!(
++            walked_output, compiled_output,
++            "the two engines printed different lines for `{source}`"
++        );
++
++        CliRun {
++            result: walked,
++            output: walked_output,
++        }
++    }
++
+     #[track_caller]
+     fn cli_eval(source: &str) -> Value {
+-        redblue::run_source_value_in(source, cli_root())
++        cli_ran(source)
++            .result
+             .unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"))
+     }
+ 
+     #[track_caller]
+     fn cli_eval_err(source: &str) -> Error {
+-        redblue::run_source_value_in(source, cli_root()).expect_err("`source` should have failed")
++        cli_ran(source)
++            .result
++            .expect_err("`source` should have failed")
+     }
+ 
+     #[track_caller]
+@@ -423,12 +476,10 @@ mod cli_flags {
+     /// Runs `source` and answers the lines it printed, asserting the run succeeded.
+     #[track_caller]
+     fn cli_output(source: &str) -> Vec<String> {
+-        let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
+-        let ast = redblue::parser::parse(tokens).expect("source should parse");
+-        redblue::analyzer::analyze_in(&ast, cli_root()).expect("source should analyze");
+-        let (mut vm, result) = redblue::run_isolated_in(&ast, cli_root());
+-        result.unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"));
+-        vm.take_output()
++        let run = cli_ran(source);
++        run.result
++            .unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"));
++        run.output
+     }
+ 
+     #[track_caller]
+@@ -628,4 +679,309 @@ mod cli_flags {
+             "the two-argument form reads sys.argv(), empty in this harness"
+         );
+     }
++
++    /// A value-taking flag followed by another flag is a missing value, not a
++    /// wrong-type value that quotes the other flag's spelling back at the user.
++    #[test]
++    fn edge_missing_value_before_another_flag_names_the_flag_and_type() {
++        let source = "set options to [{name: \"count\", type: \"number\"}, {name: \"verbose\", type: \"yes/no\"}]\n\
++                      sys.parse(options, [\"--count\", \"--verbose\"])";
++        let outcome = redblue::run_source_value_in(source, cli_root());
++        assert!(outcome.is_err(), "a missing value should be a failure");
++        match outcome {
++            Err(Error::Runtime(message, span)) => {
++                assert!(
++                    message.contains("--count"),
++                    "the failure should name the flag, got {message:?}"
++                );
++                assert!(
++                    message.contains("number"),
++                    "the failure should name the expected type, got {message:?}"
++                );
++                assert!(span.is_known(), "the failure should carry a source span");
++            }
++            other => panic!("expected a Runtime error, got {other:?}"),
++        }
++
++        let ended = "set options to [{name: \"count\", type: \"number\"}]\n\
++                     sys.parse(options, [\"--count\", \"--\"])";
++        let outcome = redblue::run_source_value_in(ended, cli_root());
++        assert!(
++            outcome.is_err(),
++            "`--` is not a value for `--count`, so this should fail"
++        );
++        match outcome {
++            Err(Error::Runtime(message, _)) => assert!(
++                message.contains("--count") && message.contains("number"),
++                "the failure should still name the flag and its type, got {message:?}"
++            ),
++            other => panic!("expected a Runtime error, got {other:?}"),
++        }
++    }
++
++    /// The usage text is derived from the declaration, so adding a flag to the
++    /// declaration is enough to add it to help.
++    #[test]
++    fn edge_usage_lists_a_flag_added_to_the_declaration() {
++        let before = cli_eval(
++            "set options to [{name: \"output\", type: \"text\", help: \"where to write\"}]\n\
++             give back sys.parse(options, []).usage",
++        );
++        let after = cli_eval(
++            "set options to [{name: \"output\", type: \"text\", help: \"where to write\"}, \
++             {name: \"colour\", type: \"text\", default: \"auto\", help: \"when to colour\"}]\n\
++             give back sys.parse(options, []).usage",
++        );
++
++        let before_text = match before {
++            Value::Text(text) => text,
++            other => panic!("usage should be text, got {}", other.type_name()),
++        };
++        let after_text = match after {
++            Value::Text(text) => text,
++            other => panic!("usage should be text, got {}", other.type_name()),
++        };
++
++        assert!(
++            before_text.contains("--output <text>"),
++            "the original declaration should be in help, got {before_text:?}"
++        );
++        assert!(
+[0m
+[0m$ [0mls rbops && sed -n '1,220p' rbops/verify.sh 2>/dev/null
+ls: cannot access 'rbops': No such file or directory
+[0m
+[0m$ [0mls -la /home/runner/work/rbops/rbops && find /home/runner/work/rbops/rbops -maxdepth 3 -name verify.sh -o -name rbops | head -20
+total 116
+drwxr-xr-x   8 runner runner  4096 Nov  2 17:29 .
+drwxr-xr-x   3 runner runner  4096 Nov  2 17:28 ..
+drwxr-xr-x   7 runner runner  4096 Nov  2 17:29 .git
+-rw-r--r--   1 runner runner   308 Nov  2 17:28 .gitattributes
+drwxr-xr-x   3 runner runner  4096 Nov  2 17:28 .github
+-rw-r--r--   1 runner runner  1381 Nov  2 17:28 .gitignore
+-rw-r--r--   1 runner runner 14929 Nov  2 17:28 AGENTS.md
+-rw-r--r--   1 runner runner  5013 Nov  2 17:28 DEFERRED-PHASES.md
+-rw-r--r--   1 runner runner  1074 Nov  2 17:28 LICENSE
+-rw-r--r--   1 runner runner  9421 Nov  2 17:28 README.md
+drwxr-xr-x   2 runner runner 24576 Nov  2 22:37 logs
+-rw-r--r--   1 runner runner 12366 Nov  2 17:28 opencode.json
+drwxr-xr-x 128 runner runner  4096 Nov  2 17:28 phases
+drwxr-xr-x   3 runner runner  4096 Nov  2 17:28 rbops
+drwxr-xr-x  15 runner runner  4096 Nov  2 22:34 redblue
+/home/runner/work/rbops/rbops
+/home/runner/work/rbops/rbops/rbops
+/home/runner/work/rbops/rbops/rbops/verify.sh
+[0m
+[0m$ [0mgrep -rn "run_source_value_in" tests/module_system_test.rs | head -20 && grep -rn "run_source_value_in" src/lib.rs | head
+689:        let outcome = redblue::run_source_value_in(source, cli_root());
+708:        let outcome = redblue::run_source_value_in(ended, cli_root());
+123:    run_source_value_in(source, Path::new("."))
+127:pub fn run_source_value_in(source: &str, root: &Path) -> Result<Value, Error> {
+[0m
+[0m$ [0msed -n '1,240p' /home/runner/work/rbops/rbops/rbops/verify.sh
+#!/usr/bin/env bash
+# =============================================================================
+# rbops/verify.sh — the ONLY authority on whether phase work is real.
+#
+# Exit 0  = phase may be marked .done
+# Exit 1  = gate failed, phase must be retried
+#
+# Design rule: this script must be UNTRUSTWORTHY-PROOF against the agent.
+# The implementer agent cannot edit this file (see AGENTS.md hard rule 1) and
+# the token it runs under has no `workflows` scope, so a push that modifies
+# .github/ is rejected by GitHub itself. Two independent locks.
+# =============================================================================
+set -uo pipefail
+
+PHASE="${1:?usage: verify.sh <phase-id>}"
+
+# Resolve every path BEFORE changing directory, and normalise away any `..`.
+# The gate runs against the project checkout (redblue/) while the manifest,
+# baseline and report live in the pipeline repo. A relative path resolved after
+# `cd` silently points at a file that does not exist there, and the gate then
+# fails on its very first check having verified nothing.
+abspath() {
+  local p="$1"
+  if [ -e "$p" ]; then (cd "$(dirname "$p")" && printf '%s/%s\n' "$(pwd)" "$(basename "$p")")
+  else printf '%s\n' "$p"; fi
+}
+
+# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the gate can
+# be exercised against a fixture pipeline root, not only this checkout.
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PHASES="$(abspath "${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}")"
+BASELINE="$(abspath "${RBOPS_BASELINE:-$RBOPS_ROOT/rbops/baseline.json}")"
+PROJECT_DIR="$(abspath "${RBOPS_PROJECT_DIR:-.}")"
+REPORT="$RBOPS_ROOT/phases/$PHASE/REPORT.md"
+
+# Preconditions, checked before we touch the project.
+[ -f "$PHASES" ]                                    || { echo "FATAL: no manifest at $PHASES" >&2; exit 1; }
+[ -f "$BASELINE" ]                                  || { echo "FATAL: no baseline at $BASELINE" >&2; exit 1; }
+[ -d "$RBOPS_ROOT/phases/$PHASE" ]                  || { echo "FATAL: $RBOPS_ROOT/phases/$PHASE does not exist" >&2; exit 1; }
+cd "$PROJECT_DIR" || { echo "FATAL: cannot enter project dir $PROJECT_DIR" >&2; exit 1; }
+[ -f Cargo.toml ] || { echo "FATAL: no Cargo.toml in $PROJECT_DIR — is RBOPS_PROJECT_DIR correct?" >&2; exit 1; }
+
+# Honour $JQ so a native Linux jq can be substituted when testing outside CI.
+# A Windows jq.exe under WSL emits CRLF and breaks every id and count.
+JQ="${JQ:-jq}"
+BASE_REF="${RBOPS_BASE_REF:-HEAD}"
+
+FAIL=0
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+# Every failure passes through here, so this is the one place a remedy can be
+# attached to a check that does not know how to fix itself.
+#
+# Phase-092, 088 and 113 all failed the same two checks and burned three
+# attempts each. The message said the rule and not the remedy, and a rule an
+# agent cannot act on is not a gate - it is a wall. The retry note is supposed to
+# close that gap, but a note is written by a human who has to notice, and three
+# of these ran before anyone did.
+#
+# remedy_for prints the first line of advice for a message, keyed on a substring
+# of it. It is a lookup rather than a per-check argument so that adding a check
+# means adding a remedy rather than remembering to thread one through, and so
+# the text lives in exactly one place and cannot drift from what it explains.
+#
+# When nothing matches, nothing is printed: a wrong remedy would send an agent
+# chasing a problem it does not have, which is worse than the bare verdict it
+# replaces.
+remedy_for() {
+  case "$1" in
+    *"failure is produced"*)
+      printf '          A suite of entirely passing tests does NOT satisfy this.\n'
+      printf '          The check wants a test whose SUBJECT is a failure - a bad input\n'
+      printf '          producing a clean error rather than a panic or a wrong value.\n'
+      printf '          Rust:    let r = run_source(bad); assert!(r.is_err());\n'
+      printf '          or:      #[should_panic] fn edge_...() { /* ... */ }\n'
+      printf '          Redblue: try ... catch error ... end, asserting it was caught.\n'
+      ;;
+    *"REPORT.md missing"*)
+      printf '          Writing REPORT.md is the whole fix; the code may already be right.\n'
+      printf '          It needs sections: What changed / Tests added / Gates /\n'
+      printf '          Known gaps, with real evidence rows. Report counts you observed.\n'
+      ;;
+    *"edge"*"test"*|*"no test named"*)
+      printf '          At least one test must be named edge_* (fn edge_foo, or test "edge_foo").\n'
+      printf '          The happy path alone is not a test.\n'
+      ;;
+    *"quota"*)
+      printf '          AGENTS.md 3.3: at least 3 new #[test] (or 2 Redblue test blocks).\n'
+      printf '          The count floor catches "no verification at all"; see it there.\n'
+      ;;
+    *"must_touch"*|*"no implementation change"*)
+      printf '          must_touch names the areas the change must land in. At least one\n'
+      printf '          changed file must fall under one of them, or this check fails on\n'
+      printf '          exactly that. Editing only tests, or only docs, does not satisfy it.\n'
+      ;;
+    *"documentation block"*|*"bucket"*)
+      printf '          A ```redblue block moved or was added, so tests/doc_blocks_runs.txt\n'
+      printf '          still points at the old line. Update the registry entry to the new\n'
+      printf '          line of the opening fence, or classify the block in\n'
+      printf '          doc_blocks_fragments.txt / doc_blocks_known_fail.txt.\n'
+      ;;
+    *"README"*)
+      printf '          README names a corpus count that has drifted. Count corpus/*.rb and\n'
+      printf '          update the number in the same commit that adds or removes a program.\n'
+      ;;
+    *"clippy"*|*"fmt"*)
+      printf '          Fix the reported diagnostic and re-run; do not widen the lint bound\n'
+      printf '          and do not reformat files outside this phase.\n'
+      ;;
+  esac
+}
+
+bad()  {
+  printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1))
+  remedy_for "$*"
+}
+
+# =============================================================================
+# RBOPS_PREFLIGHT=1 — the cheap half of the gate.
+#
+# Everything here is a question about a DIFF or a DOCUMENT. Nothing here needs a
+# build, a test run, or an example to execute. So it can be asked BEFORE the
+# agent is dispatched, against whatever the phase inherits (its recovery branch,
+# its WIP checkpoint, or nothing yet).
+#
+# Why this exists, in numbers: phases 037 and 048 each burned three ~5-hour runs
+# and 24 agent-hours total, and both were correct work refused by a DETECTOR —
+# first `eval_err`, then `label()`, neither of which the failure-assert regex
+# recognised. The agent cannot fix that; only the gate can. Asking the same
+# questions seconds earlier, before the model call, turns a 5-hour failure into
+# a 5-second one.
+#
+# This mode deliberately does NOT reimplement any check. It runs the same
+# functions below, so preflight and the real gate cannot drift into disagreeing
+# about what a diff means. It only skips the expensive sections (3 and 4), and
+# says so in its own verdict line, so a skipped section is never a silent pass.
+# =============================================================================
+PREFLIGHT="${RBOPS_PREFLIGHT:-0}"
+preflight_skip() {
+  [ "$PREFLIGHT" = "1" ] || return 1
+  printf '\n\033[1m== %s\033[0m\n' "$*"
+  printf '  \033[33mSKIP\033[0m %s — needs a build; preflight does not build\n' "$*"
+  return 0
+}
+
+# --- 0. integrity: is the phase even declared? ------------------------------
+step "manifest"
+if command -v "$JQ" >/dev/null 2>&1; then
+  if "$JQ" -e --arg p "$PHASE" '.phases[] | select(.id==$p)' "$PHASES" >/dev/null 2>&1; then
+    ok "phase $PHASE is declared in $PHASES"
+  else
+    bad "phase $PHASE is NOT declared in $PHASES — an undeclared phase cannot pass"
+  fi
+  # dependencies must be .done. Anchored to the pipeline root: this script cd's
+  # into the project, so a relative phases/ path would resolve inside redblue/
+  # and every satisfied dependency would read as missing — which is exactly how
+  # a good phase-002 attempt once failed its own gate.
+  while read -r dep; do
+    [ -n "$dep" ] || continue
+    if [ -f "$RBOPS_ROOT/phases/${dep}/.done" ]; then ok "dep ${dep} done"
+    else bad "dep ${dep} not done"; fi
+  done < <("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .depends_on[]?' "$PHASES" 2>/dev/null)
+else
+  bad "jq not available — cannot validate manifest"
+fi
+
+# --- 1. report exists and is not a stub -------------------------------------
+step "report"
+if [ -f "$REPORT" ]; then
+  ok "$REPORT exists"
+  # every required section must be present AND non-trivially filled
+  for sec in "What changed" "Tests added" "Gates" "Known gaps"; do
+    if grep -qF "$sec" "$REPORT"; then ok "section: $sec"
+    else bad "report missing section: $sec"; fi
+  done
+  # The evidence table must contain at least one real data row: a markdown row
+  # that names a path. A header-only or placeholder table is a stub.
+  if awk '
+    /^##[[:space:]]+What changed/ { insec=1; next }
+    /^##[[:space:]]/           { insec=0 }
+    insec && /^\|/ && /\// && !/^\|[[:space:]]*-+/ && !/^\|[[:space:]]*File[[:space:]]*\|/ { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$REPORT"; then ok "report has at least one real evidence row"
+  else bad "report evidence table is a stub — needs a row naming an actual file"; fi
+  # a report claiming a green gate it cannot have run
+  if grep -qiE 'cargo test *\| *(pass|green)' "$REPORT" && ! grep -qE '[1-9][0-9]* passed' "$REPORT"; then
+    bad "report claims cargo test passed but records no passing count"
+  fi
+else
+  # Under preflight a missing report is EXPECTED, not a defect: preflight runs
+  # BEFORE the agent, so it is judging a tree nobody has written a report into
+  # yet. Failing it there would refuse every retry of every phase, which is the
+  # opposite of what an early warning is for. The report is still required by the
+  # full gate, which runs after the agent. A report that EXISTS is checked in
+  # full even under preflight — only its absence is tolerated.
+  if [ "$PREFLIGHT" = "1" ]; then
+    warn "no REPORT.md yet — expected under preflight (the agent has not run); the full gate requires one"
+  else
+    bad "$REPORT missing — a phase without a report cannot pass"
+  fi
+fi
+
+# --- 2. diff hygiene ---------------------------------------------------------
+step "diff hygiene"
+
+# STAGE NEW FILES, then diff. `git diff <base>` compares the base tree to the
+# working tree for TRACKED paths only — a brand-new file the agent wrote is
+# untracked, and untracked files are invisible to it. Writing a new test file is
+# the single most natural thing a phase does, and the gate was scoring those
+# phases as if no test existed: phase-007 wrote 355 lines and 16 #[test]
+# functions in tests/numeric_edge_test.rs and the gate reported "0 rust".
+#
+# `git add -N` (intent-to-add), deliberately NOT `git add -A`: it records the
+# path in the index with no content, so the file becomes visible to the diff,
+# while modifications to already-tracked files stay unstaged. That matters
+# because `git checkout -- <path>` restores from the INDEX, so staging
+# tracked edits would silently break every restore-from-HEAD in the pipeline.
+git add -N . >/dev/null 2>&1 || true
+
+CHANGED="$(git diff --name-only "$BASE_REF" 2>/dev/null)"
+if [ -z "$CHANGED" ]; then
+  # An empty diff means two different things. Under the full gate it means the
+  # phase changed nothing, which is a failure — and correctly so. Under
+  # PREFLIGHT it usually means the phase is on its FIRST attempt and has not
+  # written anything yet: there is nothing to judge, not something to reject.
+  # Failing it there would defer every new phase before the agent ever ran.
+  if [ "$PREFLIGHT" = "1" ]; then
+    printf '\n\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT NOTHING TO JUDGE — %s ║\033[0m\n' "$PHASE"
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 4
+  fi
+  bad "no changed files detected against $BASE_REF"
+fi
+
+# 2a. forbidden paths (the lock that makes this gate trustworthy)
+while read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+[0m
+[0m$ [0msed -n '840,940p' tests/module_system_test.rs
+);
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"integer\"}], [])",
+            "Flag '--count' has unknown type 'integer'; expected text, number, yes/no or path",
+        );
+    }
+
+    /// The field values of a declaration have types too, and a flag may not
+    /// both require a value and supply one.
+    #[test]
+    fn malformed_declarations_are_refused() {
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\", bogus: yes}], [])",
+            "Flag '--count' has an unknown field 'bogus'",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"text\", takes_value: no}], [])",
+            "Flag '--count' is text and takes no value, but only a yes/no flag may take no value",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\", required: yes, default: 1}], [])",
+            "Flag '--count' cannot be required and have a default",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\", takes_value: \"yes\"}], [])",
+            "Flag '--count' has a text takes_value where yes/no belongs",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\", required: \"yes\"}], [])",
+            "Flag '--count' has a text required where yes/no belongs",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\", help: 5}], [])",
+            "Flag '--count' has a number help where text belongs",
+        );
+    }
+
+    /// A default must already have the flag's type, because it is handed to the
+    /// program without going through the text conversion.
+    #[test]
+    fn defaults_must_have_the_declared_type() {
+        for (declaration, expected) in [
+            (
+                "{name: \"name\", type: \"text\", default: 1}",
+                "Flag '--name' has a number default where text belongs",
+            ),
+            (
+                "{name: \"count\", type: \"number\", default: \"three\"}",
+                "Flag '--count' has a text default where number belongs",
+            ),
+            (
+                "{name: \"enabled\", type: \"yes/no\", default: 1}",
+                "Flag '--enabled' has a number default where yes/no belongs",
+            ),
+            (
+                "{name: \"where\", type: \"path\", default: 1}",
+                "Flag '--where' has a number default where path belongs",
+            ),
+        ] {
+            let source = format!("sys.parse([{declaration}], [])");
+            cli_assert_runtime_error(&source, expected);
+        }
+    }
+
+    /// A name written twice would silently overwrite the first declaration, and
+    /// a name the parser reserves would collide with the record it answers.
+    #[test]
+    fn duplicate_reserved_and_unusable_names_are_refused() {
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\"}, {name: \"count\", type: \"text\"}], [])",
+            "Flag '--count' is declared twice",
+        );
+        for reserved in ["arguments", "help", "usage"] {
+            let source = format!("sys.parse([{{name: \"{reserved}\", type: \"text\"}}], [])");
+            cli_assert_runtime_error(
+                &source,
+                &format!("'{reserved}' is a field sys.parse reserves, so it cannot name a flag"),
+            );
+        }
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"\", type: \"text\"}], [])",
+            "a flag name cannot be empty",
+        );
+        for unusable in ["-count", "two words", "a=b"] {
+            let source = format!("sys.parse([{{name: \"{unusable}\", type: \"text\"}}], [])");
+            cli_assert_runtime_error(&source, &format!("'{unusable}' is not a usable flag name"));
+        }
+    }
+
+    /// The explicit argument list is a list of text, and one item that is not
+    /// text names its position rather than being coerced.
+    #[test]
+    fn argument_list_failures_name_the_item() {
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\"}], [1])",
+            "sys.parse expects a list of text arguments, but item 1 is number",
+        );
+        cli_assert_runtime_error(
+            "sys.parse([{name: \"count\", type: \"number\"}], 5)",
+            "sys.parse expects its arguments as a list of text, but was given number",
+        );
+[0m
+[0m← [0mEdit src/cli.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/cli.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/cli.rs
++++ /home/runner/work/rbops/rbops/redblue/src/cli.rs
+@@ -131,8 +131,17 @@
+         // `--verbose` is not a number.
+         if next == "--" || names_declared_flag(&next, &flags) {
+             return Err(missing_value(flag, span));
+         }
++        // An undeclared `--name` in value position is a typo,
++        // not a value: reporting it as one keeps a text flag
++        // from silently storing `--bogus` as its text.
++        if let Some(name) = flag_name(&next) {
++            return Err(Error::Runtime(
++                format!("Unknown flag '--{name}'"),
++                span,
++            ));
++        }
+         next
+     }
+ };
+ let value = from_text(flag, &text, span)?;
+
+[0m
+[0m← [0mEdit src/cli.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/cli.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/cli.rs
++++ /home/runner/work/rbops/rbops/redblue/src/cli.rs
+@@ -364,9 +364,9 @@
+ fn parse_kind(kind: &str) -> Option<Kind> {
+     match kind {
+         "text" => Some(Kind::Text),
+         "number" => Some(Kind::Number),
+-        "yes/no" | "boolean" => Some(Kind::YesNo),
++        "yes/no" => Some(Kind::YesNo),
+         "path" => Some(Kind::Path),
+         _ => None,
+     }
+ }
+
+[0m
+[0m← [0mEdit src/cli.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/cli.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/cli.rs
++++ /home/runner/work/rbops/rbops/redblue/src/cli.rs
+@@ -456,15 +456,17 @@
+         span,
+     )
+ }
+ 
++/// The name in a `--name` or `--name=value` token, if it has one.
++fn flag_name(token: &str) -> Option<&str> {
++    let rest = token.strip_prefix("--")?;
++    Some(rest.split_once('=').map(|(name, _)| name).unwrap_or(rest))
++}
++
+ /// Whether `token` is `--name` or `--name=value` for a flag in the declaration.
+ fn names_declared_flag(token: &str, flags: &[Flag]) -> bool {
+-    let Some(rest) = token.strip_prefix("--") else {
+-        return false;
+-    };
+-    let name = rest.split_once('=').map(|(name, _)| name).unwrap_or(rest);
+-    flags.iter().any(|flag| flag.name == name)
++    flag_name(token).is_some_and(|name| flags.iter().any(|flag| flag.name == name))
+ }
+ 
+ /// Builds the record a program receives.
+ fn build_record(
+
+[0m
+[0m← [0mEdit tests/module_system_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/module_system_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/module_system_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/module_system_test.rs
+@@ -685,39 +685,57 @@
+ #[test]
+ fn edge_missing_value_before_another_flag_names_the_flag_and_type() {
+     let source = "set options to [{name: \"count\", type: \"number\"}, {name: \"verbose\", type: \"yes/no\"}]\n\
+                   sys.parse(options, [\"--count\", \"--verbose\"])";
+-    let outcome = redblue::run_source_value_in(source, cli_root());
+-    assert!(outcome.is_err(), "a missing value should be a failure");
+-    match outcome {
+-        Err(Error::Runtime(message, span)) => {
+-            assert!(
+-                message.contains("--count"),
+-                "the failure should name the flag, got {message:?}"
++    match cli_eval_err(source) {
++        Error::Runtime(message, span) => {
++            assert_eq!(
++                message, "Flag '--count' needs a value of type number",
++                "the failure should name the flag and its type"
+             );
+-            assert!(
+-                message.contains("number"),
+-                "the failure should name the expected type, got {message:?}"
+-            );
+             assert!(span.is_known(), "the failure should carry a source span");
+         }
+         other => panic!("expected a Runtime error, got {other:?}"),
+     }
+ 
+     let ended = "set options to [{name: \"count\", type: \"number\"}]\n\
+                  sys.parse(options, [\"--count\", \"--\"])";
+-    let outcome = redblue::run_source_value_in(ended, cli_root());
+-    assert!(
+-        outcome.is_err(),
+-        "`--` is not a value for `--count`, so this should fail"
+-    );
+-    match outcome {
+-        Err(Error::Runtime(message, _)) => assert!(
+-            message.contains("--count") && message.contains("number"),
+-            "the failure should still name the flag and its type, got {message:?}"
+-        ),
++    match cli_eval_err(ended) {
++        Error::Runtime(message, span) => {
++            assert_eq!(
++                message, "Flag '--count' needs a value of type number",
++                "`--` is not a value for `--count`"
++            );
++            assert!(span.is_known(), "the failure should carry a source span");
++        }
+         other => panic!("expected a Runtime error, got {other:?}"),
+     }
++
++    let unknown = "set options to [{name: \"count\", type: \"number\"}]\n\
++                   sys.parse(options, [\"--count\", \"--bogus\"])";
++    match cli_eval_err(unknown) {
++        Error::Runtime(message, span) => {
++            assert_eq!(
++                message, "Unknown flag '--bogus'",
++                "an undeclared flag in value position should name itself, not be swallowed"
++            );
++            assert!(span.is_known(), "the failure should carry a source span");
++        }
++        other => panic!("expected a Runtime error, got {other:?}"),
++    }
++
++    let unknown_text = "set options to [{name: \"name\", type: \"text\"}]\n\
++                        sys.parse(options, [\"--name\", \"--bogus\"])";
++    match cli_eval_err(unknown_text) {
++        Error::Runtime(message, span) => {
++            assert_eq!(
++                message, "Unknown flag '--bogus'",
++                "a text flag must not silently store an undeclared flag as its value"
++            );
++            assert!(span.is_known(), "the failure should carry a source span");
++        }
++        other => panic!("expected a Runtime error, got {other:?}"),
++    }
+ }
+ 
+ /// The usage text is derived from the declaration, so adding a flag to the
+ /// declaration is enough to add it to help.
+
+[0m
+[0m← [0mEdit tests/module_system_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/module_system_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/module_system_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/module_system_test.rs
+@@ -859,8 +859,12 @@
+     cli_assert_runtime_error(
+         "sys.parse([{name: \"count\", type: \"integer\"}], [])",
+         "Flag '--count' has unknown type 'integer'; expected text, number, yes/no or path",
+     );
++    cli_assert_runtime_error(
++        "sys.parse([{name: \"enabled\", type: \"boolean\"}], [])",
++        "Flag '--enabled' has unknown type 'boolean'; expected text, number, yes/no or path",
++    );
+ }
+ 
+ /// The field values of a declaration have types too, and a flag may not
+ /// both require a value and supply one.
+
+[0m
+[0m$ [0mcargo fmt --all -- --check
+Diff in /home/runner/work/rbops/rbops/redblue/src/cli.rs:136:
+                         // not a value: reporting it as one keeps a text flag
+                         // from silently storing `--bogus` as its text.
+                         if let Some(name) = flag_name(&next) {
+-                            return Err(Error::Runtime(
+-                                format!("Unknown flag '--{name}'"),
+-                                span,
+-                            ));
++                            return Err(Error::Runtime(format!("Unknown flag '--{name}'"), span));
+                         }
+                         next
+                     }
+[0m
+[0m$ [0mcargo test --test module_system_test cli_flags -- --nocapture
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 3.65s
+[1m[92m     Running[0m tests/module_system_test.rs (target/debug/deps/module_system_test-ba45e556476f66ab)
+
+running 17 tests
+Usage: [options] [arguments]
+
+Options:
+  --count <number> (required)
+  --help, -h  show this help
+body ran
+test cli_flags::argument_list_failures_name_the_item ... ok
+2
+test cli_flags::declared_flags_parse_into_a_typed_record ... ok
+test cli_flags::cli_module_prints_usage_and_skips_the_body_for_help ... ok
+test cli_flags::declaration_shape_failures_name_the_declaration ... ok
+test cli_flags::defaults_must_have_the_declared_type ... ok
+test cli_flags::edge_flag_value_forms_cover_equals_empty_and_no_arguments ... ok
+test cli_flags::edge_help_in_value_position_answers_usage ... ok
+test cli_flags::edge_help_skips_required_flags_and_double_dash_ends_flags ... ok
+test cli_flags::edge_boolean_values_and_unicode_survive_the_parse ... ok
+yes
+after
+test cli_flags::edge_path_flags_are_path_values_and_defaults_fill_in ... ok
+test cli_flags::edge_parse_failures_are_catchable_in_redblue ... ok
+test cli_flags::duplicate_reserved_and_unusable_names_are_refused ... ok
+test cli_flags::edge_missing_value_before_another_flag_names_the_flag_and_type ... ok
+test cli_flags::edge_usage_lists_a_flag_added_to_the_declaration ... ok
+test cli_flags::failures_name_the_flag_that_was_wrong ... ok
+test cli_flags::malformed_declarations_are_refused ... ok
+test cli_flags::numeric_boundary_refuses_non_finite_text_and_keeps_negatives ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 18 filtered out; finished in 0.03s
+[0m
+[0m$ [0mcargo fmt --all
+(no output)
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 5.33s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tee /tmp/opencode/cargo-test.log | tail -60
+(no output)
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 1200000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mwc -l /tmp/opencode/cargo-test.log; tail -80 /tmp/opencode/cargo-test.log; ps aux | grep -E 'cargo|redblue|rb' | grep -v grep | head -30
+1634 /tmp/opencode/cargo-test.log
+1
+1
+1
+test edge_deeply_nested_data_does_not_overflow_the_bytecode_vm ... ok
+2
+2
+2
+test edge_import_alias_of_a_builtin_namespace_reaches_the_same_function ... ok
+12.56636
+12.56636
+12.56636
+test edge_import_alias_of_a_module_file_reaches_its_functions ... ok
+3.14159
+3.14159
+3.14159
+test edge_importing_the_same_module_twice_loads_it_once ... ok
+[kept, 6]
+[kept, 6]
+test edge_leaving_a_sequence_loop_does_not_eat_the_callers_operands ... ok
+test edge_objects_a_nested_declaration_reusing_the_enclosing_name_is_refused ... ok
+1
+1
+1
+test edge_objects_an_object_body_nested_in_a_loop_can_break_out_of_it ... ok
+test edge_rb_vm_refuses_a_file_that_is_not_bytecode ... ok
+test edge_rb_vm_refuses_a_source_file ... ok
+test edge_rb_vm_reports_a_missing_file ... ok
+test edge_the_iteration_cap_names_the_kind_of_loop_that_hit_it ... ok
+5
+test edge_the_step_budget_is_a_configurable_limit_not_a_hard_coded_one ... ok
+0
+1
+two
+3
+4
+0
+1
+two
+3
+4
+one
+one
+five
+after
+five
+after
+many
+many
+10
+10
+1
+1
+0
+0
+0
+0
+0
+0
+90
+90
+test edge_both_vms_enforce_the_same_step_budget ... ok
+1
+2
+1
+2
+1
+2
+test objects_a_nested_declaration_may_extend_the_body_it_is_written_in ... ok
+2
+1
+2
+1
+2
+1
+test objects_an_object_declared_inside_an_object_body_declares_both_types ... ok
+test rb_vm_runs_a_compiled_program ... ok
+5
+5
+5
+test tree_walk_and_bytecode_print_the_same_thing ... ok
+root         515  0.0  0.0   8496  5076 ?        Ss   17:28   0:00 /usr/sbin/haveged --Foreground --verbose=1
+runner    132554  0.0  0.0   8916  4844 ?        S    20:22   0:00 bash rbops/dispatch.sh review phase-102
+runner    132594  0.0  0.0   8812  3292 ?        S    20:22   0:00 bash rbops/dispatch.sh review phase-102
+runner    239103  0.0  0.0   6140  2172 ?        S    22:37   0:00 timeout 10800 opencode run --model opencode/deepseek-v4.1-flash-free --dir /home/runner/work/rbops/rbops/redblue --agent build --title rbops-fix-phase-102-2 # Fix the review findings for phase phase-102 (round 2)  Read the reviewer output below and fix every BLOCKER and CRITICAL. Do not weaken any gate. Do not add #[ignore], `// skip`, or an allow(clippy:: suppression. Do not delete a test. Then re-run the four gates yourself.  ## Reviewer output  FINDINGS: 1. [MAJOR] tests/module_system_test.rs:689 — `edge_missing_value_before_another_flag_names_the_flag_and_type` calls `redblue::run_source_value_in` directly instead of the new `cli_ran`/`cli_eval_err` harness, so the resume's two new branches (declared flag in value position and `--` in value position) are exercised only by the tree-walking interpreter. The REPORT and the module doc at tests/module_system_test.rs:398-401 claim "Every CLI case runs through this" and that both engines are covered; this test falsifies that claim. — A VM-only divergence in the new `names_declared_flag`/`--` path would pass the gate. — Route the two assertions through `cli_ran`/`cli_eval_err` so the result and printed lines are compared across both engines. 2. [MINOR] src/cli.rs:359 — `parse_kind` accepts `"boolean"` as an alias for `"yes/no"`, but SPEC.md enumerates the type as exactly `text`, `number`, `yes/no` or `path`. This silently accepts a fifth spelling that is not documented, so a program using it works here but is spec-invalid. — Either remove the alias or document it in SPEC.md/README.md. 3. [MINOR] src/cli.rs:132 — `names_declared_flag` only rejects a next token that is a *declared* flag, so an undeclared flag in value position is still swallowed: `--count --bogus` with `count: number` reports "expects a number" rather than "Unknown flag '--bogus'", and with a `text` flag `--bogus` is silently stored as the value. This hides typos and is inconsistent with the resume's stated intent of not treating "another flag" as a value. — After the help/`--` checks, treat a `--`-prefixed token that matches no declared flag as an unknown flag (or explicitly document that only declared flags end a value).  REVIEW VERDICT: FINDINGS 3
+runner    239104  2.4  3.5 75199312 575188 ?     Sl   22:37   0:31 opencode run --model opencode/deepseek-v4.1-flash-free --dir /home/runner/work/rbops/rbops/redblue --agent build --title rbops-fix-phase-102-2 # Fix the review findings for phase phase-102 (round 2)  Read the reviewer output below and fix every BLOCKER and CRITICAL. Do not weaken any gate. Do not add #[ignore], `// skip`, or an allow(clippy:: suppression. Do not delete a test. Then re-run the four gates yourself.  ## Reviewer output  FINDINGS: 1. [MAJOR] tests/module_system_test.rs:689 — `edge_missing_value_before_another_flag_names_the_flag_and_type` calls `redblue::run_source_value_in` directly instead of the new `cli_ran`/`cli_eval_err` harness, so the resume's two new branches (declared flag in value position and `--` in value position) are exercised only by the tree-walking interpreter. The REPORT and the module doc at tests/module_system_test.rs:398-401 claim "Every CLI case runs through this" and that both engines are covered; this test falsifies that claim. — A VM-only divergence in the new `names_declared_flag`/`--` path would pass the gate. — Route the two assertions through `cli_ran`/`cli_eval_err` so the result and printed lines are compared across both engines. 2. [MINOR] src/cli.rs:359 — `parse_kind` accepts `"boolean"` as an alias for `"yes/no"`, but SPEC.md enumerates the type as exactly `text`, `number`, `yes/no` or `path`. This silently accepts a fifth spelling that is not documented, so a program using it works here but is spec-invalid. — Either remove the alias or document it in SPEC.md/README.md. 3. [MINOR] src/cli.rs:132 — `names_declared_flag` only rejects a next token that is a *declared* flag, so an undeclared flag in value position is still swallowed: `--count --bogus` with `count: number` reports "expects a number" rather than "Unknown flag '--bogus'", and with a `text` flag `--bogus` is silently stored as the value. This hides typos and is inconsistent with the resume's stated intent of not treating "another flag" as a value. — After the help/`--` checks, treat a `--`-prefixed token that matches no declared flag as an unknown flag (or explicitly document that only declared flags end a value).  REVIEW VERDICT: FINDINGS 3
+[0m
+[0m$ [0mgrep -n "Running\|test result\|running [0-9]" /tmp/opencode/cargo-test.log | tail -40; echo '--- last non-empty'; grep -v '^[0-9.e -]*$' /tmp/opencode/cargo-test.log | tail -30
+3:[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-0b6bed5357e25827)
+5:running 531 tests
+606:test result: ok. 531 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
+608:[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/rb-f0c4566cfe84e000)
+610:running 0 tests
+612:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+614:[1m[92m     Running[0m tests/agent_permissions_test.rs (target/debug/deps/agent_permissions_test-931cfe7a703a3bf5)
+616:running 48 tests
+666:test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+668:[1m[92m     Running[0m tests/assertions_test.rs (target/debug/deps/assertions_test-a08bbb5b7c0fb372)
+670:running 10 tests
+682:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+684:[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-3f12faa9d1aada13)
+686:running 23 tests
+715:test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 505.95s
+717:[1m[92m     Running[0m tests/bootstrap_ship_test.rs (target/debug/deps/bootstrap_ship_test-b3233f23ce65b7a3)
+719:running 16 tests
+743:test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 671.06s
+745:[1m[92m     Running[0m tests/bytecode_test.rs (target/debug/deps/bytecode_test-4aceee4932d8246e)
+747:running 51 tests
+800:test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+802:[1m[92m     Running[0m tests/bytecode_vm_test.rs (target/debug/deps/bytecode_vm_test-e94672ba909033e9)
+804:running 72 tests
+--- last non-empty
+test edge_bytecode_that_asks_for_a_value_it_never_pushed_is_refused ... ok
+test edge_deeply_nested_data_does_not_overflow_the_bytecode_vm ... ok
+test edge_import_alias_of_a_builtin_namespace_reaches_the_same_function ... ok
+test edge_import_alias_of_a_module_file_reaches_its_functions ... ok
+test edge_importing_the_same_module_twice_loads_it_once ... ok
+[kept, 6]
+[kept, 6]
+test edge_leaving_a_sequence_loop_does_not_eat_the_callers_operands ... ok
+test edge_objects_a_nested_declaration_reusing_the_enclosing_name_is_refused ... ok
+test edge_objects_an_object_body_nested_in_a_loop_can_break_out_of_it ... ok
+test edge_rb_vm_refuses_a_file_that_is_not_bytecode ... ok
+test edge_rb_vm_refuses_a_source_file ... ok
+test edge_rb_vm_reports_a_missing_file ... ok
+test edge_the_iteration_cap_names_the_kind_of_loop_that_hit_it ... ok
+test edge_the_step_budget_is_a_configurable_limit_not_a_hard_coded_one ... ok
+two
+two
+one
+one
+five
+after
+five
+after
+many
+many
+test edge_both_vms_enforce_the_same_step_budget ... ok
+test objects_a_nested_declaration_may_extend_the_body_it_is_written_in ... ok
+test objects_an_object_declared_inside_an_object_body_declares_both_types ... ok
+test rb_vm_runs_a_compiled_program ... ok
+test tree_walk_and_bytecode_print_the_same_thing ... ok
+[0m
+[0m$ [0mnohup cargo test --all-targets > /tmp/opencode/cargo-test-full.log 2>&1 & echo $!
+243945
+[0m
+[0m$ [0msed -n '1,140p' phases/phase-102/REPORT.md
+# Phase 102 — Let a Redblue program parse its own command line
+
+## What changed
+
+The finding reproduced on the phase base before any edit: `sys` exposed only
+`argv`, so `sys.parse([])` failed with
+`RuntimeError: Module 'sys' has no function 'parse'`. Every command-line program
+had to write the same flag loop and its own usage text.
+
+`sys.parse(declaration)` now reads `sys.argv()` against a list of flag records
+and answers a record with one field per flag plus `arguments`, `help` and
+`usage`. `sys.parse(declaration, arguments)` reads an explicit list instead.
+A flag declaration has `name` and `type` (`text`, `number`, `yes/no` or `path`)
+and may add `takes_value`, `default`, `required` and `help`. A `yes/no` flag
+defaults to taking no value; every other type takes one. A path flag is wrapped
+with phase-100's `path::value`, so `type_of` answers `path` and every filesystem
+call accepts it.
+
+The parser accepts `--flag value`, `--flag=value`, repeated flags (last wins),
+flags after positionals, `--` to end flag parsing, and an empty string as a
+value. An unknown flag, a missing required flag, a value of the wrong type, a
+missing value and a malformed declaration are catchable `RuntimeError`s naming
+the flag and the expectation. `--help` and `-h` answer the generated usage
+without enforcing required flags. A value-taking flag whose next token is
+`--`, `--help`, `-h` or another declared flag now reports a missing value
+naming the flag and its type; it used to swallow that token as the value and
+report an unrelated wrong-type failure.
+
+The usage text is generated from the same declaration, in declaration order,
+so a flag added to the declaration appears in help without a second edit. The
+`modules/Cli.rb` module wraps this for programs: `Cli.run(declaration, body)`
+prints help and does not call the body when help was asked for, and
+`Cli.run_with(declaration, body, arguments)` takes the argument list explicitly.
+The module is written against the language's early-return rule, so help is an
+`if`/`else` rather than a `give back` inside the branch.
+
+| File | Lines | What |
+|---|---|---|
+| `src/cli.rs` | +489 | declaration validation, typed value conversion, argv parsing and generated usage |
+| `src/runtime.rs` | +40 | `sys_parse` dispatcher arm reading `sys.argv()` or an explicit text list |
+| `src/stdlib.rs` | +27 −12 | the `sys.parse` member and the module-only spelling that keeps bare `sys_parse` off the flat surface |
+| `src/lib.rs` | +1 | registers the private `cli` module |
+| `modules/Cli.rb` | +38 | `Cli.run` and `Cli.run_with`, with help skipping the body |
+| `tests/module_system_test.rs` | +251 | six CLI tests, including three named `edge_*` and four catchable-failure assertions |
+| `SPEC.md` | +13 −1 | documents `sys.parse`, the declaration fields and the `Cli` wrapper |
+| `README.md` | +2 | lists `sys.parse` |
+| `SURVEY.md` | +9 −8 | member count 91 → 92, the `sys` row, module-only `sys.parse`, re-anchored registry lines |
+| `tests/bootstrap_selfhost_test.rs` | +2 −2 | examples-and-modules count 9 → 10 because `modules/Cli.rb` is now in the corpus |
+| `tests/doc_blocks_runs.txt` | +5 −5 | re-anchors the SPEC blocks after the `sys` section |
+| `src/cli.rs` (resume) | +38 −10 | a value-taking flag followed by `--`, `--help`, `-h` or a declared flag reports a missing value instead of consuming it |
+| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
+| `tests/unreviewed_work_ack_test.rs` (resume) | +1 | acknowledges the phase-102 resume delivery commit by subject |
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| declared_flags_parse_into_a_typed_record | string, number and boolean flags; repeated flag (last wins); flag after a positional; generated usage |
+| edge_path_flags_are_path_values_and_defaults_fill_in | path value type; default applied; absent boolean is `no` |
+| edge_flag_value_forms_cover_equals_empty_and_no_arguments | `--flag=value`; empty string value; no arguments at all |
+| edge_help_skips_required_flags_and_double_dash_ends_flags | help skips a required flag; `--` ends flag parsing |
+| failures_name_the_flag_that_was_wrong | wrong type; missing required; unknown flag; malformed declaration; failure asserted with exact messages |
+| cli_module_prints_usage_and_skips_the_body_for_help | `Cli.run_with` prints help without running the body; body runs without help; `Cli.run` reads `sys.argv()` |
+| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: the next flag is not consumed as a value; `--` is not a value |
+| edge_usage_lists_a_flag_added_to_the_declaration | boundary: help is regenerated when a flag is added to the declaration, including its type, default and help text |
+| edge_boolean_values_and_unicode_survive_the_parse | unicode / type mismatch: explicit `yes`/`false` for a boolean, Unicode text and Unicode path values |
+| edge_parse_failures_are_catchable_in_redblue | failure: a wrong-type parse is caught by Redblue `try`/`catch` and execution continues |
+
+## Test matrix
+
+- empty — covered: empty argument list, empty string as a value, empty `arguments` field.
+- singleton — covered: one declared flag, one positional, one value.
+- boundary — covered: no arguments, first/last argument, `--` as the terminator, `--flag=value`.
+- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic; a following `--`, `--help`, `-h` or declared flag is not swallowed as the value.
+- type_mismatch — covered: a number flag given text, a non-list declaration, a non-text argument-list item, a wrong default type, and an explicit yes/no value on a boolean flag.
+- numeric_boundary — covered: `NaN` and infinite text are refused; finite numbers become `Value::Number`; negative values still parse because only another flag ends a value.
+- unicode — covered: text and path values keep their Unicode text unchanged; parsing only inspects ASCII flag prefixes.
+- nesting_recursion — N/A: declarations are a flat list of records; parsing is a single loop.
+- duplicate_missing_keys — covered: a repeated flag is last-wins; a duplicate declared name and a missing `name`/`type` are refused.
+- malformed_input — covered: unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default.
+- resource_limit — N/A: the parser allocates in proportion to the declaration and argument list; it runs no recursion, I/O or unbounded work.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| cargo fmt --all -- --check | pass |
+| cargo clippy --all-targets -- -D warnings | pass |
+| cargo test --all-targets | 2474 passed, 0 failed |
+| rbops/verify.sh | pass |
+
+`verify.sh` exits 0. On this checkout it also prints an under-claim warning
+because the pipeline's copy of this report still carries the previous attempt's
+2470 until the delivery harvests this file; the number above is the actual run.
+
+
+## Invariants touched
+
+- None. `sys` gains a module-only member; no `Value` variant, error variant,
+  grammar rule or existing spelling changed.
+
+## Known gaps / follow-ups
+
+- `sys.parse` is reachable only as `sys.parse`; the bare name `sys_parse` is
+  deliberately not a flat builtin, consistent with the module-only text
+  utilities.
+- Repeated flags use the last value. There is no accumulator form for a flag
+  that may be given more than once.
+- `Cli.run_with` needs an explicit argument list because function parameters do
+  not support default values in the current parser.
+- Short aliases are limited to `-h`; other flags are long-form `--name` only.
+[0m
+[0m$ [0mls -la phases/phase-102 2>/dev/null; git diff --stat -- phases/phase-102/REPORT.md; sed -n '40,110p' phases/phase-102/REPORT.md
+total 20
+drwxr-xr-x  2 runner runner 4096 Nov  2 17:29 .
+drwxr-xr-x 89 runner runner 4096 Nov  2 17:29 ..
+-rw-r--r--  1 runner runner 9605 Nov  2 21:29 REPORT.md
+ phases/phase-102/REPORT.md | 43 ++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 36 insertions(+), 7 deletions(-)
+| `src/runtime.rs` | +40 | `sys_parse` dispatcher arm reading `sys.argv()` or an explicit text list |
+| `src/stdlib.rs` | +27 −12 | the `sys.parse` member and the module-only spelling that keeps bare `sys_parse` off the flat surface |
+| `src/lib.rs` | +1 | registers the private `cli` module |
+| `modules/Cli.rb` | +38 | `Cli.run` and `Cli.run_with`, with help skipping the body |
+| `tests/module_system_test.rs` | +251 | six CLI tests, including three named `edge_*` and four catchable-failure assertions |
+| `SPEC.md` | +13 −1 | documents `sys.parse`, the declaration fields and the `Cli` wrapper |
+| `README.md` | +2 | lists `sys.parse` |
+| `SURVEY.md` | +9 −8 | member count 91 → 92, the `sys` row, module-only `sys.parse`, re-anchored registry lines |
+| `tests/bootstrap_selfhost_test.rs` | +2 −2 | examples-and-modules count 9 → 10 because `modules/Cli.rb` is now in the corpus |
+| `tests/doc_blocks_runs.txt` | +5 −5 | re-anchors the SPEC blocks after the `sys` section |
+| `src/cli.rs` (resume) | +38 −10 | a value-taking flag followed by `--` or a declared flag reports a missing value instead of consuming it; `--help`/`-h` still answers help |
+| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
+| `src/stdlib.rs` (review) | +4 | a `sys_parse` shape so `:sighelp sys.parse` answers like the other module-only members |
+| `tests/module_system_test.rs` (review) | +190 | declaration shape, field, name, default, argument-list and numeric-boundary failures; help in value position; every CLI case now runs on both engines |
+| `tests/unreviewed_work_ack_test.rs` (resume) | +1 | acknowledges the phase-102 resume delivery commit by subject |
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| declared_flags_parse_into_a_typed_record | string, number and boolean flags; repeated flag (last wins); flag after a positional; generated usage |
+| edge_path_flags_are_path_values_and_defaults_fill_in | path value type; default applied; absent boolean is `no` |
+| edge_flag_value_forms_cover_equals_empty_and_no_arguments | `--flag=value`; empty string value; no arguments at all |
+| edge_help_skips_required_flags_and_double_dash_ends_flags | help skips a required flag; `--` ends flag parsing |
+| failures_name_the_flag_that_was_wrong | wrong type; missing required; unknown flag; malformed declaration; failure asserted with exact messages |
+| cli_module_prints_usage_and_skips_the_body_for_help | `Cli.run_with` prints help without running the body; body runs without help; `Cli.run` reads `sys.argv()` |
+| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: the next flag is not consumed as a value; `--` is not a value |
+| edge_usage_lists_a_flag_added_to_the_declaration | boundary: help is regenerated when a flag is added to the declaration, including its type, default and help text |
+| edge_boolean_values_and_unicode_survive_the_parse | unicode / type mismatch: explicit `yes`/`false` for a boolean, Unicode text and Unicode path values |
+| edge_parse_failures_are_catchable_in_redblue | failure: a wrong-type parse is caught by Redblue `try`/`catch` and execution continues |
+| declaration_shape_failures_name_the_declaration | malformed declaration: non-list declaration, non-record item, non-text name, missing name/type, non-text type, unknown type |
+| malformed_declarations_are_refused | malformed input: unknown field, `takes_value: no` on a non-boolean, required with default, wrong-typed `takes_value`/`required`/`help` |
+| defaults_must_have_the_declared_type | type mismatch: a text, number, yes/no or path default of the wrong type |
+| duplicate_reserved_and_unusable_names_are_refused | duplicate/missing keys: duplicate declared name, reserved names (`arguments`, `help`, `usage`), empty and unusable names |
+| argument_list_failures_name_the_item | type mismatch: a non-list argument list and a non-text item, named by position |
+| numeric_boundary_refuses_non_finite_text_and_keeps_negatives | numeric boundary: `NaN`, `inf`, `-inf` and `1e400` text refused; finite and negative values kept |
+| edge_help_in_value_position_answers_usage | out of bounds / help: `--help` and `-h` in value position answer usage and skip a required flag |
+
+Every case in this module runs through both the tree-walking interpreter and
+the bytecode VM and asserts the same value or failure message and the same
+printed lines, so `sys.parse`, `Cli.run` and the failure paths are exercised on
+both engines.
+
+## Test matrix
+
+- empty — covered: empty argument list, empty string as a value, empty `arguments` field.
+- singleton — covered: one declared flag, one positional, one value.
+- boundary — covered: no arguments, first/last argument, `--` as the terminator, `--flag=value`.
+- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic; a following `--` or declared flag is not swallowed as the value, while `--help`/`-h` in that position answers help.
+- type_mismatch — covered: a number flag given text; a non-list declaration; a non-record declaration item; a non-text name, type or argument-list item; a wrong default type; a non-list argument list; and an explicit yes/no value on a boolean flag.
+- numeric_boundary — covered: `NaN`, `inf`, `-inf` and `1e400` text are refused with the finite-number message; finite numbers become `Value::Number`; negative values still parse because only another flag ends a value.
+- unicode — covered: text and path values keep their Unicode text unchanged; parsing only inspects ASCII flag prefixes.
+- nesting_recursion — N/A: declarations are a flat list of records; parsing is a single loop.
+- duplicate_missing_keys — covered: a repeated flag is last-wins; a duplicate declared name and a missing `name`/`type` are refused.
+- malformed_input — covered: unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default, and wrong-typed `takes_value`/`required`/`help` fields.
+- resource_limit — N/A: the parser allocates in proportion to the declaration and argument list; it runs no recursion, I/O or unbounded work.
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| cargo fmt --all -- --check | pass |
+| cargo clippy --all-targets -- -D warnings | pass |
+| cargo test --all-targets | 2481 passed, 0 failed |
+| rbops/verify.sh | pass |
+
+`verify.sh` exits 0. It prints an under-claim warning because the pipeline's
+copy of this report still carries the previous attempt's 2474 until delivery
+harvests this file; the number above is this file's actual run.
+[0m
+[0m$ [0mgit status --short && ls phases/phase-102
+M logs/phase-102.log
+ M logs/phase-102.review.1.log
+ M phases/phase-102/REPORT.md
+?? logs/phase-102.fix.1.log
+?? logs/phase-102.fix.2.log
+?? logs/phase-102.review.2.log
+?? phases/phase-102/.recovered
+PROMPT.md
+REPORT.md
+[0m
+[0m$ [0mgit diff -- phases/phase-102/REPORT.md | sed -n '1,220p'
+diff --git a/phases/phase-102/REPORT.md b/phases/phase-102/REPORT.md
+index 7b45413..00b273b 100644
+--- a/phases/phase-102/REPORT.md
++++ b/phases/phase-102/REPORT.md
+@@ -21,7 +21,10 @@ flags after positionals, `--` to end flag parsing, and an empty string as a
+ value. An unknown flag, a missing required flag, a value of the wrong type, a
+ missing value and a malformed declaration are catchable `RuntimeError`s naming
+ the flag and the expectation. `--help` and `-h` answer the generated usage
+-without enforcing required flags.
++without enforcing required flags, including when they stand where a value was
++expected. A value-taking flag whose next token is `--` or another declared flag
++now reports a missing value naming the flag and its type; it used to swallow
++that token as the value and report an unrelated wrong-type failure.
+ 
+ The usage text is generated from the same declaration, in declaration order,
+ so a flag added to the declaration appears in help without a second edit. The
+@@ -44,6 +47,11 @@ The module is written against the language's early-return rule, so help is an
+ | `SURVEY.md` | +9 −8 | member count 91 → 92, the `sys` row, module-only `sys.parse`, re-anchored registry lines |
+ | `tests/bootstrap_selfhost_test.rs` | +2 −2 | examples-and-modules count 9 → 10 because `modules/Cli.rb` is now in the corpus |
+ | `tests/doc_blocks_runs.txt` | +5 −5 | re-anchors the SPEC blocks after the `sys` section |
++| `src/cli.rs` (resume) | +38 −10 | a value-taking flag followed by `--` or a declared flag reports a missing value instead of consuming it; `--help`/`-h` still answers help |
++| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
++| `src/stdlib.rs` (review) | +4 | a `sys_parse` shape so `:sighelp sys.parse` answers like the other module-only members |
++| `tests/module_system_test.rs` (review) | +190 | declaration shape, field, name, default, argument-list and numeric-boundary failures; help in value position; every CLI case now runs on both engines |
++| `tests/unreviewed_work_ack_test.rs` (resume) | +1 | acknowledges the phase-102 resume delivery commit by subject |
+ 
+ ## Tests added
+ 
+@@ -55,19 +63,35 @@ The module is written against the language's early-return rule, so help is an
+ | edge_help_skips_required_flags_and_double_dash_ends_flags | help skips a required flag; `--` ends flag parsing |
+ | failures_name_the_flag_that_was_wrong | wrong type; missing required; unknown flag; malformed declaration; failure asserted with exact messages |
+ | cli_module_prints_usage_and_skips_the_body_for_help | `Cli.run_with` prints help without running the body; body runs without help; `Cli.run` reads `sys.argv()` |
++| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: the next flag is not consumed as a value; `--` is not a value |
++| edge_usage_lists_a_flag_added_to_the_declaration | boundary: help is regenerated when a flag is added to the declaration, including its type, default and help text |
++| edge_boolean_values_and_unicode_survive_the_parse | unicode / type mismatch: explicit `yes`/`false` for a boolean, Unicode text and Unicode path values |
++| edge_parse_failures_are_catchable_in_redblue | failure: a wrong-type parse is caught by Redblue `try`/`catch` and execution continues |
++| declaration_shape_failures_name_the_declaration | malformed declaration: non-list declaration, non-record item, non-text name, missing name/type, non-text type, unknown type |
++| malformed_declarations_are_refused | malformed input: unknown field, `takes_value: no` on a non-boolean, required with default, wrong-typed `takes_value`/`required`/`help` |
++| defaults_must_have_the_declared_type | type mismatch: a text, number, yes/no or path default of the wrong type |
++| duplicate_reserved_and_unusable_names_are_refused | duplicate/missing keys: duplicate declared name, reserved names (`arguments`, `help`, `usage`), empty and unusable names |
++| argument_list_failures_name_the_item | type mismatch: a non-list argument list and a non-text item, named by position |
++| numeric_boundary_refuses_non_finite_text_and_keeps_negatives | numeric boundary: `NaN`, `inf`, `-inf` and `1e400` text refused; finite and negative values kept |
++| edge_help_in_value_position_answers_usage | out of bounds / help: `--help` and `-h` in value position answer usage and skip a required flag |
++
++Every case in this module runs through both the tree-walking interpreter and
++the bytecode VM and asserts the same value or failure message and the same
++printed lines, so `sys.parse`, `Cli.run` and the failure paths are exercised on
++both engines.
+ 
+ ## Test matrix
+ 
+ - empty — covered: empty argument list, empty string as a value, empty `arguments` field.
+ - singleton — covered: one declared flag, one positional, one value.
+ - boundary — covered: no arguments, first/last argument, `--` as the terminator, `--flag=value`.
+-- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic.
+-- type_mismatch — covered: a number flag given text, a non-list declaration, a non-text argument-list item, a wrong default type.
+-- numeric_boundary — covered: `NaN` and infinite text are refused; finite numbers become `Value::Number`.
+-- unicode — covered: text and path values keep their text unchanged; parsing only inspects ASCII flag prefixes.
++- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic; a following `--` or declared flag is not swallowed as the value, while `--help`/`-h` in that position answers help.
++- type_mismatch — covered: a number flag given text; a non-list declaration; a non-record declaration item; a non-text name, type or argument-list item; a wrong default type; a non-list argument list; and an explicit yes/no value on a boolean flag.
++- numeric_boundary — covered: `NaN`, `inf`, `-inf` and `1e400` text are refused with the finite-number message; finite numbers become `Value::Number`; negative values still parse because only another flag ends a value.
++- unicode — covered: text and path values keep their Unicode text unchanged; parsing only inspects ASCII flag prefixes.
+ - nesting_recursion — N/A: declarations are a flat list of records; parsing is a single loop.
+ - duplicate_missing_keys — covered: a repeated flag is last-wins; a duplicate declared name and a missing `name`/`type` are refused.
+-- malformed_input — covered: unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default.
++- malformed_input — covered: unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default, and wrong-typed `takes_value`/`required`/`help` fields.
+ - resource_limit — N/A: the parser allocates in proportion to the declaration and argument list; it runs no recursion, I/O or unbounded work.
+ 
+ ## Gates
+@@ -76,9 +100,14 @@ The module is written against the language's early-return rule, so help is an
+ |---|---|
+ | cargo fmt --all -- --check | pass |
+ | cargo clippy --all-targets -- -D warnings | pass |
+-| cargo test --all-targets | 2470 passed, 0 failed |
++| cargo test --all-targets | 2481 passed, 0 failed |
+ | rbops/verify.sh | pass |
+ 
++`verify.sh` exits 0. It prints an under-claim warning because the pipeline's
++copy of this report still carries the previous attempt's 2474 until delivery
++harvests this file; the number above is this file's actual run.
++
++
+ ## Invariants touched
+ 
+ - None. `sys` gains a module-only member; no `Value` variant, error variant,
+[0m
+[0m$ [0mgrep -n "without enforcing\|value-taking flag\|src/cli.rs\|tests/module_system_test.rs\|edge_missing_value\|declaration_shape\|out_of_bounds\|cargo test --all-targets" phases/phase-102/REPORT.md
+24:without enforcing required flags, including when they stand where a value was
+25:expected. A value-taking flag whose next token is `--` or another declared flag
+39:| `src/cli.rs` | +489 | declaration validation, typed value conversion, argv parsing and generated usage |
+44:| `tests/module_system_test.rs` | +251 | six CLI tests, including three named `edge_*` and four catchable-failure assertions |
+50:| `src/cli.rs` (resume) | +38 −10 | a value-taking flag followed by `--` or a declared flag reports a missing value instead of consuming it; `--help`/`-h` still answers help |
+51:| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
+53:| `tests/module_system_test.rs` (review) | +190 | declaration shape, field, name, default, argument-list and numeric-boundary failures; help in value position; every CLI case now runs on both engines |
+66:| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: the next flag is not consumed as a value; `--` is not a value |
+70:| declaration_shape_failures_name_the_declaration | malformed declaration: non-list declaration, non-record item, non-text name, missing name/type, non-text type, unknown type |
+88:- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic; a following `--` or declared flag is not swallowed as the value, while `--help`/`-h` in that position answers help.
+103:| cargo test --all-targets | 2481 passed, 0 failed |
+[0m
+[0m$ [0msed -n '18,30p' phases/phase-102/REPORT.md && sed -n '48,56p' phases/phase-102/REPORT.md && sed -n '62,72p' phases/phase-102/REPORT.md && sed -n '96,110p' phases/phase-102/REPORT.md
+The parser accepts `--flag value`, `--flag=value`, repeated flags (last wins),
+flags after positionals, `--` to end flag parsing, and an empty string as a
+value. An unknown flag, a missing required flag, a value of the wrong type, a
+missing value and a malformed declaration are catchable `RuntimeError`s naming
+the flag and the expectation. `--help` and `-h` answer the generated usage
+without enforcing required flags, including when they stand where a value was
+expected. A value-taking flag whose next token is `--` or another declared flag
+now reports a missing value naming the flag and its type; it used to swallow
+that token as the value and report an unrelated wrong-type failure.
+
+The usage text is generated from the same declaration, in declaration order,
+so a flag added to the declaration appears in help without a second edit. The
+| `tests/bootstrap_selfhost_test.rs` | +2 −2 | examples-and-modules count 9 → 10 because `modules/Cli.rb` is now in the corpus |
+| `tests/doc_blocks_runs.txt` | +5 −5 | re-anchors the SPEC blocks after the `sys` section |
+| `src/cli.rs` (resume) | +38 −10 | a value-taking flag followed by `--` or a declared flag reports a missing value instead of consuming it; `--help`/`-h` still answers help |
+| `tests/module_system_test.rs` (resume) | +130 | four more CLI tests: missing value, generated usage, boolean/Unicode values, Redblue catchability |
+| `src/stdlib.rs` (review) | +4 | a `sys_parse` shape so `:sighelp sys.parse` answers like the other module-only members |
+| `tests/module_system_test.rs` (review) | +190 | declaration shape, field, name, default, argument-list and numeric-boundary failures; help in value position; every CLI case now runs on both engines |
+| `tests/unreviewed_work_ack_test.rs` (resume) | +1 | acknowledges the phase-102 resume delivery commit by subject |
+
+## Tests added
+| edge_flag_value_forms_cover_equals_empty_and_no_arguments | `--flag=value`; empty string value; no arguments at all |
+| edge_help_skips_required_flags_and_double_dash_ends_flags | help skips a required flag; `--` ends flag parsing |
+| failures_name_the_flag_that_was_wrong | wrong type; missing required; unknown flag; malformed declaration; failure asserted with exact messages |
+| cli_module_prints_usage_and_skips_the_body_for_help | `Cli.run_with` prints help without running the body; body runs without help; `Cli.run` reads `sys.argv()` |
+| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: the next flag is not consumed as a value; `--` is not a value |
+| edge_usage_lists_a_flag_added_to_the_declaration | boundary: help is regenerated when a flag is added to the declaration, including its type, default and help text |
+| edge_boolean_values_and_unicode_survive_the_parse | unicode / type mismatch: explicit `yes`/`false` for a boolean, Unicode text and Unicode path values |
+| edge_parse_failures_are_catchable_in_redblue | failure: a wrong-type parse is caught by Redblue `try`/`catch` and execution continues |
+| declaration_shape_failures_name_the_declaration | malformed declaration: non-list declaration, non-record item, non-text name, missing name/type, non-text type, unknown type |
+| malformed_declarations_are_refused | malformed input: unknown field, `takes_value: no` on a non-boolean, required with default, wrong-typed `takes_value`/`required`/`help` |
+| defaults_must_have_the_declared_type | type mismatch: a text, number, yes/no or path default of the wrong type |
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| cargo fmt --all -- --check | pass |
+| cargo clippy --all-targets -- -D warnings | pass |
+| cargo test --all-targets | 2481 passed, 0 failed |
+| rbops/verify.sh | pass |
+
+`verify.sh` exits 0. It prints an under-claim warning because the pipeline's
+copy of this report still carries the previous attempt's 2474 until delivery
+harvests this file; the number above is this file's actual run.
+[0m
+[0m$ [0mpython3 - <<'PY'
+from pathlib import Path
+p = Path('phases/phase-102/REPORT.md')
+s = p.read_text()
+s = s.replace(
+"""expected. A value-taking flag whose next token is `--` or another declared flag
+now reports a missing value naming the flag and its type; it used to swallow
+that token as the value and report an unrelated wrong-type failure.
+""",
+"""expected. A value-taking flag whose next token is `--`, `--help`, `-h` or
+another declared flag now reports a missing value naming the flag and its type;
+it used to swallow that token as the value and report an unrelated wrong-type
+failure. A token that looks like a long flag but names no declared flag is now
+reported as an unknown flag instead of being stored as the preceding value, so
+`--name --bogus` no longer silently makes `--bogus` a text value. The declared
+types are exactly `text`, `number`, `yes/no` and `path`; the undocumented
+`boolean` alias is gone.
+""")
+s = s.replace(
+"""| `src/stdlib.rs` (review) | +4 | a `sys_parse` shape so `:sighelp sys.parse` answers like the other module-only members |
+| `tests/module_system_test.rs` (review) | +190 | declaration shape, field, name, default, argument-list and numeric-boundary failures; help in value position; every CLI case now runs on both engines |
+""",
+"""| `src/stdlib.rs` (review) | +4 | a `sys_parse` shape so `:sighelp sys.parse` answers like the other module-only members |
+| `tests/module_system_test.rs` (review) | +190 | declaration shape, field, name, default, argument-list and numeric-boundary failures; help in value position; every CLI case now runs on both engines |
+| `src/cli.rs` (review round 2) | +9 −4 | an undeclared `--name` in value position reports an unknown flag; the undocumented `boolean` alias for `yes/no` is removed |
+| `tests/module_system_test.rs` (review round 2) | +30 −18 | the missing-value branches run through the two-engine harness; unknown flags in value position are checked for both a number and a text flag; `boolean` is asserted to be an unknown type |
+""")
+s = s.replace(
+"| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: the next flag is not consumed as a value; `--` is not a value |",
+"| edge_missing_value_before_another_flag_names_the_flag_and_type | out of bounds / missing value: a declared flag or `--` is not consumed as a value, and an undeclared `--bogus` is an unknown flag on both engines |")
+s = s.replace(
+"| declaration_shape_failures_name_the_declaration | malformed declaration: non-list declaration, non-record item, non-text name, missing name/type, non-text type, unknown type |",
+"| declaration_shape_failures_name_the_declaration | malformed declaration: non-list declaration, non-record item, non-text name, missing name/type, non-text type, unknown type including the removed `boolean` spelling |")
+s = s.replace(
+"- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic; a following `--` or declared flag is not swallowed as the value, while `--help`/`-h` in that position answers help.",
+"- out_of_bounds — covered: a missing value after a flag is a catchable error rather than an index panic; a following `--`, declared flag or undeclared long flag is not swallowed as the value (the last is an unknown-flag failure), while `--help`/`-h` in that position answers help.")
+p.write_text(s)
+PY
+git diff --stat -- phases/phase-102/REPORT.md
+phases/phase-102/REPORT.md | 50 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 43 insertions(+), 7 deletions(-)
+[0m
+[0m$ [0mps -p 243945 -o pid,etime,stat,cmd; grep -n "Running\|test result\|running [0-9]" /tmp/opencode/cargo-test-full.log | tail -30; tail -5 /tmp/opencode/cargo-test-full.log
+PID     ELAPSED STAT CMD
+ 243945       00:30 Sl   /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --all-targets
+2:[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-0b6bed5357e25827)
+4:running 531 tests
+605:test result: ok. 531 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+607:[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/rb-f0c4566cfe84e000)
+609:running 0 tests
+611:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+613:[1m[92m     Running[0m tests/agent_permissions_test.rs (target/debug/deps/agent_permissions_test-931cfe7a703a3bf5)
+615:running 48 tests
+665:test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+667:[1m[92m     Running[0m tests/assertions_test.rs (target/debug/deps/assertions_test-a08bbb5b7c0fb372)
+669:running 10 tests
+681:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+683:[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-3f12faa9d1aada13)
+685:running 23 tests
+test edge_the_self_compilation_still_obeys_the_step_budget ... ok
+test edge_stage3_refuses_every_malformed_corpus_program ... ok
+test edge_stage3_is_byte_identical_on_the_awkward_shapes ... ok
+test edge_the_two_engines_run_a_branching_program_the_same ... ok
+test stage2_is_byte_identical_for_each_statement_kind ... ok
+[0m
+[0m$ [0mgrep -n "cargo test\|cargo fmt\|cargo clippy\|step \"" /home/runner/work/rbops/rbops/rbops/verify.sh | head -60
+148:step "manifest"
+169:step "report"
+187:  if grep -qiE 'cargo test *\| *(pass|green)' "$REPORT" && ! grep -qE '[1-9][0-9]* passed' "$REPORT"; then
+188:    bad "report claims cargo test passed but records no passing count"
+205:step "diff hygiene"
+336:if preflight_skip "cargo fmt"; then
+339:step "cargo fmt"
+340:if cargo fmt --all -- --check >/tmp/fmt.log 2>&1; then ok "cargo fmt --check"
+341:else bad "cargo fmt --check"; tail -20 /tmp/fmt.log; fi
+343:step "cargo clippy"
+344:if cargo clippy --all-targets -- -D warnings >/tmp/clippy.log 2>&1; then
+345:  ok "cargo clippy -D warnings"
+347:  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | sed -n '1,20p'
+350:step "cargo test"
+351:if cargo test --all-targets >/tmp/test.log 2>&1; then
+354:  if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
+355:  else bad "cargo test reported 0 passing tests — a suite that cannot fail is not a suite"; fi
+357:  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | sed -n '1,20p'
+360:step "doc tests"
+361:cargo test --doc >/tmp/doctest.log 2>&1 || { bad "cargo test --doc"; tail -15 /tmp/doctest.log; }
+404:step "test policy"
+501:step "report honesty"
+[0m
+[0m$ [0msed -n '330,540p' /home/runner/work/rbops/rbops/rbops/verify.sh
+fi
+else
+  ok "no must_touch declared (nothing to enforce)"
+fi
+
+# --- 3. the four gates -------------------------------------------------------
+if preflight_skip "cargo fmt"; then
+  :
+else
+step "cargo fmt"
+if cargo fmt --all -- --check >/tmp/fmt.log 2>&1; then ok "cargo fmt --check"
+else bad "cargo fmt --check"; tail -20 /tmp/fmt.log; fi
+
+step "cargo clippy"
+if cargo clippy --all-targets -- -D warnings >/tmp/clippy.log 2>&1; then
+  ok "cargo clippy -D warnings"
+else
+  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | sed -n '1,20p'
+fi
+
+step "cargo test"
+if cargo test --all-targets >/tmp/test.log 2>&1; then
+  PASSED="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  FAILED="$(grep -oE '[0-9]+ failed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
+  else bad "cargo test reported 0 passing tests — a suite that cannot fail is not a suite"; fi
+else
+  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | sed -n '1,20p'
+fi
+
+step "doc tests"
+cargo test --doc >/tmp/doctest.log 2>&1 || { bad "cargo test --doc"; tail -15 /tmp/doctest.log; }
+fi
+
+# --- 4. examples still run (the language's spec-by-example) ------------------
+if preflight_skip "examples"; then
+  :
+else
+# Do not hide why the build failed: an unbuilt binary used to surface as the
+# useless "rb binary not built".
+if ! cargo build >/tmp/build.log 2>&1; then
+  bad "cargo build"; tail -20 /tmp/build.log
+fi
+RB="./target/debug/rb"
+if [ -x "$RB" ]; then
+  for ex in examples/*.rb modules/*.rb; do
+    [ -f "$ex" ] || continue
+    if timeout 60 "$RB" run "$ex" >/dev/null 2>&1; then
+      ok "runs: $ex"
+      continue
+    fi
+    detail="$(timeout 60 "$RB" run "$ex" 2>&1 | tail -1)"
+    # Was this failure already known at bootstrap time?
+    known="$("$JQ" -r --arg p "$ex" \
+              '.unparseable[]? | select(.path == $p) | .path' "$BASELINE" 2>/dev/null | head -1)"
+    if [ -n "$known" ]; then
+      # Rule 1: touching a baselined file revokes the exemption. A phase cannot
+      # edit a broken file and keep calling it "pre-existing".
+      if printf '%s\n' "$CHANGED" | grep -qxF -- "$ex"; then
+        bad "example still fails AND this phase touched it (baseline revoked): $ex — $detail"
+      else
+        warn "pre-existing failure, baselined, not touched by this phase: $ex — $detail"
+      fi
+    else
+      bad "example fails: $ex — $detail"
+    fi
+  done
+  ok "example sweep done"
+else
+  bad "rb binary missing at $RB after a successful build — check [[bin]] name in Cargo.toml"
+fi
+fi
+
+# --- 5. test policy: edge cases and failure assertions are mandatory ---------
+step "test policy"
+# The quota is disjunctive, matching AGENTS.md 3.3: a phase qualifies with
+# >=3 Rust tests OR >=2 Redblue tests. This is deliberately a low floor, not a
+# target — it catches "no verification at all", and sufficiency beyond it is
+# the reviewer's call. A high count once failed a good 5-test phase.
+MIN_RS="$("$JQ" -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null)" || MIN_RS=""
+if [ -z "$MIN_RS" ]; then warn "could not read .test_policy.min_rust_tests; using 3"; MIN_RS=3; fi
+MIN_RB="$("$JQ" -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null)" || MIN_RB=""
+if [ -z "$MIN_RB" ]; then warn "could not read .test_policy.min_redblue_tests; using 2"; MIN_RB=2; fi
+# Count the `#[test]` ATTRIBUTE, not a name prefix. Requiring `fn test_`/`fn
+# edge_` meant a test named `modulo_by_zero_is_a_runtime_error` — perfectly
+# clear, perfectly real — did not count toward the quota. phase-007 wrote 16
+# #[test] functions and the quota read 0 because only the 6 edge_-prefixed ones
+# matched. The prefix belongs to the edge_-naming rule below, which enforces it
+# deliberately; the quota should be counting tests.
+NEW_TESTS="$(git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null | grep -cE '^\+\s*#\[test\]' )"
+NEW_RB="$(git diff -U0 "$BASE_REF" -- '*.rb' 2>/dev/null | grep -cE '^\+\s*test ' )"
+# Both idioms must be recognised, in BOTH target languages. The quota above is
+# disjunctive (Rust OR Redblue), so these two rules have to be too — otherwise a
+# Redblue-only phase can satisfy the quota and still be told it proved nothing.
+#   Rust:    fn edge_empty_list()          Redblue:  test "edge_empty list"
+# The optional quote is the whole bug: a Redblue test name is a string literal,
+# so `test edge_x` never occurs, and the unquoted-only regex rejected 61 real
+# tests in phase-003 including correctly-named ones.
+EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test +"?)edge_')"
+# Some subsystems have no failure channel to assert on. A linter reports
+# problems as a diagnostics collection; a formatter and an LSP produce documents,
+# not errors. Requiring `is_err`/`should_panic` of them is a category error, and
+# it is not hypothetical: phase-015 (formatter) and phase-016 (linter) were both
+# blocked after burning every attempt on it, while phase-016's tests were
+# asserting failure correctly as `assert_eq!(warnings.len(), 1, ...)`.
+#
+# Such a phase declares `failure_assert: "not_applicable"` and the check is
+# SKIPPED, visibly — never silently passed, and never a global relaxation. The
+# reviewer still judges whether the tests can actually fail, and every
+# error-producing phase keeps the rule at full strength.
+FAILASSERT_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .failure_assert // "required"' "$PHASES" 2>/dev/null)" || FAILASSERT_MODE="required"
+[ -n "$FAILASSERT_MODE" ] || FAILASSERT_MODE="required"
+
+# Failure assertions per language. Rust has is_err/expect_err/should_panic;
+# Redblue has no exceptions and instead has `try ... catch error`, which was
+# missing here entirely — the one construct Redblue offers for asserting a fault.
+# Anchored to the line start so a test whose *data* mentions `catch error` cannot
+# buy a pass.
+#
+# Rust also has the `eval_err` idiom: a helper that evaluates a program
+# expecting an error, followed by `assert!(matches!(e, Error::...))`. Phase-037
+# blocked a 1200-green phase on this rule with 12 such assertions in the diff
+# and zero recognized strings — `let e = eval_err("random_choice([])");
+# assert!(matches!(e, Error::Runtime(_, _)))` asserts a failure is produced as
+# surely as `is_err()` does. Same class as the #[test]-attribute fix (007) and
+# the bilingual rules: the detector was narrower than the language's real
+# failure-asserting idioms. The reviewer remains the ceiling — a bare
+# `let _ = eval_err(x);` with no assertion is gaming, and it reads as gaming.
+if [ "$FAILASSERT_MODE" = "not_applicable" ]; then
+  # Skipped, and said out loud. A silent pass here would be indistinguishable
+  # from the rule being satisfied.
+  warn "failure-assertion rule NOT APPLICABLE to this phase (failure_assert: not_applicable) — the reviewer still judges whether the tests can fail"
+else
+  # Redblue's Error carries a label rather than a Result, so a test that proves
+  # a failure was produced reads `assert_eq!(label(&e), "RuntimeError")` through
+  # a local helper rather than calling is_err() on a Result. Phase-048 blocked on
+  # this with ~10 such assertions (every one documented as "failure asserted" in
+  # its REPORT) and zero recognized strings. Detecting the assertion is what
+  # matters, not which method spells it, so the pattern also accepts a helper
+  # call beside a spelled-out error label: a test cannot buy this by naming a
+  # label in prose, because the label must be quoted inside the matched line.
+  FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|expect_refusal|assert_stdout_contains|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
+  if [ "$FAILASSERT" -ge 1 ]; then
+    ok "failure-asserting test present: $FAILASSERT"
+  else
+    bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
+  fi
+fi
+
+TEST_POLICY_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .test_policy // "required"' "$PHASES" 2>/dev/null)" || TEST_POLICY_MODE="required"
+[ -n "$TEST_POLICY_MODE" ] || TEST_POLICY_MODE="required"
+if [ "$TEST_POLICY_MODE" = "not_applicable" ]; then
+  warn "test quota and edge_* rule NOT APPLICABLE to this phase (test_policy: not_applicable) — the reviewer still judges documentation and substance"
+else
+  if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
+    ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
+  else
+    bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
+  fi
+  [ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
+    || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
+fi
+
+# Same precision rule as the construct scan above: the token must begin the
+# line. A test fixture that embeds `#[ignore]` as data is not a skipped test.
+SKIPDELTA="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+  | grep -cE '^\+[[:space:]]*(#\[ignore|//[[:space:]]*skip\b)')"
+[ "$SKIPDELTA" -eq 0 ] && ok "no newly skipped tests" || bad "$SKIPDELTA newly skipped/ignored tests"
+
+# --- 6. self-consistency: does the report match reality? --------------------
+step "report honesty"
+if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
+  REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
+  if [ -n "${CLAIM:-}" ]; then
+    # Asymmetric by design. The threat model is FABRICATION: claiming green
+    # that was never earned. A claim ABOVE reality (+2 tolerance for reruns)
+    # fails the phase. A claim BELOW reality is sloppiness in prose, not a lie
+    # that ships bad code — the gate itself measured the real number, so warn
+    # and move on. This distinction once blocked a phase with 59 green tests
+    # over a "0 passing" typo.
+    if [ "$CLAIM" -gt $((REAL + 2)) ]; then
+      bad "report claims $CLAIM passing, actual run has $REAL — over-claiming is fabrication"
+    elif [ "$CLAIM" -lt $((REAL - 2)) ]; then
+      warn "report claims $CLAIM passing, actual run has $REAL — under-claimed, fix the number"
+      ok "reported test count ($CLAIM) does not exceed actual ($REAL)"
+    else
+      ok "reported test count ($CLAIM) matches actual ($REAL)"
+    fi
+  fi
+fi
+
+# --- verdict -----------------------------------------------------------------
+printf '\n'
+if [ "$PREFLIGHT" = "1" ]; then
+  # A preflight PASS is NOT a gate pass, and the exit code says so: 0 means "no
+  # defect found in the cheap half", never "this phase may be marked .done". The
+  # caller (dispatch.sh cmd_run) still runs the full gate after the agent. A
+  # distinct exit code makes it impossible for a preflight to be mistaken for
+  # the real thing by a caller that does not read this banner.
+  if [ "$FAIL" -eq 0 ]; then
+    printf '\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT CLEAN — %-19s ║\033[0m\n' "$PHASE"
+    printf '\033[33m║ diff-based checks only; no build run ║\033[0m\n'
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 0
+  fi
+  printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[31m║ PREFLIGHT FAIL   — %-19s ║\033[0m\n' "$PHASE"
+  printf '\033[31m║ %d diff-based check(s) failed         ║\033[0m\n' "$FAIL"
+[0m
+[0m$ [0mgit diff -- src/cli.rs tests/module_system_test.rs | sed -n '1,260p'
+diff --git a/src/cli.rs b/src/cli.rs
+index df57b8d..46b5bbf 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -105,16 +105,40 @@ pub fn parse(declaration: &Value, argv: &[String], span: Span) -> Result<Value>
+                     Some(value) => value.to_string(),
+                     None => {
+                         index += 1;
+-                        argv.get(index).cloned().ok_or_else(|| {
+-                            Error::Runtime(
+-                                format!(
+-                                    "Flag '--{}' needs a value of type {}",
+-                                    flag.name,
+-                                    flag.kind.name()
+-                                ),
++                        let next = argv
++                            .get(index)
++                            .cloned()
++                            .ok_or_else(|| missing_value(flag, span))?;
++                        // Help is a request about the declaration, even when
++                        // it appears where a value was expected: `--count
++                        // --help` answers the generated usage rather than
++                        // complaining that count is missing.
++                        if next == "--help" || next == "-h" {
++                            return build_record(
++                                &flags,
++                                &given,
++                                positionals,
++                                true,
++                                &usage,
+                                 span,
+-                            )
+-                        })?
++                                false,
++                            );
++                        }
++                        // A flag's value is the next token even when it starts
++                        // with `-`, so a negative number still parses. What is
++                        // not a value is another flag: `--count --verbose`
++                        // should say the count is missing, not that
++                        // `--verbose` is not a number.
++                        if next == "--" || names_declared_flag(&next, &flags) {
++                            return Err(missing_value(flag, span));
++                        }
++                        // An undeclared `--name` in value position is a typo,
++                        // not a value: reporting it as one keeps a text flag
++                        // from silently storing `--bogus` as its text.
++                        if let Some(name) = flag_name(&next) {
++                            return Err(Error::Runtime(format!("Unknown flag '--{name}'"), span));
++                        }
++                        next
+                     }
+                 };
+                 let value = from_text(flag, &text, span)?;
+@@ -338,7 +362,7 @@ fn parse_kind(kind: &str) -> Option<Kind> {
+     match kind {
+         "text" => Some(Kind::Text),
+         "number" => Some(Kind::Number),
+-        "yes/no" | "boolean" => Some(Kind::YesNo),
++        "yes/no" => Some(Kind::YesNo),
+         "path" => Some(Kind::Path),
+         _ => None,
+     }
+@@ -418,6 +442,29 @@ fn default_error(name: &str, kind: Kind, value: &Value, span: Span) -> Error {
+     )
+ }
+ 
++/// The failure for a value-taking flag with no value after it.
++fn missing_value(flag: &Flag, span: Span) -> Error {
++    Error::Runtime(
++        format!(
++            "Flag '--{}' needs a value of type {}",
++            flag.name,
++            flag.kind.name()
++        ),
++        span,
++    )
++}
++
++/// The name in a `--name` or `--name=value` token, if it has one.
++fn flag_name(token: &str) -> Option<&str> {
++    let rest = token.strip_prefix("--")?;
++    Some(rest.split_once('=').map(|(name, _)| name).unwrap_or(rest))
++}
++
++/// Whether `token` is `--name` or `--name=value` for a flag in the declaration.
++fn names_declared_flag(token: &str, flags: &[Flag]) -> bool {
++    flag_name(token).is_some_and(|name| flags.iter().any(|flag| flag.name == name))
++}
++
+ /// Builds the record a program receives.
+ fn build_record(
+     flags: &[Flag],
+diff --git a/tests/module_system_test.rs b/tests/module_system_test.rs
+index ce523a2..99d8563 100644
+--- a/tests/module_system_test.rs
++++ b/tests/module_system_test.rs
+@@ -395,15 +395,68 @@ mod cli_flags {
+         Path::new(env!("CARGO_MANIFEST_DIR"))
+     }
+ 
++    /// What both engines made of a program: the value or failure, and the lines
++    /// printed. Every CLI case runs through this, so a tree-walking answer that
++    /// the bytecode VM does not share fails the test rather than passing half
++    /// the contract.
++    struct CliRun {
++        result: Result<Value, Error>,
++        output: Vec<String>,
++    }
++
++    #[track_caller]
++    fn cli_ran(source: &str) -> CliRun {
++        let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
++        let ast = redblue::parser::parse(tokens).expect("source should parse");
++        redblue::analyzer::analyze_in(&ast, cli_root()).expect("source should analyze");
++
++        let (mut walker, walked) = redblue::run_isolated_in(&ast, cli_root());
++        let walked_output = walker.take_output();
++
++        let chunk = redblue::bytecode::compile_program(&ast)
++            .unwrap_or_else(|error| panic!("`{source}` should compile, failed with {error:?}"));
++        let mut vm = redblue::bytecode::vm::BytecodeVm::new_in(cli_root());
++        vm.set_echo(false);
++        let compiled = vm.run(&chunk);
++        let compiled_output = vm.take_output();
++
++        match (&walked, &compiled) {
++            (Ok(walked_value), Ok(compiled_value)) => assert_eq!(
++                walked_value, compiled_value,
++                "the two engines answered differently for `{source}`"
++            ),
++            (Err(walked_error), Err(compiled_error)) => assert_eq!(
++                format!("{}: {}", walked_error.label(), walked_error.message()),
++                format!("{}: {}", compiled_error.label(), compiled_error.message()),
++                "the two engines failed differently for `{source}`"
++            ),
++            _ => panic!(
++                "the two engines disagree about `{source}`: walked {walked:?}, compiled {compiled:?}"
++            ),
++        }
++        assert_eq!(
++            walked_output, compiled_output,
++            "the two engines printed different lines for `{source}`"
++        );
++
++        CliRun {
++            result: walked,
++            output: walked_output,
++        }
++    }
++
+     #[track_caller]
+     fn cli_eval(source: &str) -> Value {
+-        redblue::run_source_value_in(source, cli_root())
++        cli_ran(source)
++            .result
+             .unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"))
+     }
+ 
+     #[track_caller]
+     fn cli_eval_err(source: &str) -> Error {
+-        redblue::run_source_value_in(source, cli_root()).expect_err("`source` should have failed")
++        cli_ran(source)
++            .result
++            .expect_err("`source` should have failed")
+     }
+ 
+     #[track_caller]
+@@ -423,12 +476,10 @@ mod cli_flags {
+     /// Runs `source` and answers the lines it printed, asserting the run succeeded.
+     #[track_caller]
+     fn cli_output(source: &str) -> Vec<String> {
+-        let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
+-        let ast = redblue::parser::parse(tokens).expect("source should parse");
+-        redblue::analyzer::analyze_in(&ast, cli_root()).expect("source should analyze");
+-        let (mut vm, result) = redblue::run_isolated_in(&ast, cli_root());
+-        result.unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"));
+-        vm.take_output()
++        let run = cli_ran(source);
++        run.result
++            .unwrap_or_else(|error| panic!("`{source}` should have run, failed with {error:?}"));
++        run.output
+     }
+ 
+     #[track_caller]
+@@ -628,4 +679,331 @@ mod cli_flags {
+             "the two-argument form reads sys.argv(), empty in this harness"
+         );
+     }
++
++    /// A value-taking flag followed by another flag is a missing value, not a
++    /// wrong-type value that quotes the other flag's spelling back at the user.
++    #[test]
++    fn edge_missing_value_before_another_flag_names_the_flag_and_type() {
++        let source = "set options to [{name: \"count\", type: \"number\"}, {name: \"verbose\", type: \"yes/no\"}]\n\
++                      sys.parse(options, [\"--count\", \"--verbose\"])";
++        match cli_eval_err(source) {
++            Error::Runtime(message, span) => {
++                assert_eq!(
++                    message, "Flag '--count' needs a value of type number",
++                    "the failure should name the flag and its type"
++                );
++                assert!(span.is_known(), "the failure should carry a source span");
++            }
++            other => panic!("expected a Runtime error, got {other:?}"),
++        }
++
++        let ended = "set options to [{name: \"count\", type: \"number\"}]\n\
++                     sys.parse(options, [\"--count\", \"--\"])";
++        match cli_eval_err(ended) {
++            Error::Runtime(message, span) => {
++                assert_eq!(
++                    message, "Flag '--count' needs a value of type number",
++                    "`--` is not a value for `--count`"
++                );
++                assert!(span.is_known(), "the failure should carry a source span");
++            }
++            other => panic!("expected a Runtime error, got {other:?}"),
++        }
++
++        let unknown = "set options to [{name: \"count\", type: \"number\"}]\n\
++                       sys.parse(options, [\"--count\", \"--bogus\"])";
++        match cli_eval_err(unknown) {
++            Error::Runtime(message, span) => {
++                assert_eq!(
++                    message, "Unknown flag '--bogus'",
++                    "an undeclared flag in value position should name itself, not be swallowed"
++                );
++                assert!(span.is_known(), "the failure should carry a source span");
++            }
++            other => panic!("expected a Runtime error, got {other:?}"),
++        }
++
++        let unknown_text = "set options to [{name: \"name\", type: \"text\"}]\n\
++                            sys.parse(options, [\"--name\", \"--bogus\"])";
++        match cli_eval_err(unknown_text) {
++            Error::Runtime(message, span) => {
++                assert_eq!(
++                    message, "Unknown flag '--bogus'",
++                    "a text flag must not silently store an undeclared flag as its value"
++                );
++                assert!(span.is_known(), "the failure should carry a source span");
++            }
++            other => panic!("expected a Runtime error, got {other:?}"),
++        }
++    }
++
++    /// The usage text is derived from the declaration, so adding a flag to the
++    /// declaration is enough to add it to help.
++    #[test]
++    fn edge_usage_lists_a_flag_added_to_the_declaration() {
++        let before = cli_eval(
++            "set options to [{name: \"output\", type: \"text\", help: \"where to write\"}]\n\
++             give back sys.parse(options, []).usage",
++        );
++        let after = cli_eval(
++            "set options to [{name: \"output\", type: \"text\", help: \"where to write\"}, \
++             {name: \"colour\", type: \"text\", default: \"auto\", help: \"when to colour\"}]\n\
++             give back sys.parse(options, []).usage",
++        );
+[0m
+[0m$ [0msleep 60; ps -p 243945 -o pid,etime,stat,cmd; grep -n "Running\|test result\|running [0-9]" /tmp/opencode/cargo-test-full.log | tail -15; tail -3 /tmp/opencode/cargo-test-full.log
+PID     ELAPSED STAT CMD
+ 243945       01:46 Sl   /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --all-targets
+2:[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-0b6bed5357e25827)
+4:running 531 tests
+605:test result: ok. 531 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+607:[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/rb-f0c4566cfe84e000)
+609:running 0 tests
+611:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+613:[1m[92m     Running[0m tests/agent_permissions_test.rs (target/debug/deps/agent_permissions_test-931cfe7a703a3bf5)
+615:running 48 tests
+665:test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+667:[1m[92m     Running[0m tests/assertions_test.rs (target/debug/deps/assertions_test-a08bbb5b7c0fb372)
+669:running 10 tests
+681:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+683:[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-3f12faa9d1aada13)
+685:running 23 tests
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+[0m
+[0m$ [0msleep 300; ps -p 243945 -o pid,etime,stat,cmd; grep -n "Running\|test result\|running [0-9]" /tmp/opencode/cargo-test-full.log | tail -15; tail -3 /tmp/opencode/cargo-test-full.log
+PID     ELAPSED STAT CMD
+ 243945       06:52 Sl   /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --all-targets
+2:[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-0b6bed5357e25827)
+4:running 531 tests
+605:test result: ok. 531 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s
+607:[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/rb-f0c4566cfe84e000)
+609:running 0 tests
+611:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+613:[1m[92m     Running[0m tests/agent_permissions_test.rs (target/debug/deps/agent_permissions_test-931cfe7a703a3bf5)
+615:running 48 tests
+665:test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+667:[1m[92m     Running[0m tests/assertions_test.rs (target/debug/deps/assertions_test-a08bbb5b7c0fb372)
+669:running 10 tests
+681:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+683:[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-3f12faa9d1aada13)
+685:running 23 tests
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families ... ok
+[0m

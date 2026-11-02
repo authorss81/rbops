@@ -1,14 +1,32 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
+I'll inspect the core implementation files and tests.
 [0m→ [0mRead src/cli.rs
-[0m→ [0mRead src/runtime.rs[90m [offset=1, limit=60][0m
-[0m→ [0mRead tests/module_system_test.rs[90m [offset=1, limit=80][0m
-[0m✱ [0mGrep "sys_parse|SYSTEM.*parse|sys\.parse|sys.argv"[90m in src · 40 matches[0m
-[0m✱ [0mGrep "fn .*cli|cli::|sys\.parse|arguments|--help|usage"[90m in tests/module_system_test.rs · 100 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3720, limit=120][0m
-[0m→ [0mRead tests/module_system_test.rs[90m [offset=382, limit=250][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=1795, limit=80][0m
-[0m✱ [0mGrep "needs a value|does not take a value|declared twice|is not a usable flag name|unknown field|cannot be required|sys\.parse expects|is not a finite number|but item"[90m in tests · 35 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=55, limit=110][0m
-[0m✱ [0mGrep "pub type Fields|enum Fields|struct Fields|type Fields"[90m in src · 1 match[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=1, limit=120][0m
+[0m✱ [0mGrep "sys_parse|sys\.parse|sys_parse_value|fn sys"[90m 32 matches[0m
+[0m✱ [0mGrep "sys|MODULE_MEMBERS|BUILTIN_NAMES"[90m 36 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1795, limit=90][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3720, limit=90][0m
+[0m→ [0mRead tests/module_system_test.rs[90m [limit=380, offset=378][0m
+[0m✱ [0mGrep "pub type Fields|struct Fields|type Fields"[90m 1 match[0m
+[0m✱ [0mGrep "module_member_name|is_module_only_builtin|module_only|qualified_member"[90m 41 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=120, offset=2420][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=40, offset=2010][0m
+[0m✱ [0mGrep "sys_parse|text_wrap|builtins_without_signatures|signatures_cover|builtin_signature"[90m 21 matches[0m
+[0m→ [0mRead tests/text_utilities_test.rs[90m [limit=40, offset=640][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [limit=70, offset=650][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=120, offset=220][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=60, offset=3080][0m
+[0m✱ [0mGrep "declared twice|unknown field|cannot be required and have a default|not a finite number|list of flag declarations|is not a usable flag name|reserves, so it cannot name|takes no value, but only a yes/no|list of text arguments"[90m 37 matches[0m
+FINDINGS:
+
+1. [BLOCKER] phases/phase-102/REPORT.md "Test matrix" + `tests/module_system_test.rs:389-761` — the report claims coverage that does not exist. It says type_mismatch covers "a non-list declaration, a non-text argument-list item, a wrong default type"; duplicate_missing_keys covers "a duplicate declared name"; malformed_input covers "unknown declaration field, reserved flag name, unusable name, `takes_value: no` on a non-boolean, required with default"; numeric_boundary covers "`NaN` and infinite text are refused". No test in the `cli_flags` module exercises any of these branches (`src/cli.rs:156`, `:170`, `:183`, `:193`, `:201`, `:217`, `:247`, `:259`, `:273`, `:289`, `:296`, `:322`, `:335`, `:3757`, `:3774`). The only failure test is `failures_name_the_flag_that_was_wrong` at `tests/module_system_test.rs:565`, which checks four messages only. — Why it matters: the report is the phase's completion evidence, and it overstates gate coverage. — Fix: add the missing assertions or correct the matrix to say these are untested. — VERIFIED: read the whole `cli_flags` module (lines 389-761) and grepped `tests/*.rs` for every validation message (`unknown field`, `declared twice`, `cannot be required and have a default`, `list of flag declarations`, `list of text arguments`, `is not a usable flag name`, `reserves, so it cannot name`, `takes no value, but only a yes/no`); no sys.parse test matches.
+
+2. [MAJOR] `src/cli.rs:117-123` — `--help`/`-h` in value position now produces a missing-value error instead of help: `sys.parse(options, ["--count", "--help"])` hits `next == "--help"` and returns `missing_value` rather than the generated usage. This contradicts the SPEC sentence "`--help`/`-h` answers the generated usage without requiring the rest", and the resume report even claims `--help`/`-h` are covered while `edge_missing_value_before_another_flag_names_the_flag_and_type` tests only `--verbose` and `--` (`tests/module_system_test.rs:635-668`). — Fix: treat `--help`/`-h` as help regardless of value position, or narrow the SPEC wording and add a test pinning the error. — What would settle it: an explicit SPEC statement that `--help` is only recognised at flag position.
+
+3. [MAJOR] `tests/module_system_test.rs:399,425` — every new CLI test runs only the tree-walking engine (`run_source_value_in`, `run_isolated_in`); there is no bytecode/`.rbc` test for `sys.parse`, `Cli.run`, or the new failure paths. The project's contract requires both VMs to agree, and the resume report asserts behaviour without exercising the second engine. — Fix: run the same cases through the bytecode VM (as other suites do) and assert identical results. — What would settle it: a bytecode test showing a compiled program can reach `sys.parse`.
+
+4. [MINOR] `src/stdlib.rs:2456` — the doc comment says module-only names "do have shapes, because the dotted spelling reaches them", but `sys.parse` has no entry in `BUILTIN_SIGNATURES` (the `sys_argv` entry at `src/stdlib.rs:2431` is the only sys shape). `builtin_signature("sys_parse")` therefore returns `None`, so `:sighelp sys.parse` stays silent unlike `text.wrap` and the other module-only utilities. — Fix: add a `("sys_parse", "sys.parse(declaration[, arguments]) -> ...")` row.
+
+REVIEW VERDICT: FINDINGS 4
