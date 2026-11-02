@@ -1,0 +1,30 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m✱ [0mGrep "fn (text_utility_builtin|text_utility_width|wrap_text|unified_diff|dedent_text|template_text|pad_text|align_text|diff_line|text_utility_error)"[90m 10 matches[0m
+[0m✱ [0mGrep "TEXT_UTILITY|MAX_|1_000_000|4_000_000|try_reserve"[90m 9 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=960, limit=620][0m
+[0m✱ [0mGrep "module_has_member|format!\("\{\}_\{\}"|text_wrap|builtin\(|Value::Builtin"[90m 100 matches[0m
+[0m→ [0mRead tests/text_utilities_test.rs
+[0m→ [0mRead src/stdlib.rs[90m [offset=1760, limit=300][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead tests/stdlib_gap_survey_test.rs
+[0m✱ [0mGrep "text_wrap|text_diff|text_dedent|text_template|text_pad|text_align"[90m 6 matches[0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=640, limit=110][0m
+[0m✱ [0mGrep "fn (format_value|display|to_string)|impl .*Display for Value|Value::Text\(text\) =>"[90m 2 matches[0m
+[0m✱ [0mGrep "is_alphanumeric|'_'|underscore|is_identifier"[90m 2 matches[0m
+FINDINGS:
+
+1. [BLOCKER] src/stdlib.rs:1192 — `text.diff` refuses two **identical** texts when they exceed the cell cap, instead of answering the empty text that SPEC.md promises. `unified_diff` builds the line table and returns `Err` at the `if cells > MAX_DIFF_CELLS` check (line 1192) **before** it reaches the identical-text shortcut at line 1238 (`if steps.iter().all(... Equal ...) { return Ok(String::new()); }`). `text.diff(old, old)` with 3000 identical lines gives `cells = 3001*3001 = 9_006_001 > 4_000_000`, so it errors. SPEC.md:1277 says "Identical texts answer the empty text" with no size exception. Fix: compare `old == new` and return `Ok(String::new())` at the top of `unified_diff`, before the cap check. — VERIFIED: traced `src/stdlib.rs:1184-1201` (cap returns `Err`) against `src/stdlib.rs:1238-1240` (equality shortcut), and computed `cells` for 3000 lines each.
+
+2. [MAJOR] src/stdlib.rs:1876 — The SPEC's "These six are spelled as module members only" is false: `text_wrap`, `text_diff`, `text_dedent`, `text_template`, `text_pad` and `text_align` are added to `BUILTIN_NAMES` (lines 1876-1881) and to the global table (lines 421-428). The lexer accepts `_` in identifiers (`src/lexer.rs:392`), and the analyzer accepts any `is_builtin` name (`src/analyzer.rs:217`), so a program can write `text_wrap("the quick brown fox", 9)` as a bare call and it reaches the dispatcher. That is a spelling the language now has, contradicting SPEC.md § text ("module members only"). Fix: keep these out of the user-spellable `BUILTIN_NAMES`/global surface (or give them a NUL-prefixed internal name like `LRU_CACHE_DECLARE`) and dispatch module calls without registering a bare identifier. — traced, not run.
+
+3. [MAJOR] src/stdlib.rs:1456 — `padded_text` reserves `(left + right) * fill.len()` bytes, where `fill.len()` is the byte length of the **whole fill string**, not the bytes of the characters actually cycled. A legal call with a long fill and a large width can therefore reserve an arbitrarily huge amount and fail `try_reserve_exact` with "too large to allocate", even though the real output is small: e.g. `text.pad("x", 1_000_000, <a 1 KB fill>)` reserves ~1 GB (or more) to write at most ~4 MB. SPEC.md only says widths past 1,000,000 are refused and a fill of one or more characters is valid, so this is a spurious refusal. Fix: reserve at most `text.len() + (left + right) * 4` (max UTF-8 char width), or drop the pre-reservation and let `push` grow. — traced, not run.
+
+4. [MINOR] src/stdlib.rs:1188 — The diff cap is documented as "texts whose line counts multiply past 4,000,000" (SPEC.md:1280), but the code computes `(old_len + 1) * (new_len + 1)`. Two 2000-line texts have a line-count product of exactly 4,000,000 (not "past"), yet `2001 * 2001 = 4,004,001` is refused. The boundary is also untested: `edge_text_diff_refuses_a_line_table_past_the_documented_limit_on_both_engines` only tries 3000 lines. Fix: either change the spec to say the `(old+1)*(new+1)` table is capped, or compare `old_len * new_len`; add a test at the exact boundary. — traced from `src/stdlib.rs:1188-1192` and the SPEC hunk.
+
+5. [MINOR] src/stdlib.rs:1203 — The comment at lines 1054-1060 and REPORT.md describe the 4,000,000-cell cap as "about 32 MiB", but the table is `vec![vec![0usize; new_len + 1]; old_len + 1]`, i.e. one separate heap `Vec` per row. A permitted `old_len = 3_999_999, new_len = 0` input (`cells = 4_000_000`) allocates ~4 million inner `Vec`s, which is far more than 32 MiB once allocator metadata is counted. The cap is still bounded, but the documented memory figure is wrong and the worst case is the one not tested. Fix: use a single flat `Vec<usize>` of `cells` entries, or document the real worst case.
+
+6. [MINOR] tests/text_utilities_test.rs:480 — The two "past the limit" and "invalid width/side" tests assert only `is_err()` on each engine (`lines 480-491` and `546-558`). They cannot distinguish the documented catchable `RuntimeError` that names `wrap`/`pad`/`align` from any other runtime failure. The other negative test (`both_refuse(..., "wrap")` at lines 444-461) does check the name, but only for width `0` and type mismatches; the `> 1_000_000` path and the `pad`/`align` cap path are never checked for the promised message. Fix: use `both_refuse(source, "wrap")`, `"pad"`, `"align"` for these cases.
+
+REVIEW VERDICT: FINDINGS 6
