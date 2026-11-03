@@ -2,21 +2,23 @@
 > reviewer · deepseek-v4.1-flash-free
 [0m
 [0m→ [0mRead src/cli.rs
-[0m✱ [0mGrep "sys_parse|sys\.parse|MODULE_MEMBERS|BUILTIN_SIGNATURES"[90m in src · 40 matches[0m
-[0m→ [0mRead tests/module_system_test.rs[90m [offset=380, limit=500][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3720, limit=100][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=1780, limit=100][0m
-[0m→ [0mRead tests/module_system_test.rs[90m [offset=880, limit=110][0m
-[0m✱ [0mGrep "type Fields|pub fn record|fn type_name|pub fn list"[90m in src/value.rs · 9 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=45, offset=2440][0m
-[0m→ [0mRead src/repl/mod.rs[90m [limit=60, offset=4415][0m
-[0m✱ [0mGrep "is_module_only_builtin|BUILTIN_SIGNATURES"[90m in src · 11 matches[0m
-[0m✱ [0mGrep "set_program_args|sys\.argv|sys_argv"[90m in tests · 8 matches[0m
-[0m✱ [0mGrep "fn resolve\(|fn module_has_member"[90m in src/stdlib.rs · 5 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=45, offset=200][0m
+[0m→ [0mRead modules/Cli.rb
+[0m✱ [0mGrep "type Fields|pub fn finite_number|fn finite_number"[90m in src · 2 matches[0m
+[0m✱ [0mGrep "sys_parse|sys\.parse"[90m in src · 14 matches[0m
+[0m✱ [0mGrep "pub fn text_of|pub fn value"[90m in src/path.rs · 4 matches[0m
+[0m✱ [0mGrep "is_negative_number|edge_negative|negative"[90m in tests/module_system_test.rs · 100 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3730, limit=80][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1795, limit=80][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=2420, limit=30][0m
+[0m→ [0mRead tests/module_system_test.rs[90m [offset=300, limit=330][0m
+[0m✱ [0mGrep "set_program_args|program_args|PROGRAM_ARGS"[90m in . · 20 matches[0m
+[0m✱ [0mGrep "sys|parse|Cli"[90m in tests/doc_blocks_runs.txt · 100 matches[0m
+[0m→ [0mRead tests/module_system_test.rs[90m [offset=630, limit=180][0m
+[0m✱ [0mGrep "finite_number|is_finite|INFINITY"[90m in src · 48 matches[0m
 FINDINGS:
-1. [MAJOR] tests/module_system_test.rs:689 — `edge_missing_value_before_another_flag_names_the_flag_and_type` calls `redblue::run_source_value_in` directly instead of the new `cli_ran`/`cli_eval_err` harness, so the resume's two new branches (declared flag in value position and `--` in value position) are exercised only by the tree-walking interpreter. The REPORT and the module doc at tests/module_system_test.rs:398-401 claim "Every CLI case runs through this" and that both engines are covered; this test falsifies that claim. — A VM-only divergence in the new `names_declared_flag`/`--` path would pass the gate. — Route the two assertions through `cli_ran`/`cli_eval_err` so the result and printed lines are compared across both engines.
-2. [MINOR] src/cli.rs:359 — `parse_kind` accepts `"boolean"` as an alias for `"yes/no"`, but SPEC.md enumerates the type as exactly `text`, `number`, `yes/no` or `path`. This silently accepts a fifth spelling that is not documented, so a program using it works here but is spec-invalid. — Either remove the alias or document it in SPEC.md/README.md.
-3. [MINOR] src/cli.rs:132 — `names_declared_flag` only rejects a next token that is a *declared* flag, so an undeclared flag in value position is still swallowed: `--count --bogus` with `count: number` reports "expects a number" rather than "Unknown flag '--bogus'", and with a `text` flag `--bogus` is silently stored as the value. This hides typos and is inconsistent with the resume's stated intent of not treating "another flag" as a value. — After the help/`--` checks, treat a `--`-prefixed token that matches no declared flag as an unknown flag (or explicitly document that only declared flags end a value).
+1. [MINOR] src/cli.rs:138-141 — An undeclared **short** flag in value position is silently stored as the flag's value, unlike an undeclared long flag (which is rejected at 138-139) and unlike the top-level `-x` rejection at 160-161. `sys.parse([{name:"name", type:"text"}], ["--name", "-x"])` succeeds with `name == "-x"` while `["-x"]` alone raises `Unknown flag '-x'`. That is inconsistent with the phase's stated "a typo in value position is an unknown flag" rule and means the new short-flag path can still swallow a mis-typed switch. Fix: in the value branch, reject a `next` that starts with `-`, is not `-`, and fails `is_negative_number` as `Unknown flag '{next}'` (or explicitly document that short-flag-shaped values are allowed).
+2. [MINOR] src/cli.rs:466-468 — `is_negative_number` uses `parse::<f64>().is_ok_and(|n| n.is_finite())`, so tokens that parse as non-finite floats (`-inf`, `-Infinity`, `-NaN`, `-1e400`) fall through to the unknown-flag branch at 160-161 instead of being handled like other numbers. `sys.parse([], ["-inf"])` therefore reports `Unknown flag '-inf'`, whereas the same text in value position reports the finite-number failure. No test covers the `Ok`-but-non-finite path of this branch. Fix: either accept the token as a positional and let later conversion refuse it, or narrow the predicate to a numeric spelling and add a test for `-inf`/`-1e400` in both positions.
+3. [MINOR] src/cli.rs:418-421 — In `from_default`, the `Kind::Number` arm copies `Value::Number(*number)` without routing it through `finite_number`, while `from_text` at 385 does. If a non-finite `Value::Number` ever reaches a declaration (the parser refuses non-finite literals, but the invariant is not enforced here), `sys.parse` will return an infinite/default value instead of the finite-number refusal the phase advertises. Fix: call `crate::value::finite_number(*number, span)?` in that arm, mirroring `from_text`. Reachability is unverified; this is a defensive gap and a test with a non-finite default would settle it.
+4. [MINOR] src/runtime.rs:3753 — The `sys_parse` arm reads only `args.first()` and `args.get(1)` and never checks for extra arguments, so `sys.parse(options, [], "extra")` silently ignores the third argument rather than refusing it. The declaration and argument-list paths are rigorously validated, so silently accepting an extra value is inconsistent; if the generic builtin call path does not enforce arity, this is user-reachable. Fix: reject `args.len() > 2` with a `RuntimeError` naming the extra argument. Unverified whether an upstream arity check already exists.
 
-REVIEW VERDICT: FINDINGS 3
+REVIEW VERDICT: FINDINGS 4
