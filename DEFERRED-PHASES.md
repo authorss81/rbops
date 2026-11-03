@@ -103,3 +103,21 @@ these are the parts that were held back.
 The governing insight behind the split: **the standard library is the ceiling,
 not the REPL.** Tier 0 derives the work, Tier 1 is the substance, and these
 tiers rest on things that do not exist yet.
+### 7. Asynchronous Programming & Concurrency (Fibers vs async/await)
+**Blocked by:** Tier 1 completion (Phases 001-126). Slotted for post-v1.0.
+
+**Mathematical Foundation:**
+An async operation transforms a function from $f: A \to B$ into a Kleisli morphism over a Future monad $f: A \to M(B)$, where wait acts as the monadic bind (>>=). In conventional compilers, this forces every async function to be rewritten into a heap-allocated state machine, splitting the language into two disjoint function categories ("function coloring" problem).
+
+**Architectural Decision:**
+1. **Do NOT add sync / wait keywords to the syntax.** Function coloring violates Redblue's plain English readability mandate.
+2. **Adopt the Go/Erlang/Java Virtual Threads model:** Keep all user code syntactically synchronous and linear. Concurrency is handled at the VM runtime level via lightweight fibers (green threads) that cooperatively yield on blocking I/O (
+etwork.get, iles.read).
+3. **Structured concurrency syntax:** When parallel execution is explicitly desired, use plain English blocks:
+   ``redblue
+   parallel
+       set users to network.get("https://api.example.com/users")
+       set posts to network.get("https://api.example.com/posts")
+   until done
+   ``
+4. **Implementation timing:** Must remain deferred until after Phase 126. Injecting a state machine transformation into the AST/VM during the current stability sprint would freeze standard library delivery.
