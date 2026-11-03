@@ -1,32 +1,26 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
+[0m✱ [0mGrep "logging"[90m in src/stdlib.rs · 80 matches[0m
+[0m✱ [0mGrep "logging"[90m in src/runtime.rs · 80 matches[0m
 [0m→ [0mRead src/logging.rs
-[0m→ [0mRead src/wasm.rs
-I'll inspect the core implementation files first, then the tests.
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1650, limit=400][0m
-[0m✱ [0mGrep "logging"[90m in src/runtime.rs · 76 matches[0m
-[0m✱ [0mGrep "logging"[90m in src/stdlib.rs · 76 matches[0m
-Now let me inspect the runtime dispatch and stdlib registration.
-[0m✱ [0mGrep "libc"[90m in Cargo.toml · 29 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3520, limit=110][0m
-[0m→ [0mRead Cargo.toml[90m [offset=20, limit=30][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=85, limit=30][0m
-[0m✱ [0mGrep "Io|IoError|fn span|pub enum Error"[90m in src/error.rs · 66 matches[0m
-[0m✱ [0mGrep "is_capturing|CAPTURING|begin_capture"[90m in src · 13 matches[0m
-[0m✱ [0mGrep "Error::Io"[90m in src · 35 matches[0m
-[0m✱ [0mGrep "logging"[90m in tests/stdlib_module_docs_test.rs · 100 matches[0m
-[0m→ [0mRead tests/stdlib_module_names_test.rs
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [limit=120][0m
+[0m✱ [0mGrep "fn (edge_|records_|default_|a_record_|the_tree_)"[90m in tests/stdlib_modules_test.rs · 100 matches[0m
+[0m→ [0mRead src/wasm.rs[90m [offset=30, limit=140][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3540, limit=110][0m
+[0m✱ [0mGrep "mod logging_module"[90m in tests/stdlib_modules_test.rs · 1 match[0m
+[0m✱ [0mGrep "logging\.|logging_module|set_timestamps|set_destination|current_instant"[90m in tests/stdlib_modules_test.rs · 100 matches[0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1468, limit=340][0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1808, limit=350][0m
+[0m→ [0mRead src/wasm.rs[90m [offset=169, limit=110][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=540, limit=45][0m
 FINDINGS:
-1. [BLOCKER] src/logging.rs:127 — Timestamps are produced with `chrono::Utc::now()` directly instead of the host clock the rest of the runtime uses (`rb_set_clock` / `runtime::set_host_clock`); on `wasm32-unknown-unknown` `SystemTime::now()` has no clock and panics (src/wasm.rs:877-886 explicitly says so and exists to avoid exactly this), so an enabled logging call in the playground aborts the run rather than emitting a record, and even where a JS clock exists the timestamp disagrees with `time.now()` on a host that set the clock. — Fix: derive the timestamp from the shared host-clock accessor used by `time.now()` (runtime.rs:520), falling back to `Utc::now()` only on native targets. — VERIFIED: traced src/logging.rs:127 to src/wasm.rs:877-886 ("`wasm32-unknown-unknown` has no clock of its own and `SystemTime::now()` panics there"); not exercised on a wasm target.
 
-2. [MAJOR] src/wasm.rs:31 — `CAPTURING`/`CAPTURED` are process-global while the new logging configuration is thread-local (src/logging.rs:70-72), and `logging.rs:171` consults the global `is_capturing()` without taking `RUN_LOCK`; a `stdout` log call on one host thread therefore appends its record into whichever other thread currently has a capture open, corrupting that run's output and losing the record. The REPORT's claim that thread-local configuration "isolates tests" is only true for threshold/destination, not for the capture sink. — Fix: make the capture state thread-local, or route the logging `stdout` path through the same serialization (`run_lock`) as `emit`. — Not verified by running; a test that runs a capture on one thread while another thread logs to `stdout` would settle it.
+1. [MAJOR] src/logging.rs:71 — the logging configuration is a `thread_local!` that only `logging.reset()` ever restores, and `src/wasm.rs:173` (`begin_capture`) and `src/wasm.rs:219` (`run_outcome`) start a run without resetting it. A second program run in the same process/thread therefore inherits the first program's threshold, destination and timestamp mode, so a program that never calls `logging.set_level` can emit records and write to a stale file path, contradicting SPEC's "default is off... a program has to ask for diagnostics". The tests themselves work around this leak by calling `redblue::logging::reset()` before `run_program`/`tree_walk` (`tests/stdlib_modules_test.rs:1608`, `:1657`), which is evidence the reset is missing from the run path rather than the test. Fix: reset the logging config at the start of `run_outcome`/`run_source_value` (and cover it with a test that runs two programs in one process and asserts the second starts at `off`/stderr). Note: I read `run_outcome` and `begin_capture` but not the thin `run_program` wrapper; if that wrapper is the only public entry, the same reset is needed there.
 
-3. [MINOR] src/logging.rs:154 — `libc::write` returning `-1` is treated as a hard failure without checking `EINTR`; a signal can turn a valid log write into a spurious catchable `IoError`. — Fix: retry when `io::Error::last_os_error().kind() == ErrorKind::Interrupted`.
+2. [MAJOR] phases/phase-103/REPORT.md:116 — the resume adds exactly three test functions (`edge_a_pre_epoch_instant_keeps_its_timestamp`, `edge_a_refused_setting_leaves_the_previous_configuration_intact`, `edge_reset_restores_the_default_configuration`), so if the committed baseline of 2502 was accurate the new total is 2505, not the reported 2508. The report then admits at `:119` that `verify.sh` reads a *stale pre-harvest copy* of the report, so the honesty check validates the old number and cannot validate the current one. That is a gate claim the diff does not support. Fix: report the honest count (2505) or actually re-run and update, and make `verify.sh` read the delivered report rather than the pre-harvest snapshot.
 
-4. [MINOR] tests/stdlib_modules_test.rs:1862 — The only "closed stream" fixture is a read-only file (`EBADF`); there is no test for the REPORT's explicit claim that "a pipe with no reader raises the same catchable `IoError`" (src/logging.rs:140-145 relies on this). A pipe whose reader has exited exercises `EPIPE`, a different errno and a different signal path. — Fix: add a test writing to a pipe with a closed read end and assert the `Io` catch fires.
+3. [MAJOR, UNVERIFIED] src/logging.rs:220 — when a capture is open, a `stdout` log record is pushed immediately through `crate::wasm::try_emit`, whereas the tree-walker's `say` output is buffered and taken via `take_output` (`tests/stdlib_modules_test.rs:1486`). The only stdout-ordering test (`tests/stdlib_modules_test.rs:1607`) logs before it says, so it cannot distinguish correct interleaving from a record that jumps ahead of buffered `say` lines. A program that says `"first"` then logs would then capture `[INFO] ...\nfirst\n`. I could not confirm whether `run_program` uses the buffering path or the live-emit path, which is what would settle it; add a test with `say "before"` then `logging.info("after")` and assert `before\n[INFO] after\n`.
 
-5. [MINOR] SPEC.md:1231 — The new logging example is classified RUNS (`tests/doc_blocks_runs.txt`) but calls `logging.set_destination("app.log")`; executing the block writes/append-accumulates `app.log` in the executor's working directory instead of a scratch path, polluting the checkout across runs. — Fix: point the example at a temp path, use `stdout`, or classify it as a fragment; a temp-CWD executor would settle whether this is already harmless.
+4. [MINOR] src/logging.rs:140 — the pre-epoch fix is only exercised through the private `format_timestamp_at` unit test (`src/logging.rs:268`); there is no integration test that drives a pre-epoch instant through the real `format_timestamp` → `runtime::current_instant` → host-clock path or through the playground's `rb_set_clock`. The arithmetic in the new branch looks correct for the sample case, but the documented path that produced the defect (a host clock before 1970) remains untested end to end.
 
-REVIEW VERDICT: FINDINGS 5
+REVIEW VERDICT: FINDINGS 4
