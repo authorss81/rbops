@@ -2,26 +2,31 @@
 > reviewer · deepseek-v4.1-flash-free
 [0m
 [0m→ [0mRead src/logging.rs
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1, limit=120][0m
-[0m✱ [0mGrep "logging"[90m in src/runtime.rs · 74 matches[0m
-[0m✱ [0mGrep "logging_module|fn logging|logging\."[90m in tests/stdlib_modules_test.rs · 86 matches[0m
+[0m→ [0mRead src/wasm.rs
+I'll inspect the core implementation files first, then the tests.
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1650, limit=400][0m
+[0m✱ [0mGrep "logging"[90m in src/runtime.rs · 76 matches[0m
+[0m✱ [0mGrep "logging"[90m in src/stdlib.rs · 76 matches[0m
+Now let me inspect the runtime dispatch and stdlib registration.
+[0m✱ [0mGrep "libc"[90m in Cargo.toml · 29 matches[0m
 [0m→ [0mRead src/runtime.rs[90m [offset=3520, limit=110][0m
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1468, limit=390][0m
-[0m✱ [0mGrep "pub fn emit|fn emit|pub fn append|fn append"[90m in src · 9 matches[0m
-[0m✱ [0mGrep "pub enum Error|Io\(|IoError|impl fmt::Display for Error"[90m in src/error.rs · 45 matches[0m
-[0m→ [0mRead src/wasm.rs[90m [offset=60, limit=40][0m
-[0m→ [0mRead src/vfs.rs[90m [offset=30, limit=80][0m
-[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=1100, limit=120][0m
-[0m✱ [0mGrep "run_isolated|run_source_value|fn run|logging::reset|each|for .* in .*rows"[90m in tests/stdlib_module_docs_test.rs · 100 matches[0m
+[0m→ [0mRead Cargo.toml[90m [offset=20, limit=30][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=85, limit=30][0m
+[0m✱ [0mGrep "Io|IoError|fn span|pub enum Error"[90m in src/error.rs · 66 matches[0m
+[0m✱ [0mGrep "is_capturing|CAPTURING|begin_capture"[90m in src · 13 matches[0m
+[0m✱ [0mGrep "Error::Io"[90m in src · 35 matches[0m
+[0m✱ [0mGrep "logging"[90m in tests/stdlib_module_docs_test.rs · 100 matches[0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [limit=120][0m
 FINDINGS:
-1. [MAJOR] src/logging.rs:139 — The stdout/stderr destinations do not honour the spec's "a destination that cannot be written is a catchable `IoError`, not a process abort": stderr goes through `eprint!`, which panics on write failure, while stdout goes through `crate::wasm::emit` (src/logging.rs:135), which silently ignores write errors and drops records past `MAX_OUTPUT_BYTES` (src/wasm.rs:85-94), always returning `Ok`. Only file destinations can produce the documented `IoError`. Fix: route both streams through `io::stdout()/io::stderr().write_all(...)` and return the resulting `io::Result` so `runtime.rs` maps it to `Error::Io`. VERIFIED: traced `write` -> `Destination::Stderr` -> `eprint!` (std panics on stderr write failure) and `Destination::Stdout` -> `wasm::emit` -> `let _ = ...write_all(...)`.
+1. [BLOCKER] src/logging.rs:127 — Timestamps are produced with `chrono::Utc::now()` directly instead of the host clock the rest of the runtime uses (`rb_set_clock` / `runtime::set_host_clock`); on `wasm32-unknown-unknown` `SystemTime::now()` has no clock and panics (src/wasm.rs:877-886 explicitly says so and exists to avoid exactly this), so an enabled logging call in the playground aborts the run rather than emitting a record, and even where a JS clock exists the timestamp disagrees with `time.now()` on a host that set the clock. — Fix: derive the timestamp from the shared host-clock accessor used by `time.now()` (runtime.rs:520), falling back to `Utc::now()` only on native targets. — VERIFIED: traced src/logging.rs:127 to src/wasm.rs:877-886 ("`wasm32-unknown-unknown` has no clock of its own and `SystemTime::now()` panics there"); not exercised on a wasm target.
 
-2. [MAJOR] tests/stdlib_modules_test.rs:1743 — REPORT.md claims `edge_empty_and_multiline_messages_are_written_unchanged` covers a *trailing newline*, but the test only writes `""` and `"first\nsecond"` (lines 1743-1744). No message ending in `\n` is exercised, so the "message written exactly as given / record ends with one newline" boundary is untested despite the completion claim. Fix: add `logging.info("ends\n")` and assert the resulting file contains the message's newline plus the record newline.
+2. [MAJOR] src/wasm.rs:31 — `CAPTURING`/`CAPTURED` are process-global while the new logging configuration is thread-local (src/logging.rs:70-72), and `logging.rs:171` consults the global `is_capturing()` without taking `RUN_LOCK`; a `stdout` log call on one host thread therefore appends its record into whichever other thread currently has a capture open, corrupting that run's output and losing the record. The REPORT's claim that thread-local configuration "isolates tests" is only true for threshold/destination, not for the capture sink. — Fix: make the capture state thread-local, or route the logging `stdout` path through the same serialization (`run_lock`) as `emit`. — Not verified by running; a test that runs a capture on one thread while another thread logs to `stdout` would settle it.
 
-3. [MINOR] tests/stdlib_modules_test.rs:1572 — `fs::read_to_string(&log).unwrap_or_default()` swallows every read error. For the `off` row the expected text is empty, so an unreadable file that exists and contains records is scored as a pass; the test cannot distinguish "nothing written" from "cannot read what was written". Fix: assert `!log.exists()` for `off`, and propagate read errors for the other thresholds.
+3. [MINOR] src/logging.rs:154 — `libc::write` returning `-1` is treated as a hard failure without checking `EINTR`; a signal can turn a valid log write into a spurious catchable `IoError`. — Fix: retry when `io::Error::last_os_error().kind() == ErrorKind::Interrupted`.
 
-4. [MINOR] tests/stdlib_modules_test.rs:1815 — SPEC.md names "a directory instead of a file" as an unwritable destination, but the only failure test uses a missing parent directory. The EISDIR path through `vfs::append` is untested. Fix: add a destination that is an existing directory and assert the same catchable `IoError`.
+4. [MINOR] tests/stdlib_modules_test.rs:1862 — The only "closed stream" fixture is a read-only file (`EBADF`); there is no test for the REPORT's explicit claim that "a pipe with no reader raises the same catchable `IoError`" (src/logging.rs:140-145 relies on this). A pipe whose reader has exited exercises `EPIPE`, a different errno and a different signal path. — Fix: add a test writing to a pipe with a closed read end and assert the `Io` catch fires.
 
-5. [MINOR] src/runtime.rs:3553 — logging write failures are constructed as `Error::Io(...)` with no source span (`error.rs:130` returns `None` for `Error::Io`), so a caught logging failure loses line/column information and cannot satisfy the project's span assertion used for `Runtime` errors. Fix: carry a span-bearing error variant for builtin failures, or include the call site in the error.
+5. [MINOR] SPEC.md:1231 — The new logging example is classified RUNS (`tests/doc_blocks_runs.txt`) but calls `logging.set_destination("app.log")`; executing the block writes/append-accumulates `app.log` in the executor's working directory instead of a scratch path, polluting the checkout across runs. — Fix: point the example at a temp path, use `stdout`, or classify it as a fragment; a temp-CWD executor would settle whether this is already harmless.
 
 REVIEW VERDICT: FINDINGS 5

@@ -1,0 +1,24 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/logging.rs
+[0m✱ [0mGrep "logging|capture_member|is_capturing|try_emit"[90m in src/wasm.rs · 94 matches[0m
+[0m✱ [0mGrep "logging"[90m in src/runtime.rs · 80 matches[0m
+[0m→ [0mRead src/wasm.rs[90m [limit=150, offset=30][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=110, offset=3540][0m
+[0m✱ [0mGrep "fn .*logging|fn edge_|readerless|closed_std|directory_destination|unrelated_thread"[90m in tests/stdlib_modules_test.rs · 100 matches[0m
+Findings so far: the threshold logic and level ordering look correct. Now inspecting the capture plumbing and the actual tests to check for vacuous assertions and the new closed-stream claims.
+[0m✱ [0mGrep "logging"[90m in tests · 92 matches[0m
+[0m→ [0mRead src/wasm.rs[90m [limit=70, offset=890][0m
+[0m✱ [0mGrep "fn run_isolated|join_capture|run_isolated_with_depth"[90m in src · 14 matches[0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [limit=620, offset=1468][0m
+[0m→ [0mRead src/wasm.rs[90m [limit=130, offset=179][0m
+[0m✱ [0mGrep "run_isolated|run_source_value|Vm::new|std::thread|spawn"[90m in src/repl · 27 matches[0m
+FINDINGS:
+1. [MAJOR] src/runtime.rs:3554 — the message arm matches `[message]` for any `Value` and calls `message.to_string()`, so `logging.info(5)` (or a list/record/`nothing`) silently logs a coerced string. This contradicts the documented signature `logging.info(text)` at src/stdlib.rs:2449 and the REPORT's claim that "wrong argument types ... are catchable `Runtime` errors"; `edge_invalid_levels_and_destinations_are_refused` tests `logging.info()` (arity) but never a wrong-typed message. Fix: require `Value::Text` for the message (or explicitly document coercion) and add a test for `logging.info(5)`.
+
+2. [MINOR] src/wasm.rs:941 — `edge_an_unrelated_thread_is_not_part_of_an_open_capture` never opens a capture and never calls `is_capturing`/`try_emit`; it only checks that a thread-local does not leak into a fresh thread. It would stay green if `is_capturing()` at src/wasm.rs:109 ignored `capture_member()` entirely, so the newly added false branch of `capture_member() && CAPTURING` has no real test. Fix: call `begin_capture()` on one thread, then from an unrelated thread assert `is_capturing()` is false and `try_emit` reaches the real stream while `CAPTURED` stays unchanged.
+
+3. [MINOR] src/logging.rs:123 — `format_timestamp()` returns `None` when `current_instant()` fails, so on a wasm host that has not called `rb_set_clock` a record emitted with `timestamps == true` silently loses its timestamp and becomes indistinguishable from `set_timestamps(no)`. SPEC's logging section states timestamps are on by default and that the record shape is `[timestamp] [LEVEL] message`; the no-clock fallback is documented only in a code comment and the phase report, not in SPEC. Fix: either document the no-clock fallback in SPEC or emit a defined placeholder/error so "on" and "off" remain distinguishable.
+
+REVIEW VERDICT: FINDINGS 3

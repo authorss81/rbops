@@ -1,0 +1,2758 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0msed -n '490,550p' src/runtime.rs && echo "---LOGGING---" && sed -n '90,150p' src/logging.rs
+/// that does not is told so. This is a source of a value, like the filesystem
+/// and the network: nothing about how `time` is *used* differs, and
+/// `time.format`, `time.unix` and the arithmetic over a timestamp are the same
+/// code in both builds.
+#[cfg(not(target_arch = "wasm32"))]
+fn now() -> Result<SystemTime> {
+    Ok(SystemTime::now())
+}
+
+/// The playground's clock, as a [`Duration`] from the Unix epoch. `None` until
+/// the host has supplied one.
+#[cfg(target_arch = "wasm32")]
+static HOST_CLOCK: std::sync::Mutex<Option<Duration>> = std::sync::Mutex::new(None);
+
+/// Records the host's clock. Exported as `rb_set_clock`; see [`now`].
+#[cfg(target_arch = "wasm32")]
+pub fn set_host_clock(seconds: f64) {
+    if let Ok(mut slot) = HOST_CLOCK.lock() {
+        *slot = if seconds.is_finite() && seconds >= 0.0 {
+            Some(Duration::from_secs_f64(seconds))
+        } else {
+            None
+        };
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn now() -> Result<SystemTime> {
+    let slot = HOST_CLOCK
+        .lock()
+        .map_err(|_| Error::Io("The playground clock could not be read".to_string()))?;
+    let since_epoch = slot.ok_or_else(|| {
+        Error::Runtime(
+            "time.now() has no clock in the WebAssembly playground: the platform has none for \
+             a program to read. The host supplies one — see rb_set_clock in src/wasm.rs."
+                .to_string(),
+            Span::unknown(),
+        )
+    })?;
+
+    // `UNIX_EPOCH + d` panics on overflow, and the host's clock is an input a
+    // page can set to anything, so the round trip is checked rather than
+    // trusted: a host that sends 1e300 gets a clean error, not an abort.
+    UNIX_EPOCH.checked_add(since_epoch).ok_or_else(|| {
+        Error::Runtime(
+            format!(
+                "The playground's clock is at {since_epoch:?}, which is not an instant \
+                     this platform can represent"
+            ),
+            Span::unknown(),
+        )
+    })
+}
+
+/// The current instant, shared by `time.now()` and a logging record's
+/// timestamp.
+///
+/// The two read one clock on purpose: a record and a `time.now()` taken in the
+/// same program should agree, and the playground supplies only one clock
+/// through [`set_host_clock`]. Calling `SystemTime::now()` directly would panic
+/// on `wasm32-unknown-unknown`, where the logging module used to take its
+---LOGGING---
+    CONFIG.with(|config| config.borrow().threshold.name().to_string())
+}
+
+pub fn set_timestamps(on: bool) {
+    CONFIG.with(|config| config.borrow_mut().timestamps = on);
+}
+
+pub fn set_destination(destination: &str) -> Result<(), String> {
+    if destination.is_empty() {
+        return Err("logging.set_destination requires a non-empty destination".to_string());
+    }
+    let destination = match destination {
+        "stdout" => Destination::Stdout,
+        "stderr" => Destination::Stderr,
+        path => Destination::File(path.to_string()),
+    };
+    CONFIG.with(|config| config.borrow_mut().destination = destination);
+    Ok(())
+}
+
+pub fn enabled(level: Level) -> bool {
+    CONFIG.with(|config| {
+        let config = config.borrow();
+        level != Level::Off && config.threshold != Level::Off && level >= config.threshold
+    })
+}
+
+/// A timestamp for the current record, from the same clock `time.now()` reads.
+///
+/// A host that has no clock — the playground before `rb_set_clock` — gets a
+/// record without a timestamp rather than an abort. That is the one place the
+/// two differ: `time.now()` answers an error when there is no clock, while a
+/// logging call still has something to say and must not take the run down.
+fn format_timestamp() -> Option<String> {
+    let instant = crate::runtime::current_instant().ok()?;
+    Some(
+        chrono::DateTime::<chrono::Utc>::from(instant)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+    )
+}
+
+pub fn write(level: Level, message: &str) -> io::Result<()> {
+    let (destination, timestamps) = CONFIG.with(|config| {
+        let config = config.borrow();
+        (config.destination.clone(), config.timestamps)
+    });
+    if !enabled(level) {
+        return Ok(());
+    }
+
+    let timestamp = if timestamps { format_timestamp() } else { None };
+    let record = format_record(level, message, timestamp.as_deref());
+
+    match destination {
+        Destination::Stdout => write_stdout(&record),
+        Destination::Stderr => write_stderr(&record),
+        Destination::File(path) => crate::vfs::append(&path, &record),
+    }
+}
+[0m
+[0m$ [0mgit status && git log --oneline -10
+On branch main
+Your branch is ahead of 'origin/main' by 1 commit.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   SPEC.md
+	modified:   phases/phase-103/REPORT.md
+	modified:   src/interpreter.rs
+	modified:   src/logging.rs
+	modified:   src/runtime.rs
+	modified:   src/wasm.rs
+	modified:   tests/doc_blocks_fragments.txt
+	modified:   tests/doc_blocks_known_fail.txt
+	modified:   tests/doc_blocks_runs.txt
+	modified:   tests/stdlib_modules_test.rs
+	modified:   tests/unreviewed_work_ack_test.rs
+
+no changes added to commit (use "git add" and/or "git commit -a")
+d380ea4 resume phase-103: adopt preserved work
+9011d98 rbops: phase-102 (2026-11-03T02:08:06Z)
+e2ab2b6 resume phase-102: adopt preserved work
+a585ead rbops: phase-101 (2026-11-02T11:09:05Z)
+833bea4 resume phase-101: adopt preserved work
+16612b9 rbops: phase-100 (2026-11-01T13:55:19Z)
+8f9fa6a resume phase-100: adopt preserved work
+d597770 config: configure 45s chunkTimeout and 60s headerTimeout in project opencode.json
+3f48a7e rbops: phase-099 (2026-10-31T06:12:43Z)
+2da3033 resume phase-099: adopt preserved work
+[0m
+[0m$ [0msed -n '3540,3590p' src/runtime.rs && echo "---WASM---" && sed -n '900,940p' src/wasm.rs
+Ok(Some(Value::Nothing))
+        }
+        "console_clear" => {
+            crate::wasm::emit("\x1B[2J\x1B[1H");
+            Ok(Some(Value::Nothing))
+        }
+        // Logging module
+        "logging_debug" | "logging_info" | "logging_warn" | "logging_error" => {
+            let level = match name {
+                "logging_debug" => crate::logging::Level::Debug,
+                "logging_info" => crate::logging::Level::Info,
+                "logging_warn" => crate::logging::Level::Warn,
+                _ => crate::logging::Level::Error,
+            };
+            let message = match args {
+                [Value::Text(message)] => message.clone(),
+                _ => {
+                    return Err(Error::Runtime(
+                        format!(
+                            "logging.{} requires one text message",
+                            name.trim_start_matches("logging_")
+                        ),
+                        span,
+                    ))
+                }
+            };
+            crate::logging::write(level, &message).map_err(|e| {
+                Error::Io(format!(
+                    "logging.{} could not write to its destination: {e}",
+                    name.trim_start_matches("logging_")
+                ))
+            })?;
+            Ok(Some(Value::Nothing))
+        }
+        "logging_set_level" => {
+            let level = match args {
+                [Value::Text(level)] => level,
+                _ => {
+                    return Err(Error::Runtime(
+                        "logging.set_level requires one text level".to_string(),
+                        span,
+                    ))
+                }
+            };
+            crate::logging::set_level(level).map_err(|message| Error::Runtime(message, span))?;
+            Ok(Some(Value::Nothing))
+        }
+        "logging_level" => {
+            if !args.is_empty() {
+                return Err(Error::Runtime(
+                    "logging.level takes no arguments".to_string(),
+---WASM---
+    keyword_list().as_ptr()
+}
+
+/// The byte length of [`rb_keywords_ptr`].
+#[no_mangle]
+pub extern "C" fn rb_keywords_len() -> i32 {
+    i32::try_from(keyword_list().len()).unwrap_or(i32::MAX)
+}
+
+/// Records the host's wall clock, in seconds since the Unix epoch, so that
+/// `time.now()` has something to read. `wasm32-unknown-unknown` has no clock of
+/// its own and `SystemTime::now()` panics there, which would abort the module
+/// rather than fail one run, so a playground that wants `time` calls this first
+/// with `Date.now() / 1000`.
+///
+/// A negative or non-finite value is recorded as "no clock", which is what
+/// `time.now()` then reports — the same answer a host that never called this
+/// gets. It is not an error: the clock is not a parameter to a program, and
+/// refusing it would give the host a failure mode it cannot cause on purpose.
+#[no_mangle]
+pub extern "C" fn rb_set_clock(seconds: f64) {
+    #[cfg(target_arch = "wasm32")]
+    crate::runtime::set_host_clock(seconds);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Natively `time.now()` reads the system clock and ignores this. The
+        // export exists in both builds so one set of bindings drives both.
+        let _ = seconds;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A capture belongs to the run that opened it, not to the process.
+    ///
+    /// The program runs on an interpreter thread of its own, so the capture
+    /// itself has to stay process-global; membership is what keeps an unrelated
+    /// thread from writing into it.
+    #[test]
+[0m
+[0m$ [0msed -n '1,120p' tests/doc_blocks_runs.txt && echo "---REPORT---" && sed -n '1,140p' phases/phase-103/REPORT.md
+# The RUNS bucket — documentation code blocks this suite executes and that exit 0.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of this file, `tests/doc_blocks_fragments.txt` and
+# `tests/doc_blocks_known_fail.txt`. A block in none of them fails the suite.
+#
+# Being listed HERE is a promise the suite keeps by running the block: if one of
+# these stops exiting 0, `running_every_block_agrees_with_the_bucket_it_is_in`
+# fails and the block has to move to the KNOWN-FAIL file, with the first line of
+# stderr it now prints. That is the whole point of listing the working blocks
+# at all: without this file a block that stopped working would silently join the
+# fragments, and a documentation promise would rot without a word.
+#
+# "Runs" means BOTH runners now. `rb run` has to exit 0 AND `rb compile` has to
+# exit 0. `SPEC.md:647` sat in this file for a whole phase while `rb compile`
+# refused the function literal it is written with — "`to (x) ... end` as an
+# expression is not compiled yet" — and no gate in the suite could see it,
+# because `rb run` never asked the compiler anything.
+#
+# FORMAT
+#   <doc>:<line>
+# `line` is the line of the opening ```redblue fence, counted from 1. Editing a
+# document above a block moves it, and a moved block fails this suite rather
+# than quietly losing its bucket.
+#
+# COUNTS, as of the run that wrote this file
+#   SPEC.md 42 · docs/GRAMMAR.md 7 · README.md 7 · HANDOUT.md 4 · PHILOSOPHY.md 0
+#   60 of 111 blocks. The other 51 are 39 fragments and 12 known failures.
+
+# --- SPEC.md ---------------------------------------------------------------
+SPEC.md:40
+SPEC.md:58
+SPEC.md:132
+SPEC.md:160
+SPEC.md:203
+SPEC.md:235
+SPEC.md:246
+SPEC.md:354
+SPEC.md:466
+SPEC.md:496
+SPEC.md:602
+SPEC.md:647
+SPEC.md:659
+SPEC.md:687
+SPEC.md:710
+SPEC.md:721
+SPEC.md:789
+SPEC.md:806
+SPEC.md:820
+SPEC.md:828
+SPEC.md:840
+SPEC.md:893
+SPEC.md:919
+SPEC.md:962
+SPEC.md:1000
+SPEC.md:1034
+SPEC.md:1058
+SPEC.md:1145
+SPEC.md:1160
+SPEC.md:1195
+SPEC.md:1279
+SPEC.md:1358
+SPEC.md:1421
+SPEC.md:1471
+SPEC.md:1505
+SPEC.md:1534
+SPEC.md:1609
+SPEC.md:1633
+SPEC.md:1682
+SPEC.md:1801
+SPEC.md:1852
+SPEC.md:1878
+
+# --- docs/GRAMMAR.md-----------------------------------------------------
+docs/GRAMMAR.md:558
+docs/GRAMMAR.md:605
+docs/GRAMMAR.md:610
+docs/GRAMMAR.md:626
+docs/GRAMMAR.md:633
+docs/GRAMMAR.md:642
+docs/GRAMMAR.md:657
+
+# --- HANDOUT.md----------------------------------------------------------
+
+# --- README.md-----------------------------------------------------------
+README.md:9
+README.md:33
+README.md:46
+README.md:57
+README.md:139
+README.md:150
+README.md:162
+HANDOUT.md:126
+HANDOUT.md:149
+HANDOUT.md:156
+HANDOUT.md:250
+SPEC.md:1231
+---REPORT---
+# Phase 103 — A logging module with levels, destinations and deterministic records
+
+## What changed
+| File | Lines | What |
+|---|---|---|
+| `src/logging.rs` | +198 | `Level`, `Destination`, thread-local `Config`, threshold and timestamp setters, record formatting, file writes, and fallible stream writes that report a closed or broken descriptor |
+| `src/wasm.rs` | +25 −6 | `try_emit`, the fallible form of `emit`, and `is_capturing` so a `stdout` log record stays inside a host capture |
+| `src/lib.rs` | +1 | Exports `logging` |
+| `src/stdlib.rs` | +83 | `logging` in `MODULES` and `MODULE_MEMBERS`; nine builtins, names, signatures and effectful entries |
+| `src/runtime.rs` | +87 | Shared dispatch for `logging.debug/info/warn/error`, `set_level`, `level`, `set_timestamps`, `set_destination` and `reset` |
+| `tests/stdlib_modules_test.rs` | +512 | Fifteen `logging_module` tests covering thresholds, destinations, timestamps, parity, ordering, closed streams and failures |
+| `SPEC.md` | +45 | `logging` section: level order, `off` default, destinations, formats, determinism and write failures |
+| `README.md` | +18 | `logging` quick-reference block and default-behaviour paragraph |
+| `SURVEY.md` | +47 −47 | Inventory re-anchored to 123 builtins, 15 modules and 101 dotted members; logging gap removed |
+| `tests/stdlib_module_names_test.rs` | +5 | A documented `logging` call that runs |
+| `tests/stdlib_module_docs_test.rs` | +57 | Answerable rows for all nine logging builtins |
+| `tests/doc_blocks_runs.txt` | +13 −12 | New SPEC block classified RUNS; shifted SPEC blocks re-anchored |
+| `tests/doc_blocks_fragments.txt` | +4 −4 | SPEC fragment anchors moved with the new section |
+| `tests/doc_blocks_known_fail.txt` | +1 −1 | SPEC known-failure anchor moved with the new section |
+| `tests/unreviewed_work_ack_test.rs` | +1 | `resume phase-103:` added to the delivery-subject rule |
+
+## Behaviour
+`logging.debug`, `logging.info`, `logging.warn` and `logging.error` take one
+message. A record is written only when its level is at or above the current
+threshold. The levels are ordered `debug`, `info`, `warn`, `error`; the threshold
+is one of those four or `off`, and the default is `off`. A library can therefore
+add logging calls without changing what a program that has not opted in emits.
+
+`logging.set_level` accepts the five threshold names and
+`logging.set_destination` accepts `stderr`, `stdout`, or any other non-empty text
+as a file path. `logging.level` reads the threshold back, `logging.set_timestamps`
+turns timestamps on or off, and `logging.reset` restores `off`, `stderr` and
+timestamps on. Invalid names, empty destinations, wrong argument types and extra
+arguments are catchable `Runtime` errors that name the builtin.
+
+The default destination is `stderr`, not the program's normal output stream. A
+record has the form `[LEVEL] message` in deterministic mode and
+`[YYYY-MM-DDTHH:MM:SS.mmmZ] [LEVEL] message` when timestamps are on, always
+ending with one newline. The timestamp is read from the same clock as
+`time.now()`, including the playground clock a host supplies through
+`rb_set_clock`, rather than from a second clock the logging module owns. A host
+with no clock writes the record without a timestamp rather than failing the
+run, the same fallback SPEC documents; `time.now()` still answers that there is
+no clock. An empty or multi-line message is written unchanged.
+File destinations append one record per write through the same `vfs` path as
+`files.append`, so a record can be read by either engine. A file that cannot be
+written raises a catchable `IoError` naming `logging`; it does not abort the
+process.
+
+The `stdout` and `stderr` destinations are written through a fallible path too,
+so a descriptor that is closed, read-only, or a pipe with no reader raises the
+same catchable `IoError` instead of silently losing the record. On Unix the
+record is written to the descriptor directly because the standard library
+treats `EBADF` on a standard stream as success; a `stdout` record stays inside a
+host capture only when the calling thread belongs to the run that opened it, so
+one run's logging cannot be collected by another run's capture.
+
+The configuration is thread-local and both engines dispatch through the same
+`runtime::builtin` arms. There is no second formatter or threshold check in the
+bytecode VM, so the same program produces the same records under both engines.
+
+## Tests added
+| Test | Edge class covered |
+|---|---|
+| `records_at_or_above_the_threshold_reach_a_file_destination` | happy path; below, at and above the threshold |
+| `edge_every_adjacent_threshold_pair_filters_exactly` | every adjacent pair plus `off` |
+| `default_logging_emits_nothing_into_a_programs_output` | default `off`; no file, no stdout, no stderr record |
+| `edge_the_stdout_destination_joins_the_programs_captured_output` | explicit stdout destination and captured output |
+| `edge_the_default_destination_is_stderr_not_stdout` | native CLI split between stdout and stderr |
+| `a_record_carries_a_timestamp_unless_deterministic_mode_omits_it` | timestamp shape and deterministic mode |
+| `the_tree_walker_and_the_bytecode_vm_emit_equal_records` | cross-engine output and cross-engine files |
+| `edge_empty_and_multiline_messages_are_written_unchanged` | empty message, embedded newline and trailing newline |
+| `edge_nested_calls_interleave_records_in_call_order` | nested calls and stable ordering |
+| `edge_an_unwritable_destination_is_a_catchable_error` | missing directory, `IoError`, both engines |
+| `edge_invalid_levels_and_destinations_are_refused` | bad level, empty destination, wrong types and arity |
+| `edge_a_closed_stderr_is_a_catchable_error` | a read-only standard stream, `IoError`, not a silent drop |
+| `edge_a_closed_stdout_is_a_catchable_error` | a read-only output stream, `IoError`, caught and recorded |
+| `edge_a_readerless_pipe_is_a_catchable_error` | a pipe with no reader, `EPIPE`, caught and recorded |
+| `edge_a_directory_destination_is_a_catchable_error` | a directory as a file destination, both engines |
+| `edge_an_unrelated_thread_is_not_part_of_an_open_capture` | capture membership is scoped to the run that opened it, not the process |
+
+## Mandatory edge-case matrix
+| Row | Status |
+|---|---|
+| empty | covered — an empty message writes an empty body; an empty destination is refused |
+| singleton | covered — one record at the threshold is written once, and one below it writes nothing |
+| boundary | covered — every adjacent threshold pair, the highest level and `off` |
+| out_of_bounds | covered — an unknown level and a destination whose directory does not exist, or is a directory, are refused |
+| type_mismatch | covered — a number where a level or destination is wanted, a non-boolean timestamp switch, and extra arguments to `level`/`reset` |
+| numeric_boundary | covered — a number is not accepted as a level or destination; logging performs no numeric formatting |
+| unicode | N/A — messages are opaque text passed through unchanged; this facility adds no Unicode-specific boundary |
+| nesting_recursion | covered — a function called inside another writes its records in call order |
+| duplicate_missing_keys | N/A — logging has no user-supplied keys or collections |
+| malformed_input | covered — unknown level, empty destination, missing message and wrong argument types |
+| resource_limit | covered — a closed, read-only or readerless stream and an unwritable file are catchable `IoError`s, not aborts or silent drops |
+
+## Gates
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test --all-targets` | pass — 79 test binaries, 2502 passed, 0 failed, 0 ignored |
+| `../rbops/verify.sh "phase-103"` | pass |
+
+## Invariants touched
+- `stdlib::MODULES` gains `logging`; `MODULE_MEMBERS` gains its nine documented
+  members. The analyzer's existing dotted-call path needs no grammar change.
+- `BUILTIN_NAMES`, `BUILTIN_SIGNATURES` and `EFFECTFUL_BUILTINS` gain the nine
+  `logging_*` entries, so documentation, reachability and effect auditing agree
+  with dispatch.
+- No lexer, parser, analyzer, `Value` or bytecode instruction changed. Both
+  engines already call the shared `runtime::builtin` function.
+- The default is deliberately inert: threshold `off`, destination `stderr`, and
+  timestamps on. A program must enable a level before any record exists.
+- No new dependency: timestamps use `chrono`, file writes use the existing `vfs`
+  abstraction, and the Unix descriptor write uses the existing `libc`
+  target-dependency. `say`/`print` still go through `emit` unchanged; only
+  logging uses the fallible `try_emit`.
+- No test was skipped, ignored or weakened, and no lint suppression was added.
+
+## Existing test reconciliation
+- `tests/stdlib_module_names_test.rs` gains the `logging` module and a call that
+  answers `off` before any configuration. The existing bidirectional module and
+  member checks then cover the new surface.
+- `tests/stdlib_module_docs_test.rs` gains an answerable program row for every
+  `logging_*` builtin.
+- `tests/doc_blocks_runs.txt` classifies the new `SPEC.md:1231` block as RUNS and
+  re-anchors later SPEC blocks whose line numbers moved. The untouched README
+  example uses the document's existing plain fence, so it is not a
+  `redblue`-tagged block for the executor.
+- `tests/doc_blocks_fragments.txt` and `tests/doc_blocks_known_fail.txt` were
+  re-anchored, not reclassified. The phase-088 scanner exposed five logging
+  tests whose only success check was `is_ok()`; each now also compares the
+  program's captured output, so the scanner remains at zero vacuous tests.
+- `SURVEY.md` now states 123 builtins, 15 modules and 101 dotted members, lists
+  the logging row, removes the old "no logging" gap, and re-anchors citations
+  displaced by the new registry entries.
+- `tests/unreviewed_work_ack_test.rs` gains the `resume phase-103:` delivery
+  subject. The rule already covers every phase in flight; this phase's delivery
+  commit was the one subject it had not been told about yet. No entry was
+[0m
+[0m$ [0msed -n '1,90p' tests/stdlib_modules_test.rs && grep -n "logging_module\|fn edge_a_readerless\|fn a_record_carries\|fn default_logging\|current_instant\|set_timestamps" tests/stdlib_modules_test.rs
+//! The `files`, `json`, `csv` and `network` modules must be testable and total.
+//!
+//! Every filesystem test runs against a temp directory of its own under
+//! `target/tmp`, so the suite is deterministic and never writes outside the
+//! checkout. Nothing here performs a successful network request: the one test
+//! that opens a socket asserts the *absence of a hang*, and the rest check
+//! argument handling, which never reaches the network.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use redblue::bytecode::compile_source;
+use redblue::bytecode::vm::BytecodeVm;
+use redblue::{run_source_value, Error, Value, NETWORK_CONNECT_TIMEOUT_SECS, NETWORK_TIMEOUT_SECS};
+
+/// One test's private directory under `target/tmp/phase014`.
+///
+/// Removed before it is created, so a directory left behind by an interrupted
+/// run cannot make the next run of the same test see stale files.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    #[track_caller]
+    fn new(name: &str) -> TempDir {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp/phase014")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|e| panic!("{} should be creatable: {}", path.display(), e));
+        TempDir { path }
+    }
+
+    /// A path inside this directory. The name is used verbatim, so a test can
+    /// ask for a name with a space in it.
+    fn file(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+
+    /// The path as a Redblue text literal.
+    fn literal(&self, name: &str) -> String {
+        redblue_text(&self.file(name).to_string_lossy())
+    }
+
+    /// Writes `content` to `name` and returns the path.
+    #[track_caller]
+    fn write_file(&self, name: &str, content: &str) -> PathBuf {
+        let path = self.file(name);
+        std::fs::write(&path, content)
+            .unwrap_or_else(|e| panic!("{} should be writable: {}", path.display(), e));
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Lexes and parses `source`.
+#[track_caller]
+fn parse(source: &str) -> redblue::parser::Program {
+    let tokens = redblue::lexer::Lexer::tokenize(source).expect("source should lex");
+    redblue::parser::parse(tokens).expect("source should parse")
+}
+
+/// Runs `source` and returns the value of its last statement, which is why
+/// every source below ends in a bare expression and never in `say`.
+#[track_caller]
+fn eval(source: &str) -> Value {
+    let (_vm, result) = redblue::run_isolated(&parse(source));
+    result.unwrap_or_else(|error| panic!("source should have run, failed with {:?}", error))
+}
+
+/// Runs `source` and returns the error it produced.
+#[track_caller]
+fn eval_err(source: &str) -> Error {
+    let (_vm, result) = redblue::run_isolated(&parse(source));
+    result.expect_err("source should have failed")
+}
+
+/// Asserts `source` fails with a `Runtime` error whose message contains `part`.
+#[track_caller]
+fn assert_runtime_error(source: &str, part: &str) {
+    match eval_err(source) {
+        Error::Runtime(message, span) => {
+            assert!(
+1468:mod logging_module {
+1528:             logging.set_timestamps(no)\n\
+1563:                 logging.set_timestamps(no)\n\
+1578:    fn default_logging_emits_nothing_into_a_programs_output() {
+1611:             logging.set_timestamps(no)\n\
+1627:             logging.set_timestamps(no)\n\
+1652:    fn a_record_carries_a_timestamp_unless_deterministic_mode_omits_it() {
+1660:             logging.set_timestamps(yes)\n\
+1680:             logging.set_timestamps(no)\n\
+1707:                 logging.set_timestamps(no)\n\
+1741:                 logging.set_timestamps(no)\n\
+1778:                 logging.set_timestamps(no)\n\
+1820:             logging.set_timestamps(no)\n\
+1843:            ("logging.set_timestamps(\"yes\")", "logging.set_timestamps"),
+1904:             logging.set_timestamps(no)\n\
+1946:                 logging.set_timestamps(no)\n\
+1983:    fn edge_a_readerless_pipe_is_a_catchable_error() {
+1991:                 logging.set_timestamps(no)\n\
+2034:             logging.set_timestamps(no)\n\
+[0m
+[0m$ [0mgrep -n "HANDOUT\|SPEC.md\|RUNS\|fragments\|known_fail\|COUNT" tests/doc_blocks_test.rs | head -80 && echo "---" && grep -n "SPEC.md:" tests/doc_blocks_runs.txt | wc -l && grep -n "SPEC.md:" tests/doc_blocks_fragments.txt | wc -l && grep -n "SPEC.md:" tests/doc_blocks_known_fail.txt | wc -l
+5://! (`SPEC.md` 64, `docs/GRAMMAR.md` 9, `PHILOSOPHY.md` 9, `HANDOUT.md` 8,
+8://! `tests/for_range_test.rs:2` cites `SPEC.md:380-391` and
+9://! `tests/formatter_test.rs:2008` cites `SPEC.md:383`. A block that nobody
+11://! SPEC.md as dead syntax until phase-080 found it.
+17://! - `doc_blocks_fragments.txt` — not executed, with the reason written down.
+18://! - `doc_blocks_known_fail.txt` — executed, exited non-zero, and the exact
+21://! **A RUNS block has to compile as well as run.** `rb run` reads the
+24://! refused it outright — and `SPEC.md:647`, the program the specification uses
+28://! not be compiled. RUNS now means `rb run` exits 0 **and** `rb compile`
+63:    "SPEC.md",
+66:    "HANDOUT.md",
+203:/// RUNS file has no second column, so a value is optional here and its absence
+261:/// `rb run` only ever reads the tree-walking engine, so a block in the RUNS
+263:/// it outright — and that is not a hypothetical: `SPEC.md:647`, the program the
+270:/// So a RUNS block has to be *both* runnable and compilable, and this is the
+315:/// `SPEC.md:780` imports it. The working directory is the scratch directory so
+317:/// `SPEC.md:1080`'s `input(...)` reads end-of-file instead of waiting on a
+355:fn check_known_fail(key: &str, recorded: &str, outcome: &Outcome) -> Recorded {
+381:    fragments: Vec<Row>,
+382:    known_fail: Vec<Row>,
+391:            fragments: read_rows(
+392:                &dir.join("doc_blocks_fragments.txt"),
+393:                "doc_blocks_fragments.txt",
+395:            known_fail: read_rows(
+396:                &dir.join("doc_blocks_known_fail.txt"),
+397:                "doc_blocks_known_fail.txt",
+422:        self.fragments
+424:            .chain(self.known_fail.iter())
+433:            ("RUNS", &self.runs),
+434:            ("FRAGMENT", &self.fragments),
+435:            ("KNOWN-FAIL", &self.known_fail),
+482:    let fragments = audit.keys(&audit.fragments);
+483:    let known_fail = audit.keys(&audit.known_fail);
+492:                (&runs, "RUNS"),
+493:                (&fragments, "FRAGMENT"),
+494:                (&known_fail, "KNOWN-FAIL"),
+512:        .chain(fragments.iter())
+513:        .chain(known_fail.iter())
+534:         running. Classify it: RUNS if it exits 0, KNOWN-FAIL with the first \
+569:            "RUNS" => {
+573:                    "{key} is classified RUNS and did not run.\n\
+581:                    "{key} is classified RUNS and `rb compile` refused it.\n\
+584:                     A RUNS block is a program `rb` runs *and* compiles. Either \
+601:                    check_known_fail(key, &recorded, &outcome),
+622:/// This is the failure channel: `check_known_fail` is handed every recorded
+624:/// Without this, `check_known_fail` is only ever shown entries that happen to
+628:fn edge_a_known_fail_recording_that_is_wrong_is_rejected() {
+631:        !audit.known_fail.is_empty(),
+635:    for row in &audit.known_fail {
+649:            check_known_fail(&row.key, &row.value, &outcome),
+675:                std::panic::catch_unwind(|| check_known_fail(&row.key, recording, &outcome));
+692:            std::panic::catch_unwind(|| check_known_fail(&row.key, &row.value, &claimed_ok));
+855:    let text = read_doc(&root(), "SPEC.md").expect("SPEC.md is in the checkout");
+858:        "SPEC.md carries redblue blocks"
+---
+44
+29
+7
+[0m
+[0m$ [0mgrep -n "current_instant\|fn now\|pub fn\|set_host_clock" src/runtime.rs | sed -n '1,80p'; echo "---SPEC logging---"; sed -n '1220,1290p' SPEC.md
+44:pub fn module_program(path: &str) -> Result<Program> {
+62:pub fn module_bindings(
+83:pub fn property(span: Span, object: Value, name: &str) -> Result<Value> {
+142:pub fn index(span: Span, list: Value, index_value: Value) -> Result<Value> {
+192:pub fn binary_op(span: Span, op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
+396:pub fn unary_op(span: Span, op: &UnaryOp, value: Value) -> Result<Value> {
+422:pub fn append_through(
+447:pub fn append_target(span: Span, args: &[Value]) -> Result<&str> {
+495:fn now() -> Result<SystemTime> {
+506:pub fn set_host_clock(seconds: f64) {
+517:fn now() -> Result<SystemTime> {
+549:/// through [`set_host_clock`]. Calling `SystemTime::now()` directly would panic
+553:pub(crate) fn current_instant() -> Result<SystemTime> {
+1371:pub fn seed_random(seed: u64) {
+1551:    pub fn new(capacity: usize) -> Self {
+1560:    pub fn get(&mut self, args: &[Value]) -> Option<Value> {
+1572:    pub fn clear(&mut self) {
+1578:    pub fn insert(&mut self, args: &[Value], value: Value) {
+2560:pub fn builtin(span: Span, name: &str, args: &[Value]) -> Result<Option<Value>> {
+3910:pub fn set_program_args(args: Vec<String>) {
+3924:pub fn take_program_args() -> Vec<String> {
+---SPEC logging---
+module function, so there is no `console.input` — the same rule as for `say` and
+`print` — and it takes parentheses like any other call.
+
+There is no `ask`. It was a reserved word with no rule in the parser to read it,
+which is how this section came to name it, and it is an ordinary identifier
+again — `set ask to 1` is a program. Both spellings are refused: `ask("n")` is
+`Unknown function 'ask'`, and `ask "n"` — which is not a call at all, because a
+function is only called with parentheses — is `Unknown variable 'ask'`.
+
+### logging
+
+```redblue
+logging.set_level("info")          // debug, info, warn, error or off
+set threshold to logging.level()   // "info"
+logging.set_timestamps(no)         // deterministic records, with no timestamp
+logging.set_destination("stdout")  // "stderr", "stdout" or a file path
+logging.debug("looking up a row")  // below the threshold: not written
+logging.info("read 12 rows")
+logging.warn("the cache is cold")
+logging.error("the file does not exist")
+logging.reset()                    // threshold off, destination stderr, timestamps on
+```
+
+A record is written only when its level is at or above the threshold. The levels
+are ordered `debug`, `info`, `warn`, `error`, and the threshold is one of those
+four or `off`. The **default is `off`**, so a call added to a library writes
+nothing and cannot change what the program using it prints; a program has to ask
+for diagnostics before it gets any. The threshold is set with
+`logging.set_level` and read back with `logging.level`. `logging.reset` restores
+the defaults.
+
+The destination is `stderr` by default, which keeps diagnostics off the
+program's output stream, and `logging.set_destination` takes either the exact
+text `stderr`, the exact text `stdout`, or any other text as a file path. A file
+destination is appended to, one record per write, through the same filesystem as
+`files.write`, so a record written by one engine is readable by the other. A
+destination that cannot be written — a missing directory, a directory instead of
+a file — is a catchable `IoError` naming `logging`, not a process abort.
+
+A record has the shape `[timestamp] [LEVEL] message`, or `[LEVEL] message` when
+timestamps are off. Timestamps are **on by default**, because a log a reader
+cannot place in time is less useful; they make a record nondeterministic, so
+`logging.set_timestamps(no)` is the deterministic mode and is what a golden
+output or a corpus comparison should use. The timestamp is UTC, to the
+millisecond, in the form `2026-11-03T12:34:56.789Z`. A host with no clock — the
+WebAssembly playground before `rb_set_clock` — writes the record without the
+timestamp field rather than failing the run or aborting; the same situation
+makes `time.now()` a catchable error, because a logging call still has a record
+to write. The message is written exactly as given, including an empty message
+and the newlines of a multi-line one; the record itself ends with one newline.
+
+`logging.debug`, `logging.info`, `logging.warn` and `logging.error` each take one
+message. The four are functions of the module, so their bare spellings are not a
+second surface. The tree-walking VM and the bytecode VM share one implementation
+of the threshold, destination and formatting, so the same program writes the
+same records under both.
+
+### text
+
+```redblue
+set upper to text.uppercase("hello")  // "HELLO"
+set lower to text.lowercase("HELLO")  // "hello"
+set trimmed to text.trim("  hi  ")    // "hi"
+set parts to text.split("a,b,c", by ",")  // ["a", "b", "c"]
+set joined to text.join(["a", "b", "c"], by ",")  // "a,b,c"
+set holds to text.contains("abc", "b")  // yes
+set starts to text.starts_with("abc", "ab")  // yes
+set ends to text.ends_with("abc", "bc")  // yes
+set swapped to text.replace("a-b", "-", "+")  // "a+b"
+set size to text.length("héllo")  // 5
+set wrapped to text.wrap("the quick brown fox", 9)  // ["the quick", "brown fox"]
+[0m
+[0m$ [0mcat src/logging.rs
+use std::cell::RefCell;
+use std::io;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Debug,
+    Info,
+    Warn,
+    Error,
+    Off,
+}
+
+impl Level {
+    pub fn parse(name: &str) -> Option<Level> {
+        match name {
+            "debug" => Some(Level::Debug),
+            "info" => Some(Level::Info),
+            "warn" => Some(Level::Warn),
+            "error" => Some(Level::Error),
+            "off" => Some(Level::Off),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Debug => "debug",
+            Level::Info => "info",
+            Level::Warn => "warn",
+            Level::Error => "error",
+            Level::Off => "off",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Level::Debug => "DEBUG",
+            Level::Info => "INFO",
+            Level::Warn => "WARN",
+            Level::Error => "ERROR",
+            Level::Off => "OFF",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Destination {
+    Stdout,
+    Stderr,
+    File(String),
+}
+
+#[derive(Clone, Debug)]
+struct Config {
+    threshold: Level,
+    destination: Destination,
+    timestamps: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            threshold: Level::Off,
+            destination: Destination::Stderr,
+            timestamps: true,
+        }
+    }
+}
+
+thread_local! {
+    static CONFIG: RefCell<Config> = RefCell::new(Config::default());
+}
+
+pub fn reset() {
+    CONFIG.with(|config| *config.borrow_mut() = Config::default());
+}
+
+pub fn set_level(name: &str) -> Result<(), String> {
+    let level = Level::parse(name).ok_or_else(|| {
+        format!(
+            "logging.set_level requires one of debug, info, warn, error or off, \
+             but was given '{name}'"
+        )
+    })?;
+    CONFIG.with(|config| config.borrow_mut().threshold = level);
+    Ok(())
+}
+
+pub fn level() -> String {
+    CONFIG.with(|config| config.borrow().threshold.name().to_string())
+}
+
+pub fn set_timestamps(on: bool) {
+    CONFIG.with(|config| config.borrow_mut().timestamps = on);
+}
+
+pub fn set_destination(destination: &str) -> Result<(), String> {
+    if destination.is_empty() {
+        return Err("logging.set_destination requires a non-empty destination".to_string());
+    }
+    let destination = match destination {
+        "stdout" => Destination::Stdout,
+        "stderr" => Destination::Stderr,
+        path => Destination::File(path.to_string()),
+    };
+    CONFIG.with(|config| config.borrow_mut().destination = destination);
+    Ok(())
+}
+
+pub fn enabled(level: Level) -> bool {
+    CONFIG.with(|config| {
+        let config = config.borrow();
+        level != Level::Off && config.threshold != Level::Off && level >= config.threshold
+    })
+}
+
+/// A timestamp for the current record, from the same clock `time.now()` reads.
+///
+/// A host that has no clock — the playground before `rb_set_clock` — gets a
+/// record without a timestamp rather than an abort. That is the one place the
+/// two differ: `time.now()` answers an error when there is no clock, while a
+/// logging call still has something to say and must not take the run down.
+fn format_timestamp() -> Option<String> {
+    let instant = crate::runtime::current_instant().ok()?;
+    Some(
+        chrono::DateTime::<chrono::Utc>::from(instant)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+    )
+}
+
+pub fn write(level: Level, message: &str) -> io::Result<()> {
+    let (destination, timestamps) = CONFIG.with(|config| {
+        let config = config.borrow();
+        (config.destination.clone(), config.timestamps)
+    });
+    if !enabled(level) {
+        return Ok(());
+    }
+
+    let timestamp = if timestamps { format_timestamp() } else { None };
+    let record = format_record(level, message, timestamp.as_deref());
+
+    match destination {
+        Destination::Stdout => write_stdout(&record),
+        Destination::Stderr => write_stderr(&record),
+        Destination::File(path) => crate::vfs::append(&path, &record),
+    }
+}
+
+/// Writes a record to the real descriptor and reports a failed write.
+///
+/// `std::io::stderr().write_all` treats `EBADF` as success, so a descriptor
+/// that is genuinely closed would still lose the record silently. Writing to
+/// the descriptor directly keeps a closed stream a failure the program can
+/// catch.
+#[cfg(unix)]
+fn write_descriptor(fd: libc::c_int, record: &str) -> io::Result<()> {
+    let bytes = record.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        let chunk = &bytes[written..];
+        // SAFETY: `chunk` is a valid slice for `chunk.len()` bytes and `fd` is
+        // one of the process's standard stream descriptors.
+        let count = unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "the log destination accepted no bytes",
+            ));
+        }
+        written += count as usize;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_stdout(record: &str) -> io::Result<()> {
+    if crate::wasm::is_capturing() {
+        return crate::wasm::try_emit(record);
+    }
+    let _ = io::Write::flush(&mut io::stdout());
+    write_descriptor(libc::STDOUT_FILENO, record)
+}
+
+#[cfg(unix)]
+fn write_stderr(record: &str) -> io::Result<()> {
+    write_descriptor(libc::STDERR_FILENO, record)
+}
+
+#[cfg(not(unix))]
+fn write_stdout(record: &str) -> io::Result<()> {
+    crate::wasm::try_emit(record)
+}
+
+#[cfg(not(unix))]
+fn write_stderr(record: &str) -> io::Result<()> {
+    io::Write::write_all(&mut io::stderr(), record.as_bytes())
+}
+
+pub fn format_record(level: Level, message: &str, timestamp: Option<&str>) -> String {
+    match timestamp {
+        Some(timestamp) => format!("[{timestamp}] [{}] {message}\n", level.label()),
+        None => format!("[{}] {message}\n", level.label()),
+    }
+}
+[0m
+[0m$ [0msed -n '540,570p' src/runtime.rs && sed -n '1460,1560p' tests/stdlib_modules_test.rs && sed -n '1640,1700p' tests/stdlib_modules_test.rs && sed -n '1970,2070p' tests/stdlib_modules_test.rs
+)
+    })
+}
+
+/// The current instant, shared by `time.now()` and a logging record's
+/// timestamp.
+///
+/// The two read one clock on purpose: a record and a `time.now()` taken in the
+/// same program should agree, and the playground supplies only one clock
+/// through [`set_host_clock`]. Calling `SystemTime::now()` directly would panic
+/// on `wasm32-unknown-unknown`, where the logging module used to take its
+/// timestamp from `chrono::Utc::now()` and abort the whole module instead of
+/// writing a record.
+pub(crate) fn current_instant() -> Result<SystemTime> {
+    now()
+}
+
+/// The whole seconds `timestamp` names, counted from the Unix epoch, for
+/// `chrono` to format.
+///
+/// `SystemTime + Duration` panics when the addition overflows, and it does so
+/// from inside `std`, past every `Result` in this crate — `time.format(1e300)`
+/// aborted the process. The range is therefore checked here: a timestamp that
+/// is not finite or past what a date can name is a `Runtime` error, while a
+/// fractional timestamp truncates toward zero instead of being refused.
+/// `timestamp as u64` is not usable for the conversion: it saturates, so
+/// a negative timestamp would have quietly formatted as the epoch rather than
+/// as 1969.
+fn seconds_for_format(timestamp: f64, span: Span) -> Result<i64> {
+    seconds_for_instant(timestamp, "time.format", span)
+}
+    let source = format!(
+        r#"path.list("{}")"#,
+        dir.file("plain.txt").to_string_lossy().replace('\\', "/")
+    );
+    let error = run_source_value(&source).expect_err("a file is not a directory");
+    assert_eq!(error.label(), "IoError", "{error}");
+}
+
+mod logging_module {
+    use std::fs;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct Run {
+        output: Vec<String>,
+        result: Result<Value, Error>,
+    }
+
+    fn tree_walk(source: &str) -> Run {
+        let tokens = redblue::lexer::Lexer::tokenize(source).expect("source tokenizes");
+        let ast = redblue::parser::parse(tokens).expect("source parses");
+        redblue::analyzer::analyze(&ast).expect("source analyzes");
+        let mut vm = redblue::Vm::new();
+        let result = vm.run_quietly(&ast);
+        Run {
+            output: vm.take_output(),
+            result,
+        }
+    }
+
+    fn bytecode(source: &str) -> Run {
+        let chunk = compile_source(source).expect("source compiles");
+        let mut vm = BytecodeVm::new();
+        vm.set_echo(false);
+        let result = vm.run(&chunk);
+        Run {
+            output: vm.take_output(),
+            result,
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp/logging-tests")
+            .join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn quoted(path: &Path) -> String {
+        path.to_string_lossy().replace('\\', "\\\\")
+    }
+
+    fn runtime_message(error: Error) -> String {
+        match error {
+            Error::Runtime(message, _) => message,
+            other => panic!("expected a Runtime error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn records_at_or_above_the_threshold_reach_a_file_destination() {
+        let dir = scratch("threshold");
+        let log = dir.join("records.log");
+        let source = format!(
+            "logging.set_level(\"info\")\n\
+             logging.set_timestamps(no)\n\
+             logging.set_destination(\"{}\")\n\
+             logging.debug(\"below\")\n\
+             logging.info(\"at\")\n\
+             logging.warn(\"above\")\n",
+            quoted(&log)
+        );
+
+        let run = tree_walk(&source);
+        assert!(run.result.is_ok(), "{:?}", run.result);
+        assert_eq!(run.output.join("\n"), "");
+
+        assert_eq!(
+            fs::read_to_string(&log).expect("the destination holds the records"),
+            "[INFO] at\n[WARN] above\n",
+        );
+    }
+
+    #[test]
+    fn edge_every_adjacent_threshold_pair_filters_exactly() {
+        let dir = scratch("adjacent");
+        for (threshold, expected) in [
+            (
+                "debug",
+                "[DEBUG] debug\n[INFO] info\n[WARN] warn\n[ERROR] error\n",
+            ),
+            ("info", "[INFO] info\n[WARN] warn\n[ERROR] error\n"),
+            ("warn", "[WARN] warn\n[ERROR] error\n"),
+            ("error", "[ERROR] error\n"),
+            ("off", ""),
+        ] {
+            let log = dir.join(format!("{threshold}.log"));
+            let source = format!(
+            output.status.success(),
+            "the program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "result\n");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "[INFO] diagnostic\n"
+        );
+    }
+
+    #[test]
+    fn a_record_carries_a_timestamp_unless_deterministic_mode_omits_it() {
+        let dir = scratch("timestamps");
+        let stamped = dir.join("stamped.log");
+        let deterministic = dir.join("deterministic.log");
+
+        redblue::logging::reset();
+        let stamped_run = tree_walk(&format!(
+            "logging.set_level(\"info\")\n\
+             logging.set_timestamps(yes)\n\
+             logging.set_destination(\"{}\")\n\
+             logging.info(\"stamped\")\n",
+            quoted(&stamped)
+        ));
+        assert!(stamped_run.result.is_ok(), "{:?}", stamped_run.result);
+        assert_eq!(stamped_run.output.join("\n"), "");
+        let stamped_record = fs::read_to_string(&stamped).expect("stamped record");
+        let timestamp = regex::Regex::new(
+            r"^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] \[INFO\] stamped\n$",
+        )
+        .expect("timestamp pattern");
+        assert!(
+            timestamp.is_match(&stamped_record),
+            "a record without a timestamp: {stamped_record:?}"
+        );
+
+        redblue::logging::reset();
+        let deterministic_run = tree_walk(&format!(
+            "logging.set_level(\"info\")\n\
+             logging.set_timestamps(no)\n\
+             logging.set_destination(\"{}\")\n\
+             logging.info(\"stamped\")\n",
+            quoted(&deterministic)
+        ));
+        assert!(
+            deterministic_run.result.is_ok(),
+            "{:?}",
+            deterministic_run.result
+        );
+        assert_eq!(deterministic_run.output.join("\n"), "");
+        assert_eq!(
+            fs::read_to_string(&deterministic).expect("deterministic record"),
+            "[INFO] stamped\n",
+        );
+    }
+
+    #[test]
+    fn the_tree_walker_and_the_bytecode_vm_emit_equal_records() {
+        let dir = scratch("engines");
+        let tree_log = dir.join("tree.log");
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).expect("the catch wrote its marker"),
+            "caught",
+            "a closed stdout must be catchable, not silently discarded"
+        );
+    }
+
+    /// A pipe with no reader is a different failure from a read-only
+    /// descriptor: it raises `EPIPE`, not `EBADF`. The logging module promises
+    /// both are the same catchable `IoError`, so this pins the pipe case too.
+    #[cfg(unix)]
+    #[test]
+    fn edge_a_readerless_pipe_is_a_catchable_error() {
+        let dir = scratch("readerless-pipe");
+        let file = dir.join("program.rb");
+        let marker = dir.join("caught.txt");
+        fs::write(
+            &file,
+            format!(
+                "logging.set_level(\"info\")\n\
+                 logging.set_timestamps(no)\n\
+                 logging.set_destination(\"stdout\")\n\
+                 try\n\
+                     logging.info(\"to a pipe with no reader\")\n\
+                 catch error of Io\n\
+                     files.write(\"{}\", \"caught\")\n\
+                 end\n",
+                quoted(&marker)
+            ),
+        )
+        .expect("program file");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rb"))
+            .arg("run")
+            .arg(&file)
+            .stdout(readerless_pipe())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("rb runs");
+
+        assert!(
+            output.status.success(),
+            "the program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).expect("the catch wrote its marker"),
+            "caught",
+            "a readerless pipe must be catchable, not a process abort"
+        );
+    }
+
+    /// A path that names a directory is a write failure on both engines, not a
+    /// panic and not a record that quietly goes nowhere.
+    #[test]
+    fn edge_a_directory_destination_is_a_catchable_error() {
+        let dir = scratch("directory-destination");
+        let target = dir.join("a-directory");
+        fs::create_dir_all(&target).expect("directory destination");
+
+        let source = format!(
+            "logging.reset()\n\
+             logging.set_level(\"info\")\n\
+             logging.set_timestamps(no)\n\
+             logging.set_destination(\"{}\")\n\
+             try\n\
+                 logging.info(\"nowhere\")\n\
+             catch error of Io\n\
+                 say \"caught\"\n\
+             end\n\
+             say \"done\"\n",
+            quoted(&target)
+        );
+
+        for run in [tree_walk(&source), bytecode(&source)] {
+            assert!(run.result.is_ok(), "{:?}", run.result);
+            assert_eq!(run.output, vec!["caught".to_string(), "done".to_string()]);
+        }
+    }
+}
+[0m
+[0m$ [0mgrep -n "chrono" Cargo.toml Cargo.lock | head -20 && sed -n '120,175p' phases/phase-103/REPORT.md
+Cargo.toml:32:chrono = "0.4"
+Cargo.lock:82:name = "chrono"
+Cargo.lock:768: "chrono",
+
+## Existing test reconciliation
+- `tests/stdlib_module_names_test.rs` gains the `logging` module and a call that
+  answers `off` before any configuration. The existing bidirectional module and
+  member checks then cover the new surface.
+- `tests/stdlib_module_docs_test.rs` gains an answerable program row for every
+  `logging_*` builtin.
+- `tests/doc_blocks_runs.txt` classifies the new `SPEC.md:1231` block as RUNS and
+  re-anchors later SPEC blocks whose line numbers moved. The untouched README
+  example uses the document's existing plain fence, so it is not a
+  `redblue`-tagged block for the executor.
+- `tests/doc_blocks_fragments.txt` and `tests/doc_blocks_known_fail.txt` were
+  re-anchored, not reclassified. The phase-088 scanner exposed five logging
+  tests whose only success check was `is_ok()`; each now also compares the
+  program's captured output, so the scanner remains at zero vacuous tests.
+- `SURVEY.md` now states 123 builtins, 15 modules and 101 dotted members, lists
+  the logging row, removes the old "no logging" gap, and re-anchors citations
+  displaced by the new registry entries.
+- `tests/unreviewed_work_ack_test.rs` gains the `resume phase-103:` delivery
+  subject. The rule already covers every phase in flight; this phase's delivery
+  commit was the one subject it had not been told about yet. No entry was
+  removed and no assertion was loosened.
+
+## Known gaps / follow-ups
+- Configuration is thread-local. That isolates tests and matches the
+  single-threaded CLI, but two host threads do not share a threshold or
+  destination.
+- There is no rotation, size limit, retention policy, file locking or structured
+  field support. Each enabled call appends one record.
+- The timestamp format is fixed: UTC with millisecond precision. There is no
+  custom format, local timezone, or caller-supplied clock.
+- `stdout` and `stderr` are reserved destination names, so a file literally
+  named `stdout` or `stderr` cannot be selected without a path prefix.
+- There is no per-module logger or level filter; one threshold and one
+  destination apply to every call in the thread.
+[0m
+[0m$ [0msed -n '78,100p' Cargo.lock && grep -n "name = \"chrono\"" -A5 Cargo.lock
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
+
+[[package]]
+name = "chrono"
+version = "0.4.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+dependencies = [
+ "iana-time-zone",
+ "js-sys",
+ "num-traits",
+ "wasm-bindgen",
+ "windows-link",
+]
+
+[[package]]
+name = "clipboard-win"
+version = "5.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+dependencies = [
+ "error-code",
+82:name = "chrono"
+83-version = "0.4.45"
+84-source = "registry+https://github.com/rust-lang/crates.io-index"
+85-checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+86-dependencies = [
+87- "iana-time-zone",
+[0m
+[0m$ [0msed -n '1,120p' tests/doc_blocks_test.rs && sed -n '760,900p' tests/doc_blocks_test.rs
+//! Every ```redblue block in the five documents that define Redblue is
+//! extracted, classified and — where it is a program — executed.
+//!
+//! The finding this pins: the five documents carried **97** code blocks
+//! (`SPEC.md` 64, `docs/GRAMMAR.md` 9, `PHILOSOPHY.md` 9, `HANDOUT.md` 8,
+//! `README.md` 7) and **no test ran any of them**. Every existing reference to
+//! documentation was a hand-quoted single example:
+//! `tests/for_range_test.rs:2` cites `SPEC.md:380-391` and
+//! `tests/formatter_test.rs:2008` cites `SPEC.md:383`. A block that nobody
+//! executes rots in silence, which is exactly how `items at 0` sat in
+//! SPEC.md as dead syntax until phase-080 found it.
+//!
+//! So the harness is the deliverable, not a number. Two data files in this
+//! directory hold the classification, matched by `doc:line`:
+//!
+//! - `doc_blocks_runs.txt` — executed, and it exits 0.
+//! - `doc_blocks_fragments.txt` — not executed, with the reason written down.
+//! - `doc_blocks_known_fail.txt` — executed, exited non-zero, and the exact
+//!   first line of stderr is recorded.
+//!
+//! **A RUNS block has to compile as well as run.** `rb run` reads the
+//! tree-walking engine and nothing else, so before `compile_block` existed a
+//! block could be listed here as working documentation while `rb compile`
+//! refused it outright — and `SPEC.md:647`, the program the specification uses
+//! to introduce function values, sat in that file for a whole phase with
+//! `rb compile` stopping on it with "`to (x) ... end` as an expression is not
+//! compiled yet". Every gate was green and the headline example still could
+//! not be compiled. RUNS now means `rb run` exits 0 **and** `rb compile`
+//! exits 0; the compiler lowers a function literal now, and
+//! `tests/function_literal_test.rs` is where that is pinned.
+//!
+//! All three lists are checked in, and a block in none of them fails the suite, so
+//! none of the lists can rot: adding a block to a document without classifying
+//! it fails here, and so does deleting one — the extracted count is pinned, and
+//! the entry would point at a block that is no longer there.
+//!
+//! Listing the *working* blocks is what makes the suite worth running. If a
+//! block in `doc_blocks_runs.txt` stops exiting 0, the run test fails and it
+//! has to be re-classified, rather than drifting silently into "not one of the
+//! ones we run".
+//!
+//! **No network.** Two blocks make live HTTP requests to a host that does not
+//! exist; they are classified `network` in the fragment file with that reason
+//! written beside them. They are the only two, and a reader must not read the
+//! fragment bucket as "runs".
+//!
+//! **Sandbox.** Each run gets its own empty working directory, so a block that
+//! writes `output.txt` writes it there and not in the repository. The program
+//! file itself is written *into the project root*, because
+//! `redblue::root_of` resolves `import <name>` against the directory holding
+//! the program — a block that imports `MathUtils` has to see `modules/`. The
+//! scratch files are named `*.tmp`, which `.gitignore` already covers.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The five documents that define the language, and the only ones this suite
+/// reads. The order is fixed so a failure message reads the same every run.
+const DOCS: &[&str] = &[
+    "SPEC.md",
+    "README.md",
+    "PHILOSOPHY.md",
+    "HANDOUT.md",
+    "docs/GRAMMAR.md",
+];
+
+/// The number of ```redblue blocks the audit measured across [`DOCS`].
+///
+/// This is a floor, not a measurement. The harness measures the real count and
+/// reports it; this number exists so that *deleting* an example from a document
+/// fails the suite. Without it, the cheapest way to make this test green would
+/// be to delete the blocks it cannot run, which is the rot this file exists to
+/// prevent.
+const MINIMUM_BLOCKS: usize = 97;
+
+/// One fenced `redblue` block, with the position a reader would jump to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Block {
+    doc: String,
+    /// 1-based line of the opening fence.
+    line: usize,
+    body: String,
+    /// False when the document ends before the closing fence.
+    closed: bool,
+}
+
+impl Block {
+    /// The `doc:line` key both data files are matched on.
+    fn key(&self) -> String {
+        format!("{}:{}", self.doc, self.line)
+    }
+
+    /// The program text handed to `rb`.
+    fn source(&self) -> String {
+        format!("{}\n", self.body)
+    }
+}
+
+/// Extracts every ```redblue block from `text`, in document order.
+///
+/// A fence opens a block when the first whitespace-delimited word after the
+/// backticks is `redblue`, so ```redblue and ```redblue title="…" both open one
+/// and ```text, ```bash and a bare ``` do not. A fence inside the block closes
+/// it whatever its info string is, because Markdown allows no other spelling and
+/// an unterminated block must not swallow the rest of the document.
+///
+/// A block with no closing fence is still returned, with [`Block::closed`]
+/// false: dropping it would let a document acquire an unterminated block and
+/// have the count fall silently, which is the same failure this file exists to
+/// catch, one level down.
+fn extract_blocks(text: &str) -> Vec<Block> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+
+    while index < lines.len() {
+        let trimmed = lines[index].trim();
+}
+
+/// An empty block is a block: it is extracted, and it is neither a fence nor
+/// skipped for having nothing in it.
+#[test]
+fn edge_an_empty_block_is_extracted() {
+    let blocks = extract_blocks("```redblue\n```\n");
+    assert_eq!(blocks.len(), 1, "an empty body is still a block");
+    assert_eq!(blocks[0].body, "");
+    assert!(blocks[0].closed);
+    assert_eq!(blocks[0].source(), "\n");
+    assert_eq!(
+        blocks[0].key(),
+        ":1",
+        "an unfiled block has no document yet"
+    );
+
+    // A fence with only blank lines inside it is the same case, and the real
+    // documents have no such block — so if one appears it is classified rather
+    // than skipped.
+    let blocks = extract_blocks("```redblue\n\n\n```\n");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].body, "\n");
+}
+
+/// A fence that is not tagged `redblue` is not documentation Redblue code, and
+/// is left alone — as is a bare fence.
+#[test]
+fn edge_a_fence_that_is_not_tagged_redblue_is_ignored() {
+    let text = concat!(
+        "```\n",                         // 1  bare: not tagged
+        "say \"bare fence\"\n",          // 2
+        "```\n",                         // 3
+        "```text\n",                     // 4
+        "say \"prose, not code\"\n",     // 5
+        "```\n",                         // 6
+        "```bash\n",                     // 7
+        "rb run hello.rb\n",             // 8
+        "```\n",                         // 9
+        "```ruby\n",                     // 10
+        "puts \"hi\"\n",                 // 11
+        "```\n",                         // 12
+        "```redblue\n",                  // 13
+        "say \"the one that counts\"\n", // 14
+        "```\n",                         // 15
+    );
+    let blocks = extract_blocks(text);
+    assert_eq!(
+        blocks.len(),
+        1,
+        "only the ```redblue block is documentation; got {blocks:?}"
+    );
+    assert_eq!(blocks[0].body, "say \"the one that counts\"");
+    assert_eq!(blocks[0].line, 13);
+
+    // An info string with a suffix still tags the block redblue — Markdown
+    // convention — while a different first word does not, and a tag that merely
+    // contains "redblue" is not the tag.
+    let blocks = extract_blocks("```redblue title=\"Set the name\"\nset n to 1\n```\n");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].body, "set n to 1");
+    for ignored in ["```notredblue", "```Redblue", "```rust", "```red"] {
+        assert!(
+            extract_blocks(&format!("{ignored}\nset n to 1\n```\n")).is_empty(),
+            "{ignored} must not open a documentation block"
+        );
+    }
+
+    // CommonMark strips whitespace around the info string, so a fence written
+    // ``` redblue is the same fence. The real documents do not write it that
+    // way; the rule is pinned so that a future reader of `fence_info` does not
+    // have to guess which of the two it is implementing.
+    let blocks = extract_blocks("``` redblue \nset n to 1\n```\n");
+    assert_eq!(blocks.len(), 1, "a spaced tag is still the tag");
+    assert_eq!(blocks[0].body, "set n to 1");
+    // An indented fence is still a fence: the documents indent their blocks
+    // inside list items, and those are blocks too.
+    let blocks = extract_blocks("  ```redblue\n  set n to 1\n  ```\n");
+    assert_eq!(blocks.len(), 1, "an indented fence is a fence");
+    assert_eq!(blocks[0].body, "  set n to 1");
+}
+
+/// A document that is not there is an error naming the document, not a panic
+/// and not an empty list.
+#[test]
+fn edge_a_document_that_does_not_exist_is_an_error_rather_than_a_panic() {
+    let error = read_doc(&root(), "docs/NOT_A_DOCUMENT.md")
+        .expect_err("a missing document must not read as an empty one");
+    assert!(
+        error.starts_with("docs/NOT_A_DOCUMENT.md: "),
+        "the error must name the document it could not read, got: {error}"
+    );
+
+    // And the same call on a real one succeeds, so the error above is about the
+    // file and not about the signature.
+    let text = read_doc(&root(), "SPEC.md").expect("SPEC.md is in the checkout");
+    assert!(
+        text.contains("```redblue"),
+        "SPEC.md carries redblue blocks"
+    );
+}
+[0m
+[0m$ [0mgrep -n "SPEC.md:" tests/doc_blocks_runs.txt && echo TOTAL && grep -cE '^[A-Za-z_./-]+\.md:[0-9]+$' tests/doc_blocks_runs.txt && grep -cE '^[A-Za-z_./-]+\.md:[0-9]+$' tests/doc_blocks_fragments.txt && grep -cE '^[A-Za-z_./-]+\.md:[0-9]+$' tests/doc_blocks_known_fail.txt
+16:# exit 0. `SPEC.md:647` sat in this file for a whole phase while `rb compile`
+32:SPEC.md:40
+33:SPEC.md:58
+34:SPEC.md:132
+35:SPEC.md:160
+36:SPEC.md:203
+37:SPEC.md:235
+38:SPEC.md:246
+39:SPEC.md:354
+40:SPEC.md:466
+41:SPEC.md:496
+42:SPEC.md:602
+43:SPEC.md:647
+44:SPEC.md:659
+45:SPEC.md:687
+46:SPEC.md:710
+47:SPEC.md:721
+48:SPEC.md:789
+49:SPEC.md:806
+50:SPEC.md:820
+51:SPEC.md:828
+52:SPEC.md:840
+53:SPEC.md:893
+54:SPEC.md:919
+55:SPEC.md:962
+56:SPEC.md:1000
+57:SPEC.md:1034
+58:SPEC.md:1058
+59:SPEC.md:1145
+60:SPEC.md:1160
+61:SPEC.md:1195
+62:SPEC.md:1279
+63:SPEC.md:1358
+64:SPEC.md:1421
+65:SPEC.md:1471
+66:SPEC.md:1505
+67:SPEC.md:1534
+68:SPEC.md:1609
+69:SPEC.md:1633
+70:SPEC.md:1682
+71:SPEC.md:1801
+72:SPEC.md:1852
+73:SPEC.md:1878
+98:SPEC.md:1231
+TOTAL
+61
+0
+[0m
+[0m$ [0msed -n '1,40p' tests/doc_blocks_fragments.txt && echo "---K---" && sed -n '1,40p' tests/doc_blocks_known_fail.txt && echo "---counts---" && grep -cE '^[A-Za-z_./-]+\.md:[0-9]+' tests/doc_blocks_fragments.txt && grep -cE '^[A-Za-z_./-]+\.md:[0-9]+' tests/doc_blocks_known_fail.txt
+# The FRAGMENT bucket — documentation code blocks this suite does not execute.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of `this file` and `tests/doc_blocks_known_fail.txt`. A block in
+# neither fails the suite, so neither list can quietly shrink.
+#
+# WHAT FRAGMENT MEANS
+# The block is not executed, and the reason is written beside it. Two kinds of
+# reason appear here, and they are not the same thing:
+#
+#   excerpt - the block is not a program. It has an elided `end`, a placeholder
+#             body (`// statements`, `// ...`, `// Implementation`), or names
+#             that only the surrounding prose introduces. Nothing about running
+#             it is promised, so there is nothing for the interpreter to answer.
+#
+#   network - the block is a program, and it performs a live HTTP request. This
+#             suite runs no network (AGENTS.md § 3.1.4), so the block is
+#             classified rather than executed and its outcome is unverified.
+#             Two entries below say so; a reader must not take them for
+#             "this runs".
+#
+# A block that IS a whole program and still fails belongs in the KNOWN-FAIL
+# file with the first line of stderr it prints today, not here. Calling a
+# broken example a fragment is how a documentation promise rots unnoticed.
+#
+# FORMAT
+#   <doc>:<line><TAB><reason>
+# `line` is the line of the opening ```redblue fence, counted from 1. That
+# makes the entry brittle on purpose: editing a document above a block moves it,
+# and a moved block fails this suite rather than quietly losing its bucket.
+#
+# COUNTS, as of the run that wrote this file
+#   SPEC.md 29 · docs/GRAMMAR.md 2 · PHILOSOPHY.md 8 · README.md 0 · HANDOUT.md 0
+#   39 of 110 blocks. The other 71 are 59 RUNS and 12 KNOWN-FAIL.
+
+# --- SPEC.md ---------------------------------------------------------------
+
+SPEC.md:146	excerpt - a catalogue of five refusals, one per line, each of which is a separate program that fails on purpose; run as one program it is neither a program nor a promise about a single outcome
+SPEC.md:187	excerpt - a type-declaration catalogue: `list of number` and `record { x: number, y: number }` are not Redblue syntax, and SPEC.md's own keyword table lists no type keywords
+---K---
+# The KNOWN-FAIL bucket — documentation blocks that are whole programs and
+# still fail today.
+#
+# Read by `tests/doc_blocks_test.rs`. Every ```redblue block in SPEC.md,
+# README.md, PHILOSOPHY.md, HANDOUT.md and docs/GRAMMAR.md must appear in
+# exactly one of this file and `tests/doc_blocks_fragments.txt`. A block in
+# neither fails the suite.
+#
+# WHAT KNOWN-FAIL MEANS
+# The block is a program — every name it reads is bound somewhere above it in
+# the same block — and this suite wrote it to a file and ran it, and it exited
+# non-zero. The second column is the exact first line of stderr, so an entry
+# goes stale the moment the behaviour changes: fixing any of these without
+# re-running the suite fails here, and so does the failure moving, or changing
+# its wording, or being reclassified as a fragment.
+#
+# This is the list a human can act on. Each entry is a sentence in a document
+# that `rb` contradicts. Nothing here is implemented by this phase and nothing
+# here is fixed by it: AGENTS.md § 1.7, one phase one concern.
+#
+# FORMAT
+#   <doc>:<line><TAB><first line of stderr>
+#
+# COUNTS, as of the run that wrote this file
+#   SPEC.md 7 · PHILOSOPHY.md 1 · HANDOUT.md 4 · docs/GRAMMAR.md 0 · README.md 0
+#   12 of 110 blocks.
+
+# --- SPEC.md ---------------------------------------------------------------
+
+SPEC.md:89	Error: ParserError: Expected field name
+SPEC.md:610	Error: ParserError: Expected 'then' but got 'give'
+SPEC.md:671	Error: ParserError: Expected 'end' but got Eof
+SPEC.md:1092	Error: ParserError: Expected 'then' but got 'say'
+SPEC.md:1130	Error: RuntimeError: Maximum call depth of 1000 reached while calling 'endless'
+SPEC.md:1181	Error: AnalyzerError: Unknown variable 'async'
+SPEC.md:1520	Error: ParserError: Expected variable name, found reserved word 'back'
+
+# --- PHILOSOPHY.md ----------------------------------------------------------
+
+PHILOSOPHY.md:132	Error: ParserError: Expected variable name, found reserved word 'is'
+---counts---
+39
+12
+[0m
+[0m$ [0mgrep -n '^```redblue' SPEC.md | wc -l && grep -n '^```redblue' SPEC.md | sed -n '1,60p'
+79
+40:```redblue
+58:```redblue
+89:```redblue
+132:```redblue
+146:```redblue
+160:```redblue
+187:```redblue
+203:```redblue
+210:```redblue
+221:```redblue
+229:```redblue
+235:```redblue
+246:```redblue
+315:```redblue
+332:```redblue
+340:```redblue
+347:```redblue
+354:```redblue
+361:```redblue
+418:```redblue
+440:```redblue
+450:```redblue
+458:```redblue
+466:```redblue
+496:```redblue
+504:```redblue
+512:```redblue
+520:```redblue
+557:```redblue
+574:```redblue
+602:```redblue
+610:```redblue
+626:```redblue
+639:```redblue
+647:```redblue
+659:```redblue
+671:```redblue
+687:```redblue
+710:```redblue
+721:```redblue
+738:```redblue
+789:```redblue
+806:```redblue
+820:```redblue
+828:```redblue
+840:```redblue
+881:```redblue
+893:```redblue
+919:```redblue
+962:```redblue
+1000:```redblue
+1009:```redblue
+1018:```redblue
+1034:```redblue
+1058:```redblue
+1092:```redblue
+1108:```redblue
+1130:```redblue
+1145:```redblue
+1160:```redblue
+[0m
+[0m$ [0mgrep -rn "111\|110\|MINIMUM_BLOCKS\|blocks" tests/doc_blocks_test.rs | sed -n '1,120p'
+4://! The finding this pins: the five documents carried **97** code blocks
+16://! - `doc_blocks_runs.txt` — executed, and it exits 0.
+17://! - `doc_blocks_fragments.txt` — not executed, with the reason written down.
+18://! - `doc_blocks_known_fail.txt` — executed, exited non-zero, and the exact
+37://! Listing the *working* blocks is what makes the suite worth running. If a
+38://! block in `doc_blocks_runs.txt` stops exiting 0, the run test fails and it
+42://! **No network.** Two blocks make live HTTP requests to a host that does not
+70:/// The number of ```redblue blocks the audit measured across [`DOCS`].
+75:/// be to delete the blocks it cannot run, which is the rot this file exists to
+77:const MINIMUM_BLOCKS: usize = 97;
+114:fn extract_blocks(text: &str) -> Vec<Block> {
+116:    let mut blocks = Vec::new();
+131:        blocks.push(Block {
+140:    blocks
+169:/// reports "0 blocks found" for a missing document is indistinguishable from a
+176:fn all_blocks(root: &Path) -> BTreeMap<String, Block> {
+180:        for mut block in extract_blocks(&text) {
+185:                "{key} was extracted twice; two blocks share one opening line"
+245:    let dir = root().join("target/tmp/docblocks").join(tag);
+276:    let file = root().join(format!("docblocks-{tag}.tmp"));
+320:    let file = root().join(format!("docblocks-{tag}.tmp"));
+375:/// The suite as a whole: the blocks, the two tables, and the report the phase
+379:    blocks: BTreeMap<String, Block>,
+389:            blocks: all_blocks(&root()),
+390:            runs: read_rows(&dir.join("doc_blocks_runs.txt"), "doc_blocks_runs.txt"),
+392:                &dir.join("doc_blocks_fragments.txt"),
+393:                "doc_blocks_fragments.txt",
+396:                &dir.join("doc_blocks_known_fail.txt"),
+397:                "doc_blocks_known_fail.txt",
+460:    let measured = audit.blocks.len();
+463:        measured >= MINIMUM_BLOCKS,
+464:        "the five documents now hold {measured} ```redblue blocks, below the \
+465:         {MINIMUM_BLOCKS} this suite was written against.\n\
+471:    for block in audit.blocks.values() {
+484:    let all: Vec<String> = audit.blocks.keys().cloned().collect();
+505:        "these blocks are in more than one bucket:\n{}\n\
+514:        .filter(|key| !audit.blocks.contains_key(*key))
+532:        "these ```redblue blocks are in no bucket at all:\n{}\n\
+561:    for (key, block) in &audit.blocks {
+615:        "the audit ran {ran} blocks and checked {known} known failures; one of \
+637:            .blocks
+705:    // Two blocks, both closed: the extractor moves past a closing fence and
+712:        "some prose between the blocks\n",
+718:    let blocks = extract_blocks(text);
+719:    assert_eq!(blocks.len(), 2, "both fences open a block: {blocks:?}");
+720:    assert_eq!(blocks[0].line, 1);
+721:    assert_eq!(blocks[0].body, "say \"first\"");
+722:    assert_eq!(blocks[1].line, 7, "the second block opens on line 7");
+723:    assert_eq!(blocks[1].body, "say \"second\"");
+724:    assert!(blocks.iter().all(|block| block.closed));
+731:    let blocks = extract_blocks(cut);
+733:        blocks.len(),
+735:        "the unterminated block is returned, not dropped: {blocks:?}"
+737:    assert_eq!(blocks[0].line, 2);
+738:    assert!(!blocks[0].closed, "and it is marked unterminated");
+739:    assert_eq!(blocks[0].body, "say \"never closed\"");
+740:    assert_eq!(blocks[0].source(), "say \"never closed\"\n");
+752:    let blocks = extract_blocks(recovered);
+753:    assert_eq!(blocks.len(), 2);
+754:    assert!(blocks.iter().all(|block| block.closed));
+755:    assert_eq!(blocks[1].body, "say \"second\"");
+758:    assert!(extract_blocks("just prose\nwith lines\n").is_empty());
+759:    assert!(extract_blocks("").is_empty());
+766:    let blocks = extract_blocks("```redblue\n```\n");
+767:    assert_eq!(blocks.len(), 1, "an empty body is still a block");
+768:    assert_eq!(blocks[0].body, "");
+769:    assert!(blocks[0].closed);
+770:    assert_eq!(blocks[0].source(), "\n");
+772:        blocks[0].key(),
+780:    let blocks = extract_blocks("```redblue\n\n\n```\n");
+781:    assert_eq!(blocks.len(), 1);
+782:    assert_eq!(blocks[0].body, "\n");
+806:    let blocks = extract_blocks(text);
+808:        blocks.len(),
+810:        "only the ```redblue block is documentation; got {blocks:?}"
+812:    assert_eq!(blocks[0].body, "say \"the one that counts\"");
+813:    assert_eq!(blocks[0].line, 13);
+818:    let blocks = extract_blocks("```redblue title=\"Set the name\"\nset n to 1\n```\n");
+819:    assert_eq!(blocks.len(), 1);
+820:    assert_eq!(blocks[0].body, "set n to 1");
+823:            extract_blocks(&format!("{ignored}\nset n to 1\n```\n")).is_empty(),
+832:    let blocks = extract_blocks("``` redblue \nset n to 1\n```\n");
+833:    assert_eq!(blocks.len(), 1, "a spaced tag is still the tag");
+834:    assert_eq!(blocks[0].body, "set n to 1");
+835:    // An indented fence is still a fence: the documents indent their blocks
+836:    // inside list items, and those are blocks too.
+837:    let blocks = extract_blocks("  ```redblue\n  set n to 1\n  ```\n");
+838:    assert_eq!(blocks.len(), 1, "an indented fence is a fence");
+839:    assert_eq!(blocks[0].body, "  set n to 1");
+858:        "SPEC.md carries redblue blocks"
+[0m
+[0m$ [0mpython3 - <<'PY'
+import re, glob
+for f in ['SPEC.md','README.md','PHILOSOPHY.md','HANDOUT.md','docs/GRAMMAR.md']:
+    t=open(f).read().splitlines()
+    n=0
+    for i,l in enumerate(t):
+        s=l.strip()
+        if s.startswith('```'):
+            info=s[3:].strip().split()
+            if info and info[0]=='redblue':
+                n+=1
+    print(f,n)
+PY
+sed -n '120,180p' tests/doc_blocks_fragments.txt; tail -30 tests/doc_blocks_fragments.txt
+SPEC.md 79
+README.md 7
+PHILOSOPHY.md 9
+HANDOUT.md 8
+docs/GRAMMAR.md 9
+SPEC.md:512	excerpt - `x` is introduced by the prose about `repeat`/`until` and bound nowhere in the block
+SPEC.md:520	excerpt - `items` and `process` are bound nowhere in the block
+SPEC.md:557	excerpt - `names` and `record` are bound nowhere in the block
+SPEC.md:574	excerpt - `break` on its own, shown to document the loop-control keyword; it is only valid inside a loop
+SPEC.md:626	excerpt - placeholder body (`// parameters`) plus `default`, which the parser does not accept in a parameter list
+SPEC.md:639	excerpt - a type-annotated signature; `a as number` and `as number` are not forms the parser accepts
+SPEC.md:738	excerpt - `Employee extends Person` with no `Person` in the block; the parent is declared elsewhere
+SPEC.md:881	excerpt - `process` is bound nowhere in the block, and `config.rb` is a file the block never creates
+SPEC.md:1009	network - `network.get("https://api.example.com")` is a live HTTP request to a host that does not exist; AGENTS.md § 3.1.4 forbids a test that depends on the network. Also elided: the `if` has no `then`
+SPEC.md:1018	excerpt - `process` is bound nowhere in the block, and `files.open`/`files.close` are illustrative names
+SPEC.md:1108	excerpt - `body` is bound nowhere: the guarded read was bound to `report`, so the last line reads a field that is not in scope
+SPEC.md:1380	excerpt - `xs` is bound nowhere in the block; the four `random*` calls are shown against a list the prose has not written
+SPEC.md:1408	excerpt - placeholder body (`// ...`) on the closing `if`, and the block reads and rewrites files it never creates
+SPEC.md:1494	network - `network.get` and `network.post` are live HTTP requests; `data` is also bound nowhere. AGENTS.md § 3.1.4
+
+# --- docs/GRAMMAR.md --------------------------------------------------------
+
+docs/GRAMMAR.md:537	excerpt - the guarded read is bound to `report`, but the third line reads `body`, which is bound nowhere. The first two lines are the forms this block documents
+docs/GRAMMAR.md:617	excerpt - `age` is bound in the preceding block and not in this one, so the two are one fragment written as two
+
+# --- PHILOSOPHY.md ----------------------------------------------------------
+
+PHILOSOPHY.md:9	excerpt - illustrative pseudo-English, not Redblue: `allow user to vote` and `user age` are not forms the parser accepts, and `user` is bound nowhere
+PHILOSOPHY.md:16	excerpt - the block PHILOSOPHY.md itself shows is NOT Redblue: braces, `;` and `vote()` from another language
+PHILOSOPHY.md:142	excerpt - `temperature` is introduced by the prose about `else if` and bound nowhere in the block
+PHILOSOPHY.md:153	excerpt - `people`, `person name` and `item price` are not Redblue spellings, and none is bound
+PHILOSOPHY.md:177	excerpt - illustrative pseudo-code: `to calculate total(items)`, `to might fail fetch data(url)` and `request.get` are not Redblue forms
+PHILOSOPHY.md:198	excerpt - `has purchase history`, `to can email others(message)` and `this purchase count` are not Redblue spellings; `to can email others` also has a placeholder body (`// Implementation`)
+PHILOSOPHY.md:228	excerpt - the block PHILOSOPHY.md itself shows is NOT Redblue: `async`, `wait`, `parallel` and `until done`
+PHILOSOPHY.md:246	excerpt - `process` and `close connections` are bound nowhere in the block
+[0m
+[0m$ [0mgrep -n "enum Error\|Io(\|Runtime(\|fn label\|fn span\|impl Error" src/error.rs | sed -n '1,120p'; sed -n '1,180p' src/error.rs
+98:pub enum Error {
+102:    Runtime(String, Span),
+117:    Io(String),
+120:impl Error {
+123:    pub fn span(&self) -> Option<&Span> {
+128:            | Error::Runtime(_, span)
+130:            Error::Io(_) => return None,
+145:    pub fn label(&self) -> &'static str {
+153:            Error::Runtime(_, _) | Error::Limit(_, _) => "RuntimeError",
+154:            Error::Io(_) => "IoError",
+182:            | Error::Runtime(msg, _)
+184:            | Error::Io(msg) => msg,
+use std::fmt;
+
+/// The most terminal cells of one drawn source line.
+///
+/// A drawn line is a line the reader can read, not the whole of an input file:
+/// `rb run` renders whatever `fs::read_to_string` handed it
+/// (`src/lib.rs`), so a file with a megabyte-long line would otherwise be drawn
+/// a megabyte at a time. Past the limit the line is cut and marked with `…`, so
+/// a diagnostic is bounded by this constant rather than by the program's input.
+const MAX_DRAWN_CELLS: usize = 1024;
+
+/// The most source lines one drawn range covers.
+///
+/// The counterpart to [`MAX_DRAWN_CELLS`] along the other axis: an unterminated
+/// string runs to end of input, so without a limit its range is as long as the
+/// file is.
+const MAX_DRAWN_LINES: usize = 10;
+
+/// The marker left where a drawn line or range was cut short.
+const ELLIPSIS: char = '\u{2026}';
+
+/// A source position: a 1-based line and a 1-based **character** column.
+///
+/// Columns count characters, not bytes, so a line that starts with an emoji
+/// reports the column the caret is drawn at — and [`display_width`] is what
+/// turns that character column into the cell the caret is *drawn* at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub line: usize,
+    pub column: usize,
+    /// Where the offending thing stops, when it covers more than one line.
+    ///
+    /// A span that covers one line records no end, so a span and its position
+    /// are the same value and everything that compared the two keeps meaning
+    /// what it meant. Only a range — an unterminated string, which runs to the
+    /// end of the file — records one, because only a range has to be *drawn*.
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+impl Span {
+    pub fn new(line: usize, column: usize) -> Self {
+        Self {
+            line,
+            column,
+            end_line: line,
+            end_column: column,
+        }
+    }
+
+    /// This span, extended to cover up to `end_line:end_column`.
+    ///
+    /// An end that is not past the start is dropped: a span that covers one line
+    /// is drawn as one line, with the same caret it has always been drawn with.
+    pub fn extended_to(self, end_line: usize, end_column: usize) -> Self {
+        if end_line <= self.line {
+            return self;
+        }
+
+        Self {
+            line: self.line,
+            column: self.column,
+            end_line,
+            end_column,
+        }
+    }
+
+    /// Whether this span covers more than one line, and so has to be rendered as
+    /// several.
+    pub fn is_multiline(&self) -> bool {
+        self.end_line > self.line
+    }
+
+    /// A position that is not attached to any source text. Only for failures
+    /// that happen before a token exists, such as a module file that cannot be
+    /// read.
+    pub fn unknown() -> Self {
+        Self {
+            line: 0,
+            column: 0,
+            end_line: 0,
+            end_column: 0,
+        }
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.line > 0
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.column)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Error {
+    Lexer(String, Span),
+    Parser(String, Span),
+    Analyzer(String, Span),
+    Runtime(String, Span),
+    /// One of the host's own resource limits — the step budget, the call-depth
+    /// limit, or a loop's iteration cap.
+    ///
+    /// A variant rather than a `Runtime` whose message happens to read like one,
+    /// because the question `might fail` asks of a failure — *is this the host
+    /// stopping the program, or the program's own expression going wrong?* — has
+    /// to be answerable from the failure itself. Matching a message prefix made
+    /// the answer depend on the wording: rewording a limit message would silently
+    /// turn every guard around a runaway program into one that swallows it, and
+    /// any failure a program produced that began the same way would be reported as
+    /// a resource error and escape the guard written for it. It renders as a
+    /// `RuntimeError` and reads exactly as one — a limit is a runtime failure — but
+    /// nothing has to agree on how it is spelled for it to be told apart.
+    Limit(String, Span),
+    Io(String),
+}
+
+impl Error {
+    /// The source position of this failure, or `None` for failures that have
+    /// no position at all (`Io`) and for failures reported as `unknown`.
+    pub fn span(&self) -> Option<&Span> {
+        let span = match self {
+            Error::Lexer(_, span)
+            | Error::Parser(_, span)
+            | Error::Analyzer(_, span)
+            | Error::Runtime(_, span)
+            | Error::Limit(_, span) => span,
+            Error::Io(_) => return None,
+        };
+
+        if span.is_known() {
+            Some(span)
+        } else {
+            None
+        }
+    }
+
+    /// The name of this error's kind, as it appears in a rendered failure.
+    ///
+    /// Public so that a caller comparing two failures — the bytecode VM against
+    /// the tree-walking one — can assert on the kind without matching the whole
+    /// rendered string.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Error::Lexer(_, _) => "LexerError",
+            Error::Parser(_, _) => "ParserError",
+            Error::Analyzer(_, _) => "AnalyzerError",
+            // A limit is a runtime failure and is labelled as one, so a rendered
+            // message and an asserted `label()` do not change when this stops
+            // being spelled as a message prefix.
+            Error::Runtime(_, _) | Error::Limit(_, _) => "RuntimeError",
+            Error::Io(_) => "IoError",
+        }
+    }
+
+    /// Whether this failure is one of the host's resource limits — the step
+    /// budget, the call-depth limit, or a loop's iteration cap — rather than
+    /// something the program got wrong.
+    ///
+    /// The three limits are the host refusing to keep going rather than a failure
+    /// of the expression that was running: a program stopped at its step budget has
+    /// not computed a wrong answer, it has been stopped. `might fail` is defined
+    /// over a failure of its own expression and so does not take these; both VMs
+    /// ask this question so the two agree, and so does the guard written around a
+    /// call that hits a limit report the limit rather than yield `nothing`.
+    pub fn is_resource_limit(&self) -> bool {
+        matches!(self, Error::Limit(..))
+    }
+
+    /// The failure message on its own, with no position.
+    ///
+    /// Editor tooling carries the position in its own field, so it wants the
+    /// message alone rather than the multi-line [`fmt::Display`] form, which
+    /// repeats the location on a second line.
+    pub fn message(&self) -> &str {
+        match self {
+            Error::Lexer(msg, _)
+            | Error::Parser(msg, _)
+[0m
+[0m$ [0mgrep -rn "Error::Io\|IoError\|Error::Io(" src | sed -n '1,120p'
+src/interpreter.rs:644:        .map_err(|e| Error::Io(format!("Cannot load module '{path}': {e}")))?;
+src/bootstrap.rs:51:use crate::{compile_source, Error::Io, Error::Runtime};
+src/bootstrap.rs:287:        Error::Io(message) => Error::Io(message),
+src/bootstrap.rs:415:        Error::Io(detail) => Error::Io(format!("{message}: {detail}")),
+src/path.rs:443:                .map_err(|error| Error::Io(format!("Failed to resolve '{text}': {error}")))
+src/path.rs:452:                .map_err(|error| Error::Io(format!("Failed to list '{text}': {error}")))?;
+src/manifest.rs:727:            return Err(Error::Io(format!(
+src/manifest.rs:796:            return Err(Error::Io(format!(
+src/manifest.rs:852:        .map_err(|error| Error::Io(format!("Cannot write '{}': {}", path.display(), error)))
+src/repl/mod.rs:11124:                &Error::Io("No such file or directory".to_string()),
+src/repl/mod.rs:11128:                rendered, "IoError: No such file or directory",
+src/repl/editor.rs:171:        ReadlineError::Io(error) => error,
+src/repl/editor.rs:912:            line_from(Err(ReadlineError::Io(std::io::Error::other("no terminal")))).is_err(),
+src/error.rs:130:            Error::Io(_) => return None,
+src/error.rs:154:            Error::Io(_) => "IoError",
+src/error.rs:184:            | Error::Io(msg) => msg,
+src/testing/mod.rs:33:        .map_err(|e| crate::error::Error::Io(format!("Failed to read test file: {}", e)))?;
+src/testing/harness.rs:64:            .map_err(|e| Error::Io(format!("Failed to read {}: {}", path, e)))?;
+src/runtime.rs:46:        .map_err(|e| Error::Io(format!("Cannot load module '{}': {}", path, e)))?;
+src/runtime.rs:520:        .map_err(|_| Error::Io("The playground clock could not be read".to_string()))?;
+src/runtime.rs:3114:                .map_err(|e| Error::Io(format!("Failed to read '{}': {}", path, e)))
+src/runtime.rs:3127:                .map_err(|e| Error::Io(format!("Failed to write '{}': {}", path, e)))?;
+src/runtime.rs:3141:                .map_err(|e| Error::Io(format!("Failed to append to '{}': {}", path, e)))?;
+src/runtime.rs:3167:                .map_err(|e| Error::Io(format!("Failed to read '{}': {}", path, e)))?;
+src/runtime.rs:3185:                .map_err(|e| Error::Io(format!("Failed to delete '{}': {}", path, e)))?;
+src/runtime.rs:3203:                .map_err(|e| Error::Io(format!("Failed to copy '{}' to '{}': {}", from, to, e)))
+src/runtime.rs:3220:                .map_err(|e| Error::Io(format!("Failed to rename '{}' to '{}': {}", from, to, e)))
+src/runtime.rs:3567:                Error::Io(format!(
+src/runtime.rs:3794:                .map_err(|e| Error::Io(format!("Failed to write '{}': {}", path, e)))?;
+src/lib.rs:63:    let source = fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))?;
+src/lib.rs:86:        Err(e) => return Err(Error::Io(e.to_string()).to_string()),
+src/lib.rs:511:    let text = fs::read_to_string(source).map_err(|e| Error::Io(e.to_string()).to_string())?;
+src/lib.rs:530:    let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()).to_string())?;
+src/lib.rs:549:    let bytes = fs::read(path).map_err(|e| Error::Io(e.to_string()).to_string())?;
+src/failure.rs:120:        Error::Io(_) => FailureKind::Io,
+src/bytecode/vm.rs:4317:            .map_err(|e| Error::Io(format!("Cannot load module '{path}': {e}")))?;
+[0m
+[0m$ [0msed -n '180,320p' src/error.rs && grep -n "Io" src/bytecode/vm.rs | sed -n '1,40p'
+| Error::Parser(msg, _)
+            | Error::Analyzer(msg, _)
+            | Error::Runtime(msg, _)
+            | Error::Limit(msg, _)
+            | Error::Io(msg) => msg,
+        }
+    }
+
+    fn location(&self, file: Option<&str>) -> Option<String> {
+        let span = self.span()?;
+        Some(match file {
+            Some(name) => format!("{}:{}", name, span),
+            None => span.to_string(),
+        })
+    }
+
+    /// Renders the message, the source position, the offending source line and
+    /// a caret under the column. A span covering more than one line renders
+    /// every line it covers. Falls back to the message alone when the line is
+    /// not present in `source`.
+    pub fn render(&self, source: &str, file: Option<&str>) -> String {
+        let mut out = format!("{}: {}", self.label(), self.message());
+
+        let location = match self.location(file) {
+            Some(location) => location,
+            None => return out,
+        };
+
+        let span = self.span().expect("location implies a known span");
+
+        out.push_str(&format!("\n  --> {}", location));
+
+        let lines: Vec<&str> = source.lines().collect();
+        if span.line == 0 || span.line > lines.len() {
+            return out;
+        }
+
+        if span.is_multiline() {
+            render_range(&mut out, span, &lines);
+        } else {
+            render_single(&mut out, span, lines[span.line - 1]);
+        }
+
+        out
+    }
+}
+
+/// Characters that take no cell of their own: combining marks, joiners,
+/// variation selectors, emoji skin tones, and control characters.
+///
+/// They are written into the line and occupy nothing on screen, so a caret past
+/// one of them must not step over a column it did not draw.
+const ZERO_WIDTH: &[(u32, u32)] = &[
+    (0x0300, 0x036F),
+    (0x0483, 0x0489),
+    (0x0591, 0x05BD),
+    (0x0610, 0x061A),
+    (0x064B, 0x065F),
+    (0x0670, 0x0670),
+    (0x06D6, 0x06DC),
+    (0x0730, 0x074A),
+    (0x07A6, 0x07B0),
+    (0x0900, 0x0903),
+    (0x093A, 0x094F),
+    (0x0951, 0x0957),
+    (0x1AB0, 0x1AFF),
+    (0x1DC0, 0x1DFF),
+    (0x200B, 0x200F),
+    (0x2028, 0x202E),
+    (0x2060, 0x2064),
+    (0x20D0, 0x20F0),
+    (0xFE00, 0xFE0F),
+    (0xFE20, 0xFE2F),
+    (0x1F3FB, 0x1F3FF),
+    (0xE0100, 0xE01EF),
+];
+
+/// Characters a terminal draws two cells wide: East Asian Wide and Fullwidth,
+/// and the emoji blocks.
+///
+/// Written as ranges rather than a dependency: this is the only place the
+/// renderer needs to know how wide a character is, and the ranges it needs are
+/// the ones a reader's line can actually contain.
+const WIDE: &[(u32, u32)] = &[
+    (0x1100, 0x115F),
+    (0x2E80, 0x303E),
+    (0x3041, 0x33FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xA000, 0xA4CF),
+    (0xA960, 0xA97F),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFE10, 0xFE19),
+    (0xFE30, 0xFE6F),
+    (0xFF00, 0xFF60),
+    (0xFFE0, 0xFFE6),
+    (0x1F300, 0x1F64F),
+    (0x1F680, 0x1F6FF),
+    (0x1F900, 0x1F9FF),
+    (0x20000, 0x2FFFD),
+    (0x30000, 0x3FFFD),
+];
+
+/// Whether `code` falls in one of the inclusive ranges of `table`.
+fn in_ranges(code: u32, table: &[(u32, u32)]) -> bool {
+    table
+        .iter()
+        .any(|(first, last)| code >= *first && code <= *last)
+}
+
+/// How many terminal cells `c` is drawn in.
+///
+/// A tab is one cell: where a tab stops is the terminal's tab stop, which a
+/// renderer cannot know, and one is the honest answer rather than a guess at
+/// eight.
+fn char_cells(c: char) -> usize {
+    // Before the control check: a tab is a control character, and answering 0
+    // for it would step the caret over a column that is on the line.
+    if c == '\t' {
+        return 1;
+    }
+    let code = c as u32;
+    if c.is_control() || in_ranges(code, ZERO_WIDTH) {
+        0
+    } else if in_ranges(code, WIDE) {
+        2
+    } else {
+        1
+    }
+}
+
+/// The terminal cells the first `chars` characters of `line` are drawn in.
+///
+/// This is the distance from the left of the drawn line to the column a span
+/// names, which is what a caret has to step over to be *under* that column.
+/// Counting characters instead — which is what a [`Span`] records — puts the
+/// caret one cell left of the thing it points at for every wide character
+/// before it, and a reader following a line of mixed CJK and ASCII sees a caret
+/// that lands in the wrong place.
+///
+4313:    /// every native test, and failed on that target with an `Io` error naming a
+4317:            .map_err(|e| Error::Io(format!("Cannot load module '{path}': {e}")))?;
+[0m
+[0m$ [0msed -n '1800,1875p' tests/stdlib_modules_test.rs && sed -n '1880,1970p' tests/stdlib_modules_test.rs
+let expected = "[INFO] outer-before\n[INFO] inner\n[INFO] outer-after\n";
+        assert_eq!(
+            fs::read_to_string(&tree_log).expect("tree record"),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(&byte_log).expect("bytecode record"),
+            expected
+        );
+    }
+
+    #[test]
+    fn edge_an_unwritable_destination_is_a_catchable_error() {
+        let dir = scratch("unwritable");
+        let missing = dir.join("missing").join("record.log");
+
+        let source = format!(
+            "logging.reset()\n\
+             logging.set_level(\"info\")\n\
+             logging.set_timestamps(no)\n\
+             logging.set_destination(\"{}\")\n\
+             try\n\
+                 logging.info(\"never written\")\n\
+             catch error of Io\n\
+                 say \"caught\"\n\
+             end\n",
+            quoted(&missing)
+        );
+
+        for run in [tree_walk(&source), bytecode(&source)] {
+            assert!(run.result.is_ok(), "{:?}", run.result);
+            assert_eq!(run.output, vec!["caught".to_string()]);
+        }
+    }
+
+    #[test]
+    fn edge_invalid_levels_and_destinations_are_refused() {
+        for (source, part) in [
+            ("logging.set_level(\"chatty\")", "logging.set_level"),
+            ("logging.set_level(5)", "logging.set_level"),
+            ("logging.set_destination(\"\")", "logging.set_destination"),
+            ("logging.set_destination(5)", "logging.set_destination"),
+            ("logging.set_timestamps(\"yes\")", "logging.set_timestamps"),
+            ("logging.level(1)", "logging.level"),
+            ("logging.reset(1)", "logging.reset"),
+            ("logging.info()", "logging.info"),
+            ("logging.info(5)", "logging.info"),
+        ] {
+            let tree = runtime_message(tree_walk(source).result.expect_err(source));
+            let byte = runtime_message(bytecode(source).result.expect_err(source));
+            assert!(
+                tree.contains(part),
+                "`{source}` should name {part}, got {tree:?}"
+            );
+            assert_eq!(tree, byte, "the engines disagree about `{source}`");
+        }
+    }
+
+    /// A descriptor opened for reading refuses every write with `EBADF`, so a
+    /// child handed one as a standard stream has a genuinely closed
+    /// destination rather than a race against the parent.
+    #[cfg(unix)]
+    fn read_only_stream(dir: &Path) -> std::process::Stdio {
+        let sink = dir.join("read-only.txt");
+        fs::write(&sink, "not writable").expect("sink file");
+        std::process::Stdio::from(fs::File::open(&sink).expect("a read-only file"))
+    }
+
+    /// The write end of a pipe whose read end is already closed, so every write
+    /// to it fails with `EPIPE` — a different errno, and a different signal
+    /// path, from the `EBADF` a read-only file gives. The read end is closed in
+    /// the parent before the child inherits the write end.
+    #[cfg(unix)]
+    fn readerless_pipe() -> std::process::Stdio {
+        use std::os::fd::FromRawFd;
+        let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(
+            created,
+            0,
+            "a pipe must be creatable: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `fds[0]` is the read end `pipe` just created and this is its
+        // only owner.
+        unsafe { libc::close(fds[0]) };
+        // SAFETY: `fds[1]` is the write end `pipe` just created and this is its
+        // only owner; `Stdio` takes it over.
+        std::process::Stdio::from(unsafe { fs::File::from_raw_fd(fds[1]) })
+    }
+
+    /// The default stderr destination handed to the child read-only.
+    #[cfg(unix)]
+    #[test]
+    fn edge_a_closed_stderr_is_a_catchable_error() {
+        let dir = scratch("closed-stderr");
+        let file = dir.join("program.rb");
+        fs::write(
+            &file,
+            "logging.set_level(\"info\")\n\
+             logging.set_timestamps(no)\n\
+             try\n\
+                 logging.info(\"to a closed stderr\")\n\
+             catch error of Io\n\
+                 say \"caught\"\n\
+             end\n\
+             say \"done\"\n",
+        )
+        .expect("program file");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rb"))
+            .arg("run")
+            .arg(&file)
+            .stdout(std::process::Stdio::piped())
+            .stderr(read_only_stream(&dir))
+            .output()
+            .expect("rb runs");
+
+        assert!(
+            output.status.success(),
+            "the program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "caught\ndone\n",
+            "a closed stderr must be catchable, not silently discarded"
+        );
+    }
+
+    /// The same failure on the `stdout` destination. The catch records itself
+    /// to a file because the program's own output stream is the broken one.
+    #[cfg(unix)]
+    #[test]
+    fn edge_a_closed_stdout_is_a_catchable_error() {
+        let dir = scratch("closed-stdout");
+        let file = dir.join("program.rb");
+        let marker = dir.join("caught.txt");
+        fs::write(
+            &file,
+            format!(
+                "logging.set_level(\"info\")\n\
+                 logging.set_timestamps(no)\n\
+                 logging.set_destination(\"stdout\")\n\
+                 try\n\
+                     logging.info(\"to a closed stdout\")\n\
+                 catch error of Io\n\
+                     files.write(\"{}\", \"caught\")\n\
+                 end\n",
+                quoted(&marker)
+            ),
+        )
+        .expect("program file");
+
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rb"))
+            .arg("run")
+            .arg(&file)
+            .stdout(read_only_stream(&dir))
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("rb runs");
+
+        assert!(
+            output.status.success(),
+            "the program failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+[0m
+[0m$ [0msed -n '1,40p' src/runtime.rs && grep -rn "logging.*could not write\|could not write to its destination\|IoError" tests | head -40
+//! What a Redblue *operation* means, in the one place both VMs read it.
+//!
+//! Two VMs now exist: the tree-walker in [`crate::vm`], which is what `rb run`
+//! uses and what the language is specified against, and the bytecode VM in
+//! [`crate::bytecode::vm`], which runs a `.rbc`. They must agree on what
+//! `1 + 2` is, what `xs[9]` says when `xs` holds one element, and what
+//! `files.read` does — down to the wording of the failure.
+//!
+//! Rather than write that twice and keep the two copies in step by hand, every
+//! operation both VMs need is here: the arithmetic and comparison operators,
+//! indexing, property access, the builtin library, and the JSON and CSV
+//! readers behind it. A VM decides *how* to reach an operation — by walking an
+//! AST or by running an instruction — and this module says what it means.
+//!
+//! The tree-walker is the reference: what is here is what it already did,
+//! moved rather than rewritten, so `rb run` behaves exactly as before.
+
+use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use chrono::format::{Item, StrftimeItems};
+use chrono::{Datelike, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike};
+
+use crate::error::{Error, Result, Span};
+use crate::lexer::Lexer;
+use crate::parser::{BinaryOp, Expr, Program, Statement, UnaryOp};
+use crate::value::{Fields, Value};
+
+/// Parses a module file into the program its top level declares.
+///
+/// The caller keeps the `Program` to remember that the module has already been
+/// loaded, so a second `import` of the same name is a no-op rather than a second
+/// binding of the same names. [`module_bindings`] reads the declarations out of
+/// the same `Program`, so a module is read and parsed once however many names it
+/// contributes.
+///
+/// Through [`crate::vfs`], not `std::fs`: on `wasm32-unknown-unknown` a module
+tests/diagnostics_test.rs:257:        (Error::Io("m".to_string()), "IoError"),
+tests/might_fail_test.rs:205:    if label != "IoError" {
+tests/might_fail_test.rs:463:        "IoError",
+tests/might_fail_test.rs:835:        "IoError",
+tests/typed_catch_test.rs:670:            "Io" => "IoError",
+tests/bootstrap_selfhost_test.rs:1121:    // A missing file: an `IoError` has to reach the shell as a non-zero status.
+tests/bytecode_vm_test.rs:2047:    // `IoError` label the binary itself attaches. Matching the label keeps this
+tests/bytecode_vm_test.rs:2050:        stderr.contains("IoError"),
+tests/span_test.rs:366:        error.to_string().starts_with("IoError:"),
+tests/lexer_robustness_test.rs:340:    assert!(error.to_string().starts_with("IoError:"), "got: {}", error);
+tests/differential_test.rs:473:        "IoError",
+tests/common/vm.rs:791:                label: "IoError".to_string(),
+tests/common/vm.rs:796:            "IoError: cannot read",
+tests/common/corpus.rs:39:    "IoError",
+tests/stdlib_modules_test.rs:1248:    assert_eq!(error.label(), "IoError", "{error}");
+tests/stdlib_modules_test.rs:1272:    assert_eq!(error.label(), "IoError", "{error}");
+tests/stdlib_modules_test.rs:1465:    assert_eq!(error.label(), "IoError", "{error}");
+tests/stdlib_modules_test.rs:1980:    /// both are the same catchable `IoError`, so this pins the pipe case too.
+[0m
+[0m← [0mEdit src/runtime.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/runtime.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/runtime.rs
++++ /home/runner/work/rbops/rbops/redblue/src/runtime.rs
+@@ -505,9 +505,9 @@
+ #[cfg(target_arch = "wasm32")]
+ pub fn set_host_clock(seconds: f64) {
+     if let Ok(mut slot) = HOST_CLOCK.lock() {
+         *slot = if seconds.is_finite() && seconds >= 0.0 {
+-            Some(Duration::from_secs_f64(seconds))
++            Duration::try_from_secs_f64(seconds).ok()
+         } else {
+             None
+         };
+     }
+
+[0m
+[0m← [0mEdit src/runtime.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/runtime.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/runtime.rs
++++ /home/runner/work/rbops/rbops/redblue/src/runtime.rs
+@@ -528,9 +528,11 @@
+ })?;
+ 
+ // `UNIX_EPOCH + d` panics on overflow, and the host's clock is an input a
+ // page can set to anything, so the round trip is checked rather than
+-// trusted: a host that sends 1e300 gets a clean error, not an abort.
++// trusted. A value too large for a `Duration` was already recorded as "no
++// clock"; one that fits a `Duration` but not a `SystemTime` gets a clean
++// error here, not an abort.
+ UNIX_EPOCH.checked_add(since_epoch).ok_or_else(|| {
+     Error::Runtime(
+         format!(
+             "The playground's clock is at {since_epoch:?}, which is not an instant \
+
+[0m
+[0m← [0mEdit src/wasm.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/wasm.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/wasm.rs
++++ /home/runner/work/rbops/rbops/redblue/src/wasm.rs
+@@ -911,12 +911,13 @@
+ /// its own and `SystemTime::now()` panics there, which would abort the module
+ /// rather than fail one run, so a playground that wants `time` calls this first
+ /// with `Date.now() / 1000`.
+ ///
+-/// A negative or non-finite value is recorded as "no clock", which is what
+-/// `time.now()` then reports — the same answer a host that never called this
+-/// gets. It is not an error: the clock is not a parameter to a program, and
+-/// refusing it would give the host a failure mode it cannot cause on purpose.
++/// A negative, non-finite or out-of-range value is recorded as "no clock",
++/// which is what `time.now()` then reports — the same answer a host that never
++/// called this gets. It is not an error: the clock is not a parameter to a
++/// program, and refusing it would give the host a failure mode it cannot cause
++/// on purpose.
+ #[no_mangle]
+ pub extern "C" fn rb_set_clock(seconds: f64) {
+     #[cfg(target_arch = "wasm32")]
+     crate::runtime::set_host_clock(seconds);
+
+[0m
+[0m← [0mEdit src/logging.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/logging.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/logging.rs
++++ /home/runner/work/rbops/rbops/redblue/src/logging.rs
+@@ -1,6 +1,7 @@
+ use std::cell::RefCell;
+ use std::io;
++use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+ pub enum Level {
+     Debug,
+
+[0m
+[0m← [0mEdit src/logging.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/logging.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/logging.rs
++++ /home/runner/work/rbops/rbops/redblue/src/logging.rs
+@@ -121,16 +121,25 @@
+ /// record without a timestamp rather than an abort. That is the one place the
+ /// two differ: `time.now()` answers an error when there is no clock, while a
+ /// logging call still has something to say and must not take the run down.
+ fn format_timestamp() -> Option<String> {
+-    let instant = crate::runtime::current_instant().ok()?;
+-    Some(
+-        chrono::DateTime::<chrono::Utc>::from(instant)
+-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+-            .to_string(),
+-    )
++    format_timestamp_at(crate::runtime::current_instant().ok())
+ }
+ 
++/// Formats `instant`, or answers `None` when there is no clock or it names a
++/// moment `chrono` cannot represent.
++///
++/// Kept separate so the no-clock and out-of-range paths are testable on the
++/// native target, where the runtime always has a clock.
++fn format_timestamp_at(instant: Option<SystemTime>) -> Option<String> {
++    let since_epoch = instant?.duration_since(UNIX_EPOCH).ok()?;
++    let secs = i64::try_from(since_epoch.as_secs()).ok()?;
++    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, since_epoch.subsec_nanos())?
++        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
++        .to_string()
++        .into()
++}
++
+ pub fn write(level: Level, message: &str) -> io::Result<()> {
+     let (destination, timestamps) = CONFIG.with(|config| {
+         let config = config.borrow();
+         (config.destination.clone(), config.timestamps)
+
+[0m
+[0m← [0mEdit src/logging.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/logging.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/logging.rs
++++ /home/runner/work/rbops/rbops/redblue/src/logging.rs
+@@ -132,12 +132,13 @@
+ /// native target, where the runtime always has a clock.
+ fn format_timestamp_at(instant: Option<SystemTime>) -> Option<String> {
+     let since_epoch = instant?.duration_since(UNIX_EPOCH).ok()?;
+     let secs = i64::try_from(since_epoch.as_secs()).ok()?;
+-    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, since_epoch.subsec_nanos())?
+-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+-        .to_string()
+-        .into()
++    Some(
++        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, since_epoch.subsec_nanos())?
++            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
++            .to_string(),
++    )
+ }
+ 
+ pub fn write(level: Level, message: &str) -> io::Result<()> {
+     let (destination, timestamps) = CONFIG.with(|config| {
+
+[0m
+[0m$ [0mtail -20 src/logging.rs
+fn write_stderr(record: &str) -> io::Result<()> {
+    write_descriptor(libc::STDERR_FILENO, record)
+}
+
+#[cfg(not(unix))]
+fn write_stdout(record: &str) -> io::Result<()> {
+    crate::wasm::try_emit(record)
+}
+
+#[cfg(not(unix))]
+fn write_stderr(record: &str) -> io::Result<()> {
+    io::Write::write_all(&mut io::stderr(), record.as_bytes())
+}
+
+pub fn format_record(level: Level, message: &str, timestamp: Option<&str>) -> String {
+    match timestamp {
+        Some(timestamp) => format!("[{timestamp}] [{}] {message}\n", level.label()),
+        None => format!("[{}] {message}\n", level.label()),
+    }
+}
+[0m
+[0m← [0mEdit src/logging.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/logging.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/logging.rs
++++ /home/runner/work/rbops/rbops/redblue/src/logging.rs
+@@ -221,4 +221,31 @@
+         Some(timestamp) => format!("[{timestamp}] [{}] {message}\n", level.label()),
+         None => format!("[{}] {message}\n", level.label()),
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::time::Duration;
++
++    #[test]
++    fn edge_no_clock_means_a_record_without_a_timestamp() {
++        assert_eq!(format_timestamp_at(None), None);
++    }
++
++    #[test]
++    fn a_known_instant_is_formatted_in_utc_to_the_millisecond() {
++        assert_eq!(
++            format_timestamp_at(Some(UNIX_EPOCH + Duration::from_millis(1_234))).as_deref(),
++            Some("1970-01-01T00:00:01.234Z")
++        );
++    }
++
++    #[test]
++    fn edge_an_instant_past_chronos_range_means_no_timestamp() {
++        let instant = UNIX_EPOCH
++            .checked_add(Duration::from_secs(10_000_000_000_000))
++            .expect("the native clock represents this instant");
++        assert_eq!(format_timestamp_at(Some(instant)), None);
++    }
++}
+
+[0m
+[0m← [0mEdit src/runtime.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/runtime.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/runtime.rs
++++ /home/runner/work/rbops/rbops/redblue/src/runtime.rs
+@@ -3566,9 +3566,9 @@
+     }
+ };
+ crate::logging::write(level, &message).map_err(|e| {
+     Error::Io(format!(
+-        "logging.{} could not write to its destination: {e}",
++        "logging.{} could not write to its destination: {e} (at {span})",
+         name.trim_start_matches("logging_")
+     ))
+ })?;
+ Ok(Some(Value::Nothing))
+
+[0m
+[0m$ [0msed -n '25,35p' tests/doc_blocks_runs.txt && sed -n '86,100p' tests/doc_blocks_runs.txt
+# than quietly losing its bucket.
+#
+# COUNTS, as of the run that wrote this file
+#   SPEC.md 42 · docs/GRAMMAR.md 7 · README.md 7 · HANDOUT.md 4 · PHILOSOPHY.md 0
+#   60 of 111 blocks. The other 51 are 39 fragments and 12 known failures.
+
+# --- SPEC.md ---------------------------------------------------------------
+SPEC.md:40
+SPEC.md:58
+SPEC.md:132
+SPEC.md:160
+# --- README.md-----------------------------------------------------------
+README.md:9
+README.md:33
+README.md:46
+README.md:57
+README.md:139
+README.md:150
+README.md:162
+HANDOUT.md:126
+HANDOUT.md:149
+HANDOUT.md:156
+HANDOUT.md:250
+SPEC.md:1231
+[0m
+[0m← [0mEdit tests/doc_blocks_runs.txt
+Index: /home/runner/work/rbops/rbops/redblue/tests/doc_blocks_runs.txt
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/doc_blocks_runs.txt
++++ /home/runner/work/rbops/rbops/redblue/tests/doc_blocks_runs.txt
+@@ -24,10 +24,10 @@
+ # document above a block moves it, and a moved block fails this suite rather
+ # than quietly losing its bucket.
+ #
+ # COUNTS, as of the run that wrote this file
+-#   SPEC.md 42 · docs/GRAMMAR.md 7 · README.md 7 · HANDOUT.md 4 · PHILOSOPHY.md 0
+-#   60 of 111 blocks. The other 51 are 39 fragments and 12 known failures.
++#   SPEC.md 43 · docs/GRAMMAR.md 7 · README.md 7 · HANDOUT.md 4 · PHILOSOPHY.md 0
++#   61 of 112 blocks. The other 51 are 39 fragments and 12 known failures.
+ 
+ # --- SPEC.md ---------------------------------------------------------------
+ SPEC.md:40
+ SPEC.md:58
+
+[0m
