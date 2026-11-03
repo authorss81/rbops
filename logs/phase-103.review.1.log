@@ -1,0 +1,27 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/logging.rs
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1, limit=120][0m
+[0m✱ [0mGrep "logging"[90m in src/runtime.rs · 74 matches[0m
+[0m✱ [0mGrep "logging_module|fn logging|logging\."[90m in tests/stdlib_modules_test.rs · 86 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3520, limit=110][0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1468, limit=390][0m
+[0m✱ [0mGrep "pub fn emit|fn emit|pub fn append|fn append"[90m in src · 9 matches[0m
+[0m✱ [0mGrep "pub enum Error|Io\(|IoError|impl fmt::Display for Error"[90m in src/error.rs · 45 matches[0m
+[0m→ [0mRead src/wasm.rs[90m [offset=60, limit=40][0m
+[0m→ [0mRead src/vfs.rs[90m [offset=30, limit=80][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=1100, limit=120][0m
+[0m✱ [0mGrep "run_isolated|run_source_value|fn run|logging::reset|each|for .* in .*rows"[90m in tests/stdlib_module_docs_test.rs · 100 matches[0m
+FINDINGS:
+1. [MAJOR] src/logging.rs:139 — The stdout/stderr destinations do not honour the spec's "a destination that cannot be written is a catchable `IoError`, not a process abort": stderr goes through `eprint!`, which panics on write failure, while stdout goes through `crate::wasm::emit` (src/logging.rs:135), which silently ignores write errors and drops records past `MAX_OUTPUT_BYTES` (src/wasm.rs:85-94), always returning `Ok`. Only file destinations can produce the documented `IoError`. Fix: route both streams through `io::stdout()/io::stderr().write_all(...)` and return the resulting `io::Result` so `runtime.rs` maps it to `Error::Io`. VERIFIED: traced `write` -> `Destination::Stderr` -> `eprint!` (std panics on stderr write failure) and `Destination::Stdout` -> `wasm::emit` -> `let _ = ...write_all(...)`.
+
+2. [MAJOR] tests/stdlib_modules_test.rs:1743 — REPORT.md claims `edge_empty_and_multiline_messages_are_written_unchanged` covers a *trailing newline*, but the test only writes `""` and `"first\nsecond"` (lines 1743-1744). No message ending in `\n` is exercised, so the "message written exactly as given / record ends with one newline" boundary is untested despite the completion claim. Fix: add `logging.info("ends\n")` and assert the resulting file contains the message's newline plus the record newline.
+
+3. [MINOR] tests/stdlib_modules_test.rs:1572 — `fs::read_to_string(&log).unwrap_or_default()` swallows every read error. For the `off` row the expected text is empty, so an unreadable file that exists and contains records is scored as a pass; the test cannot distinguish "nothing written" from "cannot read what was written". Fix: assert `!log.exists()` for `off`, and propagate read errors for the other thresholds.
+
+4. [MINOR] tests/stdlib_modules_test.rs:1815 — SPEC.md names "a directory instead of a file" as an unwritable destination, but the only failure test uses a missing parent directory. The EISDIR path through `vfs::append` is untested. Fix: add a destination that is an existing directory and assert the same catchable `IoError`.
+
+5. [MINOR] src/runtime.rs:3553 — logging write failures are constructed as `Error::Io(...)` with no source span (`error.rs:130` returns `None` for `Error::Io`), so a caught logging failure loses line/column information and cannot satisfy the project's span assertion used for `Runtime` errors. Fix: carry a span-bearing error variant for builtin failures, or include the call site in the error.
+
+REVIEW VERDICT: FINDINGS 5
