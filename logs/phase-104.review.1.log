@@ -1,24 +1,25 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "base64|hex\.|hash\.|uuid\."[90m 37 matches[0m
-[0m✱ [0mGrep "fn (decode_hex|decode_base64|encode_hex|encode_base64|sha256|sha512|uuid_generate|uuid_parse|byte_or_text|BASE64_ANY_PADDING)"[90m 2 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2580, limit=150][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3990, limit=115][0m
-[0m→ [0mRead tests/encoding_hashing_test.rs[90m [offset=1, limit=200][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=75, limit=140][0m
-[0m→ [0mRead tests/encoding_hashing_test.rs[90m [offset=200, limit=110][0m
-I found a likely contradiction in the new test. Let me verify the remaining tests and registrations.
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=230, limit=80][0m
-[0m✱ [0mGrep "hex_encode|base64_encode|hash_sha256|uuid_generate|uuid_parse|hex\.decode|base64\.decode"[90m 17 matches[0m
-[0m→ [0mRead tests/libraries_policy_test.rs[90m [offset=1, limit=140][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=2060, limit=40][0m
-[0m→ [0mRead tests/libraries_policy_test.rs[90m [offset=141, limit=106][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=2515, limit=50][0m
-The new tail test looks inconsistent with the existing `aGk*` expectation. Let me verify the base64 crate's error indexing.
-[0m✱ [0mGlob "**/base64-0.21*/src/decode.rs"[90m 0 matches[0m
-[0m✱ [0mGlob "**/base64-0.21*/src/*.rs"[90m 0 matches[0m
+[0m✱ [0mGrep "fn (decode_base64|first_invalid_base64_padding|first_invalid_base64_byte|decode_hex|uuid|base64|hex|hash)"[90m 6 matches[0m
+[0m✱ [0mGrep "BASE64_ANY_PADDING|uuid_generate|uuid_parse|sha256|sha512|base64_encode|base64_decode|hex_encode|hex_decode"[90m 13 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2590, limit=240][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=4055, limit=130][0m
+[0m→ [0mRead tests/encoding_hashing_test.rs[90m [limit=400][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead tests/libraries_policy_test.rs
+[0m→ [0mRead src/stdlib.rs[90m [limit=240, offset=1][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=180, offset=1955][0m
+[0m✱ [0mGrep "base64|hex|hash|uuid"[90m in . · 16 matches[0m
+[0m✱ [0mGrep "base64|hex|hash|uuid|kn"[90m in . · 25 matches[0m
+[0m✱ [0mGrep "sha256|sha512|base64|hex|uuid|SGk|4869|550e8400"[90m in . · 0 matches[0m
 FINDINGS:
-1. [BLOCKER] tests/encoding_hashing_test.rs:166 — the newly added `edge_decoders_do_not_answer_a_valid_prefix_when_the_tail_is_bad` asserts that `base64.decode("aGk!!")` reports `"position 4"`, but that position is unreachable. The first bad byte is the `!` at index 3 (0-based; the sibling case at tests/encoding_hashing_test.rs:128 pins this same convention with `aGk*` → `"position 3"`), and a 5-character input is 1 mod 4, which `BASE64_ANY_PADDING.decode` maps to `DecodeError::InvalidLength`, formatted at src/runtime.rs:2706-2709 as `"base64.decode: incomplete base64 group ending at position {text.len()}"` = `"position 5"`. So the only messages this input can produce name position 3 or position 5, never 4. This test cannot pass, which means `cargo test --all-targets` cannot have produced the `2530 passed` recorded at phases/phase-104/REPORT.md:79 — the claimed green gate is not reproducible. Fix the expectation to the actual path (`"position 3"` if `InvalidByte` fires, or `"position 5"` for `InvalidLength`) and re-run the full gate. VERIFIED: traced `decode_base64` (src/runtime.rs:2694-2716) through both mapped variants and compared against the already-passing `aGk*` case at tests/encoding_hashing_test.rs:128; `"aGk!!"` has its first `!` at byte index 3 and a total length of 5, so position 4 is not emitted by either branch.
+1. [MAJOR] src/runtime.rs:2719-2726 — The new `first_invalid_base64_padding` has sub-branches with no test on either side: the `% 4 == 1` refusal ("A===", "AAAAA===", "AAAAA=") at line 2721, and the `required == 2` excess-padding arm (e.g. "AA===") at line 2726. Every test added this round hits only `first_pad % 4` of 0, 2 or 3, or the "followed by data" arm; `grep` of `tests/encoding_hashing_test.rs` shows no input whose first pad sits at index 1 mod 4. The phase's own edge matrix claims malformed base64 is "covered", but two newly added refusal paths are unreachable by any test, so a regression that removed them would still pass. Fix: add `base64.decode("A===")`, `base64.decode("AAAAA===")` and `base64.decode("AA===")` cases with the expected positions (1, 5, 4). — VERIFIED: read the full branch at src/runtime.rs:2712-2732 and the complete test list at tests/encoding_hashing_test.rs:289-377; no case has `first_pad % 4 == 1`.
 
-REVIEW VERDICT: FINDINGS 1
+2. [MINOR] tests/encoding_hashing_test.rs:248-254 — SPEC.md promises `uuid.generate()` answers a "random version-4 UUID", but the test asserts only parse-round-trip, length 36, and that two draws differ. A UUID with version nibble 0/1/3 and variant bits from raw random bytes would satisfy every assertion. Fix: assert the 15th hex character is `4` and the 20th is one of `8`/`9`/`a`/`b` (RFC 4122 variant), or compare against `uuid::Uuid::parse_str(id).get_version_num() == 4` in the Rust harness.
+
+3. [MINOR] tests/encoding_hashing_test.rs:262-275 — SPEC.md says `uuid.parse` accepts the hyphenated, simple, braced and `urn:uuid:` forms "in either case", but the test exercises only lowercase forms (lowercase `urn:uuid:` prefix, lowercase simple/braced bodies) with uppercase *hex digits* in the hyphenated case. If the crate ever treated the `urn:uuid:` prefix case-sensitively, or braced/simple uppercase was mishandled, the documented guarantee would silently regress. Fix: add `URN:UUID:550E8400-E29B-41D4-A716-446655440000` and `{550E8400-E29B-41D4-A716-446655440000}` to the loop.
+
+4. [MINOR] src/runtime.rs:4133-4141 — The `uuid.parse` non-text argument refusal is untested, and neither is the documented text-input form of `hex.encode`/`base64.encode` (`bytes_argument`'s `Value::Text` branch at src/runtime.rs:2615 is only ever reached through `hash.*`). tests/encoding_hashing_test.rs:381-396 covers `hash.sha256(5)`, `hex.encode(5)`, `hex.encode([256])`, `base64.encode([-1])`, and malformed text for `uuid.parse`, but no `uuid.parse(5)` and no `hex.encode("hi")` / `base64.encode("hi")` despite SPEC.md saying both encoders accept text. The edge matrix's `type_mismatch` row is therefore overstated for the UUID module. Fix: add `uuid.parse(5)` to the name-check table and one text-input encoder assertion each.
+
+REVIEW VERDICT: FINDINGS 4
