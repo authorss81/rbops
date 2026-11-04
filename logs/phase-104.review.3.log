@@ -1,0 +1,23 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2620, limit=140][0m
+[0m✱ [0mGrep "fn (decode_hex|decode_base64|first_invalid_base64_byte|offending_char|hash_builtin|uuid|encode_hex|encode_base64|byte_or_text|uuid_generate|uuid_parse|sha256|sha512)"[90m in src/runtime.rs · 4 matches[0m
+[0m✱ [0mGrep ""base64"|"hex"|"hash"|"uuid"|sha256|sha512|generate|base64_encode|hex_encode"[90m in src/stdlib.rs · 47 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3990, limit=120][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2560, limit=70][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=2510, limit=60][0m
+[0m→ [0mRead tests/encoding_hashing_test.rs
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=230, limit=120][0m
+[0m✱ [0mGrep "uuid|base64|hash\.|hex\.|sha256|sha512|generate"[90m in tests/stdlib_module_docs_test.rs · 100 matches[0m
+[0m→ [0mRead phases/phase-104/REPORT.md[90m [offset=66, limit=50][0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=1225, limit=70][0m
+[0m✱ [0mGrep "version-4|uuid.generate|naming the offending position|invalid padding"[90m in SPEC.md · 32 matches[0m
+FINDINGS:
+1. [MAJOR] src/runtime.rs:2698-2713 — `first_invalid_base64_byte` whitelists `=` as always valid, then line 2713 unconditionally replaces the crate's `InvalidByte` position with the first character outside `[A-Za-z0-9+/=]`. A misplaced `=` is itself the first refusal, so for input like `"aG=k!"` the crate reports the offending byte at the `=` (position 2/3) while the scan points at the later `!` (position 4). That contradicts the function's own contract ("first byte that made it refuse", lines 2692-2693) and `SPEC.md:1553` ("naming the offending position"). This is an error-message regression, not a panic. Fix: treat `=` as valid only in a trailing padding run, or apply the override only when `first_invalid_base64_byte(text) < crate_position` (take the minimum), so a responsible `=` is never masked by a later bad byte. VERIFIED: traced lines 2698-2704 and the unconditional override at 2713; not executed.
+
+2. [MAJOR] src/runtime.rs:2719-2730 — the `InvalidLastSymbol`, `InvalidLength` and `InvalidPadding` arms are user-reachable but have no test anywhere. The new suites only pin `InvalidByte` (`"aGk*"`, `"aGk!!"`, `"é"`) and hex odd-length; there is no case for a non-canonical final symbol (`base64.decode("aG")`), an incomplete group (`base64.decode("aGkAA")`), or bad padding, yet the REPORT's edge-case matrix at `phases/phase-104/REPORT.md:69` claims malformed input is fully covered. If these arms are truly unreachable they are dead code; if reachable, three user-facing message paths are unverified. Add one test per arm; also note the `InvalidPadding` message names the *last* `=` via `rfind`, not the first misplaced one.
+
+3. [MINOR] tests/encoding_hashing_test.rs:249-259 and tests/stdlib_module_docs_test.rs:1268-1271 — the SPEC promise at `SPEC.md:1580` that `uuid.generate()` returns a *version-4* UUID in *canonical lowercase* is never asserted. The existing tests only check that the value parses back, is 36 characters, and differs between draws; the docs test only checks `length(...) == 36`. A regression returning an unversioned 36-character UUID (or wrong case) would pass every test. Add a program/test that asserts the version nibble (`^........-....-4...-[89ab]...`) or the RFC-4122 variant bits.
+
+REVIEW VERDICT: FINDINGS 3

@@ -1,32 +1,24 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/runtime.rs
-[0m→ [0mRead tests/encoding_hashing_test.rs
-[0m✱ [0mGrep "base64|hex|hash|uuid|BASE64|SHA256|SHA512|UUID"[90m in src/stdlib.rs · 100 matches[0m
-[0m✱ [0mGrep "BASE64_ANY_PADDING|fn decode_hex|fn decode_base64|fn byte_or_text|sha256|uuid|base64|hex\.|decode_hex|decode_base64"[90m in src/runtime.rs · 62 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2550, limit=180][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3940, limit=160][0m
-[0m→ [0mRead tests/libraries_policy_test.rs
-[0m→ [0mRead tests/stdlib_module_docs_test.rs
-[0m→ [0mRead src/stdlib.rs[90m [limit=70, offset=670][0m
-[0m→ [0mRead LIBRARIES.md[90m [limit=60, offset=45][0m
-[0m→ [0mRead tests/doc_blocks_runs.txt
-[0m→ [0mRead src/stdlib.rs[90m [limit=75, offset=2500][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=15, limit=200][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=1955, limit=145][0m
+[0m✱ [0mGrep "base64|hex\.|hash\.|uuid\."[90m 37 matches[0m
+[0m✱ [0mGrep "fn (decode_hex|decode_base64|encode_hex|encode_base64|sha256|sha512|uuid_generate|uuid_parse|byte_or_text|BASE64_ANY_PADDING)"[90m 2 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2580, limit=150][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3990, limit=115][0m
+[0m→ [0mRead tests/encoding_hashing_test.rs[90m [offset=1, limit=200][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=75, limit=140][0m
+[0m→ [0mRead tests/encoding_hashing_test.rs[90m [offset=200, limit=110][0m
+I found a likely contradiction in the new test. Let me verify the remaining tests and registrations.
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=230, limit=80][0m
+[0m✱ [0mGrep "hex_encode|base64_encode|hash_sha256|uuid_generate|uuid_parse|hex\.decode|base64\.decode"[90m 17 matches[0m
+[0m→ [0mRead tests/libraries_policy_test.rs[90m [offset=1, limit=140][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=2060, limit=40][0m
+[0m→ [0mRead tests/libraries_policy_test.rs[90m [offset=141, limit=106][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=2515, limit=50][0m
+The new tail test looks inconsistent with the existing `aGk*` expectation. Let me verify the base64 crate's error indexing.
+[0m✱ [0mGlob "**/base64-0.21*/src/decode.rs"[90m 0 matches[0m
+[0m✱ [0mGlob "**/base64-0.21*/src/*.rs"[90m 0 matches[0m
 FINDINGS:
+1. [BLOCKER] tests/encoding_hashing_test.rs:166 — the newly added `edge_decoders_do_not_answer_a_valid_prefix_when_the_tail_is_bad` asserts that `base64.decode("aGk!!")` reports `"position 4"`, but that position is unreachable. The first bad byte is the `!` at index 3 (0-based; the sibling case at tests/encoding_hashing_test.rs:128 pins this same convention with `aGk*` → `"position 3"`), and a 5-character input is 1 mod 4, which `BASE64_ANY_PADDING.decode` maps to `DecodeError::InvalidLength`, formatted at src/runtime.rs:2706-2709 as `"base64.decode: incomplete base64 group ending at position {text.len()}"` = `"position 5"`. So the only messages this input can produce name position 3 or position 5, never 4. This test cannot pass, which means `cargo test --all-targets` cannot have produced the `2530 passed` recorded at phases/phase-104/REPORT.md:79 — the claimed green gate is not reproducible. Fix the expectation to the actual path (`"position 3"` if `InvalidByte` fires, or `"position 5"` for `InvalidLength`) and re-run the full gate. VERIFIED: traced `decode_base64` (src/runtime.rs:2694-2716) through both mapped variants and compared against the already-passing `aGk*` case at tests/encoding_hashing_test.rs:128; `"aGk!!"` has its first `!` at byte index 3 and a total length of 5, so position 4 is not emitted by either branch.
 
-1. [MAJOR] tests/libraries_policy_test.rs:215 — the new refusal probe passes `time.unix(...)` straight into `time.add_days`; `time.unix` answers a number (pinned at tests/stdlib_module_docs_test.rs:1006-1009), while `time.add_days` requires a date (its valid call uses `time.date(...)` at tests/stdlib_module_docs_test.rs:1040-1044). The program is therefore refused for a type mismatch, not because date arithmetic is unbound, so the assertion is green even though `time.add_days` is implemented and answering. The REPORT's claim that this probe “records that … `time.add_days` remains refused” is false: it would stay green after the gap closes. Fix by probing an actually-open binding, or by asserting the refusal is “unknown binding” rather than “requires a date”.
-
-2. [MINOR] LIBRARIES.md:70 — the new explanatory paragraph and blank lines were inserted between table row 68 and row 75, splitting the bindings Markdown table into two. Rows 75-79 (`files.*`, tensors, linear algebra, statistics, cryptography) no longer render as table rows. Move the paragraph below the completed table.
-
-3. [MINOR] src/runtime.rs:2684 — `InvalidByte(position, byte) => char::from(byte)` renders the raw byte as Latin-1. For non-ASCII input, e.g. `base64.decode("é")`, the first byte is `0xC3`, so the error says `invalid byte 'Ã'` instead of naming the character the program wrote. Use the original text at the reported position (`text.as_bytes()`/`text.get(position..)`) for the quoted value, and keep the byte position.
-
-4. [MINOR] src/runtime.rs:4042 — `uuid.generate()` calls `uuid::Uuid::new_v4()`, which is the crate's panicking v4 path when `getrandom` fails (and has no clock/entropy source on the wasm playground). Every other I/O/clock failure in this file is deliberately converted to a catchable `Runtime` error; this one can abort the interpreter instead. Use a fallible RNG fill and map the failure to `Error::Runtime`, or document and gate the panic. (Could not execute a RNG failure; this rests on `uuid` 1.x `new_v4` using `getrandom(...).expect(...)`.)
-
-5. [STYLE] tests/encoding_hashing_test.rs:113 — lines 113 and 114 are the identical assertion `hex.decode("4869") == [72, 105]`. The uppercase case is actually covered only by line 115 (`486A`); the duplicate adds nothing and makes the “uppercase” row look broader than it is.
-
-6. [STYLE] tests/doc_blocks_runs.txt:28 — the counts comment is stale after the three new SPEC blocks: it still says “SPEC.md 43 … 61 of 112,” while the file now lists 46 SPEC entries and 64 executable blocks. Update the comment so the bucket cannot be misread as current.
-
-REVIEW VERDICT: FINDINGS 6
+REVIEW VERDICT: FINDINGS 1
