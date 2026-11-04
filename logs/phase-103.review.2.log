@@ -2,27 +2,25 @@
 > reviewer · deepseek-v4.1-flash-free
 [0m
 [0m→ [0mRead src/logging.rs
-[0m→ [0mRead src/wasm.rs
-[0m✱ [0mGrep "logging|current_instant|with_test_clock|TEST_CLOCK|HOST_CLOCK"[90m in src/runtime.rs · 95 matches[0m
-[0m✱ [0mGrep "edge_a_stdout_record_keeps_its_place|edge_a_run_starts_from|edge_reset_restores|edge_a_refused_setting|pre_epoch|logging_module|fn logging"[90m in tests/stdlib_modules_test.rs · 7 matches[0m
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=1600, limit=120][0m
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=2080, limit=130][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=495, limit=110][0m
-[0m→ [0mRead src/runtime.rs[90m [limit=100, offset=3575][0m
-[0m→ [0mRead tests/stdlib_modules_test.rs[90m [limit=170, offset=1468][0m
-[0m→ [0mRead src/lib.rs[90m [limit=70, offset=95][0m
-[0m✱ [0mGrep "print_output|take_output|fn run\(|fn run_quietly|wasm::emit|defer_capture|flush_deferred"[90m in src/interpreter.rs · 49 matches[0m
-[0m✱ [0mGrep "run_isolated_in|run_isolated|join_capture|capture_member|thread::spawn"[90m in src/interpreter.rs · 35 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=120, offset=150][0m
-[0m→ [0mRead src/runtime.rs[90m [limit=30, offset=3550][0m
-[0m→ [0mRead src/runtime.rs[90m [limit=20, offset=2595][0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=40, offset=2048][0m
+[0m✱ [0mGrep "logging"[90m in src/runtime.rs · 84 matches[0m
+[0m✱ [0mGrep "logging|LOGGING|LOG"[90m in src/stdlib.rs · 84 matches[0m
+[0m✱ [0mGrep "logging|reset_logging|Config"[90m in src/bytecode/vm.rs · 3 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3560, limit=120][0m
+[0m→ [0mRead src/wasm.rs[90m [offset=30, limit=150][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=570, limit=60][0m
+[0m✱ [0mGrep "fn (edge_|records_|default_|a_record|the_tree|logging)"[90m in tests/stdlib_modules_test.rs · 100 matches[0m
+[0m✱ [0mGrep "pub fn append|fn append|pub fn write"[90m in src/vfs.rs · 9 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=190, limit=75][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1805, limit=60][0m
+[0m✱ [0mGrep "logging|set_destination|set_level|stdout_record|bytecode_entry|bootstrap"[90m in tests · 100 matches[0m
+[0m→ [0mRead src/vfs.rs[90m [offset=40, limit=60][0m
+[0m→ [0mRead src/lib.rs[90m [offset=90, limit=70][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=4360, limit=45][0m
+[0m✱ [0mGrep "BytecodeVm|bytecode::vm::run|vm::run\(|\.run\(&?chunk"[90m in src · 81 matches[0m
 FINDINGS:
 
-1. [MAJOR] src/logging.rs:220 — `write_stdout` now defers a captured `stdout` record into `DEFERRED`, but the other output paths still write straight into the capture: the `print` statement at src/interpreter.rs:2076 and the `say`/`console.log` builtins at src/runtime.rs:2603 and src/runtime.rs:3561 all call `wasm::emit` immediately. So a program that logs to `stdout` and then calls `print`/`console.log` captures the record *after* that later output, e.g. `logging.info("x")` then `print "y"` yields `y` then `[INFO] x`. This contradicts the module's "same order" output promise (src/wasm.rs:12-13) and is a regression from the pre-resume code, where the record was emitted immediately through `try_emit`. Fix: put *every* program output path (`print`, `say(...)`, `console.log`, `console.clear`, log records) through one queue, or keep log records immediate. VERIFIED: traced the exact path (defer at logging.rs:221, immediate `emit` at interpreter.rs:2076/runtime.rs:2603/runtime.rs:3561, flush at interpreter.rs:1689).
+1. [MINOR] src/logging.rs:160 — An instant outside `chrono`'s representable range silently loses the timestamp field (`from_timestamp(secs, nanos)?` returns `None`), which is a third no-timestamp case beyond the two `SPEC.md` documents (timestamps turned off, and a host with no clock). The existing unit test at `src/logging.rs:318-323` pins this behaviour, so the code is intentional; the defect is that the documented record shape is incomplete for an out-of-range host clock. Fix: state the out-of-range case in `SPEC.md` alongside the no-clock case, or make the formatter return an error/clamped value instead of dropping the field. I could not run the tests; this is a docs/spec consistency finding, not a claim that the test is wrong.
 
-2. [MAJOR] src/interpreter.rs:1684 — `let result = self.run_statements(program)?;` returns before the `flush_deferred()` at line 1689, so a `stdout` log record written before a runtime error is never flushed into the capture and is discarded. The bytecode engine has the same shape at src/bytecode/vm.rs:1105-1110 (`flush_deferred` only when `result.is_ok()`). Before the resume, `write_stdout` emitted the record immediately, so a program that logged and then failed still showed the record; now it silently vanishes, and no test covers it. Fix: flush the deferred queue on both success and failure (e.g. between `run_statements` and the `?`), or write records immediately. VERIFIED: traced the early return at line 1684 against the flush at line 1689 and the queue clear at wasm.rs:253.
+2. [MINOR] src/logging.rs:222-223 — A captured `stdout` record is routed through `wasm::try_emit`, whose overflow branch at `src/wasm.rs:135-138` does `OVERFLOW.store(true); return Ok(())`. The logging call therefore reports success while the record is dropped, and the only failure is a later `Limit`; the SPEC promise that a destination that cannot be written is a catchable `IoError` naming `logging` does not hold for a full capture. Fix: give logging a fallible emit that returns `Err(WriteZero)` on overflow and map it to the same `IoError` naming `logging` (the run is still failed via `OVERFLOW`, so this is not an overall silent success).
 
-3. [MINOR] src/lib.rs:108 (and src/lib.rs:134) — `logging::reset()` runs on the *caller* thread, but natively the program runs on a freshly spawned `redblue-vm` thread (src/interpreter.rs:198-203) whose thread-local `CONFIG` already starts at the defaults; the reset never touches the thread that executes the program. It is only effective on the `wasm32` inline path. Consequently the new test `edge_a_run_starts_from_the_default_logging_configuration` (tests/stdlib_modules_test.rs:1624) passes because the spawned thread is fresh, not because of the reset, and its `!stale.exists()` assertion cannot fail on the native target the gate runs. Fix: perform the reset inside the spawned interpreter closure, and/or test the run-isolation assertion on a target where the run is inline.
-
-REVIEW VERDICT: FINDINGS 3
+REVIEW VERDICT: FINDINGS 2
