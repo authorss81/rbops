@@ -1,23 +1,28 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "csv_stringify|json_parse_lines|toml_parse|zip_write|tar_write|zip_read|tar_read"[90m in src/runtime.rs · 62 matches[0m
-[0m✱ [0mGrep "fn parse_number_or_word|let digits = token|value as f64|sign"[90m in src/formats.rs · 100 matches[0m
-[0m→ [0mRead src/formats.rs[90m [offset=470, limit=130][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3690, limit=130][0m
-[0m→ [0mRead src/formats.rs[90m [limit=440, offset=700][0m
-[0m→ [0mRead tests/data_formats_test.rs[90m [limit=440][0m
-[0m→ [0mRead src/formats.rs[90m [limit=100, offset=600][0m
-[0m→ [0mRead src/formats.rs[90m [limit=45, offset=667][0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=205, offset=15][0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=60, offset=2690][0m
-[0m→ [0mRead tests/doc_blocks_fragments.txt
-[0m→ [0mRead tests/doc_blocks_known_fail.txt
+I'll start by inspecting the main new file, focusing on the multiline string parsing added in the uncommitted diff.
+[0m→ [0mRead tests/data_formats_test.rs[90m [offset=300, limit=240][0m
+[0m→ [0mRead src/formats.rs[90m [offset=400, limit=320][0m
+Let me inspect the rest of formats.rs for panic paths and the archive/number logic.
+[0m→ [0mRead src/formats.rs[90m [limit=380, offset=720][0m
+[0m→ [0mRead src/formats.rs[90m [limit=400, offset=1100][0m
+Let me check the runtime dispatch, stdlib wiring, and vfs changes for the archive path handling.
+[0m✱ [0mGrep "csv_stringify|json_parse_lines|json_stringify_lines|toml_parse|zip_write|zip_read|tar_write|tar_read|read_bytes"[90m in src · 87 matches[0m
+[0m→ [0mRead src/vfs.rs[90m [limit=120][0m
+[0m→ [0mRead src/formats.rs[90m [limit=130, offset=150][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=140, offset=3690][0m
+[0m→ [0mRead src/formats.rs[90m [limit=120, offset=280][0m
+[0m→ [0mRead src/formats.rs[90m [limit=230, offset=1496][0m
+[0m✱ [0mGrep "fn parse_csv|impl (std::fmt::|fmt::)?Display for Value|fn to_string"[90m in src · 2 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [limit=130, offset=4496][0m
+[0m→ [0mRead src/value.rs[90m [limit=90, offset=505][0m
+Let me check the in-memory filesystem's new `read_bytes` implementation, the one path that could silently corrupt archives on wasm.
+[0m→ [0mRead src/vfs.rs[90m [limit=110, offset=140][0m
 FINDINGS:
-1. [MAJOR] src/formats.rs:1058 — `zip_read` decodes every entry name as UTF-8 and never consults general-purpose bit 11 (the UTF-8 flag it reads at 1045); a valid stored zip whose non-ASCII names were written without that flag (CP437, the zip default) is refused with "an entry name is not UTF-8", although SPEC.md says `zip.read` "reads one" and documents only compression/encryption refusals. Fix: honour bit 11 and decode CP437 when it is clear (or at minimum use `from_utf8_lossy` with a documented caveat). This was traced from the flag read at :1045 through the unconditional decode at :1058; a stored zip with a CP437-named entry would settle it and is currently absent.
-2. [MINOR] src/formats.rs:1124 — `find_zip_end` accepts the last `ZIP_END` signature anywhere in the final 64 KiB without validating that its directory/comment reaches EOF, so a valid archive whose trailing comment contains `PK\x05\x06` is read as if that comment byte pattern were the EOCD and is misparsed or refused. Fix: accept a candidate only when `at + 22 + comment_len == bytes.len()`.
-3. [MINOR] src/formats.rs:899 — `field_text` truncates a tar name at the first NUL, while `write_field` (:792) writes the entire name; a record key containing `\0` (reachable through `json.parse`) round-trips through `tar.write`/`tar.read` to a different name. `archive_entries` (:685) validates contents but not names. Fix: reject names containing NUL (and consider rejecting duplicates, which `archive_value` currently collapses) before writing either archive.
-4. [MINOR] SURVEY.md:115 — the re-anchored module table cites `toml` at `src/stdlib.rs:202`, but the row is at :205; the same three-line drift affects `list` (SURVEY 147 vs actual 150), `network` (154 vs 157), `tar` (205 vs 208), `uuid` (203 vs 206) and `zip` (204 vs 207), all verified against the read `MODULE_MEMBERS`. The phase REPORT claims these citations were re-anchored, so an auditor following them lands on the wrong module. Fix: re-anchor the single-line rows.
-5. [MINOR] tests/data_formats_test.rs:329 — `edge_archive_rejects_missing_and_malformed_files` is named for archives but only exercises `zip.read`; the `tar.read` missing-file and malformed-file paths (`src/runtime.rs:3787`, `src/formats.rs:815`) have no equivalent program-level test, so tar's error wiring could regress silently. Fix: loop the test over `["zip", "tar"]`.
+1. [MINOR] src/formats.rs:509 — multiline basic strings accept a closing run of six or more delimiter quotes (and `src/formats.rs:548` does the same for multiline literal strings): `quote_run` counts the whole run, then `run >= 3` treats `run - 3` quotes as content and consumes all of them. TOML allows at most five consecutive quotes at the close (two content + three delimiter), so `x = """a""""""` silently parses as `a"""` instead of being refused as malformed. The fix is to error when `run > 5`; add a test for the six-quote case, which is untested on either side.
+2. [MINOR] src/formats.rs:590 — `skip_line_continuation` includes a bare `'\r'` in its whitespace set and treats it as a line break even when it is not followed by `'\n'`, while `trim_leading_newline` (`src/formats.rs:576`) only trims `\r\n` or `\n`. A backslash followed by a lone CR is therefore silently treated as a continuation and that CR is dropped from the value, although TOML defines a newline only as LF or CRLF. Require `\n` or `\r\n` here (and decide whether a lone CR should instead be content/rejected), and add a test pinning it.
 
-REVIEW VERDICT: FINDINGS 5
+Both are malformed-input acceptance gaps in the newly added multiline TOML path; the actually valid cases (first-newline trimming, two-quote runs, CRLF, line continuation) are covered by `tests/data_formats_test.rs`.
+
+REVIEW VERDICT: FINDINGS 2
