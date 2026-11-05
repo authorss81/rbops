@@ -1,29 +1,23 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/formats.rs
-[0m✱ [0mGrep "csv_stringify|json_parse_lines|json_stringify_lines|toml_parse|zip_write|zip_read|tar_write|tar_read|read_bytes"[90m 85 matches[0m
-[0m→ [0mRead src/vfs.rs
-[0m→ [0mRead src/stdlib.rs[90m [offset=1, limit=120][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3680, limit=140][0m
-[0m→ [0mRead tests/data_formats_test.rs
-[0m→ [0mRead tests/stdlib_module_names_test.rs
-[0m→ [0mRead src/stdlib.rs[90m [offset=119, limit=115][0m
-[0m→ [0mRead src/lib.rs[90m [limit=25][0m
-[0m✱ [0mGrep "wasm32|wasm-pack|target.*wasm"[90m 0 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=2435, limit=300][0m
-[0m✱ [0mGrep "type Fields|pub use indexmap|IndexMap"[90m 5 matches[0m
+[0m✱ [0mGrep "csv_stringify|json_parse_lines|toml_parse|zip_write|tar_write|zip_read|tar_read"[90m in src/runtime.rs · 62 matches[0m
+[0m✱ [0mGrep "fn parse_number_or_word|let digits = token|value as f64|sign"[90m in src/formats.rs · 100 matches[0m
+[0m→ [0mRead src/formats.rs[90m [offset=470, limit=130][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3690, limit=130][0m
+[0m→ [0mRead src/formats.rs[90m [limit=440, offset=700][0m
+[0m→ [0mRead tests/data_formats_test.rs[90m [limit=440][0m
+[0m→ [0mRead src/formats.rs[90m [limit=100, offset=600][0m
+[0m→ [0mRead src/formats.rs[90m [limit=45, offset=667][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=205, offset=15][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=60, offset=2690][0m
+[0m→ [0mRead tests/doc_blocks_fragments.txt
+[0m→ [0mRead tests/doc_blocks_known_fail.txt
 FINDINGS:
-1. [BLOCKER] src/vfs.rs:500 — the `wasm32` re-export list omits `read_bytes` even though `native` exports it and `src/runtime.rs:3767` / `src/runtime.rs:3792` call `crate::vfs::read_bytes` unconditionally — the wasm32 build therefore fails with an unresolved name, so the new archive modules break the playground target — add `read_bytes` to the `pub use memory::{...}` list at src/vfs.rs:500 — VERIFIED: traced src/vfs.rs:499-503 (only `memory::{append, copy, exists, is_file, read_dir, read_to_string, remove_file, rename, write, write_bytes}` is re-exported) against src/runtime.rs:3767 and 3792.
+1. [MAJOR] src/formats.rs:1058 — `zip_read` decodes every entry name as UTF-8 and never consults general-purpose bit 11 (the UTF-8 flag it reads at 1045); a valid stored zip whose non-ASCII names were written without that flag (CP437, the zip default) is refused with "an entry name is not UTF-8", although SPEC.md says `zip.read` "reads one" and documents only compression/encryption refusals. Fix: honour bit 11 and decode CP437 when it is clear (or at minimum use `from_utf8_lossy` with a documented caveat). This was traced from the flag read at :1045 through the unconditional decode at :1058; a stored zip with a CP437-named entry would settle it and is currently absent.
+2. [MINOR] src/formats.rs:1124 — `find_zip_end` accepts the last `ZIP_END` signature anywhere in the final 64 KiB without validating that its directory/comment reaches EOF, so a valid archive whose trailing comment contains `PK\x05\x06` is read as if that comment byte pattern were the EOCD and is misparsed or refused. Fix: accept a candidate only when `at + 22 + comment_len == bytes.len()`.
+3. [MINOR] src/formats.rs:899 — `field_text` truncates a tar name at the first NUL, while `write_field` (:792) writes the entire name; a record key containing `\0` (reachable through `json.parse`) round-trips through `tar.write`/`tar.read` to a different name. `archive_entries` (:685) validates contents but not names. Fix: reject names containing NUL (and consider rejecting duplicates, which `archive_value` currently collapses) before writing either archive.
+4. [MINOR] SURVEY.md:115 — the re-anchored module table cites `toml` at `src/stdlib.rs:202`, but the row is at :205; the same three-line drift affects `list` (SURVEY 147 vs actual 150), `network` (154 vs 157), `tar` (205 vs 208), `uuid` (203 vs 206) and `zip` (204 vs 207), all verified against the read `MODULE_MEMBERS`. The phase REPORT claims these citations were re-anchored, so an auditor following them lands on the wrong module. Fix: re-anchor the single-line rows.
+5. [MINOR] tests/data_formats_test.rs:329 — `edge_archive_rejects_missing_and_malformed_files` is named for archives but only exercises `zip.read`; the `tar.read` missing-file and malformed-file paths (`src/runtime.rs:3787`, `src/formats.rs:815`) have no equivalent program-level test, so tar's error wiring could regress silently. Fix: loop the test over `["zip", "tar"]`.
 
-2. [MAJOR] src/lib.rs:8 — `mod formats;` is in the change set but `src/formats.rs` is not, and `tests/data_formats_test.rs` (the ten tests REPORT.md claims) is also absent from the authoritative file list, so the diff as delivered cannot compile and the claimed 2552-test gate cannot be reproduced from it — either the file list is incomplete or the main implementation and its tests are untracked and will not ship; run `git status`/`git add -A` to settle it and include both files.
-
-3. [MAJOR] src/formats.rs:486 — TOML numbers are classified as floats with `token.contains(['.', 'e', 'E'])` before the radix prefixes are examined, so valid documented hex integers containing `e`/`E` (`0xDEAD`, `0x1e5`, `0xCAFE`) are sent to `f64::parse` and refused with "is not a number" — this contradicts the new SPEC.md promise that hexadecimal integers are supported, and `toml_reader_parses_the_documented_subset` only exercises decimal/float literals — check `0x`/`0o`/`0b` suffixes before the float test and add a hex-with-E test.
-
-4. [MAJOR] src/formats.rs:533 — `parse_array` calls `parse_value` recursively with no depth counter (and `insert_dotted` at src/formats.rs:614 recurses once per dotted-key component), so a deeply nested TOML document such as `a = [[[[...]]]]` aborts the process with a stack overflow instead of returning the catchable `RuntimeError` the module promises — add an explicit nesting limit (and a key-path-depth limit) with a line-numbered refusal.
-
-5. [MINOR] src/formats.rs:905 — `name_bytes.len() as u16` (and src/formats.rs:960) silently wraps for an entry name longer than 65535 bytes, producing a corrupt zip that `zip_write` reports as success; `write_octal` at src/formats.rs:766 similarly truncates tar sizes above the 11-octal-digit field — refuse oversized names/sizes with a named error rather than narrowing the cast.
-
-6. [MINOR] src/formats.rs:971 — `zip_read` never reads or checks the central-directory CRC or verifies `central_size`, so a corrupted stored entry is returned as valid content; `tar_read` verifies its checksums at src/formats.rs:794, and the phase's own invariant says archive readers must not return corrupt content — compute `crc32` over the extracted bytes and compare it, naming the entry on mismatch.
-
-REVIEW VERDICT: FINDINGS 6
+REVIEW VERDICT: FINDINGS 5

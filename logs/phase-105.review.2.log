@@ -1,0 +1,31 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/formats.rs
+[0m→ [0mRead src/runtime.rs
+[0m✱ [0mGrep "csv_stringify|json_parse_lines|json_stringify_lines|toml_parse|zip_write|zip_read|tar_write|tar_read"[90m in src/runtime.rs · 72 matches[0m
+[0m✱ [0mGrep ""csv"|"json"|"toml"|"zip"|"tar"|parse_lines|stringify_lines|read_bytes|effectful"[90m in src/stdlib.rs · 85 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=3690, limit=130][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=440, limit=50][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=2680, limit=110][0m
+[0m→ [0mRead src/vfs.rs[90m [offset=55, limit=110][0m
+[0m→ [0mRead tests/data_formats_test.rs
+[0m→ [0mRead tests/stdlib_module_docs_test.rs
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead src/stdlib.rs[90m [limit=220, offset=1][0m
+[0m→ [0mRead tests/stdlib_module_names_test.rs
+[0m→ [0mRead src/vfs.rs[90m [limit=60, offset=165][0m
+[0m✱ [0mGrep "edge_phase105"[90m in tests/stdlib_modules_test.rs · 3 matches[0m
+FINDINGS:
+
+1. [MAJOR] src/formats.rs:341 — `open_table` treats *any* existing `Toml::Array` as an array-of-tables when it sees a `[[key]]` header, so `x = [1]` followed by `[[x]] a = 1` appends a table to the value array and returns `[1, {a:1}]` instead of refusing. TOML forbids defining an array-of-tables over an already-defined array value, and the result is a value no TOML document can declare. The same loop (lines 356–364) also re-opens an existing `[a]` table silently, so duplicate table headers are accepted while duplicate *keys* are refused. Fix: track whether an array was created by `[[...]]` (separate variant/flag) and refuse otherwise; refuse a non-array table header on an already-explicitly-opened table. Traced by reading the branches, not run (read-only reviewer).
+
+2. [MAJOR] src/formats.rs:554-560 — TOML decimal integers are parsed as `i64` and then cast `as f64`, so everything above 2^53 silently loses precision: `toml.parse("n = 9223372036854775807")` yields 9223372036854775808. The new test at tests/data_formats_test.rs:355-359 compares the parsed value against a Redblue literal, and both sides are the same f64, so it cannot see this; the REPORT's claim that "the full i64 range" is handled is therefore unsubstantiated. Fix: either refuse an integer whose `as f64` round-trip is not exact (naming the line, as other refusals do) or state the precision limit in SPEC.md and pin a value that actually distinguishes the two.
+
+3. [MINOR] src/formats.rs:502-507 — date/time detection is a positional heuristic (`bytes[4] == '-' && bytes[7] == '-'`), so only the exact `YYYY-MM-DD…` shape is reported as "date and time value … is not supported". Time-only values (`07:32:00`) and single-digit forms (`2024-1-01`) fall through to "'…' is not an integer", while `2024-01-01T…` is caught. SPEC.md promises date and time values are refused as such; either match the full set of unsupported forms or word the spec to say the refusal is generic.
+
+4. [MINOR] src/formats.rs:905-911 — `field_text` decodes tar header names with `String::from_utf8_lossy`, so a non-UTF-8 entry name read from an external tar is silently rewritten with U+FFFD rather than refused or surfaced as bytes. `tar.read` is documented as returning text for valid UTF-8 and a byte list otherwise for *contents*; names take the lossy path with no test covering it. Fix: return an error naming the entry (or expose the name bytes) when the name is not UTF-8.
+
+5. [MINOR] src/formats.rs:1077-1123 — zip offsets are read as u32, cast to `usize`, and then added without checked arithmetic (`at + 46`, `local_offset + 30 + local_name + local_extra`, `data_start + compressed`). On a 32-bit target (the wasm32 playground this module explicitly supports via vfs::memory) a crafted central directory with `central_offset`/`local_offset` near `u32::MAX` overflows `usize`; in a debug build that panics instead of returning the "not a zip archive" error, which is the panic-on-user-input class the file header claims it excludes. Fix: use `checked_add` for every derived offset and return a refusal on overflow. Not runnable here, so flagged from the arithmetic rather than observed.
+
+REVIEW VERDICT: FINDINGS 5
