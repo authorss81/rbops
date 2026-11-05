@@ -1,28 +1,27 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/matrix.rs
-[0m→ [0mRead tests/matrix_test.rs
-I'll inspect the core implementation and tests, starting with the matrix module and its tests.
-[0m→ [0mRead src/stdlib.rs[90m [limit=300][0m
-[0m→ [0mRead tests/stdlib_module_docs_test.rs
-[0m→ [0mRead tests/stdlib_module_names_test.rs
-[0m→ [0mRead tests/stdlib_modules_test.rs
-[0m✱ [0mGrep "matrix|is_matrix|index_row"[90m in src/runtime.rs · 100 matches[0m
-[0m✱ [0mGrep "matrix|fn number|fn type_name|fn type_of|OBJECT"[90m in src/value.rs · 100 matches[0m
-[0m✱ [0mGrep "matrix"[90m in src/lib.rs · 100 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=120, limit=55][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2760, limit=60][0m
-[0m→ [0mRead src/value.rs[90m [limit=2000][0m
+[0m→ [0mRead src/matrix.rs[90m [limit=120][0m
+[0m→ [0mRead src/matrix.rs[90m [offset=400, limit=120][0m
+I'll review this phase focusing on the matrix implementation, especially the arithmetic edge cases and the newly claimed mean fix.
+[0m→ [0mRead src/matrix.rs[90m [offset=120, limit=140][0m
+[0m→ [0mRead src/matrix.rs[90m [offset=260, limit=140][0m
+[0m✱ [0mGrep "matrix"[90m in . · 3 matches[0m
+[0m✱ [0mGrep "matrix"[90m in . · 2 matches[0m
+[0m✱ [0mGrep "matrix"[90m in . · 82 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=150, limit=40][0m
+[0m→ [0mRead tests/matrix_test.rs[90m [offset=1, limit=80][0m
+[0m✱ [0mGrep "matrix\.mean|matrix_mean"[90m in tests · 8 matches[0m
+[0m✱ [0mGrep "matrix\.mean|mean"[90m in tests/stdlib_module_docs_test.rs · 100 matches[0m
+[0m→ [0mRead tests/matrix_test.rs[90m [offset=330, limit=75][0m
 FINDINGS:
-1. [BLOCKER] src/matrix.rs:390-406 — `matrix.matmul` checks only the inner dimensions, never the size of the result, so two operands each exactly at `MAX_ELEMENTS` produce an astronomically larger output. `matrix.ones(1000000, 1)` and `matrix.ones(1, 1000000)` both pass `element_count` (1,000,000 elements, the limit is `> 1_000_000`), then `left.dot(&right)` tries to allocate a `1e6 x 1e6` result (~8 TB), aborting the process. — Fix: call `element_count(span, left.nrows(), right.ncols())?` before `left.dot`. — VERIFIED: traced `element_count` at src/matrix.rs:52-67 (`elements > MAX_ELEMENTS` only), `ones` at 281-285 allowing exactly 1e6 per operand, and matmul at 394-406 checking only `left.ncols() != right.nrows()` before `value_of(span, &left.dot(&right))`.
 
-2. [BLOCKER] src/matrix.rs:52-67 and 171-186 — `MAX_ELEMENTS` bounds only `rows * cols`, not the dimensions themselves, so a zero-column matrix with an unbounded row count is accepted: `matrix.zeros(100000000, 0)` has 0 elements and passes, then `say`/`matrix.to_lists` iterates `for row in 0..rows` a hundred million times. `matrix.transpose` of an `0 x N` matrix creates the same shape. This is an unbounded loop/OOM reachable from one Redblue expression, not a caught `Runtime` error. — Fix: reject `rows > MAX_ELEMENTS` and `cols > MAX_ELEMENTS` (including transposed results) in `element_count`, or cap dimension lengths separately. — VERIFIED: traced `element_count` computing `rows.checked_mul(cols)` where `cols == 0` yields 0 and the limit guard cannot fire, then `text` at src/matrix.rs:172-180 looping `0..rows` and formatting each row.
+1. [BLOCKER] src/matrix.rs:440 — `matrix.mean` now computes `array.iter().map(|number| number / count).sum()`, which silently returns wrong means for ordinary inputs. For `matrix.mean(matrix.ones(1, 10))` the count is 10, each term is `fl(1.0/10.0)=0.1`, and left-to-right float summation of ten `0.1` values is `0.9999999999999999`, not `1.0`; the old `sum/count` returned exactly `1.0` because summing ten exact `1.0`s is exact. The new tests only exercise power-of-two divisors (`1e308/2`, singleton), which are exact, so they mask the regression. It also underflows: enough subnormal elements (e.g. `1e-320`) divided by the count round to `0` and the mean becomes `0`. Why it matters: a silent wrong answer in the exact function this phase changed, on trivial input like `matrix.ones(1, 10)`. Concrete fix: sum first and divide, and only fall back to per-element scaling when the sum is non-finite (or use Neumaier/compensated summation with a scaling guard); add a test asserting `matrix.mean(matrix.ones(1,10)) == 1.0` and one for an odd count. VERIFIED: traced src/matrix.rs:439-441 — `let count = array.len() as f64; let mean = array.iter().map(|number| number / count).sum();` — the summation is naive left-to-right over `1.0/10.0`, whose IEEE-754 result is `0.9999999999999999`; `Value::number` then stores that value, so the literal `1.0` assertion fails.
 
-3. [MAJOR] src/matrix.rs:371-373 — the zero-divisor refusal branch in `matrix.divide` has no test on either side. `tests/matrix_test.rs:130-159` exercises `matrix.divide` only with mismatched shapes (which fail at `same_shape` first), and `tests/stdlib_module_docs_test.rs:695-698` divides `ones` by `ones`; nothing feeds a zero divisor, so deleting the guard would leave the suite green. — Fix: add a test asserting `matrix.divide(matrix.ones(2,2), matrix.zeros(2,2))` is a `Runtime` error naming the zero divisor, and that a non-zero divisor still divides.
+2. [MAJOR] SPEC.md:2005 — the new paragraph states `matrix.mean` "divides each element by the count before adding, so the finite mean of large finite elements stays finite", presenting the inaccurate algorithm as a guarantee. It is not the arithmetic mean for general inputs (finding 1) and it also underflows for small elements; the spec now documents a behaviour that is numerically wrong. Concrete fix: either revert the algorithm and describe overflow handling differently, or specify the actual compensated/scaled algorithm and its limits; do not state divide-before-add as the definition.
 
-4. [MINOR] SURVEY.md:16 — the stated dotted-member total is 138, but `MODULE_MEMBERS` contains 137 entries (the previous 117 plus the 20-member `matrix` row: 117 + 20 = 137, not 138). — Fix: change 138 to 137.
+3. [MINOR] tests/matrix_test.rs:390 — `edge_integer_overflow_in_sum_does_not_wrap` is vacuous: matrices store `f64`, there is no integer accumulator to wrap, so the test cannot detect an integer-overflow bug and its name/REPORT claim ("sum past i64") is misleading. The values `9223372036854775807` are already rounded to `2^63` as `f64` before the sum. Concrete fix: rename it to describe f64 magnitude preservation, or delete it and cover a real numeric boundary.
 
-5. [MINOR] tests/matrix_test.rs:244-261 — the `m[row]` path added at src/runtime.rs:147-148 is only exercised through `eval`, which is the tree-walker; `edge_both_engines_produce_equal_matrix_data` (tests/matrix_test.rs:284-304) never indexes a matrix, so SPEC.md's claim that `m[row]` equals `matrix.row(m, row)` is unpinned on the bytecode VM. — Fix: add `m[1]` to the both-engines test so the runtime index branch is covered on both engines.
+4. [STYLE] src/matrix.rs:272 — `row_values` takes a `span` it never uses and papers over it with `let _ = span;`; drop the parameter (and the call-site argument) instead of discarding it.
 
-REVIEW VERDICT: FINDINGS 5
+REVIEW VERDICT: FINDINGS 4

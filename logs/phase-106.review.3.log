@@ -1,0 +1,25 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/matrix.rs
+[0m→ [0mRead tests/matrix_test.rs
+[0m→ [0mRead src/value.rs
+I'll review the matrix implementation, focusing on the resumed `mean` work and its tests.
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead tests/stdlib_modules_test.rs
+[0m✱ [0mGrep "matrix"[90m in src/stdlib.rs · 100 matches[0m
+[0m✱ [0mGrep "matrix"[90m in src/runtime.rs · 100 matches[0m
+Mean arithmetic looks carefully handled. Now checking the delivery-ack test (possible gate weakening) and the stdlib/runtime integration.
+[0m→ [0mRead src/runtime.rs[90m [offset=130, limit=40][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2770, limit=40][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=640, limit=70][0m
+The mean fix and tests look correct so far. Let me check the runtime dispatch and stdlib registration for integration errors.
+[0m→ [0mRead src/stdlib.rs[90m [offset=2530, limit=110][0m
+I've found a concrete arithmetic hole in the new `mean` fallback. Let me confirm one documentation claim before finalizing.
+[0m✱ [0mGrep "edge_integer_overflow_in_sum_does_not_wrap|edge_sum_keeps_large_f64_magnitudes_past_i64"[90m in . · 2 matches[0m
+FINDINGS:
+1. [BLOCKER] src/matrix.rs:305 — the new overflow fallback (`compensated_sum(array.iter().map(|number| number / count))` then `.unwrap_or_else(|| ... .sum())`) still overflows and refuses a finite mean at the top of the f64 range. For elements `[f64::MAX, f64::MAX, f64::MAX]` (count 3), the direct sum overflows, so the fallback divides first: `a = fl(MAX/3) = (2N+1)·2^970` with `N = 3002399751580330`. Summing the three gives `3a = (2^54-1)·2^970 = MAX + 2^970`, exactly the halfway point between `MAX` and `2^1024`; ties-to-even picks the even neighbour `2^1024`, i.e. `+inf`. `compensated_sum` then returns `None`, the `unwrap_or_else` plain `sum()` also yields `inf`, and line 472 `Value::number(mean_of(&array), span)?` rejects it. So `matrix.mean(matrix.from_lists([[1.7976931348623157e308, 1.7976931348623157e308, 1.7976931348623157e308]]))` raises `RuntimeError: infinity is not a finite number` even though the true mean is the finite value `f64::MAX`. This directly contradicts the phase's own new SPEC sentence ("when that sum would overflow it divides each element by the count before summing, so a large finite mean stays finite") and the README promise that only genuinely non-finite results are refused. The added test passes only because it uses `1e308`, which is ~1800× below `MAX`, so `3·fl(1e308/3)` stays finite. Concrete fix: do not divide each element by the count before summing; use an exact power-of-two scaling (e.g. scale by `2^k`, `k = ceil(log2(count)) + 1`, sum with compensation, rescale) or an online/running mean, and add a test at `f64::MAX` with a non-power-of-two count. — VERIFIED: traced the exact IEEE-754 arithmetic for `[MAX,MAX,MAX]` through `mean_of` lines 300–307; `3·fl(MAX/3)` is the exact tie `MAX + 2^970`, which rounds to `+inf`, and line 472 then refuses it.
+
+2. [MAJOR] src/matrix.rs:462 — `matrix.sum` still uses plain `array.sum()`, so the same intermediate-overflow class the phase fixed for `mean` is unfixed for the sibling reduction: `matrix.sum(matrix.from_lists([[1.7976931348623157e308, 1.7976931348623157e308, -1.7976931348623157e308]]))` accumulates `inf` at the second term and refuses, although the true sum is the finite `f64::MAX`. No test pins this: `edge_large_values_lose_f64_precision_and_overflow_is_refused` only exercises a two-element sum below `f64::MAX`, and `edge_sum_keeps_large_f64_magnitudes_past_i64` only exercises `1.8e19`. The SPEC describes `matrix.sum` as "the sum" and says non-finite results are refused "rather than stored as NaN or infinity", which reads as refusing genuinely non-finite answers, not finite ones whose intermediate overflowed. Fix: use the same compensated/scaled accumulation for `sum` (and add a large-with-cancellation test). — VERIFIED: traced ndarray's sequential accumulation at line 462; `MAX + MAX` is `inf` and `inf + (-MAX)` stays `inf`, so `Value::number` refuses a finite sum. I could not run the binary, so this is a by-inspection trace, not an executed repro.
+
+REVIEW VERDICT: FINDINGS 2

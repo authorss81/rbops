@@ -1,3 +1,28 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
+[0m→ [0mRead src/matrix.rs
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead tests/stdlib_modules_test.rs
+I'll begin by inspecting the core implementation and the most suspicious test/gate files.
+[0m→ [0mRead tests/matrix_test.rs
+[0m✱ [0mGrep "matrix"[90m in src/stdlib.rs · 100 matches[0m
+[0m✱ [0mGrep "matrix"[90m in src/runtime.rs · 100 matches[0m
+[0m✱ [0mGrep "type Fields|pub type Fields|struct Fields"[90m in src/value.rs · 1 match[0m
+[0m✱ [0mGrep "Value::object\("[90m in src · 6 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=640, limit=60][0m
+[0m✱ [0mGrep "phase106|matrix"[90m in tests/stdlib_modules_test.rs · 100 matches[0m
+[0m✱ [0mGrep "matrix"[90m in tests/stdlib_module_docs_test.rs · 100 matches[0m
+[0m→ [0mRead tests/stdlib_modules_test.rs[90m [offset=2440, limit=80][0m
+[0m✱ [0mGrep "matrix_"[90m in tests/stdlib_module_docs_test.rs · 27 matches[0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs[90m [offset=630, limit=140][0m
+FINDINGS:
+1. [MAJOR] src/matrix.rs:302 — the overflow fallback `scale * (sum_of_normalised / count)` loses representable residuals after cancellation: normalising by the largest magnitude makes every much smaller term underflow before it is added. `matrix.mean(matrix.from_lists([[1e308, 1e308, -1e308, -1e308, 1e-308]]))` triggers the fallback (the second partial sum is `inf`, so `compensated_sum` returns `None`) and returns `0` instead of the representable `~2e-309`. Why it matters: the new `mean` can return zero for a nonzero data set, and the SPEC's "averages scaled elements" is not the arithmetic mean in exactly the cancellation case the fallback exists for. Fix: in the fallback divide each element by `count` before summing (`array.iter().map(|x| x / count).sum()`), or track a common exponent; add the repro above as a test. (Not run; traced from the arithmetic at src/matrix.rs:281-309.)
+
+2. [MINOR] src/matrix.rs:346 — `from_lists` appends every value to `flat` and only calls `element_count` at line 376, so a caller-supplied nested list above the 1,000,000-element ceiling is copied (8 bytes per element) before being refused. The SPEC says such a matrix "is refused before it is allocated"; the `Array2` is, but the temporary is not, so the documented ceiling does not bound allocation on this path. Fix: count rows/width and reject `> MAX_ELEMENTS` while accumulating, before pushing.
+
+3. [MINOR] src/matrix.rs:241 — a fractional index is refused with "must be a whole number" and no bound, while the SPEC requires a fractional/negative/out-of-range index to name "the index and the bound". `edge_out_of_bounds_and_type_mismatch_are_caught_errors` (tests/matrix_test.rs:234) only checks for the words "out of bounds", so it cannot catch the missing bound. Fix: include `len` and `what` in the fractional-index message and tighten the test.
+
+4. [MINOR] tests/matrix_test.rs:336 — the new mean tests never exercise the fallback's division by a count whose quotient is not ±1, and never exercise a nonzero residual after cancellation, so the defect in finding 1 passes the suite. Add a fallback case such as `[[1e308, 1e308, -1e308, -1e308, 1e-308]]` and a fallback case with `sum/count` strictly between −1 and 1 (e.g. `[[1e308, 1e308, -1e308]]`).
+
+REVIEW VERDICT: FINDINGS 4
