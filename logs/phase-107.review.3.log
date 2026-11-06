@@ -1,0 +1,27 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/decimal.rs
+[0m→ [0mRead src/statistics.rs
+I'll focus on the core arithmetic and statistics implementations, plus the tests. Let me read the key files in parallel.
+[0m✱ [0mGrep "fn number|Decimal|is_finite|non-finite|non_finite"[90m in src/value.rs · 100 matches[0m
+[0m✱ [0mGrep "Decimal|decimal|variance|statistics|non-finite|non_finite|is_finite"[90m in src/runtime.rs · 100 matches[0m
+[0m→ [0mRead tests/statistics_decimal_test.rs
+[0m→ [0mRead src/runtime.rs[90m [offset=180, limit=380][0m
+[0m✱ [0mGrep "pub fn number|Value::number|non-finite|not a finite number"[90m in src/value.rs · 36 matches[0m
+[0m✱ [0mGrep "sum_all|statistics::builtin|decimal_from_text|decimal_sum|Decimal::parse|from_f64|to_f64"[90m in src · 30 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2890, limit=145][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead tests/doc_blocks_known_fail.txt
+[0m✱ [0mGrep "decimal|mean|median|mode|percentile|correlation|variance|standard_deviation"[90m in tests · 2 matches[0m
+[0m→ [0mRead tests/stdlib_module_docs_test.rs
+[0m✱ [0mGrep "SPEC\.md:1[34][0-9][0-9]"[90m in tests · 3 matches[0m
+FINDINGS:
+
+1. [BLOCKER] src/statistics.rs:286 — `correlation_of` accumulates `left_squares`/`right_squares` in raw `f64` with no overflow guard, so a finite answer can be computed as a wrong finite answer rather than refused. For `correlation([1e200, -1e200], [1, 2])`: means are 0 and 1.5; the deltas are `±1e200` and `∓0.5`; line 287 makes `left_squares = 1e400 + 1e400 = inf`, while line 286's numerator stays `-1e200` (finite). At line 299 `numerator / (left_squares.sqrt() * right_squares.sqrt())` is `-1e200 / inf = -0.0`, and `Value::number(-0.0)` accepts it. The true Pearson coefficient is `-1`. SPEC says correlation is Pearson's coefficient from `-1` to `1`, and the phase claims the "very large magnitude" edge class is covered; this silently answers `-0.0`. Fix by scaling the deltas (or the sums) before squaring/accumulating, or by detecting any non-finite accumulator and returning a `Runtime` error naming correlation, as `variance` effectively does at line 240 via `Value::number`; never return a finite ratio from an infinite denominator. — VERIFIED: traced the exact path through `src/statistics.rs:280-299`; line 290's zero check does not fire because the sums are `inf`, not `0.0`, and line 299 divides the finite `-1e200` by `inf`.
+
+2. [MINOR] src/decimal.rs:102 — `parse` rejects text based on the raw written scale, before the normalization that `Decimal::new` (line 37) and `product` (lines 182-189) now perform. `decimal.from_text("0.0000000000000000010")` is one atom of 1e-18 (19 places written, 18 needed) but is refused with "has 19 places after the point", while the same value is accepted through `Decimal::new` or as a product. This is inconsistent within the phase and surprising for text that "keeps every digit". Fix: strip trailing fractional zeros from `fraction` (or call `Decimal::new` on the parsed mantissa/scale) before the `scale > MAX_SCALE` check, so the check is on the value's needed scale, not its spelling. — This is a consistency/edge finding, not a crash.
+
+3. [MINOR] src/decimal.rs:274 — `compare` forces both operands to a common scale via `mantissa_at` (lines 304-310), which can overflow `i128` even when the ordering is trivially answerable. Comparing `decimal.from_text("170141183460469231731687303715884105727")` with `decimal.from_text("0.000000000000000001")` aligns the first mantissa to 18 places, overflows, and returns "the decimal is too large to hold" instead of `Greater`. SPEC says `decimal` ordering is exact, and it is reachable from Redbird source; the refusal is at least safe, but it is an undocumented limitation. Fix: compare by sign, then integer-digit length, or use the existing `Wide` 256-bit path before falling back to a common scale.
+
+REVIEW VERDICT: FINDINGS 3

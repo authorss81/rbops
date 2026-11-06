@@ -1,0 +1,29 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/decimal.rs
+[0m→ [0mRead src/statistics.rs
+[0m→ [0mRead src/value.rs
+[0m✱ [0mGrep "Decimal|decimal|DecimalError|from_text|from_number"[90m in src/runtime.rs · 100 matches[0m
+[0m✱ [0mGrep "Decimal|decimal"[90m in src/runtime.rs · 100 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=150, limit=330][0m
+[0m✱ [0mGrep "decimal_from_text|decimal_from_number|decimal_to_number|decimal_sum|statistics::builtin|decimal_to_text"[90m in src · 6 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2880, limit=180][0m
+[0m✱ [0mGrep "Value::Decimal"[90m in src · 34 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [limit=40, offset=500][0m
+[0m→ [0mRead src/runtime.rs[90m [limit=30, offset=5035][0m
+[0m→ [0mRead tests/statistics_decimal_test.rs
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=120, offset=220][0m
+[0m✱ [0mGrep "matrix_mean|module_has_member|fn module_member|format!\(\"\{}_\{\}\""[90m in src · 15 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=100, offset=15][0m
+FINDINGS:
+
+1. [BLOCKER] src/decimal.rs:232 — `remainder` evaluates `left % right` unguarded; Rust panics on `i128::MIN % -1`, and that value is reachable from Redblue source — `decimal.from_text("-85070591730234615865843651857942052864") * decimal.from_text("2")` yields mantissa `i128::MIN` (checked_mul returns `Some(i128::MIN)` at line 174), then `... % decimal.from_text("-1")` reaches line 232 and aborts the process instead of raising a catchable `Runtime` error. There is also no test for `mod`/remainder anywhere in `src/decimal.rs` or `tests/statistics_decimal_test.rs`. Fix: use `checked_rem` and return a `Runtime` error (or zero for the `MIN % -1` case, which is mathematically 0). VERIFIED: traced parse of `-2^126` → `product` (line 174 `checked_mul` = `-2^127`, representable) → `remainder` line 232 `left % right` with `-1`.
+
+2. [BLOCKER] src/decimal.rs:181 — `product` refuses a result whose scale sum exceeds `MAX_SCALE` *before* normalizing trailing zeros, so a representable exact product is rejected: `decimal.from_text("0.0000000025") * decimal.from_text("0.0000000004")` is exactly `1e-18` (18 places, fits), but mantissa `100` with scale `10+10=20` hits the line 181 error. `SPEC.md` says multiplication is exact "while the result fits", so this contradicts the spec (the existing test only covers `1e-18 * 1e-18 = 1e-36`, which genuinely cannot fit). Fix: strip trailing zeros from the product mantissa (reducing scale) before the `MAX_SCALE` check; note `Decimal::new` at line 37 has the same order problem, so normalization must happen before both checks. VERIFIED: traced `25/10^10 × 4/10^10 = 100/10^20 = 1/10^18`.
+
+3. [MAJOR] src/runtime.rs:2989 (with src/decimal.rs:154) — `decimal.sum` accumulates with `sum_with`, so an intermediate overflow aborts even when the final exact sum fits: `decimal.sum([decimal.from_text("170141183460469231731687303715884105727"), decimal.from_text("170141183460469231731687303715884105727"), decimal.from_text("-170141183460469231731687303715884105727")])` errors at the first addition although the exact answer is `i128::MAX`. SPEC.md promises `decimal.sum` "adds a list of decimals exactly" without stating this limitation. Fix: accumulate exactly in a wider form/cancel before overflow, or document the refusal in SPEC and add a test pinning it.
+
+4. [MINOR] tests/statistics_decimal_test.rs:254 — `edge_mean_and_variance_do_not_overflow_on_large_finite_values` only checks equal values (`[1e308, 1e308]`), so it does not actually pin the claim that variance does not overflow; `variance([1e308, -1e308])` squares to infinity and becomes a non-finite runtime error, contradicting the REPORT test-matrix row "large finite mean/variance do not overflow". Narrow the claim or add the cancelling case and state the expected error in SPEC.
+
+REVIEW VERDICT: FINDINGS 4
