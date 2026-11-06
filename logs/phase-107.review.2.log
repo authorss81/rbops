@@ -1,29 +1,28 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/decimal.rs
 [0m→ [0mRead src/statistics.rs
-[0m→ [0mRead src/value.rs
-[0m✱ [0mGrep "Decimal|decimal|DecimalError|from_text|from_number"[90m in src/runtime.rs · 100 matches[0m
-[0m✱ [0mGrep "Decimal|decimal"[90m in src/runtime.rs · 100 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=150, limit=330][0m
-[0m✱ [0mGrep "decimal_from_text|decimal_from_number|decimal_to_number|decimal_sum|statistics::builtin|decimal_to_text"[90m in src · 6 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=2880, limit=180][0m
-[0m✱ [0mGrep "Value::Decimal"[90m in src · 34 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [limit=40, offset=500][0m
-[0m→ [0mRead src/runtime.rs[90m [limit=30, offset=5035][0m
+[0m→ [0mRead src/decimal.rs
+[0m✱ [0mGrep "Decimal|decimal|equality|statistics"[90m in . · 100 matches[0m
+[0m✱ [0mGrep "Decimal|fn number|is_finite|type_name|fn list"[90m in . · 13 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=190, limit=380][0m
+[0m→ [0mRead src/runtime.rs[90m [offset=2920, limit=160][0m
 [0m→ [0mRead tests/statistics_decimal_test.rs
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=120, offset=220][0m
-[0m✱ [0mGrep "matrix_mean|module_has_member|fn module_member|format!\(\"\{}_\{\}\""[90m in src · 15 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=100, offset=15][0m
+[0m✱ [0mGrep "decimal|"mean"|"median"|"mode"|"variance"|"standard_deviation"|"percentile"|"correlation""[90m in . · 51 matches[0m
+[0m✱ [0mGrep "MODULE_MEMBERS|module_has_member|module_member|fn module|module_call|format!\("\{\}_\{\}"|underscore"[90m in . · 58 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=150, limit=120][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=1990, limit=75][0m
+[0m→ [0mRead src/value.rs[90m [offset=600, limit=60][0m
+[0m✱ [0mGrep "date.*is|is.*date|duration.*is|is.*duration|Cannot compare a|same kind|different kind|unlike|mixed.*kind"[90m in tests · 90 matches[0m
+[0m✱ [0mGrep "is not|`is`|operators|equal|different type|different kind"[90m in . · 84 matches[0m
+[0m✱ [0mGrep "matrix_mean|matrix_sum|list_map|"matrix_|"list_|matrix_builtin|fn matrix"[90m in . · 91 matches[0m
+[0m✱ [0mGrep "matrix\.mean|matrix\.sum|list\.length|matrix_mean|list_map"[90m in tests · 50 matches[0m
 FINDINGS:
 
-1. [BLOCKER] src/decimal.rs:232 — `remainder` evaluates `left % right` unguarded; Rust panics on `i128::MIN % -1`, and that value is reachable from Redblue source — `decimal.from_text("-85070591730234615865843651857942052864") * decimal.from_text("2")` yields mantissa `i128::MIN` (checked_mul returns `Some(i128::MIN)` at line 174), then `... % decimal.from_text("-1")` reaches line 232 and aborts the process instead of raising a catchable `Runtime` error. There is also no test for `mod`/remainder anywhere in `src/decimal.rs` or `tests/statistics_decimal_test.rs`. Fix: use `checked_rem` and return a `Runtime` error (or zero for the `MIN % -1` case, which is mathematically 0). VERIFIED: traced parse of `-2^126` → `product` (line 174 `checked_mul` = `-2^127`, representable) → `remainder` line 232 `left % right` with `-1`.
+1. [MAJOR] src/runtime.rs:349-355 — `in` was changed from `items.contains(&left)` to calling `equality`, which returns `Err` for any mixed-kind pair (`mixed_kinds` at src/runtime.rs:436-444). This is broader than decimals: `time.date(2024, 1, 1) in [5, time.date(2024, 1, 1)]` now aborts with `Cannot compare a date with a number` instead of answering `yes`, and `date in [5]` changes from `no` to a runtime error. SPEC.md:407 says `in` "answers `yes` when the left side equals one of its elements by value", and the phase only claims decimal/number mixing. Fix: keep membership boolean (use a membership-specific comparison that treats other-kind elements as unequal) or add date/duration membership tests and a SPEC decision. Checked by tracing `binary_op` → `equality` → `mixed_kinds`; no existing test pins mixed-kind membership.
 
-2. [BLOCKER] src/decimal.rs:181 — `product` refuses a result whose scale sum exceeds `MAX_SCALE` *before* normalizing trailing zeros, so a representable exact product is rejected: `decimal.from_text("0.0000000025") * decimal.from_text("0.0000000004")` is exactly `1e-18` (18 places, fits), but mantissa `100` with scale `10+10=20` hits the line 181 error. `SPEC.md` says multiplication is exact "while the result fits", so this contradicts the spec (the existing test only covers `1e-18 * 1e-18 = 1e-36`, which genuinely cannot fit). Fix: strip trailing zeros from the product mantissa (reducing scale) before the `MAX_SCALE` check; note `Decimal::new` at line 37 has the same order problem, so normalization must happen before both checks. VERIFIED: traced `25/10^10 × 4/10^10 = 100/10^20 = 1/10^18`.
+2. [MINOR] src/decimal.rs:109-119 — `Decimal::parse` accumulates the magnitude in a positive `i128` and only then negates it, so `decimal.from_text("-170141183460469231731687303715884105728")` is rejected as "too large" even though that value is exactly `i128::MIN` and is representable (`mantissa_from_magnitude` at src/decimal.rs:610-624 explicitly accepts that magnitude for the negative sign). The same asymmetry appears in `Wai::to_i128` at src/decimal.rs:468-474, so a negative quotient of magnitude `2^127` is refused. Fix: accumulate/convert the magnitude as `u128` or special-case `i128::MIN`, and add a boundary test for negative minimum text and quotient.
 
-3. [MAJOR] src/runtime.rs:2989 (with src/decimal.rs:154) — `decimal.sum` accumulates with `sum_with`, so an intermediate overflow aborts even when the final exact sum fits: `decimal.sum([decimal.from_text("170141183460469231731687303715884105727"), decimal.from_text("170141183460469231731687303715884105727"), decimal.from_text("-170141183460469231731687303715884105727")])` errors at the first addition although the exact answer is `i128::MAX`. SPEC.md promises `decimal.sum` "adds a list of decimals exactly" without stating this limitation. Fix: accumulate exactly in a wider form/cancel before overflow, or document the refusal in SPEC and add a test pinning it.
+3. [MINOR] src/runtime.rs:449-451 — `mixed_kinds` recurses into lists with `a.iter().zip(b.iter())`, so only the first `min(len)` positions are checked. `[1, decimal.from_text("1")] is [1]` returns `no` instead of the mixed-kind error the function's own contract promises ("a list holding a decimal and one holding a number are just as mixed as their elements"). Fix: scan each side's elements for direct mixed kinds, or iterate to the longer length, and add an unequal-length list test.
 
-4. [MINOR] tests/statistics_decimal_test.rs:254 — `edge_mean_and_variance_do_not_overflow_on_large_finite_values` only checks equal values (`[1e308, 1e308]`), so it does not actually pin the claim that variance does not overflow; `variance([1e308, -1e308])` squares to infinity and becomes a non-finite runtime error, contradicting the REPORT test-matrix row "large finite mean/variance do not overflow". Narrow the claim or add the cancelling case and state the expected error in SPEC.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 3
