@@ -1,30 +1,23 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead tests/bench/mod.rs
-[0m→ [0mRead tests/bench_test.rs
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
-I'll inspect the changed files, starting with the core harness and its tests.
+[0m→ [0mRead tests/bench/mod.rs[90m [limit=2000][0m
+[0m→ [0mRead tests/bench_test.rs[90m [limit=2000][0m
 [0m→ [0mRead tests/bench/runner.rs
 [0m→ [0mRead BENCH.md
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+Partial observations so far: the harness enforces size caps and budgets, and tests look substantive. Let me check the runner, baseline, audit test, and manifest.
 [0m→ [0mRead Cargo.toml
-[0m✱ [0mGrep "fn run_source_value"[90m in src · 2 matches[0m
-[0m✱ [0mGrep "impl fmt::Display for Value|Value::Text\("[90m in src/value.rs · 100 matches[0m
-Initial findings forming. Let me inspect the runner, manifest, baseline, and the Value display used by the baseline comparison.
-[0m→ [0mRead src/interpreter.rs[90m [offset=2220, limit=100][0m
-[0m✱ [0mGrep "GiveBack|Return\(|ControlFlow|enum Flow|ReturnValue"[90m in src/interpreter.rs · 32 matches[0m
-Let me verify the pre-existing `give back` claim in FINDINGS.md, since a false finding there would itself be a defect.
-[0m✱ [0mGrep "ForEach|For \{|Statement::For|range|Range"[90m in src/interpreter.rs · 100 matches[0m
-Let me verify the range semantics that determine whether `primes` at size 1 is correct, since the harness never tests that boundary.
+[0m→ [0mRead src/interpreter.rs[90m [offset=2220, limit=70][0m
+The harness code is largely solid. Let me verify the phase's headline pre-existing bug claim and whether a test already pins that behavior.
+[0m✱ [0mGrep "give back|GiveBack"[90m in tests · 100 matches[0m
+[0m✱ [0mGrep "--compare|compare_with_baseline|BaselineRow"[90m in tests · 16 matches[0m
+[0m✱ [0mGrep "allow\(dead_code\)|allow\(unused\)"[90m in tests · 0 matches[0m
+Verifying that no existing test already pins the `--compare` path or suppresses dead code, so I don't repeat a false finding.
 FINDINGS:
-1. [MAJOR] tests/bench_test.rs:304-330 (with tests/bench/mod.rs:43-45,313-325,660-669) — The "checkable maximum" is only a numeric comparison for three of four workloads. `check_size_supported` merely calls `ensure_workload_size_supported`; it never runs anything. `MAX_CONCAT_SIZE` is 10_000_000 while `run_concat` (mod.rs:660-669) concatenates a growing string `size` times, i.e. O(n²); at 10M that is ~10^14 character copies and cannot finish inside `DEFAULT_BUDGET` (60 s), so `run_workload("concat", 10_000_000, DEFAULT_BUDGET)` necessarily returns `BudgetExceeded` and leaves a detached CPU-burning worker. `primes` at 10M (trial division, ~10^10 operations through the interpreter) is likewise unmeasurable. The boundary test asserts `max + 1` is refused without ever demonstrating that `max` itself can be measured (only fibonacci is actually run at its max, in `edge_fibonacci_is_capped_where_f64_is_exact`). So the harness advertises a maximum it cannot deliver. Settle it by capping each workload at a size that completes inside the budget and adding a test that actually measures at `max`, or by renaming/redocumenting this as "largest reference answer we will materialize" rather than "checkable maximum".
+1. [MAJOR] tests/bench/mod.rs:776-789 — the new `--compare` CLI branch and `compare_with_baseline` (tests/bench/mod.rs:703-740) have no test on either side; grep shows no test ever passes `--compare` to `run_cli`/`run_cli_with_path`, and `tests/bench_test.rs:778` only exercises `render_comparison` directly. The file-read, parse, per-row re-run, and exit-code behavior of the user-facing mode are entirely uncovered. — Add a CLI test that writes a temp baseline, runs `run_cli_with_path(&["--compare", path], ...)`, and asserts exit 0 plus the expected rows, mirroring `edge_cli_no_arguments_runs_all_and_writes_a_parseable_baseline`.
+2. [MAJOR] tests/bench/mod.rs:703-732 — `compare_with_baseline` iterates over every parsed row and calls `run_workload(&row.workload, row.size, DEFAULT_BUDGET)` (line 725) with a *fresh* 60s budget each time, while `parse_baseline_markdown` (line 636-663) neither dedupes nor caps rows (it only rejects unknown names). A baseline file containing N repeated known-workload rows therefore makes `rb-bench --compare` run N workloads for up to N×60s (each spawning a detached thread), contradicting the module's stated invariant that `run_all` shares one budget (mod.rs:747-765). — Enforce one shared budget across the comparison loop and reject duplicate/wrong-size rows, or cap the row count. TRACED: parser push at mod.rs:656-661, loop at 723-732, per-row `DEFAULT_BUDGET` at 725.
+3. [MINOR] tests/bench_test.rs:650-660 — the write-failure test passes a *directory* (`dir`) as `output`; `timings_path` (tests/bench/mod.rs:617-619) uses `with_file_name("BENCH_TIMINGS.md")`, which replaces the last path component, so `.../rb-bench-write-failure-<pid>-<nanos>` resolves to `.../BENCH_TIMINGS.md` in the parent (normally `/tmp/BENCH_TIMINGS.md`). The timing write escapes the test sandbox, can clobber a real `/tmp/BENCH_TIMINGS.md`, is never cleaned up, and the test can pass because the *timing* write failed rather than the baseline write. — Derive the timing path from `output.parent()` only when `output` is a file, and use an output path whose parent makes the intended write fail (e.g. an unwritable subdirectory inside `dir`).
+4. [MINOR] tests/bench/mod.rs:644-647 — `parse_baseline_markdown` silently `continue`s on any row whose first cell is not an exact known workload name, despite the doc at 630-635 promising a corrupted baseline cannot compare as if it had fewer workloads. A typo such as `| fibonacii | 20 | 6765 | 1.0 ms |` is dropped and `--compare` exits 0 over the remaining rows. — If a four-cell row carries a parseable numeric size but an unknown workload name, return an error instead of skipping it; also reject duplicate `(workload, size)` rows.
 
-2. [MINOR] tests/bench_test.rs:163-167 — The "singleton" coverage label is wrong and leaves the real boundary untested: the test calls `run_workload("primes", 2, ...)` expecting 1, which is "primes ≤ 2", not "primes below 2". The size-1 side of `expected_primes`'s `if size < 2 { return 0 }` (mod.rs:637-643) is never exercised, so the zero→one transition of the `primes` reference is unverified. Add `run_workload("primes", 1)` expecting 0.
-
-3. [MINOR] tests/bench/mod.rs:477-483 — When `run_all`'s shared budget is exhausted (`remaining.is_zero()`), it builds `BenchError::BudgetExceeded { budget }` with the *full* budget passed to `run_all`, not the zero remaining time it just measured. The Display then claims the workload "did not finish within its 60.000s budget" when that workload was never given 60 s. Report the remaining duration (or a distinct exhausted-budget message) so the error is accurate.
-
-4. [MINOR] BENCH.md:7-10 — The checked-in baseline records volatile, machine-specific timings and is regenerated by every `rb-bench` run. The gate never asserts them, and the uncommitted diff already shows all four changing (e.g. primes 75.685 → 81.838 ms), so every regeneration produces a meaningless diff and the "baseline" is not reproducible. Consider committing the answer column only, or writing timings to an untracked artifact.
-
-5. [MINOR] tests/bench/mod.rs:463-466 — `bench_md_path()` resolves to the compile-time `CARGO_MANIFEST_DIR`, so the shipped `rb-bench` binary writes `BENCH.md` into the build-time source directory (read-only or gone after `cargo install`). Tests only exercise `run_cli_with_path`, so the real path is never tested and the installed binary's behaviour is unverified. Use the current working directory or an explicit env override.
-
-REVIEW VERDICT: FINDINGS 5
+REVIEW VERDICT: FINDINGS 4
