@@ -1,32 +1,21 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead tests/bench/mod.rs
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=540, limit=130][0m
 [0m→ [0mRead tests/bench_test.rs
 [0m→ [0mRead tests/bench/runner.rs
-[0m→ [0mRead Cargo.toml
-I'll inspect the phase files within budget.
-[0m✱ [0mGrep "GiveBack|Statement::Return|fn execute_block|ControlFlow|fn execute_statement"[90m in src/interpreter.rs · 34 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2180, limit=200][0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=140, offset=2495][0m
-[0m✱ [0mGrep "execute_statements\(|run_block\(|fn call_function|fn run_iteration|fn run_block"[90m in src/interpreter.rs · 16 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=160, offset=3000][0m
-[0m✱ [0mGrep "give back"[90m in tests · 64 matches[0m
-[0m✱ [0mGrep "early.return|GiveBack|give_back|give back"[90m in tests · 100 matches[0m
-[0m→ [0mRead tests/test_functions.rb[90m [limit=150, offset=40][0m
-[0m→ [0mRead tests/test_closures.rb[90m [limit=30, offset=8][0m
-[0m✱ [0mGrep "^\| concat \| 200 \| (ab){200} \| [0-9.]+ ms \|$"[90m in BENCH.md · 1 match[0m
-[0m→ [0mRead BENCH.md
+[0m→ [0mRead tests/bench/mod.rs[90m [limit=120, offset=200][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=120, offset=180][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=180][0m
+[0m→ [0mRead tests/bench/mod.rs[90m [limit=115, offset=440][0m
+[0m→ [0mRead tests/bench/mod.rs[90m [limit=75, offset=36][0m
+[0m→ [0mRead tests/bench/mod.rs[90m [limit=75, offset=368][0m
 FINDINGS:
+1. [MAJOR] tests/bench/mod.rs:297-302 (with Display at tests/bench/mod.rs:104-108) — an oversized size is refused by `ensure_size_supported` and returned as `BenchError::BudgetExceeded`, whose Display says the workload "did not finish within its {n}s budget". The workload never started, and for the sub-second budgets the tests actually use (1ms/20ms) the message prints "its 0s budget". A user running `rb-bench fibonacci 20000000` is told a falsehood about elapsed work — a misleading failure channel in a phase whose whole point is clean failure. The tests (`tests/bench_test.rs:266-288`, and `tests/bench/mod.rs:645-655`) only pin the variant, not the message, so this is not contradicted by a test — but the fix should either make the Display truthful ("size N exceeds the checkable maximum M for 'fibonacci'") or add a distinct `SizeTooLarge { workload, size, max }` variant and update those two tests.
+2. [MAJOR] tests/bench/mod.rs:437-453 — the primary documented entry point, `rb-bench` with no arguments (run all four, print the table, write `BENCH.md`), is untested. Every `run_cli` call in `tests/bench_test.rs:365-399` passes one or more arguments; nothing exercises the no-arg branch or the `std::fs::write` failure branch at line 447. This is exactly the branch the phase exists to deliver, and a regression that writes a wrong/empty file or returns the wrong exit code there would not be caught. Make the output path injectable (a `run_cli_with_path` used by both `run_cli` and a test writing to a temp dir) and assert the no-arg path writes a parseable file.
+3. [MINOR] tests/bench/mod.rs:427-431 — `run_all` passes `DEFAULT_BUDGET` (60s) to each workload individually, so the no-arg CLI can block for up to 240s before any error, while `REPORT.md` and the `DEFAULT_BUDGET` doc (tests/bench/mod.rs:19-24) present "a 60-second self-enforced budget" as a single bound. Use one deadline (`Instant` + remaining time) across the run, or state that it is per workload.
+4. [MINOR] tests/bench/mod.rs:32-37,59,292-304 — the per-workload `max_size` boundary is never tested: `edge_oversized_references_are_refused_before_allocation` (tests/bench_test.rs:266-288) only uses values far above the limit, so nothing pins `max_size` accepted / `max_size + 1` refused. Relatedly, `MAX_FIBONACCI_SIZE = 10_000_000` lets `expected_fibonacci` run into f64 infinity (fib overflows f64 around n≈1477), and `Expected::matches` uses `want == got`, so `inf == inf` is accepted as a "verified" answer. Add boundary tests and either cap Fibonacci where f64 is exact or reject non-finite expected values.
+5. [MINOR] tests/unreviewed_work_ack_test.rs:254 vs 283-295 — the new `"resume phase-073:"` prefix is acknowledged with `DELIVERY_REASON`, but that reason enumerates only phase-084, phase-063 and phase-088, so the audit now records an acknowledgement whose text does not describe the phase-073 bench harness it is accepting. Extend `DELIVERY_REASON` (and the "in-flight phases" comment at 245-251) to name phase-073's files, or the audit data is inaccurate for the commit it tolerates.
+6. [STYLE] tests/bench/mod.rs:65-70 vs 109-117 — `WrongAnswer` renders the expected text with `{:?}` (quoted) but the actual value with `Display` (unquoted), so a text mismatch reports e.g. `expected "\"ab\"", actual ab`. Render both the same way so the error is readable.
 
-1. [MAJOR] tests/bench_test.rs:26-45 — the checked-in baseline is only checked for substrings: `bench_md_exists_and_names_all_workloads` asserts the file contains each workload name, `"hardware"`, and `"ms"`, but never parses or validates the Size/Answer columns at BENCH.md:7-10. The phase's headline claim ("The answer column is verified by the harness before a row is written") is only true at generation time; nothing in the gate proves the checked-in table still agrees with the workloads. A workload whose answer changes can leave BENCH.md lying while every test stays green. Fix: parse the markdown rows and assert each `(size, answer)` equals `run_workload(name, size).answer`, which also pins concat at 200 and lex at 200 (currently only concat=7/lex=100 are pinned by `bench_workloads_compute_the_documented_literals`).
-
-2. [MAJOR] tests/bench/mod.rs:227-234 — the `WrongAnswer` refusal path is unreachable from the test suite: every in-gate invocation uses a workload whose `expected()` was designed to match, so the branch that turns a bad answer into `BenchError::WrongAnswer` is never exercised. The harness's core safety property ("A wrong answer is an error, never a fast success", mod.rs:216-217) is therefore unpinned; a regression that makes `Expected::matches` always return true would not fail a test for this branch. Fix: expose a test-only workload (or a `run_workload_with`) whose expected answer is deliberately wrong and assert `BenchError::WrongAnswer` is returned and no `Measurement` is produced. Same gap applies to `BenchError::Load`/`Disconnected` at mod.rs:205-212.
-
-3. [MINOR] tests/bench/mod.rs:197-213 — `run_with_budget` reports `BudgetExceeded` at the deadline but cannot stop the worker; the spawned thread (with its `f` already running) is detached and keeps consuming CPU. For the CLI this is masked by `std::process::exit`, but inside the test gate a regressed non-terminating workload leaves a runaway thread alive for the rest of the test process, so the 60-second budget bounds only the waiting, not the work. The doc comment admits this (mod.rs:183-186), but the resource-limit row in REPORT.md claims the budget "keeps a hung workload from hanging CI"; it does not stop it. Consider running each measurement in a child process with a kill, or state the limitation explicitly.
-
-4. [MINOR] tests/bench/mod.rs:364-379 — exit-code/usage behaviour is inconsistent for the same unknown-workload class: `[name]` validates via `default_size` and returns 2 with usage, while `[name, size]` only parses the size and defers name validation to `run_workload` (mod.rs:386-393), so `rb-bench bogus 5` exits 1 with no usage while `rb-bench bogus` exits 2 with usage. No test covers an unknown workload with an explicit size. Validate the name in the `[name, size]` arm (or centralize it in `run_cli`) and add a test.
-
-5. [STYLE] tests/bench/mod.rs:6 — the module doc says the runner is `tests/bench/main.rs`, but the actual target is `tests/bench/runner.rs` (Cargo.toml:22). Stale reference; update it.
-
-REVIEW VERDICT: FINDINGS 5
+REVIEW VERDICT: FINDINGS 6
