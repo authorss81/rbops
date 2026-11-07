@@ -1,22 +1,26 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
+[0m→ [0mRead tests/bench/mod.rs
 [0m→ [0mRead tests/bench_test.rs
-[0m→ [0mRead tests/bench/runner.rs
 [0m→ [0mRead BENCH.md
-[0m→ [0mRead tests/bench/mod.rs[90m [offset=430, limit=430][0m
+[0m→ [0mRead tests/bench/runner.rs
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-I have enough to synthesize. Findings below are read-only observations; I could not run the gate.
-
+[0m→ [0mRead src/interpreter.rs[90m [offset=2220, limit=90][0m
+[0m✱ [0mGrep "GiveBack|Return|return_value|fn execute_block|fn run_block"[90m in src/interpreter.rs · 63 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1060, limit=90][0m
+[0m✱ [0mGrep "enum LoopControl|LoopControl::Return|Return\(Value|Some\(LoopControl"[90m in src/interpreter.rs · 7 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=520, limit=40][0m
+[0m✱ [0mGrep "run_block\(|execute_statements\(|fn call_function|fn call_user|loop_control"[90m in src/interpreter.rs · 43 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2520, limit=60][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=3090, limit=50][0m
 FINDINGS:
-1. [MAJOR] tests/bench/mod.rs:442-449 (and BENCH.md:3,7-9) — the resumed change now writes wall-clock time into the *tracked* `BENCH.md`, and `render_markdown` emits `row.elapsed` plus the machine name, so every `rb-bench` run rewrites a tracked file with different numbers. This is wall-clock nondeterminism in a checked-in artifact: the "baseline" is not reproducible across machines/builds, and nothing anywhere compares a future run against these values, so the report's claim that "a later phase can detect a regression" is unsupported. It also directly contradicts `render_timings`' own doc at tests/bench/mod.rs:488-493 ("Machine-specific and not checked in") and the new `.gitignore` comment that "only the verified answers are tracked". Concrete fix: keep volatile timings in the untracked `BENCH_TIMINGS.md` and record only verified answers in `BENCH.md`, or add an explicit hardware/build-normalisation story plus a comparison tool; at minimum update the `.gitignore`/`render_timings` prose so the repo has one contract. Not run-verified; traced by reading the render path and the docs.
+1. [MAJOR] phases/phase-073/REPORT.md:84 — The gate summary claims `2708 tests, 4 rust / 4 edge / 4 failure-asserting`, but the only tests this resumed diff adds are the four at tests/bench_test.rs:1058-1161, and only `edge_check_size_supported_rejects_negative_and_unknown_names` (1114-1142) asserts a failure; the other three assert success or paths. The count also jumps 2699 -> 2708 while the diff adds four tests (2699+4=2703; the 5-test delta is unexplained, though it could be the `rb-bench` bin's five unit tests). Why it matters: the gate table is the phase's evidence that the gate passed; a summary that does not match the diff means the gate ran on a different tree or the report is inaccurate. Fix: re-run `cargo test --all-targets` and `../rbops/verify.sh phase-073` on this exact tree and paste the actual counts, or explain the 5-test delta. Not a BLOCKER only because I could not read `../rbops/verify.sh` to confirm its failure-asserting threshold. VERIFIED: read the four added test bodies and counted one failure-asserting test.
 
-2. [MAJOR] tests/bench_test.rs:27-29 and 684-686 — both baseline tests locate the checked-in file via `bench::bench_md_path()` (tests/bench/mod.rs:534-537), which returns `$RB_BENCH_OUTPUT` when set. That override is a documented, supported mode, so in any environment that sets it these tests read a foreign/stale file instead of the repo's `BENCH.md`; the checked-in baseline is then never validated (or the test fails spuriously). The sibling test at tests/bench_test.rs:284-293 already guards `if RB_BENCH_OUTPUT.is_none()`, which shows the hazard is known. Fix: resolve the baseline from the manifest directory, as `tests/unreviewed_work_ack_test.rs:450-452` does with `env!("CARGO_MANIFEST_DIR")`, instead of ambient cwd/env. This is an env-coupled test defect.
+2. [MINOR] phases/phase-073/REPORT.md:7-13 — The "What changed" line counts do not match the diff: `tests/bench/mod.rs` is a new 1147-line file, not `+349 −30`; `BENCH.md` is a new 15-line file, not `+8 −8`; `.gitignore` is `+4/−1`, not `+2 −1`; `tests/unreviewed_work_ack_test.rs` is `+10/−5`, not `+1`. Why it matters: this table is the phase's map of what it touched; wrong counts make scope verification harder. Fix: correct the table or label the counts as per-attempt.
 
-3. [MAJOR] tests/bench_test.rs:45-48 — this diff inverts an existing assertion from `!text.contains("Wall time")` ("the checked-in baseline must not record volatile wall times") to `text.contains("Wall time")`. That removes the only guard that kept volatile timings out of the tracked baseline and replaces it with an assertion demanding exactly the property the previous test forbade. Combined with finding 1, the repository now contains two contradictory contracts (the test demands tracked timings; `.gitignore`/`render_timings` say timings are untracked). Fix: decide the contract and make the test and the documentation agree; if timings stay in `BENCH.md`, delete the contradictory `.gitignore`/`render_timings` wording and state how cross-machine comparison works.
+3. [MINOR] tests/bench/mod.rs:232-266 — `run_with_budget` spawns a worker and `recv_timeout`s it; on timeout the thread is detached and keeps running. The 60-second budget bounds the caller's wait, not the work, so a hung workload is a resource leak until process exit (the report documents this as a known gap). Fix: run the measurement in a child process and kill it, or add a cancellation hook.
 
-4. [MINOR] tests/bench/mod.rs:596-606 — the no-argument runner writes `BENCH.md` first and only then writes `BENCH_TIMINGS.md`; if the second write fails it returns exit 1 after the tracked baseline has already been replaced, leaving a half-updated output set. Fix: write both to temporary paths and rename only after both succeed, or write the timing artifact first.
+4. [MINOR] tests/bench_test.rs:1059-1097 — `edge_table_truncates_long_answers_by_characters` only asserts that `"..."` appears and the full 60-character string is absent; it never asserts the truncated cell is the first 17 CJK characters plus `"..."`, so a truncation to one character plus `"..."` would also pass. Fix: assert the exact truncated answer and its 20-character length.
 
-5. [MINOR] tests/bench/mod.rs:511-526 — `hardware_note()` reads `/proc/cpuinfo` and silently falls back to "unknown CPU" on non-Linux, yet `BENCH.md` claims to name the machine the timings were measured on. On macOS/Windows the tracked baseline's hardware line becomes meaningless. Fix: use a platform-agnostic probe or make the "unknown CPU" fallback explicit in the file's prose.
-
-REVIEW VERDICT: FINDINGS 5
+REVIEW VERDICT: FINDINGS 4

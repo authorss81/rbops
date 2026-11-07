@@ -1,23 +1,28 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead tests/bench/mod.rs[90m [limit=2000][0m
-[0m→ [0mRead tests/bench_test.rs[90m [limit=2000][0m
+[0m→ [0mRead tests/bench/mod.rs
 [0m→ [0mRead tests/bench/runner.rs
-[0m→ [0mRead BENCH.md
+[0m→ [0mRead tests/bench_test.rs
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-Partial observations so far: the harness enforces size caps and budgets, and tests look substantive. Let me check the runner, baseline, audit test, and manifest.
+[0m→ [0mRead BENCH.md
 [0m→ [0mRead Cargo.toml
-[0m→ [0mRead src/interpreter.rs[90m [offset=2220, limit=70][0m
-The harness code is largely solid. Let me verify the phase's headline pre-existing bug claim and whether a test already pins that behavior.
-[0m✱ [0mGrep "give back|GiveBack"[90m in tests · 100 matches[0m
-[0m✱ [0mGrep "--compare|compare_with_baseline|BaselineRow"[90m in tests · 16 matches[0m
-[0m✱ [0mGrep "allow\(dead_code\)|allow\(unused\)"[90m in tests · 0 matches[0m
-Verifying that no existing test already pins the `--compare` path or suppresses dead code, so I don't repeat a false finding.
+[0m✱ [0mGrep "^\| concat \| 200 \| (ab){200} \| [0-9]+\.[0-9]{3} ms \|$"[90m in BENCH.md · 1 match[0m
+[0m→ [0mRead phases/phase-073/REPORT.md[90m [offset=70, limit=40][0m
+[0m✱ [0mGrep "BinaryOp::(Plus|Add)|Value::Text\([a-z]+\) \+"[90m in src/interpreter.rs · 7 matches[0m
+[0m→ [0mRead src/runtime.rs[90m [offset=180, limit=55][0m
 FINDINGS:
-1. [MAJOR] tests/bench/mod.rs:776-789 — the new `--compare` CLI branch and `compare_with_baseline` (tests/bench/mod.rs:703-740) have no test on either side; grep shows no test ever passes `--compare` to `run_cli`/`run_cli_with_path`, and `tests/bench_test.rs:778` only exercises `render_comparison` directly. The file-read, parse, per-row re-run, and exit-code behavior of the user-facing mode are entirely uncovered. — Add a CLI test that writes a temp baseline, runs `run_cli_with_path(&["--compare", path], ...)`, and asserts exit 0 plus the expected rows, mirroring `edge_cli_no_arguments_runs_all_and_writes_a_parseable_baseline`.
-2. [MAJOR] tests/bench/mod.rs:703-732 — `compare_with_baseline` iterates over every parsed row and calls `run_workload(&row.workload, row.size, DEFAULT_BUDGET)` (line 725) with a *fresh* 60s budget each time, while `parse_baseline_markdown` (line 636-663) neither dedupes nor caps rows (it only rejects unknown names). A baseline file containing N repeated known-workload rows therefore makes `rb-bench --compare` run N workloads for up to N×60s (each spawning a detached thread), contradicting the module's stated invariant that `run_all` shares one budget (mod.rs:747-765). — Enforce one shared budget across the comparison loop and reject duplicate/wrong-size rows, or cap the row count. TRACED: parser push at mod.rs:656-661, loop at 723-732, per-row `DEFAULT_BUDGET` at 725.
-3. [MINOR] tests/bench_test.rs:650-660 — the write-failure test passes a *directory* (`dir`) as `output`; `timings_path` (tests/bench/mod.rs:617-619) uses `with_file_name("BENCH_TIMINGS.md")`, which replaces the last path component, so `.../rb-bench-write-failure-<pid>-<nanos>` resolves to `.../BENCH_TIMINGS.md` in the parent (normally `/tmp/BENCH_TIMINGS.md`). The timing write escapes the test sandbox, can clobber a real `/tmp/BENCH_TIMINGS.md`, is never cleaned up, and the test can pass because the *timing* write failed rather than the baseline write. — Derive the timing path from `output.parent()` only when `output` is a file, and use an output path whose parent makes the intended write fail (e.g. an unwritable subdirectory inside `dir`).
-4. [MINOR] tests/bench/mod.rs:644-647 — `parse_baseline_markdown` silently `continue`s on any row whose first cell is not an exact known workload name, despite the doc at 630-635 promising a corrupted baseline cannot compare as if it had fewer workloads. A typo such as `| fibonacii | 20 | 6765 | 1.0 ms |` is dropped and `--compare` exits 0 over the remaining rows. — If a four-cell row carries a parseable numeric size but an unknown workload name, return an error instead of skipping it; also reject duplicate `(workload, size)` rows.
 
-REVIEW VERDICT: FINDINGS 4
+1. [MAJOR] tests/bench/mod.rs:411 — The production child-process timeout/kill branch (`Err(RecvTimeoutError::Timeout)` → `child.kill()`/`wait()`) has no test on either side. The only "hung workload" test, tests/bench_test.rs:243-248, calls `bench::run_with_budget`, which is `#[cfg(test)]` (tests/bench/mod.rs:240) and runs the closure in an in-process thread; it never reaches `measure_in_child`. So the claim in REPORT.md:104 that "production measurements run in a child process that is killed at the deadline" is unverified by the gate. — Fix: add a hidden worker workload (or a `--worker` hook) that sleeps, then a test that drives `run_workload` with a tiny budget and asserts `BudgetExceeded` and that no child survives. — VERIFIED: traced `edge_a_hung_workload_fails_loudly_at_its_budget` → `run_with_budget` at mod.rs:241-268; `measure_in_child` is only entered via `measure_in_worker` (mod.rs:318-337), which no test forces through a timeout.
+
+2. [MAJOR] tests/bench/mod.rs:495-547 — The new worker protocol parser has many failure branches (`ERR` prefix, wrong field count, unreadable nanos, unreadable hex, unknown tag, non-UTF-8 text) with no tests. `parse_worker_output` is not `#[cfg(test)]`, but every integration test only exercises the happy `OK …` line emitted by a known workload. A regression in any branch silently becomes `BenchError::Load` or a mis-decoded answer. — Fix: unit-test `parse_worker_output` directly with each malformed/`ERR` line and a non-UTF-8 hex payload. — VERIFIED: read tests/bench_test.rs in full; no test calls `parse_worker_output` or supplies malformed worker output.
+
+3. [MINOR] tests/bench/mod.rs:403-405 — On the `Ok(Err(error))` read-error branch `child.wait()` is called without `child.kill()`. If `read_to_string` fails while the child is still alive, `wait()` blocks indefinitely and the budget is bypassed. The fixed workloads emit ASCII, so this is hard to reach today, but it contradicts the "budget bounds the wait" promise. — Fix: `child.kill()` before `child.wait()` on every error branch.
+
+4. [MINOR] tests/bench/mod.rs:23-31 — The `DEFAULT_BUDGET` doc comment still says the runner "enforces this itself with a worker thread and `recv_timeout`" and that "a timed-out worker is detached and may keep running", which is the pre-refactor behaviour. The code now kills a child at mod.rs:411-414 and REPORT.md:104 says so. — Fix: update the comment to match the child-process design.
+
+5. [MINOR] tests/bench/mod.rs:929-937 — `parse_baseline_markdown` silently skips any four-cell row whose first cell is unknown when the size cell is non-numeric, and `comparison_table` (mod.rs:1041-1046) only requires a non-empty baseline. A baseline missing a workload (or a row with a typo'd name and malformed size) therefore compares "as if it had fewer workloads", contradicting the doc at mod.rs:902-909. — Fix: after parsing, require exactly the four known workload names, or reject every four-cell row that does not name a known workload.
+
+6. [MAJOR] phases/phase-073/REPORT.md:87 — The gate count is internally inconsistent and appears not to come from a run. If the five `rb-bench` bin unit tests are in the preserved `HEAD` (as the sentence says), they were already counted in the reported 2699, so `2699 + 4 = 2703`, not 2708; if they were added by this run, they would account for ~86 lines of `tests/bench/mod.rs` that the report attributes only to the child-process move. Line 88 also reports verify counted "4 rust / 4 edge / 4 failure-asserting" while the four new tests include only one that asserts an error. — Fix: paste the actual `cargo test --all-targets` and `verify.sh` output, or correct the decomposition. — VERIFIED: cannot run tests read-only; this would be settled by `cargo test --all-targets -- --list | grep -c ': test$'` on `HEAD` and on the working tree.
+
+REVIEW VERDICT: FINDINGS 6
