@@ -1,0 +1,29 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead tests/bench/mod.rs
+[0m→ [0mRead tests/bench_test.rs
+[0m→ [0mRead tests/bench/runner.rs
+[0m→ [0mRead Cargo.toml
+[0m✱ [0mGrep "GiveBack|Statement::Return|ReturnSignal|ControlFlow|return_value|fn run_source_value"[90m in src · 35 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2230, limit=90][0m
+[0m✱ [0mGrep "give back|give_back|early return|early_return"[90m in tests · 100 matches[0m
+[0m→ [0mRead tests/test_functions.rb
+[0m✱ [0mGrep "fn run_block|fn run_iteration|fn call_function|fn call_value|fn invoke"[90m in src/interpreter.rs · 4 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=120, offset=1035][0m
+[0m✱ [0mGrep "impl fmt::Display for Value|Value::Text|Value::Number"[90m in src/value.rs · 100 matches[0m
+[0m✱ [0mGrep "give back|Return Values|return"[90m in SPEC.md · 100 matches[0m
+[0m→ [0mRead src/lib.rs[90m [limit=60, offset=110][0m
+[0m✱ [0mGrep "impl fmt::Display for Value|Display for Value|fn fmt\(&self, f: &mut fmt::Formatter"[90m in src/value.rs · 7 matches[0m
+FINDINGS:
+1. [BLOCKER] tests/bench/mod.rs:251 — the reference answer is computed before the budgeted call, so the harness's central "must fail instead of waiting forever" promise is false. `run_workload` does `let expected = (workload.expected)(size);` at line 251, then calls `run_workload_with` → `measure`, whose only `run_with_budget` call is at line 225. But `expected_fibonacci` loops `for _ in 2..=size` (line 471), `expected_primes` → `primes_below` allocates `vec![false; limit + 1]` (line 511), and `expected_concat` does `"ab".repeat(size.max(0) as usize)` (line 541) — all on the caller's thread with no timeout. `parse_size` accepts any non-negative `i64`, so `rb-bench fibonacci 1000000000000000000` hangs on the main thread and `rb-bench primes 100000000000` / `rb-bench concat 500000000000` abort on allocation, even though the module doc (lines 21-27, 183-189) and the REPORT's `resource_limit` row claim a 60-second budget. The budget must cover the reference computation too, or `size` must be capped before `expected` is called. VERIFIED: traced `run_workload` lines 244-253 → `measure` 219-225; the `expected` closure runs on the caller thread before any `run_with_budget`.
+
+2. [MAJOR] src/interpreter.rs:2253 — `Statement::Return(expr) | Statement::GiveBack(expr)` merely evaluates the value and yields it; there is no return signal. `run_block` (src/interpreter.rs:1095-1098) only propagates `LoopControl` (break/skip), so execution continues after an early `give back`. This is real spec drift: `SPEC.md`'s return-value examples show `give back` inside `if`/`else`, and `tests/test_closures.rb:14` explicitly comments that `give back` does not leave a function in this build; `tests/test_functions.rb:53-62,140-145` only assert `type_of` or put the `give back` last, so no test pins early-return. This is pre-existing (the phase's `phases/phase-073/FINDINGS.md` reproduces it) and out of the test-only phase's scope, but it is still a live language bug that the phase ships and the review records. Traced, not run here; the FINDINGS.md reproduction is consistent with lines 2253 and 1095.
+
+3. [MINOR] tests/bench/mod.rs:48 — `Expected::Number(want), Value::Number(got) => want == got` uses exact `f64` equality for the reference check. The values happen to be integer-valued, but a workload whose expected/actual diverge by one ULP (e.g. a different evaluation order between engines) is reported as `WrongAnswer` rather than a numeric mismatch. Use an integer/bit-exact representation or a documented tolerance for `Expected::Number`.
+
+4. [MINOR] tests/bench/mod.rs:324 — `render_markdown` writes `row.answer` raw into a Markdown table cell. A text workload returning `|` or a newline would break the table, and `bench_md_exists_and_names_all_workloads` (tests/bench_test.rs:52-63) parses cells with a naive `split('|')`, so such a workload would fail the gate with a misleading message. Escape `|`/newlines when rendering the cell.
+
+5. [MINOR] tests/bench/mod.rs:200-216 — a timeout returns `BudgetExceeded` but leaves the worker thread detached and uncancellable; `edge_a_hung_workload_fails_loudly_at_its_budget` (tests/bench_test.rs:226-239) therefore passes while a 250 ms sleeper keeps running after the test returns. Documented in the REPORT's known gaps and not fixable without a cancellation hook or child process, but the `resource_limit` row overstates the guarantee; the leap to a child process is the concrete fix.
+
+REVIEW VERDICT: FINDINGS 5

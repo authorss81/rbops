@@ -1,0 +1,1616 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0mgit status && git log --oneline -5 && ls
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   Cargo.toml
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	BENCH.md
+	phases/phase-073/
+	tests/bench/
+	tests/bench_test.rs
+
+no changes added to commit (use "git add" and/or "git commit -a")
+4289163 rbops: phase-107 (2026-11-06T21:45:27Z)
+a46e8f6 resume phase-107: adopt preserved work
+83ebdb5 docs: expand future phases with rbos timing, developer pain points, and limitations
+35d57ef rbops: phase-106 (2026-11-06T00:34:35Z)
+1d699b3 resume phase-106: adopt preserved work
+AGENTS.md
+BENCH.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+Cargo.lock
+Cargo.toml
+HANDOUT.md
+LIBRARIES.md
+LICENSE
+MEMORY.md
+PHILOSOPHY.md
+README.md
+ROADMAP.md
+SPEC.md
+SURVEY.md
+bootstrap
+build.rs
+corpus
+docs
+examples
+export.sh
+modules
+opencode.json
+phases
+review_findings.md
+src
+target
+test.redblue
+tests
+tooling
+wasm
+[0m
+[0m→ [0mRead tests/bench/mod.rs
+[0m→ [0mRead tests/bench_test.rs
+[0m
+[0m$ [0mfind phases/phase-073 -type f -maxdepth 2 -print && cat Cargo.toml | tail -40
+phases/phase-073/FINDINGS.md
+phases/phase-073/REPORT.md
+name = "rb-bench"
+path = "tests/bench/runner.rs"
+
+# `cdylib` is what makes the WebAssembly playground module: it is the crate type
+# that emits a `.wasm` and exports every `#[no_mangle]` symbol the library
+# defines, which is what `wasm/redblue.js` calls. Built with:
+#
+#   rustup target add wasm32-unknown-unknown
+#   cargo build --release --target wasm32-unknown-unknown --lib
+#
+# writing `target/wasm32-unknown-unknown/release/redblue.wasm`. `rlib` is kept
+# so the native `rb` binary and the test suite link exactly as they did.
+[lib]
+name = "redblue"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+regex = "1.10"
+chrono = "0.4"
+reqwest = { version = "0.11", features = ["blocking"] }
+indexmap = "2"
+rustyline = "18"
+base64 = "0.21"
+hex = "0.4"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+getrandom = "0.4"
+ndarray = "0.15"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+regex = "1.10"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+[0m
+[0m→ [0mRead phases/phase-073/REPORT.md
+[0m→ [0mRead phases/phase-073/FINDINGS.md
+[0m
+[0m$ [0mgit diff Cargo.toml && cat review_findings.md | head -100
+diff --git a/Cargo.toml b/Cargo.toml
+index 265e8b3..11f5149 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,14 @@ categories = ["compiler", "development-tools"]
+ name = "rb"
+ path = "src/main.rs"
+ 
++# The benchmark harness. It is a plain binary, not a `[[bench]]` target: a
++# `[[bench]]` is built and executed by `cargo test --all-targets`, and a
++# measurement that writes `BENCH.md` must not run inside the test gate. The
++# workloads' correctness checks do run there, via `tests/bench_test.rs`.
++[[bin]]
++name = "rb-bench"
++path = "tests/bench/runner.rs"
++
+ # `cdylib` is what makes the WebAssembly playground module: it is the crate type
+ # that emits a `.wasm` and exports every `#[no_mangle]` symbol the library
+ # defines, which is what `wasm/redblue.js` calls. Built with:
+FINDINGS:
+1. [MAJOR] src/interpreter.rs:721 — `observe_bindings` copies only `locals` and `globals` to the scratch VM, but not `qualified_members`, `modules`, `module_aliases`, `declared_modules`, or `objects`. This breaks module member calls (e.g., `files.write()`, `json.parse()`) in `.watch` expressions because `Vm::call_method` checks `qualified_members` to resolve `receiver.method` to the qualified builtin name. Without it, `files.write(...)` fails with "'files' has no method 'write'" instead of reaching the effectful-builtin refusal. The test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` uses `files.write` without `import files`, so it likely fails for the wrong reason (missing method vs. refused effect) — the assertion checks for "files_write" in the refusal text, which would not appear in the actual error. Fix: extend `observe_bindings` to also copy `qualified_members` (and ideally `modules`, `module_aliases`, `declared_modules`, `objects`) from the observed VM.
+
+2. [MAJOR] src/interpreter.rs:721 — The scratch VM's `steps` counter (step budget) is never reset between watch evaluations. `observe_bindings` resets `statement_depth` and drains output but leaves `steps`, `call_depth`, `loop_depth`, `loop_control`, and `assertions_failed` accumulating. With many watches or complex watch expressions (e.g., loops), the shared scratch VM can hit the step limit (default 32M) and cause subsequent watch evaluations to fail with a step-limit error. Fix: reset `steps = 0` (and other per-run counters) in `observe_bindings`, or create a fresh scratch VM per evaluation.
+
+3. [MINOR] src/repl/debug_repl.rs:606 — TOCTOU in `read_argument`: between `read_source(argument)` failing and `std::fs::metadata(argument).is_ok()` check, the filesystem state can change (file created/deleted). If a file is created in this window, a previously-missing `.rb` file is reported as "cannot read" with a stale error; if deleted, a directory may be misclassified as code. Low practical risk for a REPL but a correctness gap. Fix: decide file-vs-code from the single `read_source` result; only fall back to metadata for the `.rb`-suffix rule.
+
+4. [MINOR] src/repl/debug_repl.rs:179 — No limit on number of `.watch` registrations. A user can register unlimited watches, each evaluated at every statement boundary, causing O(watches × statements) work with no bound. Fix: enforce a reasonable cap (e.g., 100 watches) and refuse further registrations.
+
+5. [STYLE] src/repl/debug_repl.rs:122-127 — The debug hook closure returns `DebugAction::Run` but does not catch panics. If `observe` or `evaluate_watches` panics (e.g., due to a bug), the panic propagates out of `Vm::debug_before`, crashing the program being debugged instead of reporting a watch failure. Fix: wrap the hook body in `std::panic::catch_unwind` and report the panic as a watch error.
+
+6. [STYLE] src/repl/mod.rs:3570 — Test `edge_a_watch_that_would_change_the_world_is_refused_and_writes_nothing` asserts the watch refusal contains "files_write", but the watch expression `files.write(...)` is used without `import files`. Without the import, `qualified_members` lacks `files_write`, so `call_method` fails with "'files' has no method 'write'" (not a refusal). The test likely passes for the wrong reason or masks finding #1. Fix: either add `import files` to the test setup, or update the assertion to match the actual error (and separately test the refusal path with a proper import).
+
+REVIEW VERDICT: FINDINGS 6
+[0m
+[0m$ [0mgrep -rn "run_workload\|expected_fibonacci\|BudgetExceeded\|phase-073" --include=*.rs . | head -80
+./tests/bench_test.rs:73:        let measured = bench::run_workload(name, size, DEFAULT_BUDGET).unwrap_or_else(|error| {
+./tests/bench_test.rs:95:    let fibonacci = bench::run_workload("fibonacci", 20, DEFAULT_BUDGET).expect("fib runs");
+./tests/bench_test.rs:98:    let primes = bench::run_workload("primes", 1000, DEFAULT_BUDGET).expect("primes runs");
+./tests/bench_test.rs:101:    let concat = bench::run_workload("concat", 7, DEFAULT_BUDGET).expect("concat runs");
+./tests/bench_test.rs:104:    let lex = bench::run_workload("lex", 100, DEFAULT_BUDGET).expect("lex runs");
+./tests/bench_test.rs:148:        let row = bench::run_workload(name, 0, DEFAULT_BUDGET)
+./tests/bench_test.rs:157:        bench::run_workload("fibonacci", 1, DEFAULT_BUDGET)
+./tests/bench_test.rs:163:        bench::run_workload("primes", 2, DEFAULT_BUDGET)
+./tests/bench_test.rs:169:        bench::run_workload("concat", 1, DEFAULT_BUDGET)
+./tests/bench_test.rs:175:        bench::run_workload("lex", 1, DEFAULT_BUDGET)
+./tests/bench_test.rs:184:    let refused = bench::run_workload("", 10, DEFAULT_BUDGET);
+./tests/bench_test.rs:213:    let workload = bench::run_workload("fibonacci", -1, DEFAULT_BUDGET)
+./tests/bench_test.rs:234:        BenchError::BudgetExceeded { workload, budget } => {
+./tests/bench_test.rs:244:    let error = bench::run_workload_with(
+./tests/bench/mod.rs:5://! [`run_workload`] refuses to report a timing for an answer that differs. Wall
+./tests/bench/mod.rs:76:    BudgetExceeded {
+./tests/bench/mod.rs:93:            BenchError::BudgetExceeded { workload, budget } => write!(
+./tests/bench/mod.rs:120:        expected: expected_fibonacci,
+./tests/bench/mod.rs:209:        Err(RecvTimeoutError::Timeout) => Err(BenchError::BudgetExceeded {
+./tests/bench/mod.rs:244:pub fn run_workload(name: &str, size: i64, budget: Duration) -> Result<Measurement, BenchError> {
+./tests/bench/mod.rs:252:    run_workload_with(name, size, budget, expected)
+./tests/bench/mod.rs:257:/// `run_workload` supplies the workload's own reference answer. Tests use this
+./tests/bench/mod.rs:259:pub fn run_workload_with(
+./tests/bench/mod.rs:365:        .map(|workload| run_workload(workload.name, workload.default_size, budget))
+./tests/bench/mod.rs:427:    match run_workload(selected.0, selected.1, DEFAULT_BUDGET) {
+./tests/bench/mod.rs:463:fn expected_fibonacci(size: i64) -> Expected {
+[0m
+[0m$ [0mls phases | tail -20 && find phases -maxdepth 2 -name '*073*' -o -name 'REPORT.md' | tail -20 && sed -n '1,120p' BENCH.md
+phase-087
+phase-088
+phase-089
+phase-090
+phase-092
+phase-093
+phase-094
+phase-095
+phase-096
+phase-097
+phase-098
+phase-099
+phase-100
+phase-101
+phase-102
+phase-103
+phase-104
+phase-105
+phase-106
+phase-107
+phases/phase-106/REPORT.md
+phases/phase-103/REPORT.md
+phases/phase-098/REPORT.md
+phases/phase-083/REPORT.md
+phases/phase-054/REPORT.md
+phases/phase-037/REPORT.md
+phases/phase-016/REPORT.md
+phases/phase-089/REPORT.md
+phases/phase-043/REPORT.md
+phases/phase-062/REPORT.md
+phases/phase-063/REPORT.md
+phases/phase-041/REPORT.md
+phases/phase-096/REPORT.md
+phases/phase-045/REPORT.md
+phases/phase-092/REPORT.md
+phases/phase-073
+phases/phase-073/REPORT.md
+phases/phase-048/REPORT.md
+phases/phase-084/REPORT.md
+phases/phase-086/REPORT.md
+# Redblue benchmarks
+
+Generated by `cargo run --bin rb-bench`. Wall time is printed and recorded, but never asserted: timing assertions are flakes wearing a gate's clothes. The answer column is verified by the harness before a row is written.
+
+| Workload | Size | Answer | Wall time |
+|---|---:|---:|---:|
+| fibonacci | 20 | 6765 | 1.123 ms |
+| primes | 1000 | 168 | 75.685 ms |
+| concat | 200 | abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab | 1.438 ms |
+| lex | 200 | 200 | 1.009 ms |
+
+## Hardware
+
+- CPU: AMD EPYC 7763 64-Core Processor (4 CPUs)
+- Build: debug (`cargo run --bin rb-bench`), linux x86_64
+[0m
+[0m$ [0mls ../rbops 2>/dev/null | head && ls .. | head -20 && sed -n '1,160p' ../rbops/verify.sh 2>/dev/null
+agents
+baseline.json
+dispatch.sh
+gen-prompts.sh
+phases.json
+progress_watchdog.sh
+setup-deploy-key.ps1
+smoke.sh
+verify.sh
+AGENTS.md
+DEFERRED-PHASES.md
+LICENSE
+README.md
+logs
+opencode.json
+phases
+rbops
+redblue
+#!/usr/bin/env bash
+# =============================================================================
+# rbops/verify.sh — the ONLY authority on whether phase work is real.
+#
+# Exit 0  = phase may be marked .done
+# Exit 1  = gate failed, phase must be retried
+#
+# Design rule: this script must be UNTRUSTWORTHY-PROOF against the agent.
+# The implementer agent cannot edit this file (see AGENTS.md hard rule 1) and
+# the token it runs under has no `workflows` scope, so a push that modifies
+# .github/ is rejected by GitHub itself. Two independent locks.
+# =============================================================================
+set -uo pipefail
+
+PHASE="${1:?usage: verify.sh <phase-id>}"
+
+# Resolve every path BEFORE changing directory, and normalise away any `..`.
+# The gate runs against the project checkout (redblue/) while the manifest,
+# baseline and report live in the pipeline repo. A relative path resolved after
+# `cd` silently points at a file that does not exist there, and the gate then
+# fails on its very first check having verified nothing.
+abspath() {
+  local p="$1"
+  if [ -e "$p" ]; then (cd "$(dirname "$p")" && printf '%s/%s\n' "$(pwd)" "$(basename "$p")")
+  else printf '%s\n' "$p"; fi
+}
+
+# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the gate can
+# be exercised against a fixture pipeline root, not only this checkout.
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PHASES="$(abspath "${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}")"
+BASELINE="$(abspath "${RBOPS_BASELINE:-$RBOPS_ROOT/rbops/baseline.json}")"
+PROJECT_DIR="$(abspath "${RBOPS_PROJECT_DIR:-.}")"
+REPORT="$RBOPS_ROOT/phases/$PHASE/REPORT.md"
+
+# Preconditions, checked before we touch the project.
+[ -f "$PHASES" ]                                    || { echo "FATAL: no manifest at $PHASES" >&2; exit 1; }
+[ -f "$BASELINE" ]                                  || { echo "FATAL: no baseline at $BASELINE" >&2; exit 1; }
+[ -d "$RBOPS_ROOT/phases/$PHASE" ]                  || { echo "FATAL: $RBOPS_ROOT/phases/$PHASE does not exist" >&2; exit 1; }
+cd "$PROJECT_DIR" || { echo "FATAL: cannot enter project dir $PROJECT_DIR" >&2; exit 1; }
+[ -f Cargo.toml ] || { echo "FATAL: no Cargo.toml in $PROJECT_DIR — is RBOPS_PROJECT_DIR correct?" >&2; exit 1; }
+
+# Honour $JQ so a native Linux jq can be substituted when testing outside CI.
+# A Windows jq.exe under WSL emits CRLF and breaks every id and count.
+JQ="${JQ:-jq}"
+BASE_REF="${RBOPS_BASE_REF:-HEAD}"
+
+FAIL=0
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+# Every failure passes through here, so this is the one place a remedy can be
+# attached to a check that does not know how to fix itself.
+#
+# Phase-092, 088 and 113 all failed the same two checks and burned three
+# attempts each. The message said the rule and not the remedy, and a rule an
+# agent cannot act on is not a gate - it is a wall. The retry note is supposed to
+# close that gap, but a note is written by a human who has to notice, and three
+# of these ran before anyone did.
+#
+# remedy_for prints the first line of advice for a message, keyed on a substring
+# of it. It is a lookup rather than a per-check argument so that adding a check
+# means adding a remedy rather than remembering to thread one through, and so
+# the text lives in exactly one place and cannot drift from what it explains.
+#
+# When nothing matches, nothing is printed: a wrong remedy would send an agent
+# chasing a problem it does not have, which is worse than the bare verdict it
+# replaces.
+remedy_for() {
+  case "$1" in
+    *"failure is produced"*)
+      printf '          A suite of entirely passing tests does NOT satisfy this.\n'
+      printf '          The check wants a test whose SUBJECT is a failure - a bad input\n'
+      printf '          producing a clean error rather than a panic or a wrong value.\n'
+      printf '          Rust:    let r = run_source(bad); assert!(r.is_err());\n'
+      printf '          or:      #[should_panic] fn edge_...() { /* ... */ }\n'
+      printf '          Redblue: try ... catch error ... end, asserting it was caught.\n'
+      ;;
+    *"REPORT.md missing"*)
+      printf '          Writing REPORT.md is the whole fix; the code may already be right.\n'
+      printf '          It needs sections: What changed / Tests added / Gates /\n'
+      printf '          Known gaps, with real evidence rows. Report counts you observed.\n'
+      ;;
+    *"edge"*"test"*|*"no test named"*)
+      printf '          At least one test must be named edge_* (fn edge_foo, or test "edge_foo").\n'
+      printf '          The happy path alone is not a test.\n'
+      ;;
+    *"quota"*)
+      printf '          AGENTS.md 3.3: at least 3 new #[test] (or 2 Redblue test blocks).\n'
+      printf '          The count floor catches "no verification at all"; see it there.\n'
+      ;;
+    *"must_touch"*|*"no implementation change"*)
+      printf '          must_touch names the areas the change must land in. At least one\n'
+      printf '          changed file must fall under one of them, or this check fails on\n'
+      printf '          exactly that. Editing only tests, or only docs, does not satisfy it.\n'
+      ;;
+    *"documentation block"*|*"bucket"*)
+      printf '          A ```redblue block moved or was added, so tests/doc_blocks_runs.txt\n'
+      printf '          still points at the old line. Update the registry entry to the new\n'
+      printf '          line of the opening fence, or classify the block in\n'
+      printf '          doc_blocks_fragments.txt / doc_blocks_known_fail.txt.\n'
+      ;;
+    *"README"*)
+      printf '          README names a corpus count that has drifted. Count corpus/*.rb and\n'
+      printf '          update the number in the same commit that adds or removes a program.\n'
+      ;;
+    *"clippy"*|*"fmt"*)
+      printf '          Fix the reported diagnostic and re-run; do not widen the lint bound\n'
+      printf '          and do not reformat files outside this phase.\n'
+      ;;
+  esac
+}
+
+bad()  {
+  printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1))
+  remedy_for "$*"
+}
+
+# =============================================================================
+# RBOPS_PREFLIGHT=1 — the cheap half of the gate.
+#
+# Everything here is a question about a DIFF or a DOCUMENT. Nothing here needs a
+# build, a test run, or an example to execute. So it can be asked BEFORE the
+# agent is dispatched, against whatever the phase inherits (its recovery branch,
+# its WIP checkpoint, or nothing yet).
+#
+# Why this exists, in numbers: phases 037 and 048 each burned three ~5-hour runs
+# and 24 agent-hours total, and both were correct work refused by a DETECTOR —
+# first `eval_err`, then `label()`, neither of which the failure-assert regex
+# recognised. The agent cannot fix that; only the gate can. Asking the same
+# questions seconds earlier, before the model call, turns a 5-hour failure into
+# a 5-second one.
+#
+# This mode deliberately does NOT reimplement any check. It runs the same
+# functions below, so preflight and the real gate cannot drift into disagreeing
+# about what a diff means. It only skips the expensive sections (3 and 4), and
+# says so in its own verdict line, so a skipped section is never a silent pass.
+# =============================================================================
+PREFLIGHT="${RBOPS_PREFLIGHT:-0}"
+preflight_skip() {
+  [ "$PREFLIGHT" = "1" ] || return 1
+  printf '\n\033[1m== %s\033[0m\n' "$*"
+  printf '  \033[33mSKIP\033[0m %s — needs a build; preflight does not build\n' "$*"
+  return 0
+}
+
+# --- 0. integrity: is the phase even declared? ------------------------------
+step "manifest"
+if command -v "$JQ" >/dev/null 2>&1; then
+  if "$JQ" -e --arg p "$PHASE" '.phases[] | select(.id==$p)' "$PHASES" >/dev/null 2>&1; then
+    ok "phase $PHASE is declared in $PHASES"
+  else
+    bad "phase $PHASE is NOT declared in $PHASES — an undeclared phase cannot pass"
+  fi
+  # dependencies must be .done. Anchored to the pipeline root: this script cd's
+  # into the project, so a relative phases/ path would resolve inside redblue/
+  # and every satisfied dependency would read as missing — which is exactly how
+  # a good phase-002 attempt once failed its own gate.
+  while read -r dep; do
+    [ -n "$dep" ] || continue
+[0m
+[0m$ [0msed -n '1,220p' tests/bench/runner.rs && grep -rn "const DEFAULT\|DEFAULT_BUDGET\|budget" tests/bench* phases/phase-073 -n
+//! `rb-bench` — the measuring harness, outside the `cargo test` gate path.
+//!
+//! The workloads and their correctness checks live in `mod.rs`, which the test
+//! suite also reads. This binary only parses arguments, prints the table, and
+//! writes `BENCH.md` when all four workloads ran.
+
+#[path = "mod.rs"]
+mod bench;
+
+fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    std::process::exit(bench::run_cli(&arguments));
+}
+tests/bench/mod.rs:21:/// The budget every harness workload runs under.
+tests/bench/mod.rs:26:/// running after the error. The budget bounds the wait, not the work.
+tests/bench/mod.rs:27:pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
+tests/bench/mod.rs:78:        budget: Duration,
+tests/bench/mod.rs:93:            BenchError::BudgetExceeded { workload, budget } => write!(
+tests/bench/mod.rs:95:                "workload '{workload}' did not finish within its {}s budget",
+tests/bench/mod.rs:96:                budget.as_secs()
+tests/bench/mod.rs:183:/// Runs `f` on a worker thread and gives up after `budget`.
+tests/bench/mod.rs:189:/// benchmark is far below the budget, so the thread is only a safety net.
+tests/bench/mod.rs:190:pub fn run_with_budget<T, F>(
+tests/bench/mod.rs:192:    budget: Duration,
+tests/bench/mod.rs:206:    match receiver.recv_timeout(budget) {
+tests/bench/mod.rs:211:            budget,
+tests/bench/mod.rs:222:    budget: Duration,
+tests/bench/mod.rs:225:    let (answer, elapsed) = run_with_budget(workload.name, budget, move || (workload.run)(size))?;
+tests/bench/mod.rs:242:/// Measures one named workload at one size, enforcing both the budget and the
+tests/bench/mod.rs:244:pub fn run_workload(name: &str, size: i64, budget: Duration) -> Result<Measurement, BenchError> {
+tests/bench/mod.rs:252:    run_workload_with(name, size, budget, expected)
+tests/bench/mod.rs:262:    budget: Duration,
+tests/bench/mod.rs:271:    measure(workload, size, budget, expected)
+tests/bench/mod.rs:362:pub fn run_all(budget: Duration) -> Result<Vec<Measurement>, BenchError> {
+tests/bench/mod.rs:365:        .map(|workload| run_workload(workload.name, workload.default_size, budget))
+tests/bench/mod.rs:373:        let rows = match run_all(DEFAULT_BUDGET) {
+tests/bench/mod.rs:427:    match run_workload(selected.0, selected.1, DEFAULT_BUDGET) {
+tests/bench_test.rs:20:use bench::{BenchError, DEFAULT_BUDGET};
+tests/bench_test.rs:73:        let measured = bench::run_workload(name, size, DEFAULT_BUDGET).unwrap_or_else(|error| {
+tests/bench_test.rs:95:    let fibonacci = bench::run_workload("fibonacci", 20, DEFAULT_BUDGET).expect("fib runs");
+tests/bench_test.rs:98:    let primes = bench::run_workload("primes", 1000, DEFAULT_BUDGET).expect("primes runs");
+tests/bench_test.rs:101:    let concat = bench::run_workload("concat", 7, DEFAULT_BUDGET).expect("concat runs");
+tests/bench_test.rs:104:    let lex = bench::run_workload("lex", 100, DEFAULT_BUDGET).expect("lex runs");
+tests/bench_test.rs:114:    let rows = bench::run_all(DEFAULT_BUDGET).expect("every workload runs at its default size");
+tests/bench_test.rs:148:        let row = bench::run_workload(name, 0, DEFAULT_BUDGET)
+tests/bench_test.rs:157:        bench::run_workload("fibonacci", 1, DEFAULT_BUDGET)
+tests/bench_test.rs:163:        bench::run_workload("primes", 2, DEFAULT_BUDGET)
+tests/bench_test.rs:169:        bench::run_workload("concat", 1, DEFAULT_BUDGET)
+tests/bench_test.rs:175:        bench::run_workload("lex", 1, DEFAULT_BUDGET)
+tests/bench_test.rs:184:    let refused = bench::run_workload("", 10, DEFAULT_BUDGET);
+tests/bench_test.rs:213:    let workload = bench::run_workload("fibonacci", -1, DEFAULT_BUDGET)
+tests/bench_test.rs:219:fn edge_a_hung_workload_fails_loudly_at_its_budget() {
+tests/bench_test.rs:221:        DEFAULT_BUDGET,
+tests/bench_test.rs:223:        "the harness promises a 60-second budget"
+tests/bench_test.rs:226:    let budget = Duration::from_millis(20);
+tests/bench_test.rs:227:    let error = bench::run_with_budget("hung", budget, || {
+tests/bench_test.rs:231:    .expect_err("a workload past its budget must fail");
+tests/bench_test.rs:234:        BenchError::BudgetExceeded { workload, budget } => {
+tests/bench_test.rs:236:            assert_eq!(budget, Duration::from_millis(20));
+tests/bench_test.rs:238:        other => panic!("expected a budget error, got {other:?}"),
+tests/bench_test.rs:247:        DEFAULT_BUDGET,
+tests/bench_test.rs:270:    let error = bench::run_with_budget("broken", DEFAULT_BUDGET, || {
+tests/bench_test.rs:288:    let error = bench::run_with_budget("vanished", DEFAULT_BUDGET, || -> Result<Value, String> {
+tests/bench_test.rs:306:    let rows = bench::run_all(DEFAULT_BUDGET).expect("every workload runs");
+phases/phase-073/REPORT.md:8:| `tests/bench/mod.rs` | +563 | Four workloads (`fibonacci`, `primes`, `concat`, `lex`), reference-answer checks, a 60-second self-enforced budget, table and `BENCH.md` rendering |
+phases/phase-073/REPORT.md:45:| `edge_a_hung_workload_fails_loudly_at_its_budget` | resource limit: 60-second budget is enforced; a synthetic hung workload returns `BudgetExceeded` |
+phases/phase-073/REPORT.md:70:| resource_limit | covered — 60-second budget with a deliberately hung workload; the budget bounds the wait, and the uncancellable worker is detached (see known gaps) |
+phases/phase-073/REPORT.md:81:- The 60-second budget bounds how long the harness waits, not how long the workload runs. The interpreter has no cancellation hook, so a timed-out worker thread is detached and may keep consuming CPU until the test process exits. In the CLI this is masked by `std::process::exit`; a future harness can run measurements in a child process if it needs a hard kill.
+[0m
+[0m$ [0mls -d ../phases/phase-073 ../rbops/phases/phase-073 phases/phase-073 2>&1; grep -n 'phase-073' -A20 ../rbops/phases.json | head -60
+ls: cannot access '../rbops/phases/phase-073': No such file or directory
+../phases/phase-073
+phases/phase-073
+1699:      "id": "phase-073",
+1700-      "title": "Measure before optimizing: a benchmark harness with a checked-in baseline",
+1701-      "severity": "major",
+1702-      "depends_on": [
+1703-        "phase-107"
+1704-      ],
+1705-      "risk": "medium",
+1706-      "finding": "Redblue has no benchmark harness at all: no `benches/` or `benchmarks/` directory exists, `Cargo.toml` names no criterion/divan dependency, and no BASELINE file records how fast anything is. Ipp ships `benchmarks/run_benchmarks.py` plus a checked-in `BENCHMARKS.md` table (fibonacci, prime counting, mandelbrot, string concat across interpreter/VM/Python/Node) for exactly this reason — and phase-022's 29.0s-to-3.5s speedup claim had nowhere to live except a FINDINGS paragraph, so no later phase can tell whether it regressed. Performance work without a harness is unmeasurable by construction.",
+1707-      "goal": "Add a benchmark harness (named workloads: fibonacci, prime counting, string concat, lex-heavy compile) that prints a timing table and records it in a checked-in `BENCH.md`, with every workload asserting the CORRECTNESS of its output (fib(20)==6765 etc. — deterministic, never flaky). Wall time is printed and recorded but never asserted: timing assertions are flakes wearing a gate's clothes.",
+1708-      "must_touch": [
+1709-        "tests/"
+1710-      ],
+1711-      "accept": [
+1712-        "four named workloads run to completion and print one table with per-workload wall time (asserted present in output, never asserted exact)",
+1713-        "every workload asserts its computed answer against a literal (fib(20) is 6765, the prime count is exact, the concat is exact) — a benchmark that computes the wrong answer fast is the failure this pins",
+1714-        "`BENCH.md` is checked in with the measured table from the landing machine plus its hardware note, and a test asserts the file exists and names all four workloads (content may move, coverage may not)",
+1715-        "the harness runs outside the `cargo test` gate path (it measures, it does not gate) while its correctness assertions run inside it — one mechanism never serves both masters",
+1716-        "edge_* tests cover an empty workload name (clean usage error listing the four), a workload given a size of zero (completes, answer asserted trivially true), and a 60-second budget the harness enforces itself (a hung workload fails loudly instead of hanging CI)"
+1717-      ],
+1718-      "timeout_min": 120
+1719-    },
+--
+1725:        "phase-073"
+1726-      ],
+1727-      "risk": "high",
+1728-      "finding": "`to intern(raw)` at bootstrap/compiler.rb:2285 walks the whole table on every name emitted: `while intern_i < length(G_INTERN)` with `if G_INTERN[intern_i].k is raw` at :2290-2291, returning the index or appending. Every name in the program — via `emit_name` at :2310, called for modules (:2473, :2480), objects (:2529, :2532) and every other named emit — pays a scan of the 1000+-entry table, which phase-022 FINDINGS section 4 measured as most of codegen's remaining 6 seconds and explicitly deferred: `A hash map in the language would fix it; that is a language change and belongs in its own phase.` That phase is this one. The fixed-point suite (stage1.rbc == stage2.rbc byte for byte) guards the change: a faster compiler that emits different bytes is a failure, not an optimization.",
+1729:      "goal": "Replace the linear `G_INTERN` scan with a hash lookup in the language (a name-to-index record probed by a string hash the language can compute), keeping every emitted byte identical. Codegen time on `bootstrap/compiler.rb` must drop measurably on the phase-073 harness; the fixed point must hold exactly.",
+1730-      "must_touch": [
+1731-        "src/",
+1732-        "bootstrap/"
+1733-      ],
+1734-      "accept": [
+1735-        "`edge_the_self_hosted_compiler_compiles_itself_byte_identically` passes unmodified — the optimization changes zero emitted bytes, proved by the standing fixed point rather than a new assertion",
+1736:        "codegen wall time on `bootstrap/compiler.rb` drops by at least 25% measured by the phase-073 harness on the same machine back-to-back (recorded in REPORT.md with both numbers, not asserted in a test — machine variance is real)",
+1737-        "interning the same name twice returns the same index without growing the table (a test interns 1000 repetitions and asserts table growth of exactly the distinct count)",
+1738-        "hash collisions resolve correctly: a test interns two names engineered to share a bucket and asserts both retrieve their own index (the test constructs the collision rather than hoping for one)",
+1739-        "edge_* tests cover interning the empty string, a 10KB name (hashes, never truncates), and interning during a self-compile (the fixed point covers it, plus one direct test asserting `stage2` bytes equal `stage1` bytes for a name-heavy fixture file)"
+1740-      ],
+1741-      "timeout_min": 150
+1742-    },
+1743-    {
+1744-      "id": "phase-075",
+1745-      "title": "Teach the language server navigation: goto-definition, references, completion",
+1746-      "severity": "major",
+1747-      "depends_on": [
+1748-        "phase-074"
+1749-      ],
+1750-      "risk": "medium",
+1751-      "finding": "src/lsp.rs answers questions about a file but cannot move inside it: its public surface is `diagnostics`, `diagnostics_json`, `keyword_pattern`, `escape_json` and `textmate_grammar` (lsp.rs:44-233) — diagnostics plus editor assets, no navigation. Ipp's `lsp/server.py` ships `goto_definition` (:113), `find_references` (:131) and `get_completions` (:149) with enhanced context awareness, because diagnostics without navigation is a linter with a wire protocol: the editor can underline the error but cannot jump to the definition. Phase-017 scaffolded the server; this is the first capability beyond scaffolding.",
+1752-      "goal": "Add goto-definition (name at position to its binding span), find-references (all uses of the binding at position), and completion (keywords + builtins + in-scope names at position) to `src/lsp.rs`, each as a pure function over source text returning JSON the existing `diagnostics_json` shape extends. No server loop changes: capabilities first, transport later.",
+1753-      "must_touch": [
+1754-        "src/"
+1755-      ],
+1756-      "accept": [
+[0m
+[0m$ [0mfind ../phases/phase-073 -maxdepth 2 -type f -print -exec sed -n '1,80p' {} \;
+../phases/phase-073/FINDINGS.md
+# Findings outside phase-073
+
+## Early `give back` does not return from a function
+
+**Evidence.** `src/interpreter.rs:2253`:
+
+```rust
+Statement::Return(expr) | Statement::GiveBack(expr) => match expr {
+    Some(e) => self.evaluate(e),
+    None => Ok(Value::Nothing),
+},
+```
+
+The arm evaluates the value and yields it as the value of the statement. It does
+not leave the enclosing block, so execution continues with the next statement in
+the function body.
+
+**Reproduction.**
+
+```bash
+cat > target/tmp/early-return.rb <<'RB'
+to f(n)
+    if n is less than 2 then
+        give back 10
+    end
+    give back 20
+end
+say f(1)
+say f(3)
+RB
+cargo run --quiet --bin rb -- run target/tmp/early-return.rb
+```
+
+Observed:
+
+```
+20
+20
+```
+
+Expected per `SPEC.md` § "Return Values", which shows `give back` inside an
+`if`/`else`:
+
+```
+10
+20
+```
+
+This is not used by the phase-073 workloads (they are deliberately written with
+a single final value to avoid depending on the broken behaviour), but it is a
+real spec-drift bug for the auditor.
+../phases/phase-073/REPORT.md
+# Phase 073 — Measure before optimizing: a benchmark harness with a checked-in baseline
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| `Cargo.toml` | +8 | Added the `rb-bench` binary target; it is a plain bin, not a `[[bench]]`, so `cargo test --all-targets` never runs the measuring code |
+| `tests/bench/mod.rs` | +563 | Four workloads (`fibonacci`, `primes`, `concat`, `lex`), reference-answer checks, a 60-second self-enforced budget, table and `BENCH.md` rendering |
+| `tests/bench/runner.rs` | +13 | The `rb-bench` entry point, outside the test gate path |
+| `tests/bench_test.rs` | +338 | Correctness, table, parsed-baseline, and edge-case tests that do run inside the gate |
+| `BENCH.md` | +15 | The measured baseline and hardware note from this landing machine |
+
+## Reproduction of the finding (before the change)
+
+```
+$ ls -d benches benchmarks
+ls: cannot access 'benches': No such file or directory
+ls: cannot access 'benchmarks': No such file or directory
+$ grep -n "criterion\|divan\|bench" Cargo.toml
+(no output)
+$ ls BENCH.md BENCHMARKS.md
+ls: cannot access 'BENCH.md': No such file or directory
+ls: cannot access 'BENCHMARKS.md': No such file or directory
+```
+
+The first failing test was `bench_md_exists_and_names_all_workloads`, which failed because `BENCH.md` did not exist. It now reads the checked-in baseline and requires all four workload names plus the hardware note.
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| `bench_md_exists_and_names_all_workloads` | checked-in baseline exists, records hardware, parses every row, and each `(size, answer)` agrees with `run_workload` at its default size |
+| `bench_workloads_compute_the_documented_literals` | boundary: fib(20)=6765, primes below 1000=168, concat is exact, lex statement count |
+| `bench_table_lists_four_workloads_and_wall_time` | four rows, one header, wall time present but never asserted exact |
+| `bench_markdown_shape_names_answers_and_hardware` | generated baseline has the workload names, wall-time column, hardware section |
+| `edge_zero_size_completes_with_trivial_answers` | empty / zero: all four workloads at size 0 |
+| `edge_singleton_sizes_are_exact` | singleton: fib(1), primes below 2, one concat, one lex statement |
+| `edge_a_wrong_answer_is_refused_instead_of_measured` | failure channel: a deliberately wrong reference answer returns `WrongAnswer`, never a `Measurement` |
+| `edge_a_workload_error_is_reported_as_load` | failure channel: a workload that returns an error surfaces as `BenchError::Load` |
+| `edge_a_workload_that_stops_without_an_answer_is_a_load_error` | failure channel: a disconnected worker surfaces as `BenchError::Load` |
+| `edge_empty_workload_name_lists_the_four` | malformed input: empty name is a usage error naming all four |
+| `edge_negative_and_malformed_sizes_are_refused` | type mismatch / malformed input: `-1` and `many` are refused |
+| `edge_cli_empty_workload_name_is_a_usage_error` | failure channel: CLI exits 2 for an empty name, 0 for `--help` |
+| `edge_cli_unknown_workload_with_size_is_a_usage_error` | failure channel: both `bogus` and `bogus 5` exit 2 with usage |
+| `edge_a_hung_workload_fails_loudly_at_its_budget` | resource limit: 60-second budget is enforced; a synthetic hung workload returns `BudgetExceeded` |
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test --all-targets` | 2669 passed, 0 failed |
+| `../rbops/verify.sh phase-073` | pass — `VERIFY PASS — phase-073`, 2669 tests, 14 rust / 10 edge / 9 failure-asserting, examples green |
+
+## Test requirement matrix
+
+| Row | Result |
+|---|---|
+| empty | covered — empty workload name, zero-sized workloads, empty concat text |
+| singleton | covered — fib(1), primes below 2, one concat iteration, one lex statement |
+| boundary | covered — fib(20)=6765, primes below 1000=168, exactly 200 concat iterations |
+| out_of_bounds | N/A — the harness indexes no user collection; sizes are the only index-like boundary and are checked |
+| type_mismatch | covered — non-numeric size text is refused |
+| numeric_boundary | covered — zero and negative sizes; no benchmark asserts floating-point equality beyond the exact integer answers |
+| unicode | N/A — workloads use ASCII literals; the harness does not transform text encoding |
+| nesting_recursion | N/A — all four workloads are iterative; no recursive call depth is exercised |
+| duplicate_missing_keys | N/A — workloads use no records |
+| malformed_input | covered — empty workload name, non-numeric size, negative size |
+| resource_limit | covered — 60-second budget with a deliberately hung workload; the budget bounds the wait, and the uncancellable worker is detached (see known gaps) |
+
+## Invariants touched
+
+- None. No language syntax, `Value` variant, error kind, example, or module changed.
+- The measuring harness is a separate `rb-bench` binary; the test gate only sees the correctness tests.
+
+## Known gaps / follow-ups
+
+- A pre-existing language bug was found while building the workloads: `give back` inside an `if`/`while` block does not return early. The interpreter arm at `src/interpreter.rs:2253` evaluates the value and continues the enclosing block. Reproduced with `to f(n) ... if n < 2 then give back 10 end give back 20 end; say f(1)` printing `20`. Recorded in `FINDINGS.md`; fixing it is out of scope for this test-only phase.
+- `BENCH.md` is a debug-build baseline produced by `cargo run --bin rb-bench`; release numbers are not recorded yet.
+../phases/phase-073/.base
+42891639029d6870b72c94da7095511ef43375f6
+../phases/phase-073/.seen_findings
+1312987258-822
+380253183-757
+17451435-715
+1358231637-518
+1797783838-185
+3893207559-1126
+525920707-894
+1333611258-444
+3959231836-394
+2592118806-485
+../phases/phase-073/PROMPT.md
+# phase-073 — Measure before optimizing: a benchmark harness with a checked-in baseline
+
+<!-- GENERATED by rbops/gen-prompts.sh from rbops/phases.json. DO NOT EDIT. -->
+
+| | |
+|---|---|
+| Severity | `major` |
+| Risk | `medium` |
+| Depends on | phase-107 |
+| Timeout | 120 min |
+| Must change | `tests/` |
+
+## You must change `tests/`
+
+This phase declares `must_touch: [tests/]`. The gate fails the phase unless at
+least one changed file falls under it. Writing tests, documentation or a report
+is not enough — if you finish without touching that area, the phase fails on
+exactly that check.
+
+
+## Evidence — verified finding
+
+```
+Redblue has no benchmark harness at all: no `benches/` or `benchmarks/` directory exists, `Cargo.toml` names no criterion/divan dependency, and no BASELINE file records how fast anything is. Ipp ships `benchmarks/run_benchmarks.py` plus a checked-in `BENCHMARKS.md` table (fibonacci, prime counting, mandelbrot, string concat across interpreter/VM/Python/Node) for exactly this reason — and phase-022's 29.0s-to-3.5s speedup claim had nowhere to live except a FINDINGS paragraph, so no later phase can tell whether it regressed. Performance work without a harness is unmeasurable by construction.
+```
+
+**Re-verify this before you change anything.** If the finding no longer
+reproduces on `main`, stop and write that to `FINDINGS.md` — a stale phase must
+never be "fixed" by inventing a change.
+
+## Goal
+
+Add a benchmark harness (named workloads: fibonacci, prime counting, string concat, lex-heavy compile) that prints a timing table and records it in a checked-in `BENCH.md`, with every workload asserting the CORRECTNESS of its output (fib(20)==6765 etc. — deterministic, never flaky). Wall time is printed and recorded but never asserted: timing assertions are flakes wearing a gate's clothes.
+
+## Method
+
+1. Read `AGENTS.md` in full. Obey every hard rule; they are not negotiable.
+2. Reproduce the finding. Record the exact command and the exact wrong output.
+3. Write the failing test FIRST. Watch it fail. Do not touch production code
+   until you have a red test that fails for the right reason.
+4. Make the smallest change that turns it green.
+5. Run the four gates yourself before claiming anything:
+
+   ```bash
+   cargo fmt --all -- --check
+   cargo clippy --all-targets -- -D warnings
+   cargo test --all-targets
+   ./rbops/verify.sh phase-073
+   ```
+
+6. Write `REPORT.md` in the exact shape required by `AGENTS.md` section 4.
+
+## Definition of done
+
+- [ ] four named workloads run to completion and print one table with per-workload wall time (asserted present in output, never asserted exact)
+- [ ] every workload asserts its computed answer against a literal (fib(20) is 6765, the prime count is exact, the concat is exact) — a benchmark that computes the wrong answer fast is the failure this pins
+- [ ] `BENCH.md` is checked in with the measured table from the landing machine plus its hardware note, and a test asserts the file exists and names all four workloads (content may move, coverage may not)
+- [ ] the harness runs outside the `cargo test` gate path (it measures, it does not gate) while its correctness assertions run inside it — one mechanism never serves both masters
+- [ ] edge_* tests cover an empty workload name (clean usage error listing the four), a workload given a size of zero (completes, answer asserted trivially true), and a 60-second budget the harness enforces itself (a hung workload fails loudly instead of hanging CI)
+
+## Test requirements — non-negotiable
+
+From `AGENTS.md` section 3. Tick each row that applies to this change. For
+every row you do NOT cover, write one line in `REPORT.md` saying why.
+
+- [ ] empty — covered / N/A + why
+- [ ] singleton — covered / N/A + why
+- [ ] boundary — covered / N/A + why
+- [ ] out_of_bounds — covered / N/A + why
+- [ ] type_mismatch — covered / N/A + why
+- [ ] numeric_boundary — covered / N/A + why
+- [ ] unicode — covered / N/A + why
+- [ ] nesting_recursion — covered / N/A + why
+- [ ] duplicate_missing_keys — covered / N/A + why
+- [ ] malformed_input — covered / N/A + why
+- [ ] resource_limit — covered / N/A + why
+
+You must also:
+
+- at least 3 new `#[test]` functions (or at least 2 new Redblue `test` blocks).
+[0m
+[0m$ [0mfind /home/runner/work/rbops -maxdepth 2 -type f | sed -n '1,100p'; ls -la /home/runner/work/rbops/rbops/redblue/.git 2>/dev/null | head
+/home/runner/work/rbops/rbops/LICENSE
+/home/runner/work/rbops/rbops/.gitignore
+/home/runner/work/rbops/rbops/README.md
+/home/runner/work/rbops/rbops/DEFERRED-PHASES.md
+/home/runner/work/rbops/rbops/AGENTS.md
+/home/runner/work/rbops/rbops/.gitattributes
+/home/runner/work/rbops/rbops/opencode.json
+total 272
+drwxr-xr-x  7 runner runner   4096 Nov  7 02:54 .
+drwxr-xr-x 15 runner runner   4096 Nov  7 02:49 ..
+-rw-r--r--  1 runner runner  62847 Nov  6 22:17 FETCH_HEAD
+-rw-r--r--  1 runner runner     21 Nov  6 21:46 HEAD
+-rw-r--r--  1 runner runner     41 Nov  6 21:52 ORIG_HEAD
+-rw-r--r--  1 runner runner    333 Nov  6 21:46 config
+-rwxr-xr-x  1 runner runner     73 Nov  6 21:46 description
+drwxr-xr-x  2 runner runner   4096 Nov  6 21:46 hooks
+-rw-r--r--  1 runner runner 107354 Nov  7 02:54 index
+[0m
+[0m$ [0mgrep -rn "size.*too large\|maximum.*size\|max_size\|MAX_SIZE" . --include=*.rs --include=*.md | head -40
+./src/formats.rs:936:        format!("tar cannot store the entry '{name}': its size of {size} bytes is too large")
+./src/repl/history.rs:6:    max_size: usize,
+./src/repl/history.rs:10:    pub fn new(max_size: usize) -> Self {
+./src/repl/history.rs:12:            history: VecDeque::with_capacity(max_size),
+./src/repl/history.rs:13:            max_size,
+./src/repl/history.rs:25:        if self.max_size == 0 {
+./src/repl/history.rs:29:        if self.history.len() >= self.max_size {
+./src/repl/history.rs:196:    fn push_evicts_the_oldest_entry_at_max_size() {
+./phases/phase-033/REPORT.md:45:| src/repl/history.rs | +342 −3 | `ReplHistory` replaces the REPL's `Vec<String>`; a `max_size == 0` guard in `push`; `save_to_file`/`load_from_file` take `impl AsRef<Path>`; 18 unit tests |
+./phases/phase-033/REPORT.md:91:| `edge_zero_size_history_stores_nothing` | boundary — a `max_size` of 0 held one entry |
+./phases/phase-033/REPORT.md:103:| `push_evicts_the_oldest_entry_at_max_size` / `push_evicts_before_it_adds_...` | boundary — eviction order, and the limit held after the push |
+./phases/phase-009/FINDINGS.md:47:maximum file size and no maximum string length that produces a clean error
+./phases/phase-009/REPORT.md:175:- No maximum source size and no maximum string length; the lexer is O(n) in
+./phases/phase-010/FINDINGS.md:60:## 4. No maximum source size or token count
+./SPEC.md:237:constant MAX_SIZE to 1000
+[0m
+[0m# [0mTodos
+[•] Move reference-answer computation inside the budgeted worker and add safe size caps
+[ ] Add regression test for budget covering reference computation
+[ ] Update phase REPORT/findings if needed
+[ ] Run fmt, clippy, tests, and verify gates
+[0m
+[0m← [0mEdit tests/bench/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+@@ -25,13 +25,24 @@
+ /// has no cancellation hook, so a timed-out worker is detached and may keep
+ /// running after the error. The budget bounds the wait, not the work.
+ pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
+ 
+-/// A workload's name, default size, and the two functions that make it a
+-/// benchmark rather than a smoke test.
++/// The largest size whose reference answer can be materialized without risking
++/// a multi-gigabyte allocation. A larger size is refused before the reference
++/// answer or the workload's source string is built: a harness that can only
++/// check small answers must fail cleanly on an uncheckable size rather than
++/// hanging or aborting the process.
++const MAX_FIBONACCI_SIZE: i64 = 10_000_000;
++const MAX_PRIMES_SIZE: i64 = 10_000_000;
++const MAX_CONCAT_SIZE: i64 = 10_000_000;
++const MAX_LEX_SIZE: i64 = 1_000_000;
++
++/// A workload's name, default size, largest checkable size, and the two
++/// functions that make it a benchmark rather than a smoke test.
+ pub struct Workload {
+     pub name: &'static str,
+     pub default_size: i64,
++    max_size: i64,
+     run: fn(i64) -> Result<Value, String>,
+     expected: fn(i64) -> Expected,
+ }
+ 
+
+[0m
+[0m← [0mEdit tests/bench/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+@@ -126,26 +126,30 @@
+ pub const WORKLOADS: &[Workload] = &[
+     Workload {
+         name: "fibonacci",
+         default_size: 20,
++        max_size: MAX_FIBONACCI_SIZE,
+         run: run_fibonacci,
+         expected: expected_fibonacci,
+     },
+     Workload {
+         name: "primes",
+         default_size: 1000,
++        max_size: MAX_PRIMES_SIZE,
+         run: run_primes,
+         expected: expected_primes,
+     },
+     Workload {
+         name: "concat",
+         default_size: 200,
++        max_size: MAX_CONCAT_SIZE,
+         run: run_concat,
+         expected: expected_concat,
+     },
+     Workload {
+         name: "lex",
+         default_size: 200,
++        max_size: MAX_LEX_SIZE,
+         run: run_lex,
+         expected: expected_lex,
+     },
+ ];
+
+[0m
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=225, limit=70][0m
+[0m
+[0m← [0mEdit tests/bench/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+@@ -230,15 +230,15 @@
+         ))),
+     }
+ }
+ 
+-fn measure(
++fn check_expected(
+     workload: &'static Workload,
+     size: i64,
+-    budget: Duration,
+     expected: Expected,
++    answer: Value,
++    elapsed: Duration,
+ ) -> Result<Measurement, BenchError> {
+-    let (answer, elapsed) = run_with_budget(workload.name, budget, move || (workload.run)(size))?;
+     if !expected.matches(&answer) {
+         return Err(BenchError::WrongAnswer {
+             workload: workload.name,
+             size,
+@@ -253,8 +253,51 @@
+         elapsed,
+     })
+ }
+ 
++fn measure(workload: &'static Workload, size: i64, budget: Duration, expected: Expected) -> Result<Measurement, BenchError> {
++    let (answer, elapsed) = run_with_budget(workload.name, budget, move || (workload.run)(size))?;
++    check_expected(workload, size, expected, answer, elapsed)
++}
++
++/// The reference answer is computed on the same worker as the workload, so the
++/// budget covers both. Computing it on the caller's thread first made an
++/// enormous size hang or abort before any deadline could fire.
++fn measure_with_reference(
++    workload: &'static Workload,
++    size: i64,
++    budget: Duration,
++) -> Result<Measurement, BenchError> {
++    ensure_size_supported(workload, size, budget)?;
++    let (answer, expected, elapsed) = run_with_budget(workload.name, budget, move || {
++        let expected = (workload.expected)(size);
++        let started = Instant::now();
++        let answer = (workload.run)(size)?;
++        Ok((answer, expected, started.elapsed()))
++    })?;
++    check_expected(workload, size, expected, answer, elapsed)
++}
++
++/// Refuses a size whose reference answer cannot be materialized safely.
++///
++/// The alternative is an allocation abort or an unbounded loop on the caller's
++/// thread. Reporting it as over budget keeps the harness's contract: it fails
++/// loudly instead of waiting forever, and it never reports a timing it could
++/// not check.
++fn ensure_size_supported(
++    workload: &'static Workload,
++    size: i64,
++    budget: Duration,
++) -> Result<(), BenchError> {
++    if size > workload.max_size {
++        return Err(BenchError::BudgetExceeded {
++            workload: workload.name.to_string(),
++            budget,
++        });
++    }
++    Ok(())
++}
++
+ /// Measures one named workload at one size, enforcing both the budget and the
+ /// reference answer. A wrong answer is an error, never a fast success.
+ pub fn run_workload(name: &str, size: i64, budget: Duration) -> Result<Measurement, BenchError> {
+     if size < 0 {
+@@ -262,10 +305,9 @@
+             "size must be zero or greater, got {size}"
+         )));
+     }
+     let workload = workload_named(name)?;
+-    let expected = (workload.expected)(size);
+-    run_workload_with(name, size, budget, expected)
++    measure_with_reference(workload, size, budget)
+ }
+ 
+ /// Measures one named workload at one size against a caller-supplied answer.
+ ///
+@@ -282,8 +324,9 @@
+             "size must be zero or greater, got {size}"
+         )));
+     }
+     let workload = workload_named(name)?;
++    ensure_size_supported(workload, size, budget)?;
+     measure(workload, size, budget, expected)
+ }
+ 
+ pub fn default_size(name: &str) -> Result<i64, BenchError> {
+
+[0m
+[0m← [0mEdit tests/bench_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
+@@ -14,9 +14,9 @@
+ mod bench;
+ 
+ use std::fs;
+ use std::thread;
+-use std::time::Duration;
++use std::time::{Duration, Instant};
+ 
+ use bench::{BenchError, DEFAULT_BUDGET};
+ use redblue::Value;
+ 
+
+[0m
+[0m← [0mEdit tests/bench_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
+@@ -239,8 +239,48 @@
+     }
+ }
+ 
+ #[test]
++fn edge_reference_computation_is_inside_the_budget() {
++    let budget = Duration::from_millis(20);
++    let started = Instant::now();
++    let error = bench::run_workload("fibonacci", i64::MAX, budget)
++        .expect_err("an enormous reference answer must fail, not hang the caller");
++    assert!(
++        started.elapsed() < Duration::from_secs(2),
++        "the caller waited {:?}; the reference computation escaped the budget",
++        started.elapsed()
++    );
++    match error {
++        BenchError::BudgetExceeded {
++            workload,
++            budget: reported,
++        } => {
++            assert_eq!(workload, "fibonacci");
++            assert_eq!(reported, budget);
++        }
++        other => panic!("expected a budget error for an oversized reference, got {other:?}"),
++    }
++}
++
++#[test]
++fn edge_oversized_references_are_refused_before_allocation() {
++    let budget = Duration::from_millis(20);
++    let cases: &[(&str, i64)] = &[
++        ("fibonacci", i64::MAX),
++        ("primes", 100_000_000_000),
++        ("concat", 500_000_000_000),
++        ("lex", i64::MAX),
++    ];
++    for (name, size) in cases {
++        let started = Instant::now();
++        let error = bench::run_workload(name, *size, budget)
++            .unwrap_or_else(|error| panic!("{name} at {size} should fail: {error}"));
++        let _ = error;
++    }
++}
++
++#[test]
+ fn edge_a_wrong_answer_is_refused_instead_of_measured() {
+     let error = bench::run_workload_with(
+         "fibonacci",
+         20,
+
+[0m
+[0m← [0mEdit tests/bench_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench_test.rs
+@@ -273,10 +273,18 @@
+     ];
+     for (name, size) in cases {
+         let started = Instant::now();
+         let error = bench::run_workload(name, *size, budget)
+-            .unwrap_or_else(|error| panic!("{name} at {size} should fail: {error}"));
+-        let _ = error;
++            .expect_err("an allocation-sized reference must be refused, not attempted");
++        assert!(
++            started.elapsed() < Duration::from_secs(2),
++            "{name} at {size} took {:?} before refusing",
++            started.elapsed()
++        );
++        assert!(
++            matches!(error, BenchError::BudgetExceeded { .. }),
++            "{name} at {size} should report an uncheckable size as over budget, got {error:?}"
++        );
+     }
+ }
+ 
+ #[test]
+
+[0m
+[0m$ [0mcargo fmt --all -- --check
+Diff in /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs:254:
+     })
+ }
+ 
+-fn measure(workload: &'static Workload, size: i64, budget: Duration, expected: Expected) -> Result<Measurement, BenchError> {
++fn measure(
++    workload: &'static Workload,
++    size: i64,
++    budget: Duration,
++    expected: Expected,
++) -> Result<Measurement, BenchError> {
+     let (answer, elapsed) = run_with_budget(workload.name, budget, move || (workload.run)(size))?;
+     check_expected(workload, size, expected, answer, elapsed)
+ }
+Diff in /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs:254:
+     })
+ }
+ 
+-fn measure(workload: &'static Workload, size: i64, budget: Duration, expected: Expected) -> Result<Measurement, BenchError> {
++fn measure(
++    workload: &'static Workload,
++    size: i64,
++    budget: Duration,
++    expected: Expected,
++) -> Result<Measurement, BenchError> {
+     let (answer, elapsed) = run_with_budget(workload.name, budget, move || (workload.run)(size))?;
+     check_expected(workload, size, expected, answer, elapsed)
+ }
+[0m
+[0m$ [0mcargo test --test bench_test
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0mtests/bench/mod.rs:271:9
+    [1m[94m|[0m
+[1m[94m271[0m [1m[94m|[0m       let (answer, expected, elapsed) = run_with_budget(workload.name, budget, move || {
+    [1m[94m|[0m [1m[94m _________[0m[1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m[1m[94m___-[0m
+    [1m[94m|[0m [1m[94m|[0m         [1m[91m|[0m
+    [1m[94m|[0m [1m[94m|[0m         [1m[91mexpected a tuple with 2 elements, found one with 3 elements[0m
+[1m[94m272[0m [1m[94m|[0m [1m[94m|[0m         let expected = (workload.expected)(size);
+[1m[94m273[0m [1m[94m|[0m [1m[94m|[0m         let started = Instant::now();
+[1m[94m274[0m [1m[94m|[0m [1m[94m|[0m         let answer = (workload.run)(size)?;
+[1m[94m275[0m [1m[94m|[0m [1m[94m|[0m         Ok((answer, expected, started.elapsed()))
+[1m[94m276[0m [1m[94m|[0m [1m[94m|[0m     })?;
+    [1m[94m|[0m [1m[94m|_______-[0m [1m[94mthis expression has type `((Value, Expected, std::time::Duration), std::time::Duration)`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: expected tuple `[1m[35m((Value, Expected, std::time::Duration), std::time::Duration)[0m`
+               found tuple `[1m[35m(_, _, _)[0m`
+
+[1mFor more information about this error, try `rustc --explain E0308`.[0m
+[1m[91merror[0m: could not compile `redblue` (bin "rb-bench") due to 1 previous error
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[1m[91merror[0m: could not compile `redblue` (test "bench_test") due to 1 previous error
+[0m
+[0m← [0mEdit tests/bench/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+@@ -267,14 +267,15 @@
+     size: i64,
+     budget: Duration,
+ ) -> Result<Measurement, BenchError> {
+     ensure_size_supported(workload, size, budget)?;
+-    let (answer, expected, elapsed) = run_with_budget(workload.name, budget, move || {
+-        let expected = (workload.expected)(size);
+-        let started = Instant::now();
+-        let answer = (workload.run)(size)?;
+-        Ok((answer, expected, started.elapsed()))
+-    })?;
++    let ((answer, expected, elapsed), _) =
++        run_with_budget(workload.name, budget, move || {
++            let expected = (workload.expected)(size);
++            let started = Instant::now();
++            let answer = (workload.run)(size)?;
++            Ok((answer, expected, started.elapsed()))
++        })?;
+     check_expected(workload, size, expected, answer, elapsed)
+ }
+ 
+ /// Refuses a size whose reference answer cannot be materialized safely.
+
+[0m
+[0m$ [0mcargo fmt --all && cargo test --test bench_test
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: function `measure` is never used[0m
+   [1m[94m--> [0mtests/bench/mod.rs:257:4
+    [1m[94m|[0m
+[1m[94m257[0m [1m[94m|[0m fn measure(
+    [1m[94m|[0m    [1m[91m^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `-D dead-code` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+[1m[91merror[0m[1m: function `run_workload_with` is never used[0m
+   [1m[94m--> [0mtests/bench/mod.rs:321:8
+    [1m[94m|[0m
+[1m[94m321[0m [1m[94m|[0m pub fn run_workload_with(
+    [1m[94m|[0m        [1m[91m^^^^^^^^^^^^^^^^^[0m
+
+[1m[91merror[0m: could not compile `redblue` (bin "rb-bench") due to 2 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m$ [0mgrep -n "fn measure\|pub fn run_workload_with\|fn check_expected" tests/bench/mod.rs
+234:fn check_expected(
+257:fn measure(
+270:fn measure_with_reference(
+321:pub fn run_workload_with(
+[0m
+[0m← [0mEdit tests/bench/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+@@ -253,8 +253,9 @@
+         elapsed,
+     })
+ }
+ 
++#[cfg(test)]
+ fn measure(
+     workload: &'static Workload,
+     size: i64,
+     budget: Duration,
+
+[0m
+[0m← [0mEdit tests/bench/mod.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bench/mod.rs
+@@ -318,8 +318,9 @@
+ /// Measures one named workload at one size against a caller-supplied answer.
+ ///
+ /// `run_workload` supplies the workload's own reference answer. Tests use this
+ /// to drive the wrong-answer refusal with a deliberately wrong one.
++#[cfg(test)]
+ pub fn run_workload_with(
+     name: &str,
+     size: i64,
+     budget: Duration,
+
+[0m
+[0m$ [0mcargo fmt --all && cargo test --test bench_test
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 4.91s
+[1m[92m     Running[0m tests/bench_test.rs (target/debug/deps/bench_test-d871d64fc574857b)
+
+running 16 tests
+test bench_workloads_compute_the_documented_literals ... ok
+test bench_table_lists_four_workloads_and_wall_time ... ok
+test bench_markdown_shape_names_answers_and_hardware ... ok
+test edge_a_workload_error_is_reported_as_load ... ok
+test edge_a_wrong_answer_is_refused_instead_of_measured ... ok
+test edge_cli_empty_workload_name_is_a_usage_error ... ok
+test edge_a_workload_that_stops_without_an_answer_is_a_load_error ... ok
+test edge_cli_unknown_workload_with_size_is_a_usage_error ... ok
+test edge_empty_workload_name_lists_the_four ... ok
+test edge_negative_and_malformed_sizes_are_refused ... ok
+test edge_oversized_references_are_refused_before_allocation ... ok
+test edge_reference_computation_is_inside_the_budget ... ok
+test edge_zero_size_completes_with_trivial_answers ... ok
+test edge_singleton_sizes_are_exact ... ok
+test bench_md_exists_and_names_all_workloads ... ok
+test edge_a_hung_workload_fails_loudly_at_its_budget ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+[0m
+[0m$ [0mwc -l tests/bench/mod.rs tests/bench/runner.rs tests/bench_test.rs BENCH.md phases/phase-073/REPORT.md ../phases/phase-073/REPORT.md
+628 tests/bench/mod.rs
+   13 tests/bench/runner.rs
+  386 tests/bench_test.rs
+   15 BENCH.md
+   82 phases/phase-073/REPORT.md
+   82 ../phases/phase-073/REPORT.md
+ 1206 total
+[0m
+[0m$ [0mgit diff -- tests/bench/mod.rs tests/bench_test.rs Cargo.toml | sed -n '1,260p'
+diff --git a/Cargo.toml b/Cargo.toml
+index 265e8b3..11f5149 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,14 @@ categories = ["compiler", "development-tools"]
+ name = "rb"
+ path = "src/main.rs"
+ 
++# The benchmark harness. It is a plain binary, not a `[[bench]]` target: a
++# `[[bench]]` is built and executed by `cargo test --all-targets`, and a
++# measurement that writes `BENCH.md` must not run inside the test gate. The
++# workloads' correctness checks do run there, via `tests/bench_test.rs`.
++[[bin]]
++name = "rb-bench"
++path = "tests/bench/runner.rs"
++
+ # `cdylib` is what makes the WebAssembly playground module: it is the crate type
+ # that emits a `.wasm` and exports every `#[no_mangle]` symbol the library
+ # defines, which is what `wasm/redblue.js` calls. Built with:
+[0m
+[0m# [0mTodos
+[✓] Move reference-answer computation inside the budgeted worker and add safe size caps
+[✓] Add regression test for budget covering reference computation
+[•] Update phase REPORT/findings if needed
+[ ] Run fmt, clippy, tests, and verify gates
+[0m
+[0m$ [0mgrep -n "REPORT\|Tests added\|counted\|passed" ../rbops/verify.sh | head -60
+34:REPORT="$RBOPS_ROOT/phases/$PHASE/REPORT.md"
+79:    *"REPORT.md missing"*)
+80:      printf '          Writing REPORT.md is the whole fix; the code may already be right.\n'
+81:      printf '          It needs sections: What changed / Tests added / Gates /\n'
+170:if [ -f "$REPORT" ]; then
+171:  ok "$REPORT exists"
+173:  for sec in "What changed" "Tests added" "Gates" "Known gaps"; do
+174:    if grep -qF "$sec" "$REPORT"; then ok "section: $sec"
+184:  ' "$REPORT"; then ok "report has at least one real evidence row"
+187:  if grep -qiE 'cargo test *\| *(pass|green)' "$REPORT" && ! grep -qE '[1-9][0-9]* passed' "$REPORT"; then
+188:    bad "report claims cargo test passed but records no passing count"
+198:    warn "no REPORT.md yet — expected under preflight (the agent has not run); the full gate requires one"
+200:    bad "$REPORT missing — a phase without a report cannot pass"
+352:  PASSED="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+354:  if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
+437:# SKIPPED, visibly — never silently passed, and never a global relaxation. The
+467:  # its REPORT) and zero recognized strings. Detecting the assertion is what
+502:if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
+503:  REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+504:  CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
+[0m
+[0m$ [0msed -n '160,205p;340,365p;495,540p' ../rbops/verify.sh
+[ -n "$dep" ] || continue
+    if [ -f "$RBOPS_ROOT/phases/${dep}/.done" ]; then ok "dep ${dep} done"
+    else bad "dep ${dep} not done"; fi
+  done < <("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .depends_on[]?' "$PHASES" 2>/dev/null)
+else
+  bad "jq not available — cannot validate manifest"
+fi
+
+# --- 1. report exists and is not a stub -------------------------------------
+step "report"
+if [ -f "$REPORT" ]; then
+  ok "$REPORT exists"
+  # every required section must be present AND non-trivially filled
+  for sec in "What changed" "Tests added" "Gates" "Known gaps"; do
+    if grep -qF "$sec" "$REPORT"; then ok "section: $sec"
+    else bad "report missing section: $sec"; fi
+  done
+  # The evidence table must contain at least one real data row: a markdown row
+  # that names a path. A header-only or placeholder table is a stub.
+  if awk '
+    /^##[[:space:]]+What changed/ { insec=1; next }
+    /^##[[:space:]]/           { insec=0 }
+    insec && /^\|/ && /\// && !/^\|[[:space:]]*-+/ && !/^\|[[:space:]]*File[[:space:]]*\|/ { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$REPORT"; then ok "report has at least one real evidence row"
+  else bad "report evidence table is a stub — needs a row naming an actual file"; fi
+  # a report claiming a green gate it cannot have run
+  if grep -qiE 'cargo test *\| *(pass|green)' "$REPORT" && ! grep -qE '[1-9][0-9]* passed' "$REPORT"; then
+    bad "report claims cargo test passed but records no passing count"
+  fi
+else
+  # Under preflight a missing report is EXPECTED, not a defect: preflight runs
+  # BEFORE the agent, so it is judging a tree nobody has written a report into
+  # yet. Failing it there would refuse every retry of every phase, which is the
+  # opposite of what an early warning is for. The report is still required by the
+  # full gate, which runs after the agent. A report that EXISTS is checked in
+  # full even under preflight — only its absence is tolerated.
+  if [ "$PREFLIGHT" = "1" ]; then
+    warn "no REPORT.md yet — expected under preflight (the agent has not run); the full gate requires one"
+  else
+    bad "$REPORT missing — a phase without a report cannot pass"
+  fi
+fi
+
+# --- 2. diff hygiene ---------------------------------------------------------
+step "diff hygiene"
+if cargo fmt --all -- --check >/tmp/fmt.log 2>&1; then ok "cargo fmt --check"
+else bad "cargo fmt --check"; tail -20 /tmp/fmt.log; fi
+
+step "cargo clippy"
+if cargo clippy --all-targets -- -D warnings >/tmp/clippy.log 2>&1; then
+  ok "cargo clippy -D warnings"
+else
+  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | sed -n '1,20p'
+fi
+
+step "cargo test"
+if cargo test --all-targets >/tmp/test.log 2>&1; then
+  PASSED="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  FAILED="$(grep -oE '[0-9]+ failed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
+  else bad "cargo test reported 0 passing tests — a suite that cannot fail is not a suite"; fi
+else
+  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | sed -n '1,20p'
+fi
+
+step "doc tests"
+cargo test --doc >/tmp/doctest.log 2>&1 || { bad "cargo test --doc"; tail -15 /tmp/doctest.log; }
+fi
+
+# --- 4. examples still run (the language's spec-by-example) ------------------
+if preflight_skip "examples"; then
+# line. A test fixture that embeds `#[ignore]` as data is not a skipped test.
+SKIPDELTA="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+  | grep -cE '^\+[[:space:]]*(#\[ignore|//[[:space:]]*skip\b)')"
+[ "$SKIPDELTA" -eq 0 ] && ok "no newly skipped tests" || bad "$SKIPDELTA newly skipped/ignored tests"
+
+# --- 6. self-consistency: does the report match reality? --------------------
+step "report honesty"
+if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
+  REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
+  if [ -n "${CLAIM:-}" ]; then
+    # Asymmetric by design. The threat model is FABRICATION: claiming green
+    # that was never earned. A claim ABOVE reality (+2 tolerance for reruns)
+    # fails the phase. A claim BELOW reality is sloppiness in prose, not a lie
+    # that ships bad code — the gate itself measured the real number, so warn
+    # and move on. This distinction once blocked a phase with 59 green tests
+    # over a "0 passing" typo.
+    if [ "$CLAIM" -gt $((REAL + 2)) ]; then
+      bad "report claims $CLAIM passing, actual run has $REAL — over-claiming is fabrication"
+    elif [ "$CLAIM" -lt $((REAL - 2)) ]; then
+      warn "report claims $CLAIM passing, actual run has $REAL — under-claimed, fix the number"
+      ok "reported test count ($CLAIM) does not exceed actual ($REAL)"
+    else
+      ok "reported test count ($CLAIM) matches actual ($REAL)"
+    fi
+  fi
+fi
+
+# --- verdict -----------------------------------------------------------------
+printf '\n'
+if [ "$PREFLIGHT" = "1" ]; then
+  # A preflight PASS is NOT a gate pass, and the exit code says so: 0 means "no
+  # defect found in the cheap half", never "this phase may be marked .done". The
+  # caller (dispatch.sh cmd_run) still runs the full gate after the agent. A
+  # distinct exit code makes it impossible for a preflight to be mistaken for
+  # the real thing by a caller that does not read this banner.
+  if [ "$FAIL" -eq 0 ]; then
+    printf '\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT CLEAN — %-19s ║\033[0m\n' "$PHASE"
+    printf '\033[33m║ diff-based checks only; no build run ║\033[0m\n'
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 0
+  fi
+  printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[31m║ PREFLIGHT FAIL   — %-19s ║\033[0m\n' "$PHASE"
+  printf '\033[31m║ %d diff-based check(s) failed         ║\033[0m\n' "$FAIL"
+[0m
+[0m$ [0mcargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[91merror[0m[1m: function `measure` is never used[0m
+   [1m[94m--> [0mtests/bench/mod.rs:258:4
+    [1m[94m|[0m
+[1m[94m258[0m [1m[94m|[0m fn measure(
+    [1m[94m|[0m    [1m[91m^^^^^^^[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `-D dead-code` implied by `-D warnings`
+    [1m[94m= [0m[1mhelp[0m: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+[1m[91merror[0m[1m: function `run_workload_with` is never used[0m
+   [1m[94m--> [0mtests/bench/mod.rs:323:8
+    [1m[94m|[0m
+[1m[94m323[0m [1m[94m|[0m pub fn run_workload_with(
+    [1m[94m|[0m        [1m[91m^^^^^^^^^^^^^^^^^[0m
+
+[1m[91merror[0m: could not compile `redblue` (bin "rb-bench" test) due to 2 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[0m
+[0m$ [0mtail -20 tests/bench/mod.rs
+// --- lex-heavy compile -------------------------------------------------------
+
+fn run_lex(size: i64) -> Result<Value, String> {
+    let mut source = String::new();
+    for index in 0..size {
+        source.push_str(&format!("set value{index} to {index}\n"));
+    }
+    let tokens = Lexer::tokenize(&source).map_err(|error| error.to_string())?;
+    let program = parser::parse(tokens).map_err(|error| error.to_string())?;
+    analyzer::analyze(&program).map_err(|error| error.to_string())?;
+    Ok(Value::Number(program.statements.len() as f64))
+}
+
+fn expected_lex(size: i64) -> Expected {
+    Expected::Number(size.max(0) as f64)
+}
+
+fn run_source(source: &str) -> Result<Value, String> {
+    redblue::run_source_value(source).map_err(|error| error.to_string())
+}
+[0m
+[0m$ [0mcat >> tests/bench/mod.rs <<'EOF'
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edge_a_caller_supplied_answer_is_refused_within_the_budget() {
+        let error = run_workload_with(
+            "fibonacci",
+            20,
+            Duration::from_secs(5),
+            Expected::Number(-1.0),
+        )
+        .expect_err("a wrong caller-supplied answer must be refused");
+        assert!(matches!(error, BenchError::WrongAnswer { .. }), "{error:?}");
+
+        let error = run_workload_with(
+            "fibonacci",
+            i64::MAX,
+            Duration::from_millis(1),
+            Expected::Number(1.0),
+        )
+        .expect_err("an oversized workload must not escape the budget");
+        assert!(matches!(error, BenchError::BudgetExceeded { .. }), "{error:?}");
+    }
+}
+EOF
+cargo fmt --all
+(no output)
+[0m
+[0m$ [0mcargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 6.93s
+[0m
+[0m$ [0mcargo test --all-targets > /tmp/opencode/cargo-test-phase073.log 2>&1; status=$?; tail -40 /tmp/opencode/cargo-test-phase073.log; echo "EXIT=$status"
+(no output)
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 900000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mtail -80 /tmp/opencode/cargo-test-phase073.log; echo '---'; grep -c 'running' /tmp/opencode/cargo-test-phase073.log; ps aux | grep -E 'cargo|rb-bench|bench_test' | grep -v grep | head
+test edge_numeric_boundaries ... ok
+test edge_type_mismatch_is_rejected_by_every_type_assertion ... ok
+test edge_malformed_pattern_is_reported_as_a_failure_not_a_panic ... ok
+test edge_an_invalid_pattern_and_a_non_match_record_different_expectations ... ok
+test edge_empty_and_singleton_inputs ... ok
+test every_public_assertion_has_a_probe ... ok
+test edge_unicode_text_is_matched_by_bytes_of_the_real_string ... ok
+test redblue_expect_failure_message_is_built_by_the_assertion_library ... ok
+test every_rejection_names_the_failure ... ok
+test every_surviving_assertion_works_in_both_directions ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+[1m[92m     Running[0m tests/bench_test.rs (target/debug/deps/bench_test-d871d64fc574857b)
+
+running 17 tests
+test bench::tests::edge_a_caller_supplied_answer_is_refused_within_the_budget ... ok
+test bench_markdown_shape_names_answers_and_hardware ... ok
+test bench_workloads_compute_the_documented_literals ... ok
+test edge_a_workload_error_is_reported_as_load ... ok
+test bench_md_exists_and_names_all_workloads ... ok
+test edge_a_wrong_answer_is_refused_instead_of_measured ... ok
+test edge_cli_empty_workload_name_is_a_usage_error ... ok
+test edge_cli_unknown_workload_with_size_is_a_usage_error ... ok
+test edge_empty_workload_name_lists_the_four ... ok
+test edge_negative_and_malformed_sizes_are_refused ... ok
+test edge_oversized_references_are_refused_before_allocation ... ok
+test edge_reference_computation_is_inside_the_budget ... ok
+test edge_a_workload_that_stops_without_an_answer_is_a_load_error ... ok
+test bench_table_lists_four_workloads_and_wall_time ... ok
+test edge_zero_size_completes_with_trivial_answers ... ok
+test edge_singleton_sizes_are_exact ... ok
+test edge_a_hung_workload_fails_loudly_at_its_budget ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-8185bebb92e6cb02)
+
+running 23 tests
+test edge_a_construct_stage_two_cannot_compile_is_refused_rather_than_mistranslated ... ok
+test edge_a_broken_branch_is_refused_and_writes_nothing ... ok
+test edge_each_branch_compiles_the_statements_it_was_given ... ok
+test edge_for_range_pushes_only_the_bounds_it_was_given ... ok
+test edge_malformed_source_is_reported_rather_than_compiled ... ok
+test edge_nothing_heads_an_expression_on_both_engines ... ok
+test edge_a_comparison_after_a_worded_index_is_the_same_program_on_both_engines ... ok
+test edge_stage3_is_byte_identical_on_a_sample_of_every_family ... ok
+test edge_a_while_loop_nested_in_another_patches_its_own_jump ... ok
+test edge_source_shapes_are_byte_identical ... ok
+test edge_stage3_reports_a_failure_rather_than_writing_a_file ... ok
+test edge_the_bytecode_vm_hands_arguments_to_the_program_it_runs ... ok
+test edge_the_bytecode_vm_reports_a_bad_invocation_as_a_failure ... ok
+test edge_the_self_compilation_still_obeys_the_step_budget ... ok
+test edge_stage3_refuses_every_malformed_corpus_program ... ok
+test edge_stage3_is_byte_identical_on_the_awkward_shapes ... ok
+test edge_the_two_engines_run_a_branching_program_the_same ... ok
+test stage2_is_byte_identical_for_each_statement_kind ... ok
+test edge_stage3_is_byte_identical_on_every_corpus_program has been running for over 60 seconds
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically has been running for over 60 seconds
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families ... ok
+test edge_three_consecutive_self_compilations_are_byte_identical ... ok
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 634.43s
+
+[1m[92m     Running[0m tests/bootstrap_ship_test.rs (target/debug/deps/bootstrap_ship_test-9d13b1f01fd6bef2)
+
+running 16 tests
+test edge_a_frontend_refusal_keeps_its_kind_and_position ... ok
+test edge_a_missing_empty_or_silent_compiler_is_refused_rather_than_shipped ... ok
+test edge_bare_rb_bootstrap_is_the_command_and_not_a_file_to_run ... ok
+test edge_the_release_command_exits_non_zero_on_what_it_cannot_ship ... ok
+test edge_a_rollback_that_is_not_the_fixed_point_writes_nothing has been running for over 60 seconds
+test edge_a_stage_two_that_is_not_the_fixed_point_is_refused_and_ships_nothing has been running for over 60 seconds
+test edge_concurrent_stage_two_runs_keep_their_own_paths has been running for over 60 seconds
+test edge_the_release_is_built_by_the_self_hosted_compiler has been running for over 60 seconds
+---
+18
+runner    207847  0.0  0.0   6140  2044 ?        S    02:54   0:00 timeout 10800 opencode run --model opencode/deepseek-v4.1-flash-free --dir /home/runner/work/rbops/rbops/redblue --agent build --title rbops-fix-phase-073-2 # Fix the review findings for phase phase-073 (round 2)  Read the reviewer output below and fix every BLOCKER and CRITICAL. Do not weaken any gate. Do not add #[ignore], `// skip`, or an allow(clippy:: suppression. Do not delete a test. Then re-run the four gates yourself.  ## Reviewer output  FINDINGS: 1. [BLOCKER] tests/bench/mod.rs:251 — the reference answer is computed before the budgeted call, so the harness's central "must fail instead of waiting forever" promise is false. `run_workload` does `let expected = (workload.expected)(size);` at line 251, then calls `run_workload_with` → `measure`, whose only `run_with_budget` call is at line 225. But `expected_fibonacci` loops `for _ in 2..=size` (line 471), `expected_primes` → `primes_below` allocates `vec![false; limit + 1]` (line 511), and `expected_concat` does `"ab".repeat(size.max(0) as usize)` (line 541) — all on the caller's thread with no timeout. `parse_size` accepts any non-negative `i64`, so `rb-bench fibonacci 1000000000000000000` hangs on the main thread and `rb-bench primes 100000000000` / `rb-bench concat 500000000000` abort on allocation, even though the module doc (lines 21-27, 183-189) and the REPORT's `resource_limit` row claim a 60-second budget. The budget must cover the reference computation too, or `size` must be capped before `expected` is called. VERIFIED: traced `run_workload` lines 244-253 → `measure` 219-225; the `expected` closure runs on the caller thread before any `run_with_budget`.  2. [MAJOR] src/interpreter.rs:2253 — `Statement::Return(expr) | Statement::GiveBack(expr)` merely evaluates the value and yields it; there is no return signal. `run_block` (src/interpreter.rs:1095-1098) only propagates `LoopControl` (break/skip), so execution continues after an early `give back`. This is real spec drift: `SPEC.md`'s return-value examples show `give back` inside `if`/`else`, and `tests/test_closures.rb:14` explicitly comments that `give back` does not leave a function in this build; `tests/test_functions.rb:53-62,140-145` only assert `type_of` or put the `give back` last, so no test pins early-return. This is pre-existing (the phase's `phases/phase-073/FINDINGS.md` reproduces it) and out of the test-only phase's scope, but it is still a live language bug that the phase ships and the review records. Traced, not run here; the FINDINGS.md reproduction is consistent with lines 2253 and 1095.  3. [MINOR] tests/bench/mod.rs:48 — `Expected::Number(want), Value::Number(got) => want == got` uses exact `f64` equality for the reference check. The values happen to be integer-valued, but a workload whose expected/actual diverge by one ULP (e.g. a different evaluation order between engines) is reported as `WrongAnswer` rather than a numeric mismatch. Use an integer/bit-exact representation or a documented tolerance for `Expected::Number`.  4. [MINOR] tests/bench/mod.rs:324 — `render_markdown` writes `row.answer` raw into a Markdown table cell. A text workload returning `|` or a newline would break the table, and `bench_md_exists_and_names_all_workloads` (tests/bench_test.rs:52-63) parses cells with a naive `split('|')`, so such a workload would fail the gate with a misleading message. Escape `|`/newlines when rendering the cell.  5. [MINOR] tests/bench/mod.rs:200-216 — a timeout returns `BudgetExceeded` but leaves the worker thread detached and uncancellable; `edge_a_hung_workload_fails_loudly_at_its_budget` (tests/bench_test.rs:226-239) therefore passes while a 250 ms sleeper keeps running after the test returns. Documented in the REPORT's known gaps and not fixable without a cancellation hook or child process, but the `resource_limit` row overstates the guarantee; the leap to a child process is the concrete fix.  REVIEW VERDICT: FINDINGS 5
+runner    207848  9.8  3.5 75171516 575996 ?     Sl   02:54   2:27 opencode run --model opencode/deepseek-v4.1-flash-free --dir /home/runner/work/rbops/rbops/redblue --agent build --title rbops-fix-phase-073-2 # Fix the review findings for phase phase-073 (round 2)  Read the reviewer output below and fix every BLOCKER and CRITICAL. Do not weaken any gate. Do not add #[ignore], `// skip`, or an allow(clippy:: suppression. Do not delete a test. Then re-run the four gates yourself.  ## Reviewer output  FINDINGS: 1. [BLOCKER] tests/bench/mod.rs:251 — the reference answer is computed before the budgeted call, so the harness's central "must fail instead of waiting forever" promise is false. `run_workload` does `let expected = (workload.expected)(size);` at line 251, then calls `run_workload_with` → `measure`, whose only `run_with_budget` call is at line 225. But `expected_fibonacci` loops `for _ in 2..=size` (line 471), `expected_primes` → `primes_below` allocates `vec![false; limit + 1]` (line 511), and `expected_concat` does `"ab".repeat(size.max(0) as usize)` (line 541) — all on the caller's thread with no timeout. `parse_size` accepts any non-negative `i64`, so `rb-bench fibonacci 1000000000000000000` hangs on the main thread and `rb-bench primes 100000000000` / `rb-bench concat 500000000000` abort on allocation, even though the module doc (lines 21-27, 183-189) and the REPORT's `resource_limit` row claim a 60-second budget. The budget must cover the reference computation too, or `size` must be capped before `expected` is called. VERIFIED: traced `run_workload` lines 244-253 → `measure` 219-225; the `expected` closure runs on the caller thread before any `run_with_budget`.  2. [MAJOR] src/interpreter.rs:2253 — `Statement::Return(expr) | Statement::GiveBack(expr)` merely evaluates the value and yields it; there is no return signal. `run_block` (src/interpreter.rs:1095-1098) only propagates `LoopControl` (break/skip), so execution continues after an early `give back`. This is real spec drift: `SPEC.md`'s return-value examples show `give back` inside `if`/`else`, and `tests/test_closures.rb:14` explicitly comments that `give back` does not leave a function in this build; `tests/test_functions.rb:53-62,140-145` only assert `type_of` or put the `give back` last, so no test pins early-return. This is pre-existing (the phase's `phases/phase-073/FINDINGS.md` reproduces it) and out of the test-only phase's scope, but it is still a live language bug that the phase ships and the review records. Traced, not run here; the FINDINGS.md reproduction is consistent with lines 2253 and 1095.  3. [MINOR] tests/bench/mod.rs:48 — `Expected::Number(want), Value::Number(got) => want == got` uses exact `f64` equality for the reference check. The values happen to be integer-valued, but a workload whose expected/actual diverge by one ULP (e.g. a different evaluation order between engines) is reported as `WrongAnswer` rather than a numeric mismatch. Use an integer/bit-exact representation or a documented tolerance for `Expected::Number`.  4. [MINOR] tests/bench/mod.rs:324 — `render_markdown` writes `row.answer` raw into a Markdown table cell. A text workload returning `|` or a newline would break the table, and `bench_md_exists_and_names_all_workloads` (tests/bench_test.rs:52-63) parses cells with a naive `split('|')`, so such a workload would fail the gate with a misleading message. Escape `|`/newlines when rendering the cell.  5. [MINOR] tests/bench/mod.rs:200-216 — a timeout returns `BudgetExceeded` but leaves the worker thread detached and uncancellable; `edge_a_hung_workload_fails_loudly_at_its_budget` (tests/bench_test.rs:226-239) therefore passes while a 250 ms sleeper keeps running after the test returns. Documented in the REPORT's known gaps and not fixable without a cancellation hook or child process, but the `resource_limit` row overstates the guarantee; the leap to a child process is the concrete fix.  REVIEW VERDICT: FINDINGS 5
+[0m
+[0m$ [0mgrep -n "Running\|test result:" /tmp/opencode/cargo-test-phase073.log | tail -60
+3:[1m[92m     Running[0m unittests src/lib.rs (target/debug/deps/redblue-4241553a6ced587a)
+657:test result: ok. 581 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.87s
+659:[1m[92m     Running[0m unittests src/main.rs (target/debug/deps/rb-f7fd0805ed76e0d2)
+663:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+665:[1m[92m     Running[0m unittests tests/bench/runner.rs (target/debug/deps/rb_bench-35b7b643706c4ef8)
+670:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+672:[1m[92m     Running[0m tests/agent_permissions_test.rs (target/debug/deps/agent_permissions_test-426325563700009a)
+724:test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+726:[1m[92m     Running[0m tests/assertions_test.rs (target/debug/deps/assertions_test-61d8929a68f8108c)
+740:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+742:[1m[92m     Running[0m tests/bench_test.rs (target/debug/deps/bench_test-d871d64fc574857b)
+763:test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+765:[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-8185bebb92e6cb02)
+796:test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 634.43s
+798:[1m[92m     Running[0m tests/bootstrap_ship_test.rs (target/debug/deps/bootstrap_ship_test-9d13b1f01fd6bef2)
+[0m
