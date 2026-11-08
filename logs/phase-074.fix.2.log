@@ -1,0 +1,3675 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0mgit status && git log --oneline -10
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   bootstrap/compiler.rb
+	modified:   tests/bootstrap_selfhost_test.rs
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	phases/phase-074/
+
+no changes added to commit (use "git add" and/or "git commit -a")
+71ce4f8 rbops: phase-073 (2026-11-08T13:05:41Z)
+cba845c resume phase-073: adopt preserved work
+18ef4b7 docs: resolve permission fatigue in phase 152 and document limitations 7-9
+b7e457e docs: define remediation dependency invariant and design stop rule
+f7a38eb docs: formalize world-class features as phases 179-185 and schedule S4 bootstrap as phase 186
+1f6a686 docs: add world-class language gaps, curated 100 package architecture, and GUI app feedback loop
+5bd0c79 docs: bridge toolchain phases 132-138 and schedule self-hosting S4 bootstrap as Phase 179
+1c0ffbe docs: add extreme execution velocity and microarchitectural phases (phases 173-178)
+4725634 docs: add modern language pain point survey and core grammar evolution plan (phases 168-172)
+c1bb804 docs: normalize phase identifiers to strictly canonical integers (phase-159 to phase-167)
+[0m
+[0m$ [0msed -n '2100,2300p' tests/bootstrap_selfhost_test.rs
+assert_identical(name, source);
+    }
+}
+
+// Phase 074: the compiler's intern table is internal to
+// `bootstrap/compiler.rb`, so the direct tests drive it through the compiler's
+// hidden `--intern-selftest` mode. That mode runs the same `intern` and
+// `intern_hash` the normal compile path runs; it only gives a test a way to
+// call them without a source file that happens to use every shape needed.
+//
+// The byte-equality test is the real gate: a hash table that answers a name
+// with the wrong index changes the constant pool, and the pool is part of the
+// bytes. `edge_name_heavy_fixture_is_byte_identical_in_both_stages` compiles a
+// program with many distinct names in both stages and requires the files to be
+// one file.
+
+struct InternOutput {
+    stdout: String,
+    stderr: String,
+    succeeded: bool,
+}
+
+fn run_intern_mode(args: &[&str]) -> InternOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("run")
+        .arg(compiler())
+        .args(args)
+        .output()
+        .expect("the rb binary runs");
+    InternOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        succeeded: output.status.success(),
+    }
+}
+
+fn intern_selftest() -> InternOutput {
+    run_intern_mode(&["--intern-selftest"])
+}
+
+/// The value printed for `key`, which the self-test prints as `key value`.
+fn intern_report<'a>(stdout: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key} ");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("the self-test printed no '{key}' line:\n{stdout}"))
+}
+
+fn intern_number(stdout: &str, key: &str) -> i64 {
+    intern_report(stdout, key)
+        .parse::<i64>()
+        .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
+}
+
+fn intern_selftest_type_error() -> Result<(), String> {
+    let run = run_intern_mode(&["--intern-selftest-type-error"]);
+    if run.succeeded {
+        Ok(())
+    } else {
+        Err(run.stderr)
+    }
+}
+
+#[test]
+fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "repeat_growth"),
+        1,
+        "1000 repetitions of one name grew the table by more than the one distinct name:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "other_growth"),
+        2,
+        "a second distinct name did not grow the table to exactly two entries:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn edge_engineered_collision_resolves_each_name_to_its_own_index() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "collision_found"),
+        "yes",
+        "the self-test failed to construct a collision:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "collision_distinct"),
+        "yes",
+        "two colliding names were given the same index:\n{}",
+        run.stdout
+    );
+
+    // Each colliding name must still resolve to the index it was given, after
+    // the other one was added to the same bucket.
+    for name in ["collision_a", "collision_b"] {
+        let index = intern_number(&run.stdout, &format!("{name}_index"));
+        let lookup = intern_number(&run.stdout, &format!("{name}_lookup"));
+        assert_eq!(
+            lookup, index,
+            "{name} did not resolve to its own index after the collision:\n{}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn edge_empty_and_ten_kilobyte_names_are_interned_exactly() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "empty_same"),
+        "yes",
+        "the empty name was not interned to one index:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "empty_growth"),
+        1,
+        "the empty name grew the table by more than one:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "long_same"),
+        "yes",
+        "the same 10KB name did not intern to one index:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "long_distinct"),
+        "yes",
+        "a 10KB name that differs only in its last byte reused the first index, so the name was truncated:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "long_growth"),
+        2,
+        "the two 10KB names did not grow the table to exactly two entries:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
+    let result = intern_selftest_type_error();
+    assert!(
+        result.is_err(),
+        "the compiler interned a number as if it were a name"
+    );
+    let stderr = result.unwrap_err();
+    assert!(
+        stderr.contains("length requires a list or text"),
+        "the failure was not the clean length error:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("usage:"),
+        "the run fell through to a usage error instead of reaching the intern table:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "the run panicked instead of reporting a runtime error:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn edge_name_heavy_fixture_is_byte_identical_in_both_stages() {
+    let mut source = String::new();
+    for index in 0..120 {
+        source.push_str(&format!("set name{index} to {index}\n"));
+    }
+    for index in 0..120 {
+        source.push_str(&format!("say name{index}\n"));
+    }
+    // One name emitted far more often than the others: the table must still
+    // hold it once and answer every occurrence with the same index. The
+    // statement count is kept well below the compiler's parser call-depth
+    // limit, since the contract here is byte equality rather than size.
+    for _ in 0..30 {
+        source.push_str("say name0\n");
+    }
+[0m
+[0m$ [0msed -n '2650,2850p' bootstrap/compiler.rb
+set apply_patches_arg to 0
+    set G_PATCHED to []
+    set apply_patches_i to 0
+    while apply_patches_i < length(code)
+        set apply_patches_arg to code[apply_patches_i].a
+        for each each_patch in patches
+            if each_patch.slot - start is apply_patches_i then
+                if each_patch.at is "here" then
+                    set apply_patches_arg to length(code)
+                else
+                    set apply_patches_arg to each_patch.value - start
+                end
+            end
+        end
+        append("G_PATCHED", {o: code[apply_patches_i].o, a: apply_patches_arg, x: code[apply_patches_i].x, l: code[apply_patches_i].l})
+        set apply_patches_i to apply_patches_i + 1
+    end
+    give back G_PATCHED
+end
+
+// The intern table. A name used a hundred times is one entry, so the pool is
+// the same whichever way round the source used them.
+//
+// A lookup used to walk every entry, and a self-compilation walks the table for
+// every name it emits, so the cost was the number of names times the number of
+// entries. `intern_hash` names a bucket instead, and only that bucket's entries
+// are compared. The entries stay in `G_INTERN` in insertion order, so a new
+// name still takes the next pool index and the emitted bytes are unchanged.
+to intern(raw)
+    intern_init()
+    set intern_bucket to intern_hash(raw) mod INTERN_BUCKETS
+    set intern_chain to G_INTERN_BUCKETS[intern_bucket]
+    set intern_found to -1
+    set intern_i to 0
+    while intern_i < length(intern_chain)
+        if intern_found < 0 then
+            if G_INTERN[intern_chain[intern_i]].k is raw then
+                set intern_found to intern_chain[intern_i]
+            end
+        end
+        set intern_i to intern_i + 1
+    end
+    set intern_result to 0
+    if intern_found >= 0 then
+        set intern_result to G_INTERN[intern_found].n
+    end
+    if intern_found < 0 then
+        set intern_index to length(G_POOL)
+        append("G_POOL", {t: 3, b: raw})
+        append("G_INTERN", {k: raw, n: intern_index})
+        set G_INTERN_COUNT to G_INTERN_COUNT + 1
+        intern_bucket_add(intern_bucket, length(G_INTERN) - 1)
+        set intern_result to intern_index
+    end
+    give back intern_result
+end
+
+// A polynomial rolling hash over the name's bytes, reduced so every
+// intermediate below the multiply is exact in an `f64`. The exact value does not matter; what matters
+// is that the same bytes give the same bucket on every run, in both the
+// tree-walker and the bytecode VM.
+to intern_hash(raw)
+    set intern_hash_value to 0
+    set intern_hash_i to 0
+    while intern_hash_i < length(raw)
+        set intern_hash_value to (intern_hash_value * 31 + raw[intern_hash_i]) mod 2147483647
+        set intern_hash_i to intern_hash_i + 1
+    end
+    give back intern_hash_value
+end
+
+// The bucket array, built on the first lookup. Every bucket starts empty.
+to intern_init()
+    if length(G_INTERN_BUCKETS) is 0 then
+        set intern_init_i to 0
+        while intern_init_i < INTERN_BUCKETS
+            append("G_INTERN_BUCKETS", [])
+            set intern_init_i to intern_init_i + 1
+        end
+    end
+end
+
+// The index is added to one bucket. The bucket is rebuilt rather than changed
+// in place because Redblue has no index assignment, and the table is rebuilt
+// with it because a bucket is held by value. Rebuilding the table costs one
+// `append` per bucket, paid only when a name is new; a lookup still reads its
+// bucket directly.
+to intern_bucket_add(bucket, entry_index)
+    set intern_bucket_add_chain to push(G_INTERN_BUCKETS[bucket], entry_index)
+    set G_INTERN_BUCKETS_NEXT to []
+    set intern_bucket_add_i to 0
+    while intern_bucket_add_i < length(G_INTERN_BUCKETS)
+        if intern_bucket_add_i is bucket then
+            append("G_INTERN_BUCKETS_NEXT", intern_bucket_add_chain)
+        else
+            append("G_INTERN_BUCKETS_NEXT", G_INTERN_BUCKETS[intern_bucket_add_i])
+        end
+        set intern_bucket_add_i to intern_bucket_add_i + 1
+    end
+    set G_INTERN_BUCKETS to G_INTERN_BUCKETS_NEXT
+end
+
+// The direct tests in `tests/bootstrap_selfhost_test.rs` drive the table through
+// this mode instead of hoping a source program happens to exercise one bucket.
+// It runs only for `--intern-selftest`; a normal invocation takes the two-path
+// branch in `main` and never reaches it.
+to intern_selftest()
+    set intern_selftest_start to G_INTERN_COUNT
+
+    // One name, a thousand times: the table grows by one, not by a thousand.
+    set intern_selftest_repeated to bytes.from_text("repeated")
+    set intern_selftest_first to intern(intern_selftest_repeated)
+    set intern_selftest_i to 0
+    while intern_selftest_i < 1000
+        intern(intern_selftest_repeated)
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    say "repeat_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+    intern(bytes.from_text("other"))
+    say "other_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+
+    // The empty name is a name, not a missing one.
+    set intern_selftest_empty_start to G_INTERN_COUNT
+    set intern_selftest_empty_one to intern([])
+    set intern_selftest_empty_two to intern([])
+    say "empty_same " + intern_selftest_yes(intern_selftest_empty_one is intern_selftest_empty_two)
+    say "empty_growth " + to_text(G_INTERN_COUNT - intern_selftest_empty_start)
+
+    // A name far longer than a bucket count, and a variant that differs only in
+    // its last byte. A hash that truncated the name would give them one index.
+    set intern_selftest_long_a to []
+    set intern_selftest_long_b to []
+    set intern_selftest_i to 0
+    while intern_selftest_i < 10000
+        append("intern_selftest_long_a", 120)
+        append("intern_selftest_long_b", 120)
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    append("intern_selftest_long_b", 121)
+    set intern_selftest_long_start to G_INTERN_COUNT
+    set intern_selftest_long_one to intern(intern_selftest_long_a)
+    set intern_selftest_long_two to intern(intern_selftest_long_a)
+    set intern_selftest_long_three to intern(intern_selftest_long_b)
+    say "long_same " + intern_selftest_yes(intern_selftest_long_one is intern_selftest_long_two)
+    say "long_distinct " + intern_selftest_yes(intern_selftest_long_one is not intern_selftest_long_three)
+    say "long_growth " + to_text(G_INTERN_COUNT - intern_selftest_long_start)
+
+    // Two distinct names engineered to select the same bucket: keep the first
+    // candidate, then walk a sequence of distinct names until one hashes to its
+    // bucket. Both then have to be in the bucket at once and each has to answer
+    // with its own index.
+    set intern_selftest_a to bytes.from_text("collision-0")
+    set intern_selftest_a_bucket to intern_hash(intern_selftest_a) mod INTERN_BUCKETS
+    set intern_selftest_b to []
+    set intern_selftest_found to no
+    set intern_selftest_i to 1
+    while intern_selftest_i < 20000
+        if intern_selftest_found is no then
+            set intern_selftest_b to bytes.from_text("collision-" + to_text(intern_selftest_i))
+            if (intern_hash(intern_selftest_b) mod INTERN_BUCKETS) is intern_selftest_a_bucket then
+                set intern_selftest_found to yes
+            end
+        end
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    set intern_selftest_a_index to intern(intern_selftest_a)
+    set intern_selftest_b_index to intern(intern_selftest_b)
+    say "collision_found " + intern_selftest_yes(intern_selftest_found)
+    say "collision_distinct " + intern_selftest_yes(intern_selftest_a_index is not intern_selftest_b_index)
+    say "collision_bucket " + to_text(intern_hash(intern_selftest_a) mod INTERN_BUCKETS)
+    say "collision_a_index " + to_text(intern_selftest_a_index)
+    say "collision_b_index " + to_text(intern_selftest_b_index)
+    say "collision_a_lookup " + to_text(intern(intern_selftest_a))
+    say "collision_b_lookup " + to_text(intern(intern_selftest_b))
+    give back 0
+end
+
+// The same words the rest of this file prints for a yes/no.
+to intern_selftest_yes(flag)
+    set intern_selftest_yes_text to "no"
+    if flag is yes then
+        set intern_selftest_yes_text to "yes"
+    end
+    give back intern_selftest_yes_text
+end
+
+// A name that is not a byte list must fail at the table, not be accepted as
+// some other key. The test drives this through `main`, so the failure is the
+// compiler's own runtime error and not a panic.
+to intern_selftest_type_error()
+    intern(42)
+    give back 0
+end
+
+// `Compiler::text`: intern a name and use it as an operand.
+to emit_name(opcode, raw, aux, line)
+    emit(opcode, intern(raw), aux, line)
+end
+
+// A constant that is **not** interned: a literal, appended every time it is
+// written.
+[0m
+[0m$ [0mls -la phases/phase-074/ && find phases/phase-074 -type f -maxdepth 2 | head -50
+total 20
+drwxr-xr-x  2 runner runner 4096 Nov  8 14:08 .
+drwxr-xr-x 96 runner runner 4096 Nov  8 14:08 ..
+-rw-r--r--  1 runner runner 1040 Nov  8 14:49 FINDINGS.md
+-rw-r--r--  1 runner runner 7466 Nov  8 15:29 REPORT.md
+phases/phase-074/FINDINGS.md
+phases/phase-074/REPORT.md
+[0m
+[0m$ [0mcat phases/phase-074/FINDINGS.md; echo "=====REPORT====="; cat phases/phase-074/REPORT.md
+# Findings outside phase-074
+
+## The self-hosted compiler's parser hits the call-depth limit near a thousand statements
+
+**Evidence.** Compiling a flat program with 1000 `set` statements and 1000 `say`
+statements through `bootstrap/compiler.rb` fails with:
+
+```
+Error: RuntimeError: Maximum call depth of 1000 reached while calling 'token_kind'
+  --> bootstrap/compiler.rb:795:5
+795 |     if token_kind(tokens, pos) is "id" then
+```
+
+The parser's `parse_statements` recurses once per statement, so a source with
+more than the interpreter's call-depth budget of 1000 flat statements is refused
+even though no expression or block is deeply nested. This is a pre-existing
+limit (the same source fails with the compiler from `HEAD`); it is not caused by
+the intern-table change. The name-heavy fixture in
+`tests/bootstrap_selfhost_test.rs` stays below it so the phase tests byte
+equality rather than the parser limit.
+
+A future phase could make `parse_statements` iterative, or raise the limit for
+the compiler, but that is a separate concern.
+=====REPORT=====
+# Phase 074 — Hash the self-hosted compiler's intern table instead of scanning it
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| `bootstrap/compiler.rb` | +191 −15 | Replaced the linear `G_INTERN` scan in `intern` with a 256-bucket chained hash table. Added `intern_hash` (a deterministic byte hash reduced so every intermediate is exact in `f64`), `intern_init` (lazy empty buckets), and `intern_bucket_add` (rebuilds the bucket array on a new name). Entries stay in `G_INTERN` in first-use order, so pool indexes and emitted bytes are unchanged. Added the hidden `--intern-selftest` and `--intern-selftest-type-error` modes used by the direct tests, routed before the normal two-path compile branch. |
+| `tests/bootstrap_selfhost_test.rs` | +224 −0 | Five new tests appended to the existing self-host test file: they drive the real `intern` through the hidden mode, then compile a name-heavy fixture with both stages, compare the files byte-for-byte, and decode the pool to prove each name is there exactly once. Adding them to an existing test file keeps them in the repository's test diff rather than leaving an untracked test file the policy gate cannot see. |
+
+## Reproduction of the finding (before the change)
+
+`intern` at `bootstrap/compiler.rb:2644` walked every entry on every emitted
+name:
+
+```redblue
+while intern_i < length(G_INTERN)
+    if G_INTERN[intern_i].k is raw then
+        set intern_found to intern_i
+    end
+    set intern_i to intern_i + 1
+end
+```
+
+The self-compilation under the tree-walker reproduced the cost:
+
+```
+$ /usr/bin/time -f 'elapsed %e s' target/debug/rb run bootstrap/compiler.rb bootstrap/compiler.rb target/tmp/self-before.rbc
+elapsed 321.46 s
+```
+
+The change keeps the same lookup order and the same insertion order, so the
+control experiment below emits byte-identical output.
+
+## Codegen measurement (before and after, same machine, back-to-back)
+
+The compiler has no clock; the two measurement copies under `target/tmp/` add
+only `time.now()` around `compile_program` and print the elapsed seconds to
+stderr. Both copies compile the **same** input, the current
+`bootstrap/compiler.rb`, so the numbers isolate the intern-table change rather
+than the compiler's own source changing size.
+
+```
+$ target/debug/rb run target/tmp/compiler-old-timed.rb bootstrap/compiler.rb target/tmp/timed-old-out.rbc
+codegen_seconds 147.343627442
+$ target/debug/rb run target/tmp/compiler-new-timed.rb bootstrap/compiler.rb target/tmp/timed-new-out.rbc
+codegen_seconds 70.074412387
+$ cmp target/tmp/timed-old-out.rbc target/tmp/timed-new-out.rbc && echo identical
+identical
+```
+
+| Measurement | Old linear `intern` | New hash `intern` | Change |
+|---|---:|---:|---:|
+| Codegen seconds on `bootstrap/compiler.rb` | 147.34 s | 70.07 s | **−52.4%** |
+| Whole compiler run, uninstrumented | 321.46 s | 264.77 s | −17.6% |
+| Whole compiler run, timed copies above | 342.19 s | 264.60 s | −22.7% |
+
+The whole-run drop is smaller because lexing, parsing and encoding do not touch
+the intern table, and because this phase's compiler source is larger than the
+one measured before it. The codegen drop is the number the finding is about.
+
+## Tests added
+
+| Test | Edge class covered |
+|---|---|
+| `edge_interning_the_same_name_1000_times_grows_the_table_once` | duplicate keys / boundary: 1000 repetitions of one name grow the table by exactly 1, a second distinct name grows it to exactly 2 |
+| `edge_engineered_collision_resolves_each_name_to_its_own_index` | collision: the self-test keeps a candidate and searches for a distinct name in the same bucket, then asserts both distinct indexes and both lookups after the collision |
+| `edge_empty_and_ten_kilobyte_names_are_interned_exactly` | empty / resource / boundary: `[]` is interned once; a 10KB name interns to one index and a 10KB name differing only in its last byte gets a different index, so the hash does not truncate |
+| `edge_intern_refuses_a_name_that_is_not_a_byte_list` | malformed input / type mismatch: `intern(42)` fails with a clean runtime error instead of being accepted as a name |
+| `edge_name_heavy_fixture_is_byte_identical_in_both_stages` | unicode / integration: 120 distinct names, one name repeated 30 times, and UTF-8 names `naïve`, `日本語`, `café`; stage 1 and stage 2 bytes are identical and the decoded pool holds each name exactly once |
+
+The standing test
+`edge_the_self_hosted_compiler_compiles_itself_byte_identically` passed
+unmodified (380.92 s in this run).
+
+## Test requirement matrix
+
+| Row | Result |
+|---|---|
+| empty | covered — the empty name is interned, returned twice, and grows the table by exactly one |
+| singleton | covered — one repeated name grows the table to exactly one entry; a second distinct name makes two |
+| boundary | covered — 1000 repetitions, 10KB names, a last-byte difference, and a bucket collision |
+| out_of_bounds | N/A — every index is derived internally (`hash mod 256`, then an index this table appended); there is no user-supplied index to step past, and the bucket array is exactly 256 entries long. |
+| type_mismatch | covered — `intern(42)` is a clean runtime failure, not a panic and not an accepted key |
+| numeric_boundary | covered — the hash keeps every intermediate below `2^36`, so it is exact in `f64`; the modulo result is in `0..255`, which is the only index arithmetic the table performs |
+| unicode | covered — `naïve`, `日本語` and `café` are in the integration fixture and each appears once in the decoded pool; names are hashed as their UTF-8 bytes |
+| nesting_recursion | N/A — `intern` is not recursive and adds no call frames; the fixture is flat and the compiler's existing parser depth is unchanged. |
+| duplicate_missing_keys | covered — duplicate names are the 1000-repetition and collision tests; a missing name is the append path exercised by every new name |
+| malformed_input | covered — a non-byte-list name is refused by name; the diagnostics path (`length requires a list or text`) is the failure test |
+| resource_limit | covered — the table holds one record per distinct name, a 10KB name is hashed without truncation, and the direct test interns a thousand occurrences without growth beyond the distinct count |
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test --all-targets` | pass — 2748 passed, 0 failed |
+| `../rbops/verify.sh phase-074` | **VERIFY PASS** — 2748 tests, 0 failed; test policy: 5 new Rust tests, 1 failure-asserting, 5 `edge_*` tests, 0 newly skipped |
+
+## Invariants touched
+
+- None. No language syntax, `Value` variant, error kind, example, module or
+  corpus `.rb` file changed (`bootstrap/compiler.rb` is the phase's target).
+- The emitted bytes are unchanged because entries still enter `G_POOL` and
+  `G_INTERN` in first-use order. The fixed point `stage1.rbc == stage2.rbc` is
+  the proof.
+
+## Known gaps / follow-ups
+
+- The parser still refuses a source with roughly a thousand statements with
+  `Maximum call depth of 1000 reached while calling 'token_kind'`. This was
+  found while choosing the name-heavy fixture's size and is recorded in
+  `FINDINGS.md`; it is not caused by this phase.
+- `phases/phase-073/FINDINGS.md`'s early `give back` bug is still present. The
+  hidden self-test route in `main` works around it with a flag because `give
+  back` inside an `if` does not leave the function.
+[0m
+[0m$ [0mgit diff --stat && git diff bootstrap/compiler.rb | head -100
+bootstrap/compiler.rb            | 206 ++++++++++++++++++++++++++++++---
+ tests/bootstrap_selfhost_test.rs | 241 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 432 insertions(+), 15 deletions(-)
+diff --git a/bootstrap/compiler.rb b/bootstrap/compiler.rb
+index c6fb4ca..593d6e0 100644
+--- a/bootstrap/compiler.rb
++++ b/bootstrap/compiler.rb
+@@ -45,11 +45,21 @@ constant NO_CONST to 4294967295
+ constant STATEMENT_MARKER to 4294967294
+ constant END_TRY_MARKER to 4294967295
+ 
++// The intern table's bucket count. A name is looked up in the bucket its hash
++// selects, so interning is proportional to the bucket and not to every name the
++// program has used. The count is a power of two so the modulo is cheap; 256
++// buckets keeps a self-compilation's thousand-odd names to a handful per bucket
++// while the table is still small enough to rebuild cheaply on an insertion.
++constant INTERN_BUCKETS to 256
++
+ // The fifth is the code generator's last accumulator, the sixth and seventh are
+ // the lexer's and the patcher's, and all seven are named for the same reason:
+ // a Redblue binding is program-wide, and `append` grows the list a name holds.
+ set G_POOL to []
+ set G_INTERN to []
++set G_INTERN_COUNT to 0
++set G_INTERN_BUCKETS to []
++set G_INTERN_BUCKETS_NEXT to []
+ set G_CODE to []
+ set G_JUMPS to []
+ set G_BLOCKS to []
+@@ -68,15 +78,31 @@ set G_PATCHED to []
+ to main()
+     set main_args to 0
+     set main_args to sys.argv()
+-    if length(main_args) is not 2 then
+-        refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
++    // The intern table's direct tests. A normal run has two paths and takes the
++    // branch below exactly as it did before these modes existed. The flag is
++    // kept in a name because `give back` inside an `if` leaves the `if`, not
++    // the function; returning here would only fall through to the usage check.
++    set main_self_test to no
++    if length(main_args) is 1 then
++        if main_args[0] is "--intern-selftest" then
++            intern_selftest()
++            set main_self_test to yes
++        end
++        if main_args[0] is "--intern-selftest-type-error" then
++            intern_selftest_type_error()
++            set main_self_test to yes
++        end
++    end
++    if main_self_test is no then
++        if length(main_args) is not 2 then
++            refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
++        end
++        set main_source to read_source(main_args[0])
++        set main_tokens to lex(main_source)
++        set main_program to parse_program(main_tokens)
++        set main_chunk to compile_program(main_program)
++        bytes.write(main_args[1], encode(main_chunk))
+     end
+-
+-    set main_source to read_source(main_args[0])
+-    set main_tokens to lex(main_source)
+-    set main_program to parse_program(main_tokens)
+-    set main_chunk to compile_program(main_program)
+-    bytes.write(main_args[1], encode(main_chunk))
+     give back 0
+ end
+ 
+@@ -2485,12 +2511,14 @@ end
+ // So the five lists `ctx` carried are names here, and `append` grows them:
+ //
+ //   G_POOL     the constant pool, in order of first use
+-//   G_INTERN   the intern table: every name once, with its pool index
++//   G_INTERN   the intern table's entries: every name once, with its pool index
++//   G_INTERN_BUCKETS  the hash buckets, each a list of G_INTERN indexes
+ //   G_CODE     the instructions of the block being compiled
+ //   G_JUMPS    the patches that block's jumps still need
+ //   G_BLOCKS   the nested blocks that block has compiled
+ //
+-// `G_POOL` and `G_INTERN` belong to the whole program and are never saved. The
++// `G_POOL`, `G_INTERN` and `G_INTERN_BUCKETS` belong to the whole program and
++// are never saved. The
+ // other three belong to the block being compiled, so `compile_block` saves them
+ // and puts them back: a nested block is compiled *into* its parent's run while
+ // it is being built, and its own instructions are what the block record keeps.
+@@ -2641,14 +2669,23 @@ end
+ 
+ // The intern table. A name used a hundred times is one entry, so the pool is
+ // the same whichever way round the source used them.
++//
++// A lookup used to walk every entry, and a self-compilation walks the table for
++// every name it emits, so the cost was the number of names times the number of
++// entries. `intern_hash` names a bucket instead, and only that bucket's entries
++// are compared. The entries stay in `G_INTERN` in insertion order, so a new
++// name still takes the next pool index and the emitted bytes are unchanged.
+ to intern(raw)
+-    set intern_found to 0
+-    set intern_i to 0
++    intern_init()
++    set intern_bucket to intern_hash(raw) mod INTERN_BUCKETS
++    set intern_chain to G_INTERN_BUCKETS[intern_bucket]
+     set intern_found to -1
+[0m
+[0m$ [0mls ../rbops/ && sed -n '1,240p' ../rbops/verify.sh
+agents
+baseline.json
+dispatch.sh
+gen-prompts.sh
+phases.json
+progress_watchdog.sh
+setup-deploy-key.ps1
+smoke.sh
+verify.sh
+#!/usr/bin/env bash
+# =============================================================================
+# rbops/verify.sh — the ONLY authority on whether phase work is real.
+#
+# Exit 0  = phase may be marked .done
+# Exit 1  = gate failed, phase must be retried
+#
+# Design rule: this script must be UNTRUSTWORTHY-PROOF against the agent.
+# The implementer agent cannot edit this file (see AGENTS.md hard rule 1) and
+# the token it runs under has no `workflows` scope, so a push that modifies
+# .github/ is rejected by GitHub itself. Two independent locks.
+# =============================================================================
+set -uo pipefail
+
+PHASE="${1:?usage: verify.sh <phase-id>}"
+
+# Resolve every path BEFORE changing directory, and normalise away any `..`.
+# The gate runs against the project checkout (redblue/) while the manifest,
+# baseline and report live in the pipeline repo. A relative path resolved after
+# `cd` silently points at a file that does not exist there, and the gate then
+# fails on its very first check having verified nothing.
+abspath() {
+  local p="$1"
+  if [ -e "$p" ]; then (cd "$(dirname "$p")" && printf '%s/%s\n' "$(pwd)" "$(basename "$p")")
+  else printf '%s\n' "$p"; fi
+}
+
+# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the gate can
+# be exercised against a fixture pipeline root, not only this checkout.
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PHASES="$(abspath "${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}")"
+BASELINE="$(abspath "${RBOPS_BASELINE:-$RBOPS_ROOT/rbops/baseline.json}")"
+PROJECT_DIR="$(abspath "${RBOPS_PROJECT_DIR:-.}")"
+REPORT="$RBOPS_ROOT/phases/$PHASE/REPORT.md"
+
+# Preconditions, checked before we touch the project.
+[ -f "$PHASES" ]                                    || { echo "FATAL: no manifest at $PHASES" >&2; exit 1; }
+[ -f "$BASELINE" ]                                  || { echo "FATAL: no baseline at $BASELINE" >&2; exit 1; }
+[ -d "$RBOPS_ROOT/phases/$PHASE" ]                  || { echo "FATAL: $RBOPS_ROOT/phases/$PHASE does not exist" >&2; exit 1; }
+cd "$PROJECT_DIR" || { echo "FATAL: cannot enter project dir $PROJECT_DIR" >&2; exit 1; }
+[ -f Cargo.toml ] || { echo "FATAL: no Cargo.toml in $PROJECT_DIR — is RBOPS_PROJECT_DIR correct?" >&2; exit 1; }
+
+# Honour $JQ so a native Linux jq can be substituted when testing outside CI.
+# A Windows jq.exe under WSL emits CRLF and breaks every id and count.
+JQ="${JQ:-jq}"
+BASE_REF="${RBOPS_BASE_REF:-HEAD}"
+
+FAIL=0
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+# Every failure passes through here, so this is the one place a remedy can be
+# attached to a check that does not know how to fix itself.
+#
+# Phase-092, 088 and 113 all failed the same two checks and burned three
+# attempts each. The message said the rule and not the remedy, and a rule an
+# agent cannot act on is not a gate - it is a wall. The retry note is supposed to
+# close that gap, but a note is written by a human who has to notice, and three
+# of these ran before anyone did.
+#
+# remedy_for prints the first line of advice for a message, keyed on a substring
+# of it. It is a lookup rather than a per-check argument so that adding a check
+# means adding a remedy rather than remembering to thread one through, and so
+# the text lives in exactly one place and cannot drift from what it explains.
+#
+# When nothing matches, nothing is printed: a wrong remedy would send an agent
+# chasing a problem it does not have, which is worse than the bare verdict it
+# replaces.
+remedy_for() {
+  case "$1" in
+    *"failure is produced"*)
+      printf '          A suite of entirely passing tests does NOT satisfy this.\n'
+      printf '          The check wants a test whose SUBJECT is a failure - a bad input\n'
+      printf '          producing a clean error rather than a panic or a wrong value.\n'
+      printf '          Rust:    let r = run_source(bad); assert!(r.is_err());\n'
+      printf '          or:      #[should_panic] fn edge_...() { /* ... */ }\n'
+      printf '          Redblue: try ... catch error ... end, asserting it was caught.\n'
+      ;;
+    *"REPORT.md missing"*)
+      printf '          Writing REPORT.md is the whole fix; the code may already be right.\n'
+      printf '          It needs sections: What changed / Tests added / Gates /\n'
+      printf '          Known gaps, with real evidence rows. Report counts you observed.\n'
+      ;;
+    *"edge"*"test"*|*"no test named"*)
+      printf '          At least one test must be named edge_* (fn edge_foo, or test "edge_foo").\n'
+      printf '          The happy path alone is not a test.\n'
+      ;;
+    *"quota"*)
+      printf '          AGENTS.md 3.3: at least 3 new #[test] (or 2 Redblue test blocks).\n'
+      printf '          The count floor catches "no verification at all"; see it there.\n'
+      ;;
+    *"must_touch"*|*"no implementation change"*)
+      printf '          must_touch names the areas the change must land in. At least one\n'
+      printf '          changed file must fall under one of them, or this check fails on\n'
+      printf '          exactly that. Editing only tests, or only docs, does not satisfy it.\n'
+      ;;
+    *"documentation block"*|*"bucket"*)
+      printf '          A ```redblue block moved or was added, so tests/doc_blocks_runs.txt\n'
+      printf '          still points at the old line. Update the registry entry to the new\n'
+      printf '          line of the opening fence, or classify the block in\n'
+      printf '          doc_blocks_fragments.txt / doc_blocks_known_fail.txt.\n'
+      ;;
+    *"README"*)
+      printf '          README names a corpus count that has drifted. Count corpus/*.rb and\n'
+      printf '          update the number in the same commit that adds or removes a program.\n'
+      ;;
+    *"clippy"*|*"fmt"*)
+      printf '          Fix the reported diagnostic and re-run; do not widen the lint bound\n'
+      printf '          and do not reformat files outside this phase.\n'
+      ;;
+  esac
+}
+
+bad()  {
+  printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1))
+  remedy_for "$*"
+}
+
+# =============================================================================
+# RBOPS_PREFLIGHT=1 — the cheap half of the gate.
+#
+# Everything here is a question about a DIFF or a DOCUMENT. Nothing here needs a
+# build, a test run, or an example to execute. So it can be asked BEFORE the
+# agent is dispatched, against whatever the phase inherits (its recovery branch,
+# its WIP checkpoint, or nothing yet).
+#
+# Why this exists, in numbers: phases 037 and 048 each burned three ~5-hour runs
+# and 24 agent-hours total, and both were correct work refused by a DETECTOR —
+# first `eval_err`, then `label()`, neither of which the failure-assert regex
+# recognised. The agent cannot fix that; only the gate can. Asking the same
+# questions seconds earlier, before the model call, turns a 5-hour failure into
+# a 5-second one.
+#
+# This mode deliberately does NOT reimplement any check. It runs the same
+# functions below, so preflight and the real gate cannot drift into disagreeing
+# about what a diff means. It only skips the expensive sections (3 and 4), and
+# says so in its own verdict line, so a skipped section is never a silent pass.
+# =============================================================================
+PREFLIGHT="${RBOPS_PREFLIGHT:-0}"
+preflight_skip() {
+  [ "$PREFLIGHT" = "1" ] || return 1
+  printf '\n\033[1m== %s\033[0m\n' "$*"
+  printf '  \033[33mSKIP\033[0m %s — needs a build; preflight does not build\n' "$*"
+  return 0
+}
+
+# --- 0. integrity: is the phase even declared? ------------------------------
+step "manifest"
+if command -v "$JQ" >/dev/null 2>&1; then
+  if "$JQ" -e --arg p "$PHASE" '.phases[] | select(.id==$p)' "$PHASES" >/dev/null 2>&1; then
+    ok "phase $PHASE is declared in $PHASES"
+  else
+    bad "phase $PHASE is NOT declared in $PHASES — an undeclared phase cannot pass"
+  fi
+  # dependencies must be .done. Anchored to the pipeline root: this script cd's
+  # into the project, so a relative phases/ path would resolve inside redblue/
+  # and every satisfied dependency would read as missing — which is exactly how
+  # a good phase-002 attempt once failed its own gate.
+  while read -r dep; do
+    [ -n "$dep" ] || continue
+    if [ -f "$RBOPS_ROOT/phases/${dep}/.done" ]; then ok "dep ${dep} done"
+    else bad "dep ${dep} not done"; fi
+  done < <("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .depends_on[]?' "$PHASES" 2>/dev/null)
+else
+  bad "jq not available — cannot validate manifest"
+fi
+
+# --- 1. report exists and is not a stub -------------------------------------
+step "report"
+if [ -f "$REPORT" ]; then
+  ok "$REPORT exists"
+  # every required section must be present AND non-trivially filled
+  for sec in "What changed" "Tests added" "Gates" "Known gaps"; do
+    if grep -qF "$sec" "$REPORT"; then ok "section: $sec"
+    else bad "report missing section: $sec"; fi
+  done
+  # The evidence table must contain at least one real data row: a markdown row
+  # that names a path. A header-only or placeholder table is a stub.
+  if awk '
+    /^##[[:space:]]+What changed/ { insec=1; next }
+    /^##[[:space:]]/           { insec=0 }
+    insec && /^\|/ && /\// && !/^\|[[:space:]]*-+/ && !/^\|[[:space:]]*File[[:space:]]*\|/ { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$REPORT"; then ok "report has at least one real evidence row"
+  else bad "report evidence table is a stub — needs a row naming an actual file"; fi
+  # a report claiming a green gate it cannot have run
+  if grep -qiE 'cargo test *\| *(pass|green)' "$REPORT" && ! grep -qE '[1-9][0-9]* passed' "$REPORT"; then
+    bad "report claims cargo test passed but records no passing count"
+  fi
+else
+  # Under preflight a missing report is EXPECTED, not a defect: preflight runs
+  # BEFORE the agent, so it is judging a tree nobody has written a report into
+  # yet. Failing it there would refuse every retry of every phase, which is the
+  # opposite of what an early warning is for. The report is still required by the
+  # full gate, which runs after the agent. A report that EXISTS is checked in
+  # full even under preflight — only its absence is tolerated.
+  if [ "$PREFLIGHT" = "1" ]; then
+    warn "no REPORT.md yet — expected under preflight (the agent has not run); the full gate requires one"
+  else
+    bad "$REPORT missing — a phase without a report cannot pass"
+  fi
+fi
+
+# --- 2. diff hygiene ---------------------------------------------------------
+step "diff hygiene"
+
+# STAGE NEW FILES, then diff. `git diff <base>` compares the base tree to the
+# working tree for TRACKED paths only — a brand-new file the agent wrote is
+# untracked, and untracked files are invisible to it. Writing a new test file is
+# the single most natural thing a phase does, and the gate was scoring those
+# phases as if no test existed: phase-007 wrote 355 lines and 16 #[test]
+# functions in tests/numeric_edge_test.rs and the gate reported "0 rust".
+#
+# `git add -N` (intent-to-add), deliberately NOT `git add -A`: it records the
+# path in the index with no content, so the file becomes visible to the diff,
+# while modifications to already-tracked files stay unstaged. That matters
+# because `git checkout -- <path>` restores from the INDEX, so staging
+# tracked edits would silently break every restore-from-HEAD in the pipeline.
+git add -N . >/dev/null 2>&1 || true
+
+CHANGED="$(git diff --name-only "$BASE_REF" 2>/dev/null)"
+if [ -z "$CHANGED" ]; then
+  # An empty diff means two different things. Under the full gate it means the
+  # phase changed nothing, which is a failure — and correctly so. Under
+  # PREFLIGHT it usually means the phase is on its FIRST attempt and has not
+  # written anything yet: there is nothing to judge, not something to reject.
+  # Failing it there would defer every new phase before the agent ever ran.
+  if [ "$PREFLIGHT" = "1" ]; then
+    printf '\n\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT NOTHING TO JUDGE — %s ║\033[0m\n' "$PHASE"
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 4
+  fi
+  bad "no changed files detected against $BASE_REF"
+fi
+
+# 2a. forbidden paths (the lock that makes this gate trustworthy)
+while read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+[0m
+[0m$ [0mgrep -rn "intern" phases/phase-074 tests/bootstrap_selfhost_test.rs | head -80
+phases/phase-074/FINDINGS.md:18:the intern-table change. The name-heavy fixture in
+phases/phase-074/REPORT.md:1:# Phase 074 — Hash the self-hosted compiler's intern table instead of scanning it
+phases/phase-074/REPORT.md:7:| `bootstrap/compiler.rb` | +191 −15 | Replaced the linear `G_INTERN` scan in `intern` with a 256-bucket chained hash table. Added `intern_hash` (a deterministic byte hash reduced so every intermediate is exact in `f64`), `intern_init` (lazy empty buckets), and `intern_bucket_add` (rebuilds the bucket array on a new name). Entries stay in `G_INTERN` in first-use order, so pool indexes and emitted bytes are unchanged. Added the hidden `--intern-selftest` and `--intern-selftest-type-error` modes used by the direct tests, routed before the normal two-path compile branch. |
+phases/phase-074/REPORT.md:8:| `tests/bootstrap_selfhost_test.rs` | +224 −0 | Five new tests appended to the existing self-host test file: they drive the real `intern` through the hidden mode, then compile a name-heavy fixture with both stages, compare the files byte-for-byte, and decode the pool to prove each name is there exactly once. Adding them to an existing test file keeps them in the repository's test diff rather than leaving an untracked test file the policy gate cannot see. |
+phases/phase-074/REPORT.md:12:`intern` at `bootstrap/compiler.rb:2644` walked every entry on every emitted
+phases/phase-074/REPORT.md:16:while intern_i < length(G_INTERN)
+phases/phase-074/REPORT.md:17:    if G_INTERN[intern_i].k is raw then
+phases/phase-074/REPORT.md:18:        set intern_found to intern_i
+phases/phase-074/REPORT.md:20:    set intern_i to intern_i + 1
+phases/phase-074/REPORT.md:39:`bootstrap/compiler.rb`, so the numbers isolate the intern-table change rather
+phases/phase-074/REPORT.md:51:| Measurement | Old linear `intern` | New hash `intern` | Change |
+phases/phase-074/REPORT.md:58:the intern table, and because this phase's compiler source is larger than the
+phases/phase-074/REPORT.md:65:| `edge_interning_the_same_name_1000_times_grows_the_table_once` | duplicate keys / boundary: 1000 repetitions of one name grow the table by exactly 1, a second distinct name grows it to exactly 2 |
+phases/phase-074/REPORT.md:67:| `edge_empty_and_ten_kilobyte_names_are_interned_exactly` | empty / resource / boundary: `[]` is interned once; a 10KB name interns to one index and a 10KB name differing only in its last byte gets a different index, so the hash does not truncate |
+phases/phase-074/REPORT.md:68:| `edge_intern_refuses_a_name_that_is_not_a_byte_list` | malformed input / type mismatch: `intern(42)` fails with a clean runtime error instead of being accepted as a name |
+phases/phase-074/REPORT.md:79:| empty | covered — the empty name is interned, returned twice, and grows the table by exactly one |
+phases/phase-074/REPORT.md:82:| out_of_bounds | N/A — every index is derived internally (`hash mod 256`, then an index this table appended); there is no user-supplied index to step past, and the bucket array is exactly 256 entries long. |
+phases/phase-074/REPORT.md:83:| type_mismatch | covered — `intern(42)` is a clean runtime failure, not a panic and not an accepted key |
+phases/phase-074/REPORT.md:86:| nesting_recursion | N/A — `intern` is not recursive and adds no call frames; the fixture is flat and the compiler's existing parser depth is unchanged. |
+phases/phase-074/REPORT.md:89:| resource_limit | covered — the table holds one record per distinct name, a 10KB name is hashed without truncation, and the direct test interns a thousand occurrences without growth beyond the distinct count |
+tests/bootstrap_selfhost_test.rs:2104:// Phase 074: the compiler's intern table is internal to
+tests/bootstrap_selfhost_test.rs:2106:// hidden `--intern-selftest` mode. That mode runs the same `intern` and
+tests/bootstrap_selfhost_test.rs:2107:// `intern_hash` the normal compile path runs; it only gives a test a way to
+tests/bootstrap_selfhost_test.rs:2122:fn run_intern_mode(args: &[&str]) -> InternOutput {
+tests/bootstrap_selfhost_test.rs:2136:fn intern_selftest() -> InternOutput {
+tests/bootstrap_selfhost_test.rs:2137:    run_intern_mode(&["--intern-selftest"])
+tests/bootstrap_selfhost_test.rs:2141:fn intern_report<'a>(stdout: &'a str, key: &str) -> &'a str {
+tests/bootstrap_selfhost_test.rs:2149:fn intern_number(stdout: &str, key: &str) -> i64 {
+tests/bootstrap_selfhost_test.rs:2150:    intern_report(stdout, key)
+tests/bootstrap_selfhost_test.rs:2155:fn intern_selftest_type_error() -> Result<(), String> {
+tests/bootstrap_selfhost_test.rs:2156:    let run = run_intern_mode(&["--intern-selftest-type-error"]);
+tests/bootstrap_selfhost_test.rs:2165:fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
+tests/bootstrap_selfhost_test.rs:2166:    let run = intern_selftest();
+tests/bootstrap_selfhost_test.rs:2169:        "the intern self-test failed:\n{}",
+tests/bootstrap_selfhost_test.rs:2173:        intern_number(&run.stdout, "repeat_growth"),
+tests/bootstrap_selfhost_test.rs:2179:        intern_number(&run.stdout, "other_growth"),
+tests/bootstrap_selfhost_test.rs:2188:    let run = intern_selftest();
+tests/bootstrap_selfhost_test.rs:2191:        "the intern self-test failed:\n{}",
+tests/bootstrap_selfhost_test.rs:2195:        intern_report(&run.stdout, "collision_found"),
+tests/bootstrap_selfhost_test.rs:2201:        intern_report(&run.stdout, "collision_distinct"),
+tests/bootstrap_selfhost_test.rs:2210:        let index = intern_number(&run.stdout, &format!("{name}_index"));
+tests/bootstrap_selfhost_test.rs:2211:        let lookup = intern_number(&run.stdout, &format!("{name}_lookup"));
+tests/bootstrap_selfhost_test.rs:2221:fn edge_empty_and_ten_kilobyte_names_are_interned_exactly() {
+tests/bootstrap_selfhost_test.rs:2222:    let run = intern_selftest();
+tests/bootstrap_selfhost_test.rs:2225:        "the intern self-test failed:\n{}",
+tests/bootstrap_selfhost_test.rs:2229:        intern_report(&run.stdout, "empty_same"),
+tests/bootstrap_selfhost_test.rs:2231:        "the empty name was not interned to one index:\n{}",
+tests/bootstrap_selfhost_test.rs:2235:        intern_number(&run.stdout, "empty_growth"),
+tests/bootstrap_selfhost_test.rs:2241:        intern_report(&run.stdout, "long_same"),
+tests/bootstrap_selfhost_test.rs:2243:        "the same 10KB name did not intern to one index:\n{}",
+tests/bootstrap_selfhost_test.rs:2247:        intern_report(&run.stdout, "long_distinct"),
+tests/bootstrap_selfhost_test.rs:2253:        intern_number(&run.stdout, "long_growth"),
+tests/bootstrap_selfhost_test.rs:2261:fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
+tests/bootstrap_selfhost_test.rs:2262:    let result = intern_selftest_type_error();
+tests/bootstrap_selfhost_test.rs:2265:        "the compiler interned a number as if it were a name"
+tests/bootstrap_selfhost_test.rs:2275:        "the run fell through to a usage error instead of reaching the intern table:\n{}",
+tests/bootstrap_selfhost_test.rs:2302:    // byte. Both stages have to intern the same UTF-8 sequence.
+tests/bootstrap_selfhost_test.rs:2333:            "'{name}' is not in the constant pool exactly once, so the intern table did not deduplicate it"
+[0m
+[0m$ [0msed -n '240,560p' ../rbops/verify.sh
+case "$f" in
+    .github/workflows/*|rbops/*|.opencode/agent/*)
+      bad "forbidden path touched: $f" ;;
+  esac
+done <<< "$CHANGED"
+ok "forbidden-path scan done"
+
+# 2b. forbidden diff patterns = gate weakening.
+#
+# The attribute must be at the START of an added line, which is how Rust
+# attributes actually appear. Matching `#[ignore]` anywhere in the line
+# produced a false positive: a test that asserts the linter rejects
+# `#[ignore]` contains that token inside a string literal, and the gate
+# blocked a phase for containing the word it was testing against.
+if git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null \
+  | grep -nE '^\+[[:space:]]*(#\[ignore|#\[allow\((clippy|dead_code)|//[[:space:]]*skip\b)' \
+  | sed -n '1,20p'; then
+  # NOTE: `| head -20` here would be a verdict-inverting bug, not a display
+  # choice. head exits after 20 lines; with 21+ matches grep dies on SIGPIPE
+  # (141), pipefail propagates it, and the `else` below reports a phase with
+  # twenty-one violations as clean. sed consumes the whole stream instead.
+  bad "gate-weakening construct added (#[ignore], // skip, allow(clippy::...)) — see AGENTS.md rule 2"
+else
+  ok "no gate-weakening constructs added"
+fi
+
+# 2b2. scratch and probe files must not land in the diff. phase-020 left
+# tests/zz_probe.rs — a debugging scratch file — in the tree, and the gate only
+# caught it incidentally via formatting. A formatted scratch file would have
+# shipped.
+#
+# The comment here used to claim the patterns were "prefixes and junk
+# extensions, not substrings", and the code said otherwise: `[^/]*probe[^/]*`
+# was a substring match, so ANY filename containing "probe" was refused.
+# Preflight caught it on its first real use — a legitimate
+# `tests/preflight_probe.rs` was rejected as scratch, which is exactly the
+# failure this rule exists to prevent, inverted. It is now anchored to the
+# conventions that mean "scratch" and nothing else: the `zz_` prefix phase-020
+# actually used, a `_scratch` suffix, and junk extensions. `probe_stub.rs`,
+# `resumed_probe.rs` and `preflight_probe.rs` are real test files and pass;
+# `zz_probe.rs`, `foo_scratch.rs` and `x.tmp` do not.
+_scratch="$(printf '%s\n' "$CHANGED" | grep -iE '(^|/)zz_[^/]*$|(^|/)[^/]*_scratch\.[^/]*$|\.(tmp|bak|orig|swp)$|~$' || true)"
+if [ -n "$_scratch" ]; then
+  bad "scratch/probe files in the diff — remove them, they are not phase work: $(printf '%s' "$_scratch" | tr '\n' ' ' | head -c 300)"
+else
+  ok "no scratch files"
+fi
+
+# 2c. minimum substance
+# NOTE ON QUOTING: these read `"$JQ"`, never `'"$JQ"'`. The latter is a
+# single-quoted string CONTAINING the literal characters "$JQ" — bash does not
+# expand it, so the command ran as a program named `"$JQ"`, failed, and the
+# `|| echo N` fallback silently supplied the default. Every one of these reads
+# had been dead since the gate was written: min_changed_lines and BOTH test
+# quota floors came from the fallback, not the manifest. They matched by luck.
+# A wrong fallback also hid the failure completely, so each now warns.
+MIN_LINES="$("$JQ" -r '.gate.min_changed_lines' "$PHASES" 2>/dev/null)" || MIN_LINES=""
+if [ -z "$MIN_LINES" ]; then warn "could not read .gate.min_changed_lines from the manifest; using 5"; MIN_LINES=5; fi
+ADDED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+DELETED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$2} END{print s+0}')"
+if [ "$ADDED" -ge "$MIN_LINES" ]; then ok "diff substance: +${ADDED} -${DELETED} (min +${MIN_LINES})"
+else bad "diff too small: +${ADDED} (min +${MIN_LINES})"; fi
+
+# 2d. must_touch: the phase must IMPLEMENT, not only test.
+#
+# Every other rule here measures verification. None of them measures ambition, so
+# the cheapest way to pass was to write tests for behaviour that already existed
+# and touch no implementation at all. Phase-004 did exactly that: its goal was
+# preserving insertion order in src/value.rs and it landed 19 lines of src/ and
+# 532 of tests. A gate that cannot tell the difference will happily keep buying
+# that.
+#
+# This is a FLOOR, not a judgement of substance — one line under src/ satisfies
+# it. Judging whether the change is big enough, correct, or complete is the
+# reviewer's job (AGENTS.md 5). What it removes is the tests-only escape hatch.
+#
+# It is per-phase and opt-in: a phase whose real work IS tests (phase-020, the
+# differential harness) declares tests/, and a phase with no must_touch is not
+# constrained at all. Several acceptable areas may be listed; touching ANY one
+# satisfies the phase, because which of them is correct depends on the finding.
+MUST_TOUCH="$("$JQ" -r --arg p "$PHASE" '[.phases[] | select(.id==$p) | (.must_touch // [])[]] | join(" ")' "$PHASES" 2>/dev/null)" || MUST_TOUCH=""
+if [ -n "${MUST_TOUCH// /}" ]; then
+  _hit=""
+  for _pat in $MUST_TOUCH; do
+    if printf '%s\n' "$CHANGED" | grep -q "^$_pat"; then _hit="$_pat"; break; fi
+  done
+  if [ -n "$_hit" ]; then
+    ok "implementation touched ${_hit} (must_touch: ${MUST_TOUCH})"
+  else
+    bad "no implementation change — must_touch requires a change under one of: ${MUST_TOUCH} — see AGENTS.md 3.5"
+  fi
+else
+  ok "no must_touch declared (nothing to enforce)"
+fi
+
+# --- 3. the four gates -------------------------------------------------------
+if preflight_skip "cargo fmt"; then
+  :
+else
+step "cargo fmt"
+if cargo fmt --all -- --check >/tmp/fmt.log 2>&1; then ok "cargo fmt --check"
+else bad "cargo fmt --check"; tail -20 /tmp/fmt.log; fi
+
+step "cargo clippy"
+if cargo clippy --all-targets -- -D warnings >/tmp/clippy.log 2>&1; then
+  ok "cargo clippy -D warnings"
+else
+  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | sed -n '1,20p'
+fi
+
+step "cargo test"
+if cargo test --all-targets >/tmp/test.log 2>&1; then
+  PASSED="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  FAILED="$(grep -oE '[0-9]+ failed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
+  else bad "cargo test reported 0 passing tests — a suite that cannot fail is not a suite"; fi
+else
+  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | sed -n '1,20p'
+fi
+
+step "doc tests"
+cargo test --doc >/tmp/doctest.log 2>&1 || { bad "cargo test --doc"; tail -15 /tmp/doctest.log; }
+fi
+
+# --- 4. examples still run (the language's spec-by-example) ------------------
+if preflight_skip "examples"; then
+  :
+else
+# Do not hide why the build failed: an unbuilt binary used to surface as the
+# useless "rb binary not built".
+if ! cargo build >/tmp/build.log 2>&1; then
+  bad "cargo build"; tail -20 /tmp/build.log
+fi
+RB="./target/debug/rb"
+if [ -x "$RB" ]; then
+  for ex in examples/*.rb modules/*.rb; do
+    [ -f "$ex" ] || continue
+    if timeout 60 "$RB" run "$ex" >/dev/null 2>&1; then
+      ok "runs: $ex"
+      continue
+    fi
+    detail="$(timeout 60 "$RB" run "$ex" 2>&1 | tail -1)"
+    # Was this failure already known at bootstrap time?
+    known="$("$JQ" -r --arg p "$ex" \
+              '.unparseable[]? | select(.path == $p) | .path' "$BASELINE" 2>/dev/null | head -1)"
+    if [ -n "$known" ]; then
+      # Rule 1: touching a baselined file revokes the exemption. A phase cannot
+      # edit a broken file and keep calling it "pre-existing".
+      if printf '%s\n' "$CHANGED" | grep -qxF -- "$ex"; then
+        bad "example still fails AND this phase touched it (baseline revoked): $ex — $detail"
+      else
+        warn "pre-existing failure, baselined, not touched by this phase: $ex — $detail"
+      fi
+    else
+      bad "example fails: $ex — $detail"
+    fi
+  done
+  ok "example sweep done"
+else
+  bad "rb binary missing at $RB after a successful build — check [[bin]] name in Cargo.toml"
+fi
+fi
+
+# --- 5. test policy: edge cases and failure assertions are mandatory ---------
+step "test policy"
+# The quota is disjunctive, matching AGENTS.md 3.3: a phase qualifies with
+# >=3 Rust tests OR >=2 Redblue tests. This is deliberately a low floor, not a
+# target — it catches "no verification at all", and sufficiency beyond it is
+# the reviewer's call. A high count once failed a good 5-test phase.
+MIN_RS="$("$JQ" -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null)" || MIN_RS=""
+if [ -z "$MIN_RS" ]; then warn "could not read .test_policy.min_rust_tests; using 3"; MIN_RS=3; fi
+MIN_RB="$("$JQ" -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null)" || MIN_RB=""
+if [ -z "$MIN_RB" ]; then warn "could not read .test_policy.min_redblue_tests; using 2"; MIN_RB=2; fi
+# Count the `#[test]` ATTRIBUTE, not a name prefix. Requiring `fn test_`/`fn
+# edge_` meant a test named `modulo_by_zero_is_a_runtime_error` — perfectly
+# clear, perfectly real — did not count toward the quota. phase-007 wrote 16
+# #[test] functions and the quota read 0 because only the 6 edge_-prefixed ones
+# matched. The prefix belongs to the edge_-naming rule below, which enforces it
+# deliberately; the quota should be counting tests.
+NEW_TESTS="$(git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null | grep -cE '^\+\s*#\[test\]' )"
+NEW_RB="$(git diff -U0 "$BASE_REF" -- '*.rb' 2>/dev/null | grep -cE '^\+\s*test ' )"
+# Both idioms must be recognised, in BOTH target languages. The quota above is
+# disjunctive (Rust OR Redblue), so these two rules have to be too — otherwise a
+# Redblue-only phase can satisfy the quota and still be told it proved nothing.
+#   Rust:    fn edge_empty_list()          Redblue:  test "edge_empty list"
+# The optional quote is the whole bug: a Redblue test name is a string literal,
+# so `test edge_x` never occurs, and the unquoted-only regex rejected 61 real
+# tests in phase-003 including correctly-named ones.
+EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test +"?)edge_')"
+# Some subsystems have no failure channel to assert on. A linter reports
+# problems as a diagnostics collection; a formatter and an LSP produce documents,
+# not errors. Requiring `is_err`/`should_panic` of them is a category error, and
+# it is not hypothetical: phase-015 (formatter) and phase-016 (linter) were both
+# blocked after burning every attempt on it, while phase-016's tests were
+# asserting failure correctly as `assert_eq!(warnings.len(), 1, ...)`.
+#
+# Such a phase declares `failure_assert: "not_applicable"` and the check is
+# SKIPPED, visibly — never silently passed, and never a global relaxation. The
+# reviewer still judges whether the tests can actually fail, and every
+# error-producing phase keeps the rule at full strength.
+FAILASSERT_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .failure_assert // "required"' "$PHASES" 2>/dev/null)" || FAILASSERT_MODE="required"
+[ -n "$FAILASSERT_MODE" ] || FAILASSERT_MODE="required"
+
+# Failure assertions per language. Rust has is_err/expect_err/should_panic;
+# Redblue has no exceptions and instead has `try ... catch error`, which was
+# missing here entirely — the one construct Redblue offers for asserting a fault.
+# Anchored to the line start so a test whose *data* mentions `catch error` cannot
+# buy a pass.
+#
+# Rust also has the `eval_err` idiom: a helper that evaluates a program
+# expecting an error, followed by `assert!(matches!(e, Error::...))`. Phase-037
+# blocked a 1200-green phase on this rule with 12 such assertions in the diff
+# and zero recognized strings — `let e = eval_err("random_choice([])");
+# assert!(matches!(e, Error::Runtime(_, _)))` asserts a failure is produced as
+# surely as `is_err()` does. Same class as the #[test]-attribute fix (007) and
+# the bilingual rules: the detector was narrower than the language's real
+# failure-asserting idioms. The reviewer remains the ceiling — a bare
+# `let _ = eval_err(x);` with no assertion is gaming, and it reads as gaming.
+if [ "$FAILASSERT_MODE" = "not_applicable" ]; then
+  # Skipped, and said out loud. A silent pass here would be indistinguishable
+  # from the rule being satisfied.
+  warn "failure-assertion rule NOT APPLICABLE to this phase (failure_assert: not_applicable) — the reviewer still judges whether the tests can fail"
+else
+  # Redblue's Error carries a label rather than a Result, so a test that proves
+  # a failure was produced reads `assert_eq!(label(&e), "RuntimeError")` through
+  # a local helper rather than calling is_err() on a Result. Phase-048 blocked on
+  # this with ~10 such assertions (every one documented as "failure asserted" in
+  # its REPORT) and zero recognized strings. Detecting the assertion is what
+  # matters, not which method spells it, so the pattern also accepts a helper
+  # call beside a spelled-out error label: a test cannot buy this by naming a
+  # label in prose, because the label must be quoted inside the matched line.
+  FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|expect_refusal|assert_stdout_contains|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
+  if [ "$FAILASSERT" -ge 1 ]; then
+    ok "failure-asserting test present: $FAILASSERT"
+  else
+    bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
+  fi
+fi
+
+TEST_POLICY_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .test_policy // "required"' "$PHASES" 2>/dev/null)" || TEST_POLICY_MODE="required"
+[ -n "$TEST_POLICY_MODE" ] || TEST_POLICY_MODE="required"
+if [ "$TEST_POLICY_MODE" = "not_applicable" ]; then
+  warn "test quota and edge_* rule NOT APPLICABLE to this phase (test_policy: not_applicable) — the reviewer still judges documentation and substance"
+else
+  if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
+    ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
+  else
+    bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
+  fi
+  [ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
+    || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
+fi
+
+# Same precision rule as the construct scan above: the token must begin the
+# line. A test fixture that embeds `#[ignore]` as data is not a skipped test.
+SKIPDELTA="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+  | grep -cE '^\+[[:space:]]*(#\[ignore|//[[:space:]]*skip\b)')"
+[ "$SKIPDELTA" -eq 0 ] && ok "no newly skipped tests" || bad "$SKIPDELTA newly skipped/ignored tests"
+
+# --- 6. self-consistency: does the report match reality? --------------------
+step "report honesty"
+if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
+  REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
+  if [ -n "${CLAIM:-}" ]; then
+    # Asymmetric by design. The threat model is FABRICATION: claiming green
+    # that was never earned. A claim ABOVE reality (+2 tolerance for reruns)
+    # fails the phase. A claim BELOW reality is sloppiness in prose, not a lie
+    # that ships bad code — the gate itself measured the real number, so warn
+    # and move on. This distinction once blocked a phase with 59 green tests
+    # over a "0 passing" typo.
+    if [ "$CLAIM" -gt $((REAL + 2)) ]; then
+      bad "report claims $CLAIM passing, actual run has $REAL — over-claiming is fabrication"
+    elif [ "$CLAIM" -lt $((REAL - 2)) ]; then
+      warn "report claims $CLAIM passing, actual run has $REAL — under-claimed, fix the number"
+      ok "reported test count ($CLAIM) does not exceed actual ($REAL)"
+    else
+      ok "reported test count ($CLAIM) matches actual ($REAL)"
+    fi
+  fi
+fi
+
+# --- verdict -----------------------------------------------------------------
+printf '\n'
+if [ "$PREFLIGHT" = "1" ]; then
+  # A preflight PASS is NOT a gate pass, and the exit code says so: 0 means "no
+  # defect found in the cheap half", never "this phase may be marked .done". The
+  # caller (dispatch.sh cmd_run) still runs the full gate after the agent. A
+  # distinct exit code makes it impossible for a preflight to be mistaken for
+  # the real thing by a caller that does not read this banner.
+  if [ "$FAIL" -eq 0 ]; then
+    printf '\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT CLEAN — %-19s ║\033[0m\n' "$PHASE"
+    printf '\033[33m║ diff-based checks only; no build run ║\033[0m\n'
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 0
+  fi
+  printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[31m║ PREFLIGHT FAIL   — %-19s ║\033[0m\n' "$PHASE"
+  printf '\033[31m║ %d diff-based check(s) failed         ║\033[0m\n' "$FAIL"
+  printf '\033[31m╚══════════════════════════════════════╝\033[0m\n'
+  exit 3
+fi
+if [ "$FAIL" -eq 0 ]; then
+  printf '\033[32m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[32m║ VERIFY PASS — %-24s ║\033[0m\n' "$PHASE"
+  printf '\033[32m╚══════════════════════════════════════╝\033[0m\n'
+  exit 0
+fi
+printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+printf '\033[31m║ VERIFY FAIL — %-24s ║\033[0m\n' "$PHASE"
+printf '\033[31m║ %d check(s) failed                    ║\033[0m\n' "$FAIL"
+printf '\033[31m╚══════════════════════════════════════╝\033[0m\n'
+exit 1
+[0m
+[0m$ [0msed -n '2280,2380p' tests/bootstrap_selfhost_test.rs; echo ====; grep -n "fn compiler\|fn assert_identical\|fn run_" tests/bootstrap_selfhost_test.rs | head -30
+"the run panicked instead of reporting a runtime error:\n{}",
+        stderr
+    );
+}
+
+#[test]
+fn edge_name_heavy_fixture_is_byte_identical_in_both_stages() {
+    let mut source = String::new();
+    for index in 0..120 {
+        source.push_str(&format!("set name{index} to {index}\n"));
+    }
+    for index in 0..120 {
+        source.push_str(&format!("say name{index}\n"));
+    }
+    // One name emitted far more often than the others: the table must still
+    // hold it once and answer every occurrence with the same index. The
+    // statement count is kept well below the compiler's parser call-depth
+    // limit, since the contract here is byte equality rather than size.
+    for _ in 0..30 {
+        source.push_str("say name0\n");
+    }
+    // A name is bytes, so a non-ASCII name is one name and not one entry per
+    // byte. Both stages have to intern the same UTF-8 sequence.
+    for name in ["naïve", "日本語", "café"] {
+        source.push_str(&format!("set {name} to 1\nsay {name}\n"));
+    }
+
+    let expected = stage1("name-heavy", &source);
+    let actual = stage2("name-heavy", &source);
+    assert!(
+        actual.succeeded,
+        "stage 2 failed on the name-heavy fixture:\n{}",
+        actual.stderr
+    );
+    assert_eq!(
+        actual.bytes, expected,
+        "the name-heavy fixture is not byte-identical in both stages"
+    );
+
+    let decoded = redblue::Chunk::decode(&actual.bytes).expect("stage 2's file decodes");
+    let names: Vec<&str> = decoded
+        .constants
+        .iter()
+        .filter_map(|constant| match constant {
+            redblue::bytecode::Constant::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    for index in 0..120 {
+        let name = format!("name{index}");
+        assert_eq!(
+            names.iter().filter(|candidate| **candidate == name).count(),
+            1,
+            "'{name}' is not in the constant pool exactly once, so the intern table did not deduplicate it"
+        );
+    }
+    for name in ["naïve", "日本語", "café"] {
+        assert_eq!(
+            names.iter().filter(|candidate| **candidate == name).count(),
+            1,
+            "the UTF-8 name '{name}' is not in the constant pool exactly once"
+        );
+    }
+}
+====
+24:fn compiler() -> PathBuf {
+123:fn assert_identical(name: &str, source: &str) {
+1205:fn compiler_contents() -> String {
+2122:fn run_intern_mode(args: &[&str]) -> InternOutput {
+[0m
+[0m$ [0msed -n '1,140p' tests/bootstrap_selfhost_test.rs
+//! `bootstrap/compiler.rb` — the compiler written in Redblue (ladder stage S2).
+//!
+//! Stage 1 is the Rust `rb compile`: `src/lexer.rs` -> `src/parser.rs` ->
+//! `src/bytecode/codegen.rs` -> `Chunk::encode`. Stage 2 is
+//! `bootstrap/compiler.rb`: the same four stages, written in Redblue and run by
+//! the Rust `rb`. The ladder's rule is that stage 2 is not a *second* compiler
+//! but the *same* one, and the only evidence that says so is the bytes: for a
+//! program both engines accept, the two must produce one file, byte for byte.
+//!
+//! So every test here compares `fs::read(stage2.rbc)` against
+//! `compile_source(source).encode()` and nothing else. A stage-2 compiler that
+//! runs, emits a plausible file and differs in one byte fails every test here.
+//!
+//! Nothing in `bootstrap/` is reachable from `rb compile`, and nothing in `src/`
+//! special-cases a path: the tests would notice, because a shim would make the
+//! two byte-identical without the Redblue source doing the work.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The self-hosted compiler under test.
+fn compiler() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+}
+
+/// A path under `target/tmp/`. Nothing is ever written to `corpus/` or
+/// `bootstrap/`: a test that rewrote what it is checking proves nothing.
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/bootstrap");
+    fs::create_dir_all(&dir).expect("scratch directory");
+    dir.join(name)
+}
+
+/// What one stage-2 run did.
+struct Stage2 {
+    bytes: Vec<u8>,
+    stderr: String,
+    succeeded: bool,
+}
+
+/// Reads a stage-2 output file, treating *absent* as "wrote nothing" and every
+/// other failure as the failure it is.
+///
+/// A stage 2 that refuses a program writes no file, and "no file" is a result
+/// several tests here assert. But that is the *only* absence these runs are
+/// allowed to have: `unwrap_or_default()` also turned an unreadable path — a
+/// directory where the file should be, a permissions failure, a full disk — into
+/// the same empty `Vec`, so a run whose output could not be read at all was
+/// reported as a compile that wrote nothing. That is the wrong diagnosis for the
+/// wrong cause, and on the byte-equality tests it hid behind a length mismatch
+/// rather than naming the IO error.
+///
+/// So: `NotFound` is the one answer that means "wrote nothing", and everything
+/// else stops the test by naming the file and the cause.
+fn read_output(path: &Path) -> Vec<u8> {
+    match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!(
+            "stage 2's output {} could not be read, so there is nothing to compare: {error}",
+            path.display()
+        ),
+    }
+}
+
+/// Removes a stale output file, so a run that writes nothing cannot be read as a
+/// run that wrote something.
+///
+/// This was `let _ = fs::remove_file(...)`, which discards every failure and not
+/// only the expected one. Several tests below assert "stage 2 wrote no file",
+/// and if the stale file could not be removed then the assertion would be
+/// reading the previous run's bytes and reporting them as this one's.
+///
+/// `NotFound` is the expected answer — there is nothing stale. Anything else is
+/// stopped here, by name and by cause.
+fn clear_output(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "the stale output {} could not be removed, so a run that writes nothing \
+             would be read as a run that did: {error}",
+            path.display()
+        ),
+    }
+}
+
+/// Compiles `source` by running `bootstrap/compiler.rb` under the Rust `rb`.
+fn stage2(name: &str, source: &str) -> Stage2 {
+    let input = scratch(&format!("{name}.rb"));
+    let output = scratch(&format!("{name}.rbc"));
+    fs::write(&input, source).expect("write the program to compile");
+    clear_output(&output);
+
+    let run = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("run")
+        .arg(compiler())
+        .arg(&input)
+        .arg(&output)
+        .output()
+        .expect("the rb binary runs");
+
+    Stage2 {
+        bytes: read_output(&output),
+        stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
+        succeeded: run.status.success(),
+    }
+}
+
+/// The bytes stage 1 writes for `source`.
+fn stage1(name: &str, source: &str) -> Vec<u8> {
+    match redblue::compile_source(source) {
+        Ok(chunk) => chunk.encode(),
+        Err(error) => {
+            panic!("stage 1 refuses {name}, so there are no bytes to compare:\n{error:?}\n{source}")
+        }
+    }
+}
+
+/// The one comparison this file makes: stage 2 wrote exactly what stage 1 did.
+fn assert_identical(name: &str, source: &str) {
+    let expected = stage1(name, source);
+    let actual = stage2(name, source);
+
+    assert!(
+        actual.succeeded,
+        "stage 2 failed on {name}:\n{}\nsource:\n{source}",
+        actual.stderr
+    );
+    assert_eq!(
+        actual.bytes.len(),
+        expected.len(),
+        "stage 2 wrote {} bytes where stage 1 wrote {} for {name}",
+        actual.bytes.len(),
+        expected.len()
+    );
+    assert!(
+        !actual.bytes.is_empty(),
+[0m
+[0m$ [0mgrep -n "OnceLock\|Once\|lazy\|Lazy" tests/bootstrap_selfhost_test.rs src/**/*.rs | head -20; grep -n "mod \|^use " tests/bootstrap_selfhost_test.rs | head -30
+tests/bootstrap_selfhost_test.rs:1193:    use std::sync::OnceLock;
+tests/bootstrap_selfhost_test.rs:1194:    static PATH: OnceLock<PathBuf> = OnceLock::new();
+tests/bootstrap_selfhost_test.rs:1720:/// once here and read twice. A `OnceLock` rather than a file: the bytes are in
+tests/bootstrap_selfhost_test.rs:1730:    static RUNS: std::sync::OnceLock<[Stage2; 3]> = std::sync::OnceLock::new();
+src/bytecode/vm.rs:39:use std::sync::{Arc, OnceLock};
+src/bytecode/vm.rs:668:    static NAMES: OnceLock<HashSet<String>> = OnceLock::new();
+src/repl/debug_repl.rs:490:    body: impl FnOnce() -> crate::error::Result<Value>,
+src/testing/runner.rs:24:        F: FnOnce() -> Result<(), TestAssertionError>,
+src/testing/runner.rs:198:    F: FnOnce(),
+src/testing/runner.rs:210:    F: FnOnce(),
+18:use std::fs;
+19:use std::io;
+20:use std::path::{Path, PathBuf};
+21:use std::process::Command;
+245:            "say 1 + 2 - 3 * 4 / 5 mod 6\nsay -7 + 8\nsay not yes\nsay 1 < 2\nsay 3 is greater than 2\nsay 2 is not 3\nsay 4 is greater than or equal to 4\n",
+322:        "say 1 + 2 * 3 - 4 / 2 mod 3 + 1\nsay 1 < 2 and 3 > 4 or 5 < 6\n",
+[0m
+[0m$ [0msed -n '1700,1770p' tests/bootstrap_selfhost_test.rs; sed -n '1180,1215p' tests/bootstrap_selfhost_test.rs
+assert!(
+        !run.status.success(),
+        "handing the compiler a .rbc must be a failure"
+    );
+    assert!(
+        !output.exists(),
+        "a refused input must leave no output file behind"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S3 — the fixed point
+// ---------------------------------------------------------------------------
+
+/// Three self-compilations, made once per test process and read by the two tests
+/// below.
+///
+/// The definition of done asks for the fixed point *and* for three consecutive
+/// runs, and those are three runs of the same expensive thing, so they are made
+/// once here and read twice. A `OnceLock` rather than a file: the bytes are in
+/// memory, and two tests in one process must not race for them.
+///
+/// They run at the same time rather than one after another, because one
+/// self-compilation is minutes in a test build and three of them in series is a
+/// gate nobody reads. Nothing is shared but the already-written `stage1.rbc`,
+/// which no run writes, and each run writes a file of its own — so what runs
+/// beside what cannot change a byte, which is exactly the claim
+/// `edge_three_consecutive_self_compilations_are_byte_identical` makes about them.
+fn self_compilations() -> &'static [Stage2; 3] {
+    static RUNS: std::sync::OnceLock<[Stage2; 3]> = std::sync::OnceLock::new();
+    RUNS.get_or_init(|| {
+        let running: Vec<std::process::Child> = (0..3)
+            .map(|run| self_compile(run).expect("the rb binary starts"))
+            .collect();
+
+        let runs: Vec<Stage2> = running
+            .into_iter()
+            .zip(0..3)
+            .map(|(child, run)| {
+                let executed = child.wait_with_output().unwrap_or_else(|error| {
+                    panic!("self-compilation {run} could not be waited on: {error}")
+                });
+                Stage2 {
+                    bytes: read_output(&scratch(&format!("stage3-self-{run}.rbc"))),
+                    stderr: String::from_utf8_lossy(&executed.stderr).into_owned(),
+                    succeeded: executed.status.success(),
+                }
+            })
+            .collect();
+
+        let mut runs = runs.into_iter();
+        [
+            runs.next().expect("three runs were made"),
+            runs.next().expect("three runs were made"),
+            runs.next().expect("three runs were made"),
+        ]
+    })
+}
+
+/// Starts one self-compilation and leaves it running.
+///
+/// `bootstrap/compiler.rb`, compiled by itself, run as bytecode. Stage 1 is the
+/// Rust `rb compile`. This is stage 2 obtained the long way round: the *same*
+/// Redblue compiler, but its `.rbc` executed by the bytecode VM instead of its
+/// source executed by the tree-walker. Nothing here reads
+/// `stage1_of_the_compiler()`'s own output — the input and the output are two
+/// different files, and the run writes only the output.
+///
+/// It returns the child rather than a result because the point is to have three
+/// of these running at once; `self_compilations` waits for them.
+        .output()
+        .expect("the rb binary runs");
+
+    Stage2 {
+        bytes: read_output(&output),
+        stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
+        succeeded: run.status.success(),
+    }
+}
+
+/// `bootstrap/compiler.rb` compiled by stage 1 — the self-hosted compiler, built
+/// once per test process so the S3 tests do not each pay for it.
+fn stage1_of_the_compiler() -> PathBuf {
+    use std::sync::OnceLock;
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = scratch("stage1.rbc");
+        let bytes = stage1("bootstrap/compiler.rb", &compiler_contents());
+        fs::write(&path, bytes).expect("stage 1 writes the compiler's .rbc");
+        path
+    })
+    .clone()
+}
+
+/// The source of `bootstrap/compiler.rb`.
+fn compiler_contents() -> String {
+    fs::read_to_string(compiler()).expect("bootstrap/compiler.rb is UTF-8")
+}
+
+/// One program per corpus family, named. A fixed sample rather than a slice, so
+/// a change to which files exist cannot silently change what this covers.
+///
+/// `-0001` is the first member of every family — the corpus counts from 1, so a
+/// `-0000` name names nothing. The assertion below is what says so: a sample
+/// naming a file that is not there fails by naming it, rather than passing on a
+/// family it never looked at.
+[0m
+[0m$ [0mgrep -n "BLOCKER\|CRITICAL\|MAJOR\|MINOR\|finding\|review" AGENTS.md | head -60
+(no output)
+[0m
+[0m$ [0mcat ../rbops/agents/* 2>/dev/null | head -100; ls ../rbops/agents
+<!-- Inlined into the review/audit context by rbops/dispatch.sh.
+     Source of truth: rbops/agents/auditor.md
+     The contract below is authoritative and is inlined here on purpose.
+     Dispatch runs the model with --dir pointing at the redblue checkout,
+     which ships its own opencode.json at the checkout root; opencode merges
+     the project config over the global one, so that file is where the agent
+     block is read from. The file and this text are two halves of one
+     contract, and the review request names both. -->
+
+# RBOPS AUDITOR CONTRACT
+
+You are the RBOPS auditor, per AGENTS.md section 6. You run on a schedule, not on request.
+
+Your job is to keep the phase queue non-empty AND legitimate. Those two goals are in tension and honesty wins: a phase with no file:line evidence is a FAILURE of your job, not a phase.
+
+## Step 1 — MEASURE. Do not guess.
+- `wc -l src/**/*.rs` per file; identify the largest functions and the deepest nesting.
+- Count `#[test]` functions per file. Identify every src/ module with zero tests. This is your highest-yield finding category.
+- Count `unwrap()`, `expect(`, `panic!`, `unimplemented!`, `todo!`, `TODO`, `FIXME`, `#[ignore]`, `.unwrap_or`, `as ` casts.
+- Run `cargo clippy --all-targets 2>&1` and record the warning count and the top 10 lints by count.
+- Run `cargo test 2>&1` and record the real pass/fail counts.
+- List every public item in src/lib.rs, src/lexer.rs, src/parser.rs, src/vm.rs, src/stdlib.rs and which have no test.
+
+## Step 2 — DIFF REALITY AGAINST INTENT.
+Read SPEC.md, docs/GRAMMAR.md, ROADMAP.md, README.md, PHILOSOPHY.md and HANDOUT.md. For every promise each document makes, determine whether the code actually does it. Produce a table: promise | doc:line | implemented? | code:line | gap.
+Focus on:
+- Features documented as working that are absent, stubbed, or panic.
+- Stdlib functions listed in the README that `builtins()` does not actually register.
+- Language constructs in the grammar the parser rejects.
+- Behaviour that exists in code but is documented nowhere (undocumented surface = future bug).
+
+## Step 3 — SAFETY AUDIT.
+Independently verify the pipeline's own integrity, because a compromised gate is worse than no gate:
+- Does `rbops/verify.sh` still contain all its checks? Count them.
+- Does any src/ path contain `#[ignore]`, `// skip`, or an `allow(` that suppresses a lint?
+- Does any test assert nothing?
+- Does `phases/*/REPORT.md` claim a gate result that verify.sh does not actually run?
+Any finding here is severity BLOCKER and goes to phases.json first.
+
+### 3a. Re-check the exact failure modes that have already happened
+
+These are not hypothetical. Each of them shipped, and each was invisible until
+something else broke. Re-verify every one, every audit:
+
+1. **No checkpoint commits on redblue `main`.** Six
+   `rbops: phase-NNN checkpoint <ts>` commits were ancestors of main, carrying
+   unreviewed code, because the resume path did a real merge of `rbops-wip/*`.
+   Run `git log --oneline main | grep checkpoint`. Any hit is a BLOCKER.
+2. **No unreviewed work on `main`.** For each phase with a commit on main, the
+   phase should be `.done`. A phase whose code is merged but which is not
+   `.done` shipped without the reviewer. Report which, and why.
+3. **The gate really reads the manifest.** `verify.sh` once read every threshold
+   through `'"$JQ"'`, a single-quoted string containing the literal characters
+   `"$JQ"` — bash does not expand it, so each read failed and a hardcoded
+   fallback answered. Prove a read works: change nothing, but confirm that a
+   deliberately impossible floor makes the gate fail with THAT floor in the
+   message. If it still reports the default, the manifest is decorative.
+4. **Every manifest phase has a `PROMPT.md`, and every implementation phase
+   declares `must_touch`.** 11 phases once landed in the manifest with no
+   prompt and were unrunnable.
+5. **Every agent has its permissions.** opencode resolves config from its
+   working directory, and dispatch runs it with `--dir` at the redblue clone.
+   Confirm a global `~/.config/opencode/opencode.json` exists, or every agent
+   silently runs on defaults and cannot run its own commands.
+
+Report each as OK or BROKEN with the command that shows it. A safety audit that
+repeats last audit's findings without re-running anything is worthless.
+
+## Step 3b — CHECK BOOTSTRAP READINESS. Do not infer it.
+
+You measure DEFECTS. That is not the same question as "is the language big
+enough to host a compiler", and you will never answer the second one by
+stumbling across TODO comments.
+
+A phase in the manifest may carry `bootstrap_requires`: concrete capabilities
+with file:line evidence, e.g.
+
+    "bootstrap_requires": [
+      "comparison operators lex and compare - verified absent: say 1 == 1 raises LexerError",
+      "`break` exits its loop - verified absent: Statement::Break is a TODO no-op"
+    ]
+
+For every such list:
+
+1. Run each requirement's own command. Do NOT read the code and conclude it
+   works — verify it at runtime. A declared-but-unused token, enum variant or
+   struct field is this codebase's signature defect: phase-001 found
+   `Expr::Expect` declared in the parser with no construction site. An audit
+   that called `==` working because `TokenKind::Equal` exists is wrong;
+   `say 1 == 1` raising `LexerError: Unexpected character '='` is the fact.
+2. If a requirement is unmet and no phase covers it, CREATE a phase for it with
+   the failing command in `finding`. That is the point of this step: the
+   bootstrap phase's dependency list is maintained by hand and goes stale, so
+   this is what keeps it honest as you add phases.
+3. If a requirement is ALREADY met, say so in your report. Do not create a phase
+   for work that is done.
+4. If a requirement cannot be verified, say that explicitly instead of assuming
+   it holds.
+
+A language that cannot compare values, cannot `break` out of a loop and has no
+auditor.md
+reviewer.md
+verifier.md
+[0m
+[0m$ [0mcat ../rbops/agents/reviewer.md
+<!-- Inlined into the review/audit context by rbops/dispatch.sh.
+     Source of truth: rbops/agents/reviewer.md
+     The contract below is authoritative and is inlined here on purpose.
+     Dispatch runs the model with --dir pointing at the redblue checkout,
+     which ships its own opencode.json at the checkout root; opencode merges
+     the project config over the global one, so that file is where the agent
+     block is read from. The file and this text are two halves of one
+     contract, and the review request names both. -->
+
+# RBOPS REVIEWER CONTRACT
+
+You are an adversarial senior reviewer for a compiler/interpreter project. You are READ-ONLY: you cannot edit files or run commands. You reason from the diff and the files you are shown.
+
+Your job is to find what is WRONG, not to praise what is right. Assume the author is competent and the work is subtly broken until proven otherwise.
+
+## Before you report a finding
+
+Before you report a finding, look for an existing test that pins the behaviour you
+are claiming is broken. If one exists and asserts the opposite, you are wrong -
+do not report it.
+
+You can read the tests. You do not need to run them, and a test that asserts the
+behaviour is broken is a test that says you are wrong. This is not a formality:
+phase-062 was blocked on a BLOCKER claiming that `:break`, `:step`, `:next` and
+`:continue` could not stop the program, while `tests/debugger_test.rs` contains a
+test asserting that a breakpoint in a loop fires on every iteration. The test was
+right there in the repository and the finding was still reported.
+
+## Tool Budget and Gradual Findings (CRITICAL: PREVENT TIMEOUTS)
+
+The pipeline enforces a hard wall-clock timeout. If you spend too long in open-ended
+exploration without emitting findings, you will be forcibly terminated, leaving an
+invalid review that wastes hours. You MUST obey these strict efficiency rules:
+
+1. **Tool Budget (Max 12 Calls)**: You have a hard budget of **at most 12 tool calls**
+   (Read, Grep, Glob) for the entire review session.
+   - Do NOT perform unbounded codebase exploration or search unrelated modules.
+   - Restrict your reads strictly to the files listed in the phase change set and their
+     immediate test files.
+2. **Gradual Finding Emission**:
+   - As you inspect each file, write down your suspected defect or concern immediately
+     into your output stream as you find it. Do not wait until you have read every file
+     before beginning to write.
+   - Incremental progress guarantees that your observations are captured even if turns run out.
+3. **Turn Discipline & Synthesis**:
+   - Once you have completed at most 10–12 tool calls (or earlier if the diff is understood),
+     STOP calling tools.
+   - Immediately synthesize your observations into the mandatory `FINDINGS:` list and the
+     final `REVIEW VERDICT:` line.
+4. **Mandatory Verdict Line**:
+   - You must NEVER end your turn without outputting the final line:
+     `REVIEW VERDICT: FINDINGS <count>` or `REVIEW VERDICT: CLEAN`.
+   - Any output missing this exact verdict line is treated as an invalid review by the pipeline.
+
+## A BLOCKER must be VERIFIED
+
+A BLOCKER says the phase cannot ship. A BLOCKER nobody checked is a guess, and
+a guess that stops a good phase costs more than the defect it hypothesises -
+it costs a fix pass, a re-review, and sometimes the phase.
+
+So every BLOCKER carries a marker saying how it was checked:
+
+```
+1. [BLOCKER] src/vm.rs:412 - <what is wrong> - <why it matters> - <concrete fix> - VERIFIED: <how>
+```
+
+VERIFIED means one of:
+
+- you RAN something that showed it, and you say what; or
+- you traced the exact path and can name the line where it goes wrong, and you
+  quote it.
+
+A BLOCKER without a VERIFIED marker is reported as a MAJOR. It is still a
+finding and it still has to be dealt with - the pipeline treats a MAJOR as
+blocking exactly as it treats a BLOCKER. What changes is the weight: it is no
+longer the reviewer's strongest word, and the pipeline records that it was
+downgraded, so a human reading the review can see that nobody checked it.
+
+If you cannot check a finding, say so in the finding. That is not a weakness
+in the review - it is the most useful thing you can tell the next reader.
+
+## Hunt list, in priority order
+
+1. **FAKE COMPLETION** — the single highest-value finding class.
+   - REPORT.md claims a gate passed that could not have passed.
+   - Tests that cannot fail: `assert!(result.is_ok())`, no assertion, assertion inside a comment, test body that returns early.
+   - A gate weakened: `#[ignore]` added, `// skip` added, threshold lowered, tolerance widened, `expect(...)` demoted, try/catch swallowing, `.unwrap_or_default()` on a Result that should propagate, a `return Ok(())` early-exit.
+   - A commit that only touches docs, comments, whitespace, or lockfiles.
+   - "Implemented" where the code path is unreachable.
+
+2. **PANIC AND UB PATHS** — anything user-reachable that can abort instead of erroring:
+   `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, direct slice indexing `xs[i]`, `array[i]`, integer overflow in debug, unchecked `as` casts narrowing width, division, `unwrap_or` on arithmetic, recursion without a depth bound, unbounded `loop`, string slicing on a non-char-boundary.
+   For EACH one: is it reachable from Redblue source? If yes, it is a finding.
+
+3. **UNBOUNDED RESOURCE USE** — no recursion/frame limit, no iteration cap, no output cap, no memory bound, no timeout, no cancellation. A tree-walking interpreter without a call-depth limit is a process-killer, not a bug.
+
+4. **NONDETERMINISM** — `HashMap`/`HashSet` iteration order reaching any observable output (Display, JSON, tests, snapshots); float `==`; wall-clock in output; reliance on file ordering; `rand` without a seed.
+
+5. **ERROR REGRESSION** — a program that previously produced a clean error now panics, or now silently succeeds. Error messages that lose a line/column. Error variants constructed without a source span. Errors whose Display is not actionable.
+
+6. **SPEC DRIFT** — behaviour that now contradicts `SPEC.md` or `docs/GRAMMAR.md`, or the README's examples. Quote the spec line and the code line.
+
+7. **EDGE-CASE GAPS** — per AGENTS.md section 3.2. For the behaviour changed, which rows are untested? Name the missing test explicitly. A new branch with no test on either side is a MAJOR.
+
+8. **SCOPE** — the diff touches things the phase did not claim to touch. A 400-line refactor inside a bug-fix phase is a finding.
+
+## Output format — obey exactly
+
+```
+FINDINGS:
+1. [BLOCKER] src/vm.rs:412 — <what is wrong> — <why it matters> — <concrete fix>
+2. [MAJOR] src/testing/harness.rs:88 — ...
+3. [MINOR] src/formatter.rs:210 — ...
+4. [STYLE] src/lexer.rs:44 — ...
+```
+
+Severity is exactly one of `BLOCKER`, `MAJOR`, `MINOR`, `STYLE`.
+Every finding MUST cite `file:line` that you actually read.
+A finding you cannot cite a line for is not a finding.
+Every BLOCKER MUST carry a `VERIFIED:` marker saying how it was checked. A
+BLOCKER without one is reported as a MAJOR.
+
+If there are genuinely none, output exactly `FINDINGS: none` and nothing else.
+Do not pad. Do not invent work. Zero findings is a valid and better outcome than a padded list.
+
+## Verdict line - MANDATORY, and it must be the last line
+
+End every review with exactly one of these two lines, and nothing after it:
+
+```
+REVIEW VERDICT: FINDINGS <count>
+REVIEW VERDICT: CLEAN
+```
+
+`<count>` is how many findings you listed. Use `CLEAN` only if you listed none.
+
+This line is not decoration. The pipeline decides whether a phase ships by
+parsing it, and the rule it enforces is deliberately asymmetric:
+
+- no verdict line, or an unparseable one -> the review is INVALID. The phase is
+  NOT approved and NOT marked done. An unreadable review is not a pass.
+- `FINDINGS: none` or `REVIEW VERDICT: CLEAN` -> clean, phase may ship.
+- any BLOCKER or CRITICAL -> the findings are fixed and the full gate re-run.
+
+Phase-013 shipped with six real defect classes in this review - a descending
+range that never executes, an uncharged recursion path that can overflow the
+stack, env-coupled tests - all of it discarded because it was written as prose
+without severity tags, and "no tags found" was scored as approval. A review you
+cannot parse must not be able to approve anything.
+
+If you are unsure whether something is a defect, report it as MAJOR and say
+what would settle it. Do not downgrade a finding to avoid blocking: a false
+BLOCKER costs one retry, a swallowed MAJOR ships a bug.
+[0m
+[0m$ [0mgrep -n "fn call_builtin\|=> \|match name\|set\|push\|append" src/interpreter.rs | grep -i "set\|push\|append\|insert\|list" | head -60
+17:    expect_range_number, expect_repeat_count, finite_number, range_has_next, reset_caches,
+100:/// variable was unset or not a number.
+106:/// variable was unset or not a number.
+154:/// can still read [`Vm::take_expectation_failure`], which is set on the VM that
+201:            // The configuration is thread-local, so the reset has to happen on
+202:            // the thread that runs the program. The caller's reset only reaches
+204:            crate::logging::reset();
+252:        // The inline run is the program's thread, so it resets the configuration
+254:        crate::logging::reset();
+340:    /// innermost scope, and a function value that closed over scopes pushes
+347:    /// How many bytes [`Vm::output`] holds, the newline [`Vm::run`] will append
+403:    /// How many `module` bodies are running. Above zero a `set` writes into the
+465:    /// [`Vm::set_debug_hook`].
+483:    /// [`DebugEvent::frame_writes`]. One entry per live frame, pushed and popped
+606:        paths.push(pinned);
+656:/// program: the module's own `set` and `constant` declarations, which is
+680:            Statement::Set { name, .. } | Statement::Constant { name, .. } => Some(name.clone()),
+788:    /// — a `set` it contains, an output it triggers — survives to the next one.
+955:    /// [`Vm::with_max_steps`]. This is the setter for a VM that already
+958:    pub fn set_max_steps(&mut self, max_steps: usize) {
+964:    /// Builds a VM with both limits set at once, ignoring the environment.
+968:    /// that wants to know *which* of the two stops a program has to set both. A
+1064:        self.push_scope();
+1068:                self.set_var(variable, value.unwrap_or(Value::Nothing))
+1094:    /// to reach a `break` of its own would find it already set.
+1146:    /// One byte per line is the newline [`Vm::run`] appends on the way out, so
+1180:    /// `set`, a `to` or an `import` put here.
+1191:    /// [`Vm::set_var`], which lands in the innermost live scope. Scanning
+1226:    /// Every writer of such a name goes through here, so the set of them is
+1292:    /// under their qualified names, its `set` and `constant` names under the
+1323:        // member `beta_two`. A file's `set` and `constant` names are bound flat
+1357:    /// it — `set c to Counter`, or what a `create` method hands back — is a
+1412:    /// answer from its own bookkeeping: a `set`, a `to` and an `import` all bind
+1445:    /// names twice, and binding a name twice is what a `set` refuses to do and a
+1458:        self.importing.push(name.to_string());
+1489:        self.push_scope();
+1554:    /// The body runs in a scope of its own, so a `set` inside a module is not a
+1605:        self.importing.push(name.to_string());
+1607:        self.push_scope();
+1648:                members.push((member.clone(), qualified, value));
+1717:            reset_caches(value);
+1721:                reset_caches(value);
+1726:                reset_caches(value);
+1731:                reset_caches(method);
+1743:    fn push_scope(&mut self) {
+1744:        self.locals.push(CapturedScope::new());
+1776:    /// into, and `append` is the only caller: handing back a `&mut` is what
+1781:    /// bound, because growing a name into existence would be a `set`.
+1820:        // `set` that reaches a global does — and, exactly as that `set` does,
+1848:    /// name — an assignment ([`Vm::set_var`]) and a module's own `set` run by
+1864:    /// The write lands in [`Vm::globals`] and not through [`Vm::set_var`],
+1874:    fn set_var(&mut self, name: &str, value: Value) -> Result<()> {
+1882:            // A `set` in a module body is the module's own name, not a global
+1963:        timer.stack.push(ActiveLine {
+1991:            timer.totals.push((frame.line, own));
+2004:    pub fn set_debug_hook(&mut self, hook: Option<DebugHook>) {
+2052:                self.output.push(line);
+2070:            Statement::Set { name, value } => {
+2072:                self.set_var(name, val)?;
+2088:                    self.set_var(object, Value::Record(fields))?;
+[0m
+[0m$ [0mgrep -n "\"push\"\|\"append\"\|\"set\"\|replace_at\|set_at\|\"insert" src/stdlib.rs src/interpreter.rs | head -60
+src/stdlib.rs:125:            "read", "write", "append", "exists", "lines", "delete", "copy", "rename",
+src/stdlib.rs:522:    globals.insert("push".to_string(), Value::Builtin("push".to_string()));
+src/stdlib.rs:523:    globals.insert("append".to_string(), Value::Builtin("append".to_string()));
+src/stdlib.rs:2111:    "push",
+src/stdlib.rs:2112:    "append",
+src/stdlib.rs:2364:        "push",
+src/stdlib.rs:2368:        "append",
+src/interpreter.rs:2706:        if name == "append" {
+[0m
+[0m$ [0mgrep -n "SetMember\|Field\|set .*\.\|SetProperty\|Member" src/parser.rs | head -40; grep -n "Set {" src/parser.rs | head
+143:    // set x.y to 10
+144:    SetProperty {
+737:            // `set this.field to …` is how a method writes to the object it was
+754:        // Check for property access: set x.y to value
+781:            return Ok(Some(Statement::SetProperty {
+1125:    /// and `repeat set n to n + 1 until n is 3` is the post-test one.
+3302:        let tokens = Lexer::tokenize("set x to 10").unwrap();
+3607:            Lexer::tokenize("set double to to (x) give back x * 2").expect("the source should lex"),
+130:    Set {
+345:            Statement::Set { name, .. } | Statement::Constant { name, .. } => {
+791:        Ok(Some(Statement::Set { name, value }))
+[0m
+[0m$ [0mgrep -rn "push(" bootstrap/compiler.rb | head -20; grep -n "to push\|name == \"push\"\|fn push" src/interpreter.rs | head
+288:        set cat_out to push(cat_out, each_byte)
+445:    // The token list grows by `append` rather than by `set ... to push(...)`.
+574:                set lex_number_text to push(lex_number_text, lex_number_c)
+623:                    set lex_text_out to push(lex_text_out, 10)
+627:                        set lex_text_out to push(lex_text_out, 9)
+631:                            set lex_text_out to push(lex_text_out, 13)
+635:                                set lex_text_out to push(lex_text_out, lex_text_e)
+645:                                    set lex_text_out to push(lex_text_out, byte_at(src, lex_text_p))
+654:                set lex_text_out to push(lex_text_out, lex_text_c)
+685:        set lex_word_raw to push(lex_word_raw, src[lex_word_i])
+884:            set parse_statements_next to push(body, parse_statements_r[0])
+1290:            set parse_import_more_next to push(items, {n: tokens[pos + 1].b, a: []})
+1294:            set parse_import_more_next to push(items, {n: tokens[pos + 1].b, a: parse_import_more_tail})
+1326:            set parse_block_statements_next to push(body, parse_block_statements_r[0])
+1511:        set parse_callable_args_next to push(params, tokens[pos].b)
+1593:            set parse_object_statements_next to push(body, parse_object_statements_r[0])
+2191:        set parse_arguments_next to push(args, parse_arguments_arg[0])
+2374:        set interp_read_bytes to push(interp_read_bytes, b[interp_read_i])
+2398:            set parse_text_literal_lit to push(parse_text_literal_lit, b[parse_text_literal_i])
+2403:                set parse_text_literal_lit to push(parse_text_literal_lit, 123)
+1743:    fn push_scope(&mut self) {
+[0m
+[0m$ [0msed -n '720,800p' src/parser.rs; grep -n "SetIndex\|Index.*Set\|set .*\[" src/parser.rs | head
+};
+
+        Ok(stmt.map(|statement| Stmt { span, statement }))
+    }
+
+    fn parse_set(&mut self) -> Result<Option<Statement>> {
+        self.advance(); // consume 'set'
+
+        let name = match self.current() {
+            Some(Token {
+                kind: TokenKind::Identifier(name),
+                ..
+            }) => {
+                let n = name.clone();
+                self.advance();
+                n
+            }
+            // `set this.field to …` is how a method writes to the object it was
+            // called on, so `this` is a name a `set` accepts as a target.
+            Some(Token {
+                kind: TokenKind::This,
+                ..
+            }) => {
+                self.advance();
+                "this".to_string()
+            }
+            _ => {
+                return Err(Error::Parser(
+                    expected_name("variable name", self.current()),
+                    self.span(),
+                ))
+            }
+        };
+
+        // Check for property access: set x.y to value
+        if let Some(Token {
+            kind: TokenKind::Dot,
+            ..
+        }) = self.current()
+        {
+            self.advance();
+            let property = match self.current() {
+                Some(Token {
+                    kind: TokenKind::Identifier(prop),
+                    ..
+                }) => {
+                    let p = prop.clone();
+                    self.advance();
+                    p
+                }
+                _ => {
+                    return Err(Error::Parser(
+                        expected_name("property name", self.current()),
+                        self.span(),
+                    ))
+                }
+            };
+
+            self.expect(&TokenKind::To)?;
+            let value = self.parse_expression()?;
+
+            return Ok(Some(Statement::SetProperty {
+                object: name,
+                property,
+                value,
+            }));
+        }
+
+        self.expect(&TokenKind::To)?;
+        let value = self.parse_expression()?;
+
+        Ok(Some(Statement::Set { name, value }))
+    }
+
+    /// Parses `constant NAME to <expr>` — a `set` whose name may not be bound
+    /// again afterwards, so the runtime can refuse a later assignment to it.
+    fn parse_constant(&mut self) -> Result<Option<Statement>> {
+        self.advance(); // consume 'constant'
+
+        let name = match self.current() {
+            Some(Token {
+[0m
+[0m$ [0mgrep -n "List\|Rc\|RefCell\|fn push\|builtin_push\|push_value" src/value.rs src/interpreter.rs | head -60
+src/value.rs:234:        Value::List(items) => {
+src/value.rs:392:    List(Shared<Vec<Value>>),
+src/value.rs:428:            (Value::List(left), Value::List(right)) => left == right,
+src/value.rs:475:        Value::List(Shared::new(items))
+src/value.rs:499:            Value::List(items) => {
+src/value.rs:535:            Value::List(items) => {
+src/value.rs:626:            Value::List(_) => "list",
+src/value.rs:647:            Value::List(items) => !items.is_empty(),
+src/interpreter.rs:1743:    fn push_scope(&mut self) {
+src/interpreter.rs:2132:                if let Value::List(items) = iterable_value {
+src/interpreter.rs:2581:            Expr::List(items) => {
+src/interpreter.rs:2764:        let [Value::List(items), rest @ ..] = args else {
+src/interpreter.rs:2826:                    if let Value::List(items) = this {
+src/interpreter.rs:2896:                        if let Some(Value::List(items)) = self.get_var(&name) {
+[0m
+[0m$ [0msed -n '2670,2740p' src/interpreter.rs
+fn unary_op(&self, op: &UnaryOp, value: Value) -> Result<Value> {
+        runtime::unary_op(self.span(), op, value)
+    }
+
+    fn call(&mut self, name: &str, args: &[Value], from_module: bool) -> Result<Value> {
+        if !from_module && stdlib::is_module_only_builtin(name) {
+            // The internal module-only name is not part of the flat surface, but
+            // a program may still declare a function or binding of that exact
+            // spelling — these are ordinary identifiers. The declaration wins,
+            // as it did before the utilities were stored under this name; only a
+            // call with nothing declared behind it is refused.
+            if let Some(Value::Function(function)) = self.get_var(name) {
+                return self.call_user_function(name, &function, args);
+            }
+            return Err(Error::Runtime(
+                format!("Unknown function '{}'", name),
+                self.span(),
+            ));
+        }
+        // The one place a builtin is reached, so it is the one place a refusal
+        // has to be. See `Vm::refuse_effectful_builtins`: a question must not
+        // change the world, and this fires before the effect rather than after
+        // it. A name that is not effectful costs one table lookup and is the
+        // overwhelmingly common case.
+        if self.asking_a_question && stdlib::is_effectful(name) {
+            return Err(Error::Runtime(
+                format!(
+                    "{} does something outside the value it answers, and this is a question \
+                     about a value rather than a line to run",
+                    name
+                ),
+                self.span(),
+            ));
+        }
+        // `append` writes through a binding, so it needs the frame the free
+        // `runtime::builtin` does not have; every other builtin is asked first.
+        if name == "append" {
+            let span = self.span();
+            let target = runtime::append_target(span, args)?;
+            runtime::append_through(span, target, self.get_var_mut(target), args[1].clone())?;
+            return Ok(Value::Nothing);
+        }
+        // `stdlib::builtin` is the one place a builtin name resolves, so a name
+        // answered here cannot be missing from the bytecode VM. `runtime::builtin`
+        // alone answers only the names that need a `Result`; the rest are
+        // `stdlib::builtin_function`'s, and until this call existed they were
+        // registered in the global table and answered by nothing.
+        // `map` is excluded here and answered by this walker's `map_builtin` below: it
+        // is registered as a builtin name but has to *call* a Redblue function,
+        // which the shared resolver cannot do. Asking it first would turn a
+        // working higher-order call into a refusal.
+        if !matches!(name, "map" | "list_map") {
+            if let Some(value) = stdlib::builtin(self.span(), stdlib::resolve(name), args)? {
+                return Ok(value);
+            }
+        }
+
+        // `map` is registered as a builtin name but has to *call* a Redblue function,
+        // which the free `runtime::builtin` cannot do, so it is answered by this
+        // walker's `map_builtin` below. It must be asked for before the shared
+        // resolver, which would otherwise claim the name and refuse it as one it
+        // cannot use — turning a working higher-order call into an error.
+        if matches!(name, "map" | "list_map") {
+            return self.map_builtin(args);
+        }
+        match self.get_var(name) {
+            Some(Value::Function(function)) => self.call_user_function(name, &function, args),
+            _ => Err(Error::Runtime(
+                format!("Unknown function '{}'", name),
+                self.span(),
+            )),
+[0m
+[0m$ [0mgrep -n '"push"\|fn builtin_function\|push =>\|Push' src/stdlib.rs | head -30; grep -n "pub fn builtin\|fn builtin" src/stdlib.rs | head
+522:    globals.insert("push".to_string(), Value::Builtin("push".to_string()));
+874:pub fn builtin_function(name: &str, args: Vec<Value>) -> Option<Value> {
+2111:    "push",
+2364:        "push",
+454:pub fn builtins() -> HashMap<String, Value> {
+874:pub fn builtin_function(name: &str, args: Vec<Value>) -> Option<Value> {
+1067:pub fn builtin(
+2880:pub fn builtin_signature(name: &str) -> Option<&'static str> {
+2908:pub fn builtins_without_signatures() -> Vec<&'static str> {
+[0m
+[0m$ [0msed -n '380,410p' src/value.rs; grep -n "pub type Shared\|struct Shared\|impl.*Shared" src/value.rs | head
+current >= end
+    } else {
+        current <= end
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    Nothing,
+    Number(f64),
+    Text(String),
+    YesNo(bool),
+    List(Shared<Vec<Value>>),
+    Record(Shared<Fields>),
+    Object(String, Shared<Fields>),
+    Function(FunctionValue),
+    Builtin(String),
+    /// A timezone-naive calendar date and time.
+    ///
+    /// There is no zone behind it: every component is read and written as the
+    /// same wall-clock reading, so adding 24 hours is always one day and no
+    /// daylight-saving transition can make an hour disappear. See SPEC.md §
+    /// time for the stance.
+    Date(NaiveDateTime),
+    /// A signed span of time, as the difference between two dates.
+    Duration(TimeDelta),
+    /// An exact base-10 number, for money and other values an `f64` cannot
+    /// hold exactly. See [`crate::decimal`].
+    Decimal(Decimal),
+}
+
+470:pub type Shared<T> = std::sync::Arc<T>;
+[0m
+[0m$ [0mtail -40 bootstrap/compiler.rb; grep -n "main()\|^main\|main$" bootstrap/compiler.rb | tail
+end
+        for each each_arg in expr.args
+            compile_expr(each_arg, line)
+        end
+        if expr.o.k is "var" then
+            emit_name(30, cat(cat(expr.o.n, [46]), expr.m), length(expr.args), line)
+        else
+            emit_name(30, expr.m, length(expr.args), line)
+        end
+    end
+    if expr.k is "prop" then
+        compile_expr(expr.o, line)
+        emit_name(7, expr.p, 0, line)
+    end
+    if expr.k is "index" then
+        compile_expr(expr.o, line)
+        compile_expr(expr.i, line)
+        emit(9, 0, 0, line)
+    end
+    if expr.k is "list" then
+        for each each_item in expr.items
+            compile_expr(each_item, line)
+        end
+        emit(10, length(expr.items), 0, line)
+    end
+    if expr.k is "record" then
+        for each each_field in expr.fields
+            emit_name(1, each_field.k, 0, line)
+            compile_expr(each_field.v, line)
+        end
+        emit(11, length(expr.fields), 0, line)
+    end
+    if expr.k is "expect" then
+        compile_expr(expr.a, line)
+        compile_expr(expr.b, line)
+        emit(45, 0, 0, line)
+    end
+    end
+
+main()
+78:to main()
+3412:main()
+[0m
+[0m$ [0mgrep -n "fn load_module\|import\|modules/\|module_path\|resolve_module" src/interpreter.rs | head -60
+282:/// `J.parse(..)` is a member of a module imported under an alias, and
+295:    /// The module programs already run, by the name the `import` that loaded
+296:    /// them goes by. An entry is what makes a second import of the same module a
+302:    /// Every module name an `import` has bound, to the module it names.
+304:    /// An alias — `import json as J` — binds `J`, and `J.parse(...)` has to
+313:    /// against, and what an `import` of the name finds in place of a file.
+373:    /// What the program has *declared*: the modules it has imported, the
+379:    /// that cannot see the module a program imported cannot call it.
+381:    /// The directory this program's imports are resolved against: where its
+382:    /// `redblue.manifest` is, and what every path an `import` returns is read
+386:    /// against `subdir/redblue.manifest` and opens `subdir/modules/Foo.rb`,
+393:    /// every `import` the program has.
+400:    /// reaches itself through an `import` is a circular import, and this is
+402:    importing: Vec<String>,
+587:/// The paths `import <name>` looks for under `root`, in order: `pinned` — the
+588:/// version the manifest there pins the module to — then the `modules/`
+593:/// version the program asked for; the rest are what an import did before there
+600:/// carries. Each of them is asked once per program rather than once per import,
+609:        format!("modules/{name}.rb"),
+610:        format!("./modules/{name}"),
+626:/// A directory is not a module. `modules/Fixture/` is where the versions of
+629:/// version, `import Fixture` has no module to import, and saying so beats
+640:/// read is an error, not a miss: the two say different things about the import.
+655:/// The names an `import` of `name` under `root` binds into the importing
+664:/// the analyzer resolved it once for the whole program: a program importing the
+691:    /// A VM that resolves its imports against `root`.
+694:    /// an `import` binds, and it is the manifest
+713:            importing: Vec::new(),
+740:    /// aliases they were imported under, the modules the program declared, the
+771:    /// The directory this VM resolves a program's `import` against.
+774:    /// scratch VM, evaluating a watch expression - has to resolve an import
+830:    /// declared, `J.parse(..)` is a member of a module it imported under an
+838:    /// The language context this VM has built: the modules it has imported, the
+908:    /// The module an `import … as <name>` bound `<name>` to, or `name` itself.
+910:    /// `import files as F` binds `F`, and `F.delete(…)` reaches
+1180:    /// `set`, a `to` or an `import` put here.
+1202:    /// wrote is not one of its names: after `import MathUtils` this used to offer
+1236:    /// program declared or imported.
+1243:    /// module this session imported), and only the record of publication tells
+1270:    /// Every module name an `import` bound in this program, paired with the
+1273:    /// `import files as F` binds both `F` and `files`, and both are entries
+1276:    pub fn imported_modules(&self) -> Vec<(String, String)> {
+1291:    /// members, and the names an imported module file declares — its functions
+1293:    /// ordinary bindings the import gives them. A module name nothing publishes
+1325:        // the import contributes and what `.env` lists under the module.
+1412:    /// answer from its own bookkeeping: a `set`, a `to` and an `import` all bind
+1441:    /// Runs a module's declarations into this VM, under the name the `import`
+1444:    /// A module already loaded is left alone: importing it twice binds the same
+1447:    /// `TAU` would be refused as a duplicate of the one the first import bound.
+1453:    fn load_module(&mut self, path: &str, name: &str) -> Result<()> {
+1458:        self.importing.push(name.to_string());
+1462:                self.importing.pop();
+1469:                self.importing.pop();
+1480:        self.importing.pop();
+1485:        // `import MathUtils as M` then `M.circle_area(5)` run.
+1488:        // module declares is not a name the importing program reads.
+1522:    /// imported, or a `module … end` it declared.
+1599:        // Registered before the body runs, so an `import` of this module from
+1600:        // inside its own body is a circular import rather than a second
+1605:        self.importing.push(name.to_string());
+[0m
+[0m$ [0mgrep -rn "tests/\|fixtures\|glob\|walkdir\|_test.rs\|\.rb" src/testing tests/*.rs | grep -iE "fixture|walk|glob|discover|read_dir|\.rb" | head -80
+src/testing/mod.rs:57:/// Only `.rb` is collectable. The Redblue harness parses its input as
+src/testing/harness.rs:10:    _globals: HashMap<String, crate::value::Value>,
+src/testing/harness.rs:18:            _globals: crate::stdlib::builtins(),
+tests/agent_permissions_test.rs:7://! with the project deep-merged over the global. Before this file existed the
+tests/agent_permissions_test.rs:9://! resolved and both agents silently ran as the global `default_agent: build`,
+tests/agent_permissions_test.rs:29://! resolve to *these* permissions rather than to the global build agent, and
+tests/agent_permissions_test.rs:47://! opencode deep-merges the project config over the global one, per key, so
+tests/agent_permissions_test.rs:52://! `--agent build` and a block for that name here would replace the global
+tests/agent_permissions_test.rs:89:/// with `read`, `edit`, `glob`, `grep`, `list`, `bash`, `task`,
+tests/agent_permissions_test.rs:99:///   granted by the global config, the other by opencode's permissive default.
+tests/agent_permissions_test.rs:113:/// - `external_directory` is the one the global config grants as
+tests/agent_permissions_test.rs:150:/// a `read`/`glob`/`grep`/`list` key in it is refused in either direction.
+tests/agent_permissions_test.rs:151:const REVIEWER_UNDECLARED: [&str; 4] = ["read", "glob", "grep", "list"];
+tests/agent_permissions_test.rs:159:/// keys: `bash`, `doom_loop`, `edit`, `external_directory`, `glob`, `grep`,
+tests/agent_permissions_test.rs:194:    "glob",
+tests/agent_permissions_test.rs:227:/// (`"deny"` is `{"*": "deny"}`), and the global config writes the same
+tests/agent_permissions_test.rs:238:/// only then in the global one, so a `build` block here would OVERRIDE the
+tests/agent_permissions_test.rs:239:/// global config for that name: the implementer's permissions would move
+tests/agent_permissions_test.rs:240:/// without the global file changing, and without any other gate noticing.
+tests/agent_permissions_test.rs:246:/// permissions. opencode deep-merges the project config over the global one
+tests/agent_permissions_test.rs:268:/// the global one for THAT agent, so every one of them is part of the
+tests/agent_permissions_test.rs:384:/// it — and in this checkout the global config's `external_directory
+tests/agent_permissions_test.rs:448:        format!("`agent.{name}.permission` is not declared: {name} would inherit the global permission block")
+tests/agent_permissions_test.rs:568:/// global config grants `webfetch` and `external_directory`, so the key comes
+tests/agent_permissions_test.rs:623:/// global config, which is where the rest of its permissions belong.
+tests/agent_permissions_test.rs:641:                 reads. The verifier runs the gates and inherits everything else from the global \
+tests/agent_permissions_test.rs:654:/// The project config is deep-merged over the global one, and the merge is
+tests/agent_permissions_test.rs:655:/// per key: a `build` block here replaces the global `build` block for
+tests/agent_permissions_test.rs:658:/// implementer's permissions that leaves no trace in the global config.
+tests/agent_permissions_test.rs:664:                 overrides the global config for `--agent {name}`, so the permissions of that agent \
+tests/agent_permissions_test.rs:677:/// project config is deep-merged over the global one FOR THAT AGENT, and a
+tests/agent_permissions_test.rs:702:                    _ => "a key here is merged over the global config for that agent",
+tests/agent_permissions_test.rs:732:             project config over the global one, so a top-level block here applies to every agent \
+tests/agent_permissions_test.rs:741:                 {}: opencode deep-merges the project config over the global one per key, so a \
+tests/agent_permissions_test.rs:750:            "{CONFIG_FILE} declares no `agent` key: --agent reviewer resolves to the global config"
+tests/agent_permissions_test.rs:785:             the global default_agent, and the `verifier` declaration is lost with it.",
+tests/agent_permissions_test.rs:803:        "{} must sit at the repository root, where opencode looks before the global file",
+tests/agent_permissions_test.rs:847:/// opencode's defaults are permissive and the global config this project
+tests/agent_permissions_test.rs:948:/// resolves a name in the project config first and only then in the global
+tests/agent_permissions_test.rs:949:/// one, so a `build` block here would replace the global block for that
+tests/agent_permissions_test.rs:950:/// name: the implementer's permissions would move while the global config
+tests/agent_permissions_test.rs:969:        "the implementer agent must keep resolving from the global config: a block here would \
+tests/agent_permissions_test.rs:976:/// opencode deep-merges the project config over the global one, and a
+tests/agent_permissions_test.rs:979:/// every permission under the agent it is for, so the global block is left
+tests/agent_permissions_test.rs:990:         global one and applies to every agent that declares no block of its own"
+tests/agent_permissions_test.rs:1027:/// the global config for it.
+tests/agent_permissions_test.rs:1047:/// It is merged over the global one and applies to every agent that declares
+tests/agent_permissions_test.rs:1076:/// `--agent reviewer` resolving to the global config.
+tests/agent_permissions_test.rs:1137:/// agent resolves to these permissions instead of the global build agent. The
+tests/agent_permissions_test.rs:1200:        .expect_err("a permission-less reviewer inherits whatever the global config grants");
+tests/agent_permissions_test.rs:1280:/// exactly fifteen keys (`read`, `edit`, `glob`, `grep`, `list`, `bash`,
+tests/agent_permissions_test.rs:1368:/// falls through to the rules above it — and in this checkout the global
+tests/agent_permissions_test.rs:1616:/// the global `default_agent: build` — whose `edit` and `bash` are `allow` —
+tests/agent_permissions_test.rs:1631:                 there `--agent reviewer` resolves to the global build agent."
+tests/agent_permissions_test.rs:1645:             the global `default_agent: build`, whose edit and bash are allow, and every \
+tests/agent_permissions_test.rs:1682:/// finds no project config, and `--agent reviewer` falls back to the global
+tests/agent_permissions_test.rs:1753:         and no other top-level key: opencode merges the project config over the global one per \
+tests/agent_permissions_test.rs:1858:             the global config for that agent"
+tests/agent_permissions_test.rs:1871:/// global one for that agent, so a key in it is a key that agent reads.
+tests/agent_permissions_test.rs:1891:            "`agent.{name}` declares only {}: a key beside them is merged over the global config \
+tests/agent_permissions_test.rs:1902:/// and it inherits everything else from the global config. A third key in its
+tests/agent_permissions_test.rs:1972:/// It would inherit the global config's block — `bash: allow`, `edit: allow` —
+tests/agent_permissions_test.rs:1973:/// which is the same answer, but it would be the global file's answer rather
+tests/agent_permissions_test.rs:1974:/// than this one's, and the global file is the pipeline's to change.
+tests/agent_permissions_test.rs:1979:        .expect_err("a verifier with no permission block inherits the global one instead");
+tests/agent_permissions_test.rs:1988:/// One tool and no other: the missing one is inherited from the global config
+tests/bootstrap_selfhost_test.rs:1://! `bootstrap/compiler.rb` — the compiler written in Redblue (ladder stage S2).
+tests/bootstrap_selfhost_test.rs:5://! `bootstrap/compiler.rb`: the same four stages, written in Redblue and run by
+tests/bootstrap_selfhost_test.rs:10://! So every test here compares `fs::read(stage2.rbc)` against
+tests/bootstrap_selfhost_test.rs:25:    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+tests/bootstrap_selfhost_test.rs:90:/// Compiles `source` by running `bootstrap/compiler.rb` under the Rust `rb`.
+tests/bootstrap_selfhost_test.rs:92:    let input = scratch(&format!("{name}.rb"));
+tests/bootstrap_selfhost_test.rs:93:    let output = scratch(&format!("{name}.rbc"));
+tests/bootstrap_selfhost_test.rs:220:            // orphan statement of its own, and emits a `.rbc` that differs from
+tests/bootstrap_selfhost_test.rs:338:/// (`bootstrap/compiler.rb`) are the same table and have to be answered by the
+tests/bootstrap_selfhost_test.rs:463:        .arg(scratch(&format!("{name}.rbc")))
+tests/bootstrap_selfhost_test.rs:516:        "stage 2 left a {} byte .rbc for the program it refused",
+tests/bootstrap_selfhost_test.rs:559:/// Redblue compiler exits non-zero, says why, and leaves **no** `.rbc` behind.
+tests/bootstrap_selfhost_test.rs:585:            "stage 2 left a {} byte .rbc for the refused {name}",
+tests/bootstrap_selfhost_test.rs:633:                    .is_some_and(|n| n.starts_with(family) && n.ends_with(".rb"))
+[0m
+[0m$ [0mls tests | head -50; find tests -maxdepth 2 -type d | head -30
+agent_permissions_test.rs
+assertions_test.rs
+bench
+bench_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+catch_binding_test.rs
+checkpoint_ancestry_ack.txt
+checkpoint_ancestry_test.rs
+closure_capture_test.rs
+collections_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+data_formats_test.rs
+debug_watch_test.rs
+debugger_test.rs
+diagnostics_test.rs
+differential_test.rs
+discovery_test.rs
+doc_blocks_fragments.txt
+doc_blocks_known_fail.txt
+doc_blocks_runs.txt
+doc_blocks_test.rs
+encoding_hashing_test.rs
+expect_test.rs
+failure_channel_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+handout_claims_test.rs
+index_bounds_test.rs
+index_words_test.rs
+integration_test.rb
+interpolation_test.rs
+keyword_reservation_test.rs
+lexer_robustness_test.rs
+libraries_policy_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+matrix_test.rs
+tests
+tests/bench
+tests/common
+[0m
+[0m$ [0mfind tests -maxdepth 3 -type f | grep -v '\.rs$' | head -60; sed -n '1,120p' src/testing/mod.rs
+tests/test_loop_control.rb
+tests/test_control_flow.rb
+tests/suite.rb
+tests/doc_blocks_known_fail.txt
+tests/test_text.rb
+tests/test_arithmetic.rb
+tests/test_comparisons.rb
+tests/test_lists.rb
+tests/test_object_model.rb
+tests/test_records.rb
+tests/integration_test.rb
+tests/doc_blocks_runs.txt
+tests/test_numeric_edges.rb
+tests/test_modules.rb
+tests/test_closures.rb
+tests/doc_blocks_fragments.txt
+tests/test_functions.rb
+tests/checkpoint_ancestry_ack.txt
+tests/test_mod_in.rb
+tests/test_objects.rb
+pub mod assertions;
+pub mod harness;
+pub mod reporter;
+pub mod runner;
+
+pub use assertions::*;
+pub use harness::TestHarness;
+pub use reporter::PrettyReporter;
+pub use runner::TestRunner;
+
+use crate::error::Result;
+
+/// Why a single test body did not pass. An `Assertion` failure is a Redblue
+/// `expect` that did not hold; an `Error` is a lexer/parser/analyzer/runtime
+/// fault, which is a different kind of test failure.
+#[derive(Debug)]
+pub enum TestFailure {
+    Assertion(TestAssertionError),
+    Error(crate::error::Error),
+}
+
+impl std::fmt::Display for TestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TestFailure::Assertion(failure) => write!(f, "{}", failure.message),
+            TestFailure::Error(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+pub fn run_test_file(path: &str) -> Result<TestResults> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| crate::error::Error::Io(format!("Failed to read test file: {}", e)))?;
+
+    let mut harness = TestHarness::new();
+    harness.run_source(&source)?;
+
+    Ok(harness.results())
+}
+
+pub fn run_all_tests() -> Result<TestResults> {
+    let mut harness = TestHarness::new();
+
+    let test_files = find_test_files("tests/")?;
+
+    for file in test_files {
+        if let Err(e) = harness.run_file(&file) {
+            harness.add_error(e.to_string());
+        }
+    }
+
+    Ok(harness.results())
+}
+
+/// Collects every Redblue test file under `dir`, recursively.
+///
+/// Only `.rb` is collectable. The Redblue harness parses its input as
+/// Redblue, so handing it Rust source — the `tests/*_test.rs` files that
+/// belong to `cargo test` — can only ever produce noise.
+///
+/// The result is sorted. `read_dir` yields entries in filesystem hash order,
+/// which differs between machines and filesystems; an unsorted list would make
+/// the reported test order — and therefore the failure output — unstable.
+pub fn find_test_files(dir: &str) -> Result<Vec<String>> {
+    let mut files = collect_test_files(dir);
+    files.sort();
+    Ok(files)
+}
+
+fn collect_test_files(dir: &str) -> Vec<String> {
+    let mut files = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(collect_test_files(&path.to_string_lossy()));
+            } else if path.extension() == Some("rb".as_ref()) {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    files
+}
+
+#[derive(Debug, Clone)]
+pub struct TestResults {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub errors: Vec<TestError>,
+    pub duration_ms: u128,
+}
+
+impl TestResults {
+    pub fn new() -> Self {
+        Self {
+            total: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            errors: Vec::new(),
+            duration_ms: 0,
+        }
+    }
+
+    pub fn add_pass(&mut self) {
+        self.passed += 1;
+        self.total += 1;
+    }
+
+    pub fn add_fail(&mut self, error: TestError) {
+        self.failed += 1;
+        self.total += 1;
+        self.errors.push(error);
+    }
+
+    pub fn add_skip(&mut self) {
+[0m
+[0m$ [0mgrep -rn "bootstrap/\|read_dir.*bootstrap\|WalkDir\|find_test_files\|collect_test_files" tests src | grep -v bootstrap_selfhost_test.rs | head -60
+tests/bootstrap_ship_test.rs:4://! Stage 3 (phase-022) proved the fixed point: `bootstrap/compiler.rb` compiled
+tests/bootstrap_ship_test.rs:49:    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+tests/bootstrap_ship_test.rs:52:/// A path under `target/tmp/`. Nothing is written to `bootstrap/` or `corpus/`:
+tests/bootstrap_ship_test.rs:195:/// pool holds UTF-8. `bootstrap/compiler.rb` is itself ASCII, so the fixed point
+tests/bootstrap_ship_test.rs:572:/// fell through, tried to read the directory `bootstrap/`, and exited 1 with
+tests/bootstrap_ship_test.rs:576:/// contains a `bootstrap/` **directory**, so the fall-through has something to
+tests/bootstrap_ship_test.rs:605:        stderr.contains("bootstrap/compiler.rb"),
+tests/bootstrap_ship_test.rs:610:        !cwd.join("target/bootstrap/compiler.rbc").exists(),
+tests/bootstrap_ship_test.rs:738:/// a second compiler wearing a rollback's name. Only `bootstrap/build.sh`'s
+tests/bootstrap_ship_test.rs:793:/// path. The workflow's header comment names `./bootstrap/build.sh` above every
+tests/bootstrap_ship_test.rs:805:        .find("run: ./bootstrap/build.sh")
+tests/bootstrap_ship_test.rs:821:        text.contains("target/release-bootstrap/compiler.rbc"),
+tests/bootstrap_ship_test.rs:823:         bootstrap/build.sh writes:\n{text}"
+tests/bootstrap_ship_test.rs:830:/// its own compiler — but both then uploaded `target/release-bootstrap/compiler.rbc`
+tests/bootstrap_ship_test.rs:845:    let path = "target/release-bootstrap/compiler.rbc";
+tests/bytecode_vm_test.rs:4357:/// the shape `bootstrap/compiler.rb`'s `apply_patches` has: a `while` whose body
+tests/redblue_suite_test.rs:12:    let mut files = redblue::testing::find_test_files("tests").expect("tests/ should be readable");
+tests/discovery_test.rs:4:use redblue::testing::{find_test_files, run_all_tests, TestHarness};
+tests/discovery_test.rs:35:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:58:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:71:fn find_test_files_walks_nested_directories() {
+tests/discovery_test.rs:80:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:106:    let found = find_test_files(empty.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:111:    let found = find_test_files(missing.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:132:    let first = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:134:    let second = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:162:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:186:    let found = find_test_files(root.join("tests").to_str().expect("utf-8 path"))
+tests/discovery_test.rs:231:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:296:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:329:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:351:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/discovery_test.rs:382:    let found = find_test_files(dir.to_str().expect("utf-8 scratch path"))
+tests/list_append_test.rs:7://! shape `bootstrap/compiler.rb` uses for its token list, its instruction list
+tests/differential_test.rs:28://! `redblue::testing::find_test_files("tests")` walks `tests/` recursively and
+tests/list_push_test.rs:5://! `bootstrap/compiler.rb`. Its contract is therefore load-bearing twice over:
+tests/checkpoint_ancestry_ack.txt:30:7fdea15f13a0cc2021c5cc69a65a126879e2d554|phase-019 checkpoint, tolerated: published via a resume merge that the reviewer never saw. Code is in examples/ and bootstrap/ only; no language semantics or public type changed. Recorded rather than rewritten.
+tests/common/corpus.rs:262:/// Not `tests/corpus/`. `redblue::testing::find_test_files("tests")` walks
+src/interpreter.rs:61:/// to be allowed to do. Ladder stage S3 — `bootstrap/compiler.rb` compiled by
+src/interpreter.rs:63:/// `bootstrap/compiler.rb` (measured by bisecting `REDBLUE_MAX_STEPS` until the
+src/interpreter.rs:64:/// run stopped being refused), and `rb vm stage1.rbc bootstrap/compiler.rb
+src/bootstrap.rs:18://!    `bootstrap/compiler.rb`.
+src/bootstrap.rs:56:    /// `bootstrap/compiler.rb` compiled by the Rust frontend.
+src/bootstrap.rs:187:/// This is `rb compile bootstrap/compiler.rb`, and it exists so a release can
+src/bootstrap.rs:394:/// `bootstrap/compiler.rb`, or whatever kind of failure the run actually was.
+src/repl/highlight.rs:565:        let source = include_str!("../../bootstrap/compiler.rb");
+src/testing/mod.rs:44:    let test_files = find_test_files("tests/")?;
+src/testing/mod.rs:64:pub fn find_test_files(dir: &str) -> Result<Vec<String>> {
+src/testing/mod.rs:65:    let mut files = collect_test_files(dir);
+src/testing/mod.rs:70:fn collect_test_files(dir: &str) -> Vec<String> {
+src/testing/mod.rs:77:                files.extend(collect_test_files(&path.to_string_lossy()));
+src/lib.rs:464:    let compiler = compiler.unwrap_or_else(|| "bootstrap/compiler.rb".to_string());
+src/lib.rs:475:        // the ladder never approved. `bootstrap/build.sh` catches that with a
+src/lib.rs:584:    println!("  rb bootstrap [out-dir] --compiler <file>  Build a compiler other than bootstrap/compiler.rb");
+[0m
+[0m$ [0mgrep -rn "fn.*bootstrap\|bootstrap" tests/bootstrap_ship_test.rs | head -60; grep -rn "bootstrap" tests/*.rs | grep -i "glob\|read_dir\|list\|walk" | head
+4://! Stage 3 (phase-022) proved the fixed point: `bootstrap/compiler.rb` compiled
+16://! [`redblue::bootstrap::build`] is that build. It takes the compiler's source,
+22://! path, and `bootstrap::build` calls the same `compile_source` the CLI does and
+30:use redblue::bootstrap;
+49:    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+52:/// A path under `target/tmp/`. Nothing is written to `bootstrap/` or `corpus/`:
+66:fn release() -> &'static bootstrap::Build {
+67:    static BUILD: std::sync::OnceLock<bootstrap::Build> = std::sync::OnceLock::new();
+69:        bootstrap::build(&compiler(), &scratch("release"))
+80:/// its own source but is shipped from a third file is not bootstrapped, it is
+121:/// `bootstrap::rollback` is the documented way back to the Rust compiler when
+128:    let rolled_back = bootstrap::rollback(&compiler())
+176:    let outcome = redblue::bootstrap::run_compiler_on(&chunk, &sample, &written);
+195:/// pool holds UTF-8. `bootstrap/compiler.rb` is itself ASCII, so the fixed point
+201:/// `compiler.rb` over itself. If a future change gave `src/bootstrap.rs` its
+246:    let outcome = redblue::bootstrap::run_compiler_on(&chunk, &sample, &written);
+285:    bootstrap::run_compiler_on(&chunk, &sample, &written)
+313:    let refused = bootstrap::verify(&build.stage1, &tampered);
+328:    // `src/bootstrap.rs`: handing the build a stage 2 is `Stage2::Bytes`, which
+353:        bootstrap::build(&missing, &scratch("missing")),
+364:        bootstrap::build(&empty, &scratch("empty")),
+383:        bootstrap::build(&silent, &dir),
+397:/// `rb bootstrap` is the command a release runs, so the command is tested.
+416:        .arg("bootstrap")
+422:        "`rb bootstrap <dir>` exited {:?}\nstdout: {}\nstderr: {}",
+428:    let shipped = bootstrap::Build::shipped_path(&out_dir);
+431:        "`rb bootstrap` reported success and wrote no {}",
+438:        "the compiler `rb bootstrap` shipped is not the one the library build \
+483:        .arg("bootstrap")
+491:        "`rb bootstrap --rollback` exited {:?}\nstderr: {}",
+497:        "`rb bootstrap --rollback` did not say it rolled back: {stdout}"
+501:        fs::read(bootstrap::Build::shipped_path(&out_dir)).expect("the rollback wrote a compiler");
+529:        .arg("bootstrap")
+537:        "`rb bootstrap` exited 0 for a compiler that does not exist"
+545:        !bootstrap::Build::shipped_path(&scratch("cli-missing")).exists(),
+551:        .arg("bootstrap")
+557:        "`rb bootstrap --not-a-flag` exited 0"
+566:/// `rb bootstrap` with no output directory is the command, not a file to run.
+568:/// The documented spelling is `rb bootstrap [out-dir]`, so the no-positional
+571:/// Redblue file to run, and `bootstrap` was not claimed there, so the command
+572:/// fell through, tried to read the directory `bootstrap/`, and exited 1 with
+576:/// contains a `bootstrap/` **directory**, so the fall-through has something to
+579:/// from the bootstrap command — it names the compiler it could not read, from
+582:fn edge_bare_rb_bootstrap_is_the_command_and_not_a_file_to_run() {
+585:    fs::create_dir_all(cwd.join("bootstrap"))
+586:        .expect("the scratch checkout has a bootstrap directory");
+589:        .arg("bootstrap")
+597:        "`rb bootstrap` in a directory with no compiler exited 0"
+601:        "`rb bootstrap` fell through to the file runner and tried to read the \
+602:         `bootstrap` directory as a Redblue program: {stderr}"
+605:        stderr.contains("bootstrap/compiler.rb"),
+606:        "`rb bootstrap` did not report reading the compiler it defaults to, so \
+610:        !cwd.join("target/bootstrap/compiler.rbc").exists(),
+632:        bootstrap::build(&broken, &dir),
+703:                let outcome = bootstrap::run_compiler_on(&chunk, &input, &output);
+733:/// `rb bootstrap <dir> --rollback` overwrites the shipped file with the Rust
+738:/// a second compiler wearing a rollback's name. Only `bootstrap/build.sh`'s
+746:    let target = bootstrap::Build::shipped_path(&dir);
+757:        bootstrap::rollback_onto(build, &dir, &divergent),
+773:    bootstrap::rollback_onto(build, &dir, &build.stage2)
+tests/list_append_test.rs:7://! shape `bootstrap/compiler.rb` uses for its token list, its instruction list
+tests/list_push_test.rs:5://! `bootstrap/compiler.rb`. Its contract is therefore load-bearing twice over:
+[0m
+[0m$ [0mgrep -rn "bootstrap/\*\|bootstrap\"\|bootstrap/" Cargo.toml src/*.rs src/**/*.rs tests/*.rs | grep -iE "glob|read_dir|collect|walk|find|\.rb\"|run_test_file" | head -40; grep -rn "fn run_tests\|run_all_tests\|find_test_files" src | head -20
+src/lib.rs:464:    let compiler = compiler.unwrap_or_else(|| "bootstrap/compiler.rb".to_string());
+src/lib.rs:584:    println!("  rb bootstrap [out-dir] --compiler <file>  Build a compiler other than bootstrap/compiler.rb");
+src/repl/highlight.rs:565:        let source = include_str!("../../bootstrap/compiler.rb");
+tests/bootstrap_selfhost_test.rs:25:    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+tests/bootstrap_selfhost_test.rs:1197:        let bytes = stage1("bootstrap/compiler.rb", &compiler_contents());
+tests/bootstrap_ship_test.rs:49:    Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/compiler.rb")
+tests/bootstrap_ship_test.rs:605:        stderr.contains("bootstrap/compiler.rb"),
+tests/bootstrap_ship_test.rs:805:        .find("run: ./bootstrap/build.sh")
+src/testing/mod.rs:41:pub fn run_all_tests() -> Result<TestResults> {
+src/testing/mod.rs:44:    let test_files = find_test_files("tests/")?;
+src/testing/mod.rs:64:pub fn find_test_files(dir: &str) -> Result<Vec<String>> {
+src/lib.rs:164:            let results = testing::run_all_tests()?;
+[0m
+[0m$ [0mls -d */ | head -40; find . -maxdepth 2 -name "*.rb" -not -path "./tests/*" -not -path "./target/*" | head -40
+bootstrap/
+corpus/
+docs/
+examples/
+modules/
+phases/
+src/
+target/
+tests/
+tooling/
+wasm/
+./bootstrap/compiler.rb
+./examples/random.rb
+./examples/hello.rb
+./examples/test_arithmetic.rb
+./examples/time.rb
+./examples/fizzbuzz.rb
+./examples/formats.rb
+./examples/files.rb
+./corpus/faults-0017.rb
+./corpus/numeric-boundary-0017.rb
+./corpus/stdlib-0003.rb
+./corpus/text-ops-0005.rb
+./corpus/lists-0022.rb
+./corpus/arithmetic-0009.rb
+./corpus/loop-forms-0020.rb
+./corpus/nesting-0013.rb
+./corpus/numeric-boundary-0016.rb
+./corpus/value-tails-0005.rb
+./corpus/numeric-boundary-0011.rb
+./corpus/numeric-boundary-0012.rb
+./corpus/value-tails-0017.rb
+./corpus/lists-0021.rb
+./corpus/malformed-0022.rb
+./corpus/stdlib-0016.rb
+./corpus/objects-0018.rb
+./corpus/functions-0006.rb
+./corpus/lists-0016.rb
+./corpus/functions-0007.rb
+./corpus/malformed-0017.rb
+./corpus/lists-0027.rb
+./corpus/faults-0009.rb
+./corpus/control-flow-0006.rb
+./corpus/stdlib-0005.rb
+./corpus/lists-0023.rb
+./corpus/control-flow-0005.rb
+./corpus/value-tails-0010.rb
+./corpus/arithmetic-0014.rb
+./corpus/text-ops-0011.rb
+./corpus/runtime-errors-0016.rb
+./corpus/faults-0004.rb
+[0m
+[0m$ [0mfind tooling -maxdepth 2 -type f | head -40; find bootstrap -maxdepth 2 -type f | head
+tooling/repl/README.md
+tooling/vscode/language-configuration.json
+tooling/vscode/package.json
+tooling/vscode/README.md
+tooling/vscode/extension.js
+bootstrap/build.sh
+bootstrap/compiler.rb
+[0m
+[0m$ [0mpython3 - <<'PY'
+def h(s):
+    v=0
+    for b in s.encode():
+        v=(v*31+b)%2147483647
+    return v, v%256
+for s in ['ordinary-a','ordinary-b','spread-0','spread-1','repeated','other','collision-0','collision-1','collision-2','name0','name1']:
+    print(s, h(s))
+# distribution of spread-0..spread-299
+buckets={}
+for i in range(300):
+    s=f'spread-{i}'
+    buckets[h(s)[1]]=buckets.get(h(s)[1],0)+1
+print('distinct',len(buckets),'maxchain',max(buckets.values()))
+print('top',sorted(buckets.items(), key=lambda kv:-kv[1])[:10])
+PY
+ordinary-a (2047638173, 157)
+ordinary-b (2047638174, 158)
+spread-0 (388394055, 71)
+spread-1 (388394056, 72)
+repeated (1710703961, 89)
+other (106069776, 16)
+collision-0 (1596218995, 115)
+collision-1 (1596218996, 116)
+collision-2 (1596218997, 117)
+name0 (104584965, 5)
+name1 (104584966, 6)
+distinct 169 maxchain 4
+top [(245, 4), (246, 4), (20, 4), (21, 4), (237, 3), (238, 3), (244, 3), (19, 3), (51, 3), (52, 3)]
+[0m
+[0m$ [0msed -n '2725,2835p' bootstrap/compiler.rb
+while intern_init_i < INTERN_BUCKETS
+            append("G_INTERN_BUCKETS", [])
+            set intern_init_i to intern_init_i + 1
+        end
+    end
+end
+
+// The index is added to one bucket. The bucket is rebuilt rather than changed
+// in place because Redblue has no index assignment, and the table is rebuilt
+// with it because a bucket is held by value. Rebuilding the table costs one
+// `append` per bucket, paid only when a name is new; a lookup still reads its
+// bucket directly.
+to intern_bucket_add(bucket, entry_index)
+    set intern_bucket_add_chain to push(G_INTERN_BUCKETS[bucket], entry_index)
+    set G_INTERN_BUCKETS_NEXT to []
+    set intern_bucket_add_i to 0
+    while intern_bucket_add_i < length(G_INTERN_BUCKETS)
+        if intern_bucket_add_i is bucket then
+            append("G_INTERN_BUCKETS_NEXT", intern_bucket_add_chain)
+        else
+            append("G_INTERN_BUCKETS_NEXT", G_INTERN_BUCKETS[intern_bucket_add_i])
+        end
+        set intern_bucket_add_i to intern_bucket_add_i + 1
+    end
+    set G_INTERN_BUCKETS to G_INTERN_BUCKETS_NEXT
+end
+
+// The direct tests in `tests/bootstrap_selfhost_test.rs` drive the table through
+// this mode instead of hoping a source program happens to exercise one bucket.
+// It runs only for `--intern-selftest`; a normal invocation takes the two-path
+// branch in `main` and never reaches it.
+to intern_selftest()
+    set intern_selftest_start to G_INTERN_COUNT
+
+    // One name, a thousand times: the table grows by one, not by a thousand.
+    set intern_selftest_repeated to bytes.from_text("repeated")
+    set intern_selftest_first to intern(intern_selftest_repeated)
+    set intern_selftest_i to 0
+    while intern_selftest_i < 1000
+        intern(intern_selftest_repeated)
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    say "repeat_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+    intern(bytes.from_text("other"))
+    say "other_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+
+    // The empty name is a name, not a missing one.
+    set intern_selftest_empty_start to G_INTERN_COUNT
+    set intern_selftest_empty_one to intern([])
+    set intern_selftest_empty_two to intern([])
+    say "empty_same " + intern_selftest_yes(intern_selftest_empty_one is intern_selftest_empty_two)
+    say "empty_growth " + to_text(G_INTERN_COUNT - intern_selftest_empty_start)
+
+    // A name far longer than a bucket count, and a variant that differs only in
+    // its last byte. A hash that truncated the name would give them one index.
+    set intern_selftest_long_a to []
+    set intern_selftest_long_b to []
+    set intern_selftest_i to 0
+    while intern_selftest_i < 10000
+        append("intern_selftest_long_a", 120)
+        append("intern_selftest_long_b", 120)
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    append("intern_selftest_long_b", 121)
+    set intern_selftest_long_start to G_INTERN_COUNT
+    set intern_selftest_long_one to intern(intern_selftest_long_a)
+    set intern_selftest_long_two to intern(intern_selftest_long_a)
+    set intern_selftest_long_three to intern(intern_selftest_long_b)
+    say "long_same " + intern_selftest_yes(intern_selftest_long_one is intern_selftest_long_two)
+    say "long_distinct " + intern_selftest_yes(intern_selftest_long_one is not intern_selftest_long_three)
+    say "long_growth " + to_text(G_INTERN_COUNT - intern_selftest_long_start)
+
+    // Two distinct names engineered to select the same bucket: keep the first
+    // candidate, then walk a sequence of distinct names until one hashes to its
+    // bucket. Both then have to be in the bucket at once and each has to answer
+    // with its own index.
+    set intern_selftest_a to bytes.from_text("collision-0")
+    set intern_selftest_a_bucket to intern_hash(intern_selftest_a) mod INTERN_BUCKETS
+    set intern_selftest_b to []
+    set intern_selftest_found to no
+    set intern_selftest_i to 1
+    while intern_selftest_i < 20000
+        if intern_selftest_found is no then
+            set intern_selftest_b to bytes.from_text("collision-" + to_text(intern_selftest_i))
+            if (intern_hash(intern_selftest_b) mod INTERN_BUCKETS) is intern_selftest_a_bucket then
+                set intern_selftest_found to yes
+            end
+        end
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    set intern_selftest_a_index to intern(intern_selftest_a)
+    set intern_selftest_b_index to intern(intern_selftest_b)
+    say "collision_found " + intern_selftest_yes(intern_selftest_found)
+    say "collision_distinct " + intern_selftest_yes(intern_selftest_a_index is not intern_selftest_b_index)
+    say "collision_bucket " + to_text(intern_hash(intern_selftest_a) mod INTERN_BUCKETS)
+    say "collision_a_index " + to_text(intern_selftest_a_index)
+    say "collision_b_index " + to_text(intern_selftest_b_index)
+    say "collision_a_lookup " + to_text(intern(intern_selftest_a))
+    say "collision_b_lookup " + to_text(intern(intern_selftest_b))
+    give back 0
+end
+
+// The same words the rest of this file prints for a yes/no.
+to intern_selftest_yes(flag)
+    set intern_selftest_yes_text to "no"
+    if flag is yes then
+        set intern_selftest_yes_text to "yes"
+    end
+    give back intern_selftest_yes_text
+end
+[0m
+[0m$ [0msed -n '2835,2865p' bootstrap/compiler.rb; sed -n '60,105p' bootstrap/compiler.rb
+// A name that is not a byte list must fail at the table, not be accepted as
+// some other key. The test drives this through `main`, so the failure is the
+// compiler's own runtime error and not a panic.
+to intern_selftest_type_error()
+    intern(42)
+    give back 0
+end
+
+// `Compiler::text`: intern a name and use it as an operand.
+to emit_name(opcode, raw, aux, line)
+    emit(opcode, intern(raw), aux, line)
+end
+
+// A constant that is **not** interned: a literal, appended every time it is
+// written.
+to emit_const(tag, raw, line)
+    set emit_const_index to 0
+    set emit_const_index to length(G_POOL)
+    append("G_POOL", {t: tag, b: raw})
+    emit(1, emit_const_index, 0, line)
+end
+
+// `Constant::Nothing`, which is the value a `return` with no value returns.
+to emit_nothing(line)
+    set emit_nothing_index to 0
+    set emit_nothing_index to length(G_POOL)
+    append("G_POOL", {t: 0, b: []})
+    emit(1, emit_nothing_index, 0, line)
+end
+
+set G_INTERN_COUNT to 0
+set G_INTERN_BUCKETS to []
+set G_INTERN_BUCKETS_NEXT to []
+set G_CODE to []
+set G_JUMPS to []
+set G_BLOCKS to []
+// The seventh is not the code generator's: it is the file being written, and it
+// is named for the same reason. `G_BYTES` is emptied by `encode` and read once.
+set G_BYTES to []
+// And these two are the lexer's token list and one block's patched code. Each is
+// emptied by the function that fills it and read there.
+set G_TOKENS to []
+set G_PATCHED to []
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+to main()
+    set main_args to 0
+    set main_args to sys.argv()
+    // The intern table's direct tests. A normal run has two paths and takes the
+    // branch below exactly as it did before these modes existed. The flag is
+    // kept in a name because `give back` inside an `if` leaves the `if`, not
+    // the function; returning here would only fall through to the usage check.
+    set main_self_test to no
+    if length(main_args) is 1 then
+        if main_args[0] is "--intern-selftest" then
+            intern_selftest()
+            set main_self_test to yes
+        end
+        if main_args[0] is "--intern-selftest-type-error" then
+            intern_selftest_type_error()
+            set main_self_test to yes
+        end
+    end
+    if main_self_test is no then
+        if length(main_args) is not 2 then
+            refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
+        end
+        set main_source to read_source(main_args[0])
+        set main_tokens to lex(main_source)
+        set main_program to parse_program(main_tokens)
+        set main_chunk to compile_program(main_program)
+        bytes.write(main_args[1], encode(main_chunk))
+    end
+[0m
+[0m← [0mWrite bootstrap/intern_selftest.rb
+Wrote file successfully.
+[0m
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -77,33 +77,16 @@
+ 
+ to main()
+     set main_args to 0
+     set main_args to sys.argv()
+-    // The intern table's direct tests. A normal run has two paths and takes the
+-    // branch below exactly as it did before these modes existed. The flag is
+-    // kept in a name because `give back` inside an `if` leaves the `if`, not
+-    // the function; returning here would only fall through to the usage check.
+-    set main_self_test to no
+-    if length(main_args) is 1 then
+-        if main_args[0] is "--intern-selftest" then
+-            intern_selftest()
+-            set main_self_test to yes
+-        end
+-        if main_args[0] is "--intern-selftest-type-error" then
+-            intern_selftest_type_error()
+-            set main_self_test to yes
+-        end
++    if length(main_args) is not 2 then
++        refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
+     end
+-    if main_self_test is no then
+-        if length(main_args) is not 2 then
+-            refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
+-        end
+-        set main_source to read_source(main_args[0])
+-        set main_tokens to lex(main_source)
+-        set main_program to parse_program(main_tokens)
+-        set main_chunk to compile_program(main_program)
+-        bytes.write(main_args[1], encode(main_chunk))
+-    end
++    set main_source to read_source(main_args[0])
++    set main_tokens to lex(main_source)
++    set main_program to parse_program(main_tokens)
++    set main_chunk to compile_program(main_program)
++    bytes.write(main_args[1], encode(main_chunk))
+     give back 0
+ end
+ 
+ // The file to compile, as bytes. Read as text and converted, so a file that is
+
+[0m
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -2713,11 +2713,16 @@
+ end
+ 
+ // The index is added to one bucket. The bucket is rebuilt rather than changed
+ // in place because Redblue has no index assignment, and the table is rebuilt
+-// with it because a bucket is held by value. Rebuilding the table costs one
+-// `append` per bucket, paid only when a name is new; a lookup still reads its
+-// bucket directly.
++// with it because a bucket is held by value.
++//
++// This is the documented trade-off: insertion stays O(INTERN_BUCKETS) per new
++// name, while a lookup walks one bucket. At 256 the fixed cost is paid once per
++// distinct name and is dwarfed by the repeated lookups a compilation makes — a
++// name is emitted many times, which is the case this table exists to make
++// cheap. A future list index assignment would let the bucket be updated in
++// place, but the language has none today.
+ to intern_bucket_add(bucket, entry_index)
+     set intern_bucket_add_chain to push(G_INTERN_BUCKETS[bucket], entry_index)
+     set G_INTERN_BUCKETS_NEXT to []
+     set intern_bucket_add_i to 0
+
+[0m
+[0m$ [0msed -n '2755,2850p' bootstrap/compiler.rb
+say "repeat_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+    intern(bytes.from_text("other"))
+    say "other_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+
+    // The empty name is a name, not a missing one.
+    set intern_selftest_empty_start to G_INTERN_COUNT
+    set intern_selftest_empty_one to intern([])
+    set intern_selftest_empty_two to intern([])
+    say "empty_same " + intern_selftest_yes(intern_selftest_empty_one is intern_selftest_empty_two)
+    say "empty_growth " + to_text(G_INTERN_COUNT - intern_selftest_empty_start)
+
+    // A name far longer than a bucket count, and a variant that differs only in
+    // its last byte. A hash that truncated the name would give them one index.
+    set intern_selftest_long_a to []
+    set intern_selftest_long_b to []
+    set intern_selftest_i to 0
+    while intern_selftest_i < 10000
+        append("intern_selftest_long_a", 120)
+        append("intern_selftest_long_b", 120)
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    append("intern_selftest_long_b", 121)
+    set intern_selftest_long_start to G_INTERN_COUNT
+    set intern_selftest_long_one to intern(intern_selftest_long_a)
+    set intern_selftest_long_two to intern(intern_selftest_long_a)
+    set intern_selftest_long_three to intern(intern_selftest_long_b)
+    say "long_same " + intern_selftest_yes(intern_selftest_long_one is intern_selftest_long_two)
+    say "long_distinct " + intern_selftest_yes(intern_selftest_long_one is not intern_selftest_long_three)
+    say "long_growth " + to_text(G_INTERN_COUNT - intern_selftest_long_start)
+
+    // Two distinct names engineered to select the same bucket: keep the first
+    // candidate, then walk a sequence of distinct names until one hashes to its
+    // bucket. Both then have to be in the bucket at once and each has to answer
+    // with its own index.
+    set intern_selftest_a to bytes.from_text("collision-0")
+    set intern_selftest_a_bucket to intern_hash(intern_selftest_a) mod INTERN_BUCKETS
+    set intern_selftest_b to []
+    set intern_selftest_found to no
+    set intern_selftest_i to 1
+    while intern_selftest_i < 20000
+        if intern_selftest_found is no then
+            set intern_selftest_b to bytes.from_text("collision-" + to_text(intern_selftest_i))
+            if (intern_hash(intern_selftest_b) mod INTERN_BUCKETS) is intern_selftest_a_bucket then
+                set intern_selftest_found to yes
+            end
+        end
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    set intern_selftest_a_index to intern(intern_selftest_a)
+    set intern_selftest_b_index to intern(intern_selftest_b)
+    say "collision_found " + intern_selftest_yes(intern_selftest_found)
+    say "collision_distinct " + intern_selftest_yes(intern_selftest_a_index is not intern_selftest_b_index)
+    say "collision_bucket " + to_text(intern_hash(intern_selftest_a) mod INTERN_BUCKETS)
+    say "collision_a_index " + to_text(intern_selftest_a_index)
+    say "collision_b_index " + to_text(intern_selftest_b_index)
+    say "collision_a_lookup " + to_text(intern(intern_selftest_a))
+    say "collision_b_lookup " + to_text(intern(intern_selftest_b))
+    give back 0
+end
+
+// The same words the rest of this file prints for a yes/no.
+to intern_selftest_yes(flag)
+    set intern_selftest_yes_text to "no"
+    if flag is yes then
+        set intern_selftest_yes_text to "yes"
+    end
+    give back intern_selftest_yes_text
+end
+
+// A name that is not a byte list must fail at the table, not be accepted as
+// some other key. The test drives this through `main`, so the failure is the
+// compiler's own runtime error and not a panic.
+to intern_selftest_type_error()
+    intern(42)
+    give back 0
+end
+
+// `Compiler::text`: intern a name and use it as an operand.
+to emit_name(opcode, raw, aux, line)
+    emit(opcode, intern(raw), aux, line)
+end
+
+// A constant that is **not** interned: a literal, appended every time it is
+// written.
+to emit_const(tag, raw, line)
+    set emit_const_index to 0
+    set emit_const_index to length(G_POOL)
+    append("G_POOL", {t: tag, b: raw})
+    emit(1, emit_const_index, 0, line)
+end
+
+// `Constant::Nothing`, which is the value a `return` with no value returns.
+to emit_nothing(line)
+    set emit_nothing_index to 0
+    set emit_nothing_index to length(G_POOL)
+    append("G_POOL", {t: 0, b: []})
+[0m
+[0m$ [0mgrep -n "The direct tests\|to intern_selftest\|to emit_name" bootstrap/compiler.rb
+2740:// The direct tests in `tests/bootstrap_selfhost_test.rs` drive the table through
+2744:to intern_selftest()
+2753:        set intern_selftest_i to intern_selftest_i + 1
+2774:        set intern_selftest_i to intern_selftest_i + 1
+2801:        set intern_selftest_i to intern_selftest_i + 1
+2816:to intern_selftest_yes(flag)
+2827:to intern_selftest_type_error()
+2833:to emit_name(opcode, raw, aux, line)
+[0m
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -2736,100 +2736,8 @@
+     end
+     set G_INTERN_BUCKETS to G_INTERN_BUCKETS_NEXT
+ end
+ 
+-// The direct tests in `tests/bootstrap_selfhost_test.rs` drive the table through
+-// this mode instead of hoping a source program happens to exercise one bucket.
+-// It runs only for `--intern-selftest`; a normal invocation takes the two-path
+-// branch in `main` and never reaches it.
+-to intern_selftest()
+-    set intern_selftest_start to G_INTERN_COUNT
+-
+-    // One name, a thousand times: the table grows by one, not by a thousand.
+-    set intern_selftest_repeated to bytes.from_text("repeated")
+-    set intern_selftest_first to intern(intern_selftest_repeated)
+-    set intern_selftest_i to 0
+-    while intern_selftest_i < 1000
+-        intern(intern_selftest_repeated)
+-        set intern_selftest_i to intern_selftest_i + 1
+-    end
+-    say "repeat_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+-    intern(bytes.from_text("other"))
+-    say "other_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+-
+-    // The empty name is a name, not a missing one.
+-    set intern_selftest_empty_start to G_INTERN_COUNT
+-    set intern_selftest_empty_one to intern([])
+-    set intern_selftest_empty_two to intern([])
+-    say "empty_same " + intern_selftest_yes(intern_selftest_empty_one is intern_selftest_empty_two)
+-    say "empty_growth " + to_text(G_INTERN_COUNT - intern_selftest_empty_start)
+-
+-    // A name far longer than a bucket count, and a variant that differs only in
+-    // its last byte. A hash that truncated the name would give them one index.
+-    set intern_selftest_long_a to []
+-    set intern_selftest_long_b to []
+-    set intern_selftest_i to 0
+-    while intern_selftest_i < 10000
+-        append("intern_selftest_long_a", 120)
+-        append("intern_selftest_long_b", 120)
+-        set intern_selftest_i to intern_selftest_i + 1
+-    end
+-    append("intern_selftest_long_b", 121)
+-    set intern_selftest_long_start to G_INTERN_COUNT
+-    set intern_selftest_long_one to intern(intern_selftest_long_a)
+-    set intern_selftest_long_two to intern(intern_selftest_long_a)
+-    set intern_selftest_long_three to intern(intern_selftest_long_b)
+-    say "long_same " + intern_selftest_yes(intern_selftest_long_one is intern_selftest_long_two)
+-    say "long_distinct " + intern_selftest_yes(intern_selftest_long_one is not intern_selftest_long_three)
+-    say "long_growth " + to_text(G_INTERN_COUNT - intern_selftest_long_start)
+-
+-    // Two distinct names engineered to select the same bucket: keep the first
+-    // candidate, then walk a sequence of distinct names until one hashes to its
+-    // bucket. Both then have to be in the bucket at once and each has to answer
+-    // with its own index.
+-    set intern_selftest_a to bytes.from_text("collision-0")
+-    set intern_selftest_a_bucket to intern_hash(intern_selftest_a) mod INTERN_BUCKETS
+-    set intern_selftest_b to []
+-    set intern_selftest_found to no
+-    set intern_selftest_i to 1
+-    while intern_selftest_i < 20000
+-        if intern_selftest_found is no then
+-            set intern_selftest_b to bytes.from_text("collision-" + to_text(intern_selftest_i))
+-            if (intern_hash(intern_selftest_b) mod INTERN_BUCKETS) is intern_selftest_a_bucket then
+-                set intern_selftest_found to yes
+-            end
+-        end
+-        set intern_selftest_i to intern_selftest_i + 1
+-    end
+-    set intern_selftest_a_index to intern(intern_selftest_a)
+-    set intern_selftest_b_index to intern(intern_selftest_b)
+-    say "collision_found " + intern_selftest_yes(intern_selftest_found)
+-    say "collision_distinct " + intern_selftest_yes(intern_selftest_a_index is not intern_selftest_b_index)
+-    say "collision_bucket " + to_text(intern_hash(intern_selftest_a) mod INTERN_BUCKETS)
+-    say "collision_a_index " + to_text(intern_selftest_a_index)
+-    say "collision_b_index " + to_text(intern_selftest_b_index)
+-    say "collision_a_lookup " + to_text(intern(intern_selftest_a))
+-    say "collision_b_lookup " + to_text(intern(intern_selftest_b))
+-    give back 0
+-end
+-
+-// The same words the rest of this file prints for a yes/no.
+-to intern_selftest_yes(flag)
+-    set intern_selftest_yes_text to "no"
+-    if flag is yes then
+-        set intern_selftest_yes_text to "yes"
+-    end
+-    give back intern_selftest_yes_text
+-end
+-
+-// A name that is not a byte list must fail at the table, not be accepted as
+-// some other key. The test drives this through `main`, so the failure is the
+-// compiler's own runtime error and not a panic.
+-to intern_selftest_type_error()
+-    intern(42)
+-    give back 0
+-end
+-
+ // `Compiler::text`: intern a name and use it as an operand.
+ to emit_name(opcode, raw, aux, line)
+     emit(opcode, intern(raw), aux, line)
+ end
+
+[0m
+[0m$ [0msed -n '2100,2285p' tests/bootstrap_selfhost_test.rs
+assert_identical(name, source);
+    }
+}
+
+// Phase 074: the compiler's intern table is internal to
+// `bootstrap/compiler.rb`, so the direct tests drive it through the compiler's
+// hidden `--intern-selftest` mode. That mode runs the same `intern` and
+// `intern_hash` the normal compile path runs; it only gives a test a way to
+// call them without a source file that happens to use every shape needed.
+//
+// The byte-equality test is the real gate: a hash table that answers a name
+// with the wrong index changes the constant pool, and the pool is part of the
+// bytes. `edge_name_heavy_fixture_is_byte_identical_in_both_stages` compiles a
+// program with many distinct names in both stages and requires the files to be
+// one file.
+
+struct InternOutput {
+    stdout: String,
+    stderr: String,
+    succeeded: bool,
+}
+
+fn run_intern_mode(args: &[&str]) -> InternOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("run")
+        .arg(compiler())
+        .args(args)
+        .output()
+        .expect("the rb binary runs");
+    InternOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        succeeded: output.status.success(),
+    }
+}
+
+fn intern_selftest() -> InternOutput {
+    run_intern_mode(&["--intern-selftest"])
+}
+
+/// The value printed for `key`, which the self-test prints as `key value`.
+fn intern_report<'a>(stdout: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key} ");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("the self-test printed no '{key}' line:\n{stdout}"))
+}
+
+fn intern_number(stdout: &str, key: &str) -> i64 {
+    intern_report(stdout, key)
+        .parse::<i64>()
+        .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
+}
+
+fn intern_selftest_type_error() -> Result<(), String> {
+    let run = run_intern_mode(&["--intern-selftest-type-error"]);
+    if run.succeeded {
+        Ok(())
+    } else {
+        Err(run.stderr)
+    }
+}
+
+#[test]
+fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "repeat_growth"),
+        1,
+        "1000 repetitions of one name grew the table by more than the one distinct name:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "other_growth"),
+        2,
+        "a second distinct name did not grow the table to exactly two entries:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn edge_engineered_collision_resolves_each_name_to_its_own_index() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "collision_found"),
+        "yes",
+        "the self-test failed to construct a collision:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "collision_distinct"),
+        "yes",
+        "two colliding names were given the same index:\n{}",
+        run.stdout
+    );
+
+    // Each colliding name must still resolve to the index it was given, after
+    // the other one was added to the same bucket.
+    for name in ["collision_a", "collision_b"] {
+        let index = intern_number(&run.stdout, &format!("{name}_index"));
+        let lookup = intern_number(&run.stdout, &format!("{name}_lookup"));
+        assert_eq!(
+            lookup, index,
+            "{name} did not resolve to its own index after the collision:\n{}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn edge_empty_and_ten_kilobyte_names_are_interned_exactly() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "empty_same"),
+        "yes",
+        "the empty name was not interned to one index:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "empty_growth"),
+        1,
+        "the empty name grew the table by more than one:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "long_same"),
+        "yes",
+        "the same 10KB name did not intern to one index:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "long_distinct"),
+        "yes",
+        "a 10KB name that differs only in its last byte reused the first index, so the name was truncated:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "long_growth"),
+        2,
+        "the two 10KB names did not grow the table to exactly two entries:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
+    let result = intern_selftest_type_error();
+    assert!(
+        result.is_err(),
+        "the compiler interned a number as if it were a name"
+    );
+    let stderr = result.unwrap_err();
+    assert!(
+        stderr.contains("length requires a list or text"),
+        "the failure was not the clean length error:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("usage:"),
+        "the run fell through to a usage error instead of reaching the intern table:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "the run panicked instead of reporting a runtime error:\n{}",
+        stderr
+    );
+}
+
+#[test]
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -2101,12 +2101,15 @@
+     }
+ }
+ 
+ // Phase 074: the compiler's intern table is internal to
+-// `bootstrap/compiler.rb`, so the direct tests drive it through the compiler's
+-// hidden `--intern-selftest` mode. That mode runs the same `intern` and
+-// `intern_hash` the normal compile path runs; it only gives a test a way to
+-// call them without a source file that happens to use every shape needed.
++// `bootstrap/compiler.rb`, so the direct tests build the compiler's own source
++// with the fragment in `bootstrap/intern_selftest.rb` appended in place of its
++// final `main()` call. The probe runs the same `intern` and `intern_hash` the
++// normal compile path runs; it only gives a test a way to call them without a
++// source file that happens to use every shape needed. The probe stays out of
++// `bootstrap/compiler.rb` so the self-compilation fixed point does not include
++// test-only code, and the compiler keeps its unmodified usage check.
+ //
+ // The byte-equality test is the real gate: a hash table that answers a name
+ // with the wrong index changes the constant pool, and the pool is part of the
+ // bytes. `edge_name_heavy_fixture_is_byte_identical_in_both_stages` compiles a
+@@ -2118,13 +2121,40 @@
+     stderr: String,
+     succeeded: bool,
+ }
+ 
+-fn run_intern_mode(args: &[&str]) -> InternOutput {
++/// The compiler source with its `main()` call replaced by `entry`, after the
++/// probe fragment. `compiler.rb` ends with `main()`, so cutting at the last one
++/// leaves every declaration and no call.
++fn intern_probe_source(entry: &str) -> String {
++    let source = compiler_contents();
++    let main_call = "\nmain()\n";
++    let cut = source.rfind(main_call).unwrap_or_else(|| {
++        panic!("bootstrap/compiler.rb no longer ends with a main() call:\n{source}")
++    });
++
++    let fixture = fs::read_to_string(
++        Path::new(env!("CARGO_MANIFEST_DIR")).join("bootstrap/intern_selftest.rb"),
++    )
++    .expect("the intern probe fragment is readable");
++
++    let mut combined = String::with_capacity(source.len() + fixture.len() + entry.len() + 16);
++    combined.push_str(&source[..cut]);
++    combined.push_str("\n\n");
++    combined.push_str(&fixture);
++    combined.push_str("\n\n");
++    combined.push_str(entry);
++    combined.push('\n');
++    combined
++}
++
++fn run_intern_probe(entry: &str, name: &str) -> InternOutput {
++    let path = scratch(name);
++    fs::write(&path, intern_probe_source(entry)).expect("write the compiler and probe");
++
+     let output = Command::new(env!("CARGO_BIN_EXE_rb"))
+         .arg("run")
+-        .arg(compiler())
+-        .args(args)
++        .arg(&path)
+         .output()
+         .expect("the rb binary runs");
+     InternOutput {
+         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+@@ -2132,10 +2162,21 @@
+         succeeded: output.status.success(),
+     }
+ }
+ 
+-fn intern_selftest() -> InternOutput {
+-    run_intern_mode(&["--intern-selftest"])
++/// The probe is minutes of loops, and the assertions below read overlapping
++/// keys from it. It runs once per test process; the tests read the same output.
++fn intern_selftest() -> &'static InternOutput {
++    static RUN: std::sync::OnceLock<InternOutput> = std::sync::OnceLock::new();
++    RUN.get_or_init(|| {
++        let run = run_intern_probe("intern_selftest()", "intern_selftest.rb");
++        assert!(
++            run.succeeded,
++            "the intern self-test failed:\n{}",
++            run.stderr
++        );
++        run
++    })
+ }
+ 
+ /// The value printed for `key`, which the self-test prints as `key value`.
+ fn intern_report<'a>(stdout: &'a str, key: &str) -> &'a str {
+@@ -2152,9 +2193,12 @@
+         .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
+ }
+ 
+ fn intern_selftest_type_error() -> Result<(), String> {
+-    let run = run_intern_mode(&["--intern-selftest-type-error"]);
++    let run = run_intern_probe(
++        "intern_selftest_type_error()",
++        "intern_selftest_type_error.rb",
++    );
+     if run.succeeded {
+         Ok(())
+     } else {
+         Err(run.stderr)
+
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -2247,8 +2247,29 @@
+     "two colliding names were given the same index:\n{}",
+     run.stdout
+ );
+ 
++// Both names really are in the bucket the self-test engineered, rather than
++// merely being distinct names that happened to take different buckets.
++let bucket = intern_number(&run.stdout, "collision_bucket");
++assert!(
++    (0..256).contains(&bucket),
++    "the self-test's collision bucket is not a bucket index:\n{}",
++    run.stdout
++);
++assert_eq!(
++    intern_number(&run.stdout, "collision_a_bucket"),
++    bucket,
++    "the first colliding name is not in the reported bucket:\n{}",
++    run.stdout
++);
++assert_eq!(
++    intern_number(&run.stdout, "collision_b_bucket"),
++    bucket,
++    "the second colliding name is not in the same bucket:\n{}",
++    run.stdout
++);
++
+ // Each colliding name must still resolve to the index it was given, after
+ // the other one was added to the same bucket.
+ for name in ["collision_a", "collision_b"] {
+     let index = intern_number(&run.stdout, &format!("{name}_index"));
+
+[0m

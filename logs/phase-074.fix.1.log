@@ -1,0 +1,1654 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0msed -n '2120,2180p' tests/bootstrap_selfhost_test.rs
+}
+
+fn run_intern_mode(args: &[&str]) -> InternOutput {
+    let output = Command::new(env!("CARGO_BIN_EXE_rb"))
+        .arg("run")
+        .arg(compiler())
+        .args(args)
+        .output()
+        .expect("the rb binary runs");
+    InternOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        succeeded: output.status.success(),
+    }
+}
+
+fn intern_selftest() -> InternOutput {
+    run_intern_mode(&["--intern-selftest"])
+}
+
+/// The value printed for `key`, which the self-test prints as `key value`.
+fn intern_report<'a>(stdout: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key} ");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("the self-test printed no '{key}' line:\n{stdout}"))
+}
+
+fn intern_number(stdout: &str, key: &str) -> i64 {
+    intern_report(stdout, key)
+        .parse::<i64>()
+        .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
+}
+
+fn intern_selftest_type_error() -> Result<(), String> {
+    let run = run_intern_mode(&["--intern-selftest-type-error"]);
+    if run.succeeded {
+        Ok(())
+    } else {
+        Err(run.stderr)
+    }
+}
+
+#[test]
+fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "repeat_growth"),
+        1,
+        "1000 repetitions of one name grew the table by more than the one distinct name:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "other_growth"),
+        2,
+[0m
+[0m$ [0msed -n '2690,2770p' bootstrap/compiler.rb
+set intern_i to intern_i + 1
+    end
+    set intern_result to 0
+    if intern_found >= 0 then
+        set intern_result to G_INTERN[intern_found].n
+    end
+    if intern_found < 0 then
+        set intern_index to length(G_POOL)
+        append("G_POOL", {t: 3, b: raw})
+        append("G_INTERN", {k: raw, n: intern_index})
+        set G_INTERN_COUNT to G_INTERN_COUNT + 1
+        intern_bucket_add(intern_bucket, length(G_INTERN) - 1)
+        set intern_result to intern_index
+    end
+    give back intern_result
+end
+
+// FNV-style over the name's bytes, reduced so every intermediate below the
+// multiply is exact in an `f64`. The exact value does not matter; what matters
+// is that the same bytes give the same bucket on every run, in both the
+// tree-walker and the bytecode VM.
+to intern_hash(raw)
+    set intern_hash_value to 0
+    set intern_hash_i to 0
+    while intern_hash_i < length(raw)
+        set intern_hash_value to (intern_hash_value * 31 + raw[intern_hash_i]) mod 2147483647
+        set intern_hash_i to intern_hash_i + 1
+    end
+    give back intern_hash_value
+end
+
+// The bucket array, built on the first lookup. Every bucket starts empty.
+to intern_init()
+    if length(G_INTERN_BUCKETS) is 0 then
+        set intern_init_i to 0
+        while intern_init_i < INTERN_BUCKETS
+            append("G_INTERN_BUCKETS", [])
+            set intern_init_i to intern_init_i + 1
+        end
+    end
+end
+
+// The index is added to one bucket. The bucket is rebuilt rather than changed
+// in place because Redblue has no index assignment, and the table is rebuilt
+// with it because a bucket is held by value. Rebuilding the table costs one
+// `append` per bucket, paid only when a name is new; a lookup still reads its
+// bucket directly.
+to intern_bucket_add(bucket, entry_index)
+    set intern_bucket_add_chain to push(G_INTERN_BUCKETS[bucket], entry_index)
+    set G_INTERN_BUCKETS_NEXT to []
+    set intern_bucket_add_i to 0
+    while intern_bucket_add_i < length(G_INTERN_BUCKETS)
+        if intern_bucket_add_i is bucket then
+            append("G_INTERN_BUCKETS_NEXT", intern_bucket_add_chain)
+        else
+            append("G_INTERN_BUCKETS_NEXT", G_INTERN_BUCKETS[intern_bucket_add_i])
+        end
+        set intern_bucket_add_i to intern_bucket_add_i + 1
+    end
+    set G_INTERN_BUCKETS to G_INTERN_BUCKETS_NEXT
+end
+
+// The direct tests in `tests/bootstrap_intern_test.rs` drive the table through
+// this mode instead of hoping a source program happens to exercise one bucket.
+// It runs only for `--intern-selftest`; a normal invocation takes the two-path
+// branch in `main` and never reaches it.
+to intern_selftest()
+    set intern_selftest_start to G_INTERN_COUNT
+
+    // One name, a thousand times: the table grows by one, not by a thousand.
+    set intern_selftest_repeated to bytes.from_text("repeated")
+    set intern_selftest_first to intern(intern_selftest_repeated)
+    set intern_selftest_i to 0
+    while intern_selftest_i < 1000
+        intern(intern_selftest_repeated)
+        set intern_selftest_i to intern_selftest_i + 1
+    end
+    say "repeat_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+    intern(bytes.from_text("other"))
+    say "other_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
+[0m
+[0m$ [0msed -n '70,115p' phases/phase-074/REPORT.md
+The standing test
+`edge_the_self_hosted_compiler_compiles_itself_byte_identically` passed
+unmodified (380.92 s in this run).
+
+## Test requirement matrix
+
+| Row | Result |
+|---|---|
+| empty | covered — the empty name is interned, returned twice, and grows the table by exactly one |
+| singleton | covered — one repeated name grows the table to exactly one entry; a second distinct name makes two |
+| boundary | covered — 1000 repetitions, 10KB names, a last-byte difference, and a bucket collision |
+| out_of_bounds | N/A — every index is derived internally (`hash mod 256`, then an index this table appended); there is no user-supplied index to step past, and the bucket array is exactly 256 entries long. |
+| type_mismatch | covered — `intern(42)` is a clean runtime failure, not a panic and not an accepted key |
+| numeric_boundary | covered — the hash keeps every intermediate below `2^36`, so it is exact in `f64`; the modulo result is in `0..255`, which is the only index arithmetic the table performs |
+| unicode | covered — `naïve`, `日本語` and `café` are in the integration fixture and each appears once in the decoded pool; names are hashed as their UTF-8 bytes |
+| nesting_recursion | N/A — `intern` is not recursive and adds no call frames; the fixture is flat and the compiler's existing parser depth is unchanged. |
+| duplicate_missing_keys | covered — duplicate names are the 1000-repetition and collision tests; a missing name is the append path exercised by every new name |
+| malformed_input | covered — a non-byte-list name is refused by name; the diagnostics path (`length requires a list or text`) is the failure test |
+| resource_limit | covered — the table holds one record per distinct name, a 10KB name is hashed without truncation, and the direct test interns a thousand occurrences without growth beyond the distinct count |
+
+## Gates
+
+| Gate | Result |
+|---|---|
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `cargo test --all-targets` | pass — 2748 passed, 0 failed |
+| `../rbops/verify.sh phase-074` | **VERIFY PASS** — 2748 tests, 0 failed; test policy: 5 new Rust tests, 1 failure-asserting, 5 `edge_*` tests, 0 newly skipped |
+
+## Invariants touched
+
+- None. No language syntax, `Value` variant, error kind, example, module or
+  `.rb` file changed.
+- The emitted bytes are unchanged because entries still enter `G_POOL` and
+  `G_INTERN` in first-use order. The fixed point `stage1.rbc == stage2.rbc` is
+  the proof.
+
+## Known gaps / follow-ups
+
+- The parser still refuses a source with roughly a thousand statements with
+  `Maximum call depth of 1000 reached while calling 'token_kind'`. This was
+  found while choosing the name-heavy fixture's size and is recorded in
+  `FINDINGS.md`; it is not caused by this phase.
+- `phases/phase-073/FINDINGS.md`'s early `give back` bug is still present. The
+  hidden self-test route in `main` works around it with a flag because `give
+[0m
+[0m$ [0msed -n '2140,2200p' tests/bootstrap_selfhost_test.rs
+/// The value printed for `key`, which the self-test prints as `key value`.
+fn intern_report<'a>(stdout: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key} ");
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("the self-test printed no '{key}' line:\n{stdout}"))
+}
+
+fn intern_number(stdout: &str, key: &str) -> i64 {
+    intern_report(stdout, key)
+        .parse::<i64>()
+        .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
+}
+
+fn intern_selftest_type_error() -> Result<(), String> {
+    let run = run_intern_mode(&["--intern-selftest-type-error"]);
+    if run.succeeded {
+        Ok(())
+    } else {
+        Err(run.stderr)
+    }
+}
+
+#[test]
+fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "repeat_growth"),
+        1,
+        "1000 repetitions of one name grew the table by more than the one distinct name:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "other_growth"),
+        2,
+        "a second distinct name did not grow the table to exactly two entries:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn edge_engineered_collision_resolves_each_name_to_its_own_index() {
+    let run = intern_selftest();
+    assert!(
+        run.succeeded,
+        "the intern self-test failed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        intern_report(&run.stdout, "collision_found"),
+        "yes",
+        "the self-test failed to construct a collision:\n{}",
+        run.stdout
+    );
+    assert_eq!(
+[0m
+[0m$ [0msed -n '80,105p' bootstrap/compiler.rb
+set main_args to sys.argv()
+    // The intern table's direct tests. A normal run has two paths and takes the
+    // branch below exactly as it did before these modes existed. The flag is
+    // kept in a name because `give back` inside an `if` leaves the `if`, not
+    // the function; returning here would only fall through to the usage check.
+    set main_self_test to no
+    if length(main_args) is 1 then
+        if main_args[0] is "--intern-selftest" then
+            intern_selftest()
+            set main_self_test to yes
+        end
+        if main_args[0] is "--intern-selftest-type-error" then
+            intern_selftest_type_error()
+            set main_self_test to yes
+        end
+    end
+    if main_self_test is no then
+        if length(main_args) is not 2 then
+            refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
+        end
+        set main_source to read_source(main_args[0])
+        set main_tokens to lex(main_source)
+        set main_program to parse_program(main_tokens)
+        set main_chunk to compile_program(main_program)
+        bytes.write(main_args[1], encode(main_chunk))
+    end
+[0m
+[0m$ [0mgrep -n "edge_intern_refuses\|intern_selftest_type_error\|length requires" tests/bootstrap_selfhost_test.rs bootstrap/compiler.rb
+tests/bootstrap_selfhost_test.rs:2155:fn intern_selftest_type_error() -> Result<(), String> {
+tests/bootstrap_selfhost_test.rs:2261:fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
+tests/bootstrap_selfhost_test.rs:2263:        intern_selftest_type_error().is_err(),
+bootstrap/compiler.rb:92:            intern_selftest_type_error()
+bootstrap/compiler.rb:2259:    // `length requires a list or text`, while `length(xs) is 3` answered `yes`.
+bootstrap/compiler.rb:2839:to intern_selftest_type_error()
+[0m
+[0m$ [0mgrep -n "intern_selftest_type_error\|to refuse\|panic" bootstrap/compiler.rb | head -30
+92:            intern_selftest_type_error()
+137:to refuse(line, message)
+2838:// compiler's own runtime error and not a panic.
+2839:to intern_selftest_type_error()
+[0m
+[0m$ [0msed -n '2250,2280p' tests/bootstrap_selfhost_test.rs
+run.stdout
+    );
+    assert_eq!(
+        intern_number(&run.stdout, "long_growth"),
+        2,
+        "the two 10KB names did not grow the table to exactly two entries:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
+    assert!(
+        intern_selftest_type_error().is_err(),
+        "the compiler interned a number as if it were a name"
+    );
+}
+
+#[test]
+fn edge_name_heavy_fixture_is_byte_identical_in_both_stages() {
+    let mut source = String::new();
+    for index in 0..120 {
+        source.push_str(&format!("set name{index} to {index}\n"));
+    }
+    for index in 0..120 {
+        source.push_str(&format!("say name{index}\n"));
+    }
+    // One name emitted far more often than the others: the table must still
+    // hold it once and answer every occurrence with the same index. The
+    // statement count is kept well below the compiler's parser call-depth
+    // limit, since the contract here is byte equality rather than size.
+[0m
+[0m$ [0msed -n '2830,2870p' bootstrap/compiler.rb
+if flag is yes then
+        set intern_selftest_yes_text to "yes"
+    end
+    give back intern_selftest_yes_text
+end
+
+// A name that is not a byte list must fail at the table, not be accepted as
+// some other key. The test drives this through `main`, so the failure is the
+// compiler's own runtime error and not a panic.
+to intern_selftest_type_error()
+    intern(42)
+    give back 0
+end
+
+// `Compiler::text`: intern a name and use it as an operand.
+to emit_name(opcode, raw, aux, line)
+    emit(opcode, intern(raw), aux, line)
+end
+
+// A constant that is **not** interned: a literal, appended every time it is
+// written.
+to emit_const(tag, raw, line)
+    set emit_const_index to 0
+    set emit_const_index to length(G_POOL)
+    append("G_POOL", {t: tag, b: raw})
+    emit(1, emit_const_index, 0, line)
+end
+
+// `Constant::Nothing`, which is the value a `return` with no value returns.
+to emit_nothing(line)
+    set emit_nothing_index to 0
+    set emit_nothing_index to length(G_POOL)
+    append("G_POOL", {t: 0, b: []})
+    emit(1, emit_nothing_index, 0, line)
+end
+
+to compile_statement(stmt, depth, reads_value, body_kind)
+    set compile_statement_charges to 0
+
+    // The marker that begins every statement the tree-walking VM compile_statement_charges a step
+    // for. The two exceptions are the statements a declaration *reads* rather
+[0m
+[0m$ [0mgrep -rn "panic\|panicked" src/error.rs src/main.rs | head -30
+(no output)
+[0m
+[0m$ [0mgrep -rn "eprintln\|stderr\|Runtime\|exit" src/main.rs | head -40
+(no output)
+[0m
+[0m$ [0msed -n '3170,3195p' src/runtime.rs
+// for `"héllo"` because a byte is a byte.
+                //
+                // This is the only implementation of `length` over text:
+                // `stdlib::builtin_function` had a second arm that no caller
+                // reached, and it is deleted. `tests/text_length_characters_test.rs`
+                // pins that there is one.
+                Ok(Some(Value::Number(s.chars().count() as f64)))
+            } else if let Some(value) = args.first() {
+                if looks_like_deque(value) {
+                    let length = deque_length(span, value)?;
+                    Ok(Some(Value::Number(length as f64)))
+                } else {
+                    Err(Error::Runtime(
+                        "length requires a list or text".to_string(),
+                        span,
+                    ))
+                }
+            } else {
+                Err(Error::Runtime(
+                    "length requires a list or text".to_string(),
+                    span,
+                ))
+            }
+        }
+        // -- iteration helpers -------------------------------------------------
+        //
+[0m
+[0m$ [0msed -n '1,200p' src/main.rs
+pub fn main() {
+    redblue::run_cli();
+}
+[0m
+[0m$ [0mgrep -rn "fn main\|run_file\|usage:" src/*.rs src/**/*.rs | head -40
+src/cli.rs:481:    usage: &str,
+src/lib.rs:66:pub fn run_file(path: &str) -> Result<(), Error> {
+src/lib.rs:87:fn run_file_with_diagnostic(path: &str) -> std::result::Result<(), String> {
+src/lib.rs:158:            harness.run_file(p)?;
+src/lib.rs:214:                    if let Err(rendered) = run_file_with_diagnostic(cmd) {
+src/lib.rs:240:                    if let Err(rendered) = run_file_with_diagnostic(path) {
+src/lib.rs:357:                run_file_with_diagnostic(&path)
+src/main.rs:1:pub fn main() {
+src/repl/commands.rs:247:        usage: &'static str,
+src/repl/commands.rs:268:    usage: Option<&'static str>,
+src/repl/commands.rs:321:fn is_path_usage(usage: &str) -> bool {
+src/repl/commands.rs:330:        usage: None,
+src/repl/commands.rs:338:        usage: None,
+src/repl/commands.rs:346:        usage: None,
+src/repl/commands.rs:354:        usage: None,
+src/repl/commands.rs:362:        usage: None,
+src/repl/commands.rs:370:        usage: None,
+src/repl/commands.rs:378:        usage: Some("<command>"),
+src/repl/commands.rs:386:        usage: Some(DIRECTORY_USAGE),
+src/repl/commands.rs:394:        usage: None,
+src/repl/commands.rs:402:        usage: None,
+src/repl/commands.rs:410:        usage: Some(FILE_USAGE),
+src/repl/commands.rs:418:        usage: Some(FILE_USAGE),
+src/repl/commands.rs:429:        usage: Some(FILE_USAGE),
+src/repl/commands.rs:437:        usage: Some("<name>"),
+src/repl/commands.rs:445:        usage: None,
+src/repl/commands.rs:453:        usage: None,
+src/repl/commands.rs:461:        usage: None,
+src/repl/commands.rs:469:        usage: None,
+src/repl/commands.rs:477:        usage: Some(FILE_USAGE),
+src/repl/commands.rs:485:        usage: Some(FILE_USAGE),
+src/repl/commands.rs:493:        usage: None,
+src/repl/commands.rs:501:        usage: Some("<on|off>"),
+src/repl/commands.rs:509:        usage: Some("<expression|file>"),
+src/repl/commands.rs:517:        usage: Some("<expression>"),
+src/repl/commands.rs:525:        usage: None,
+src/repl/commands.rs:533:        usage: None,
+src/repl/commands.rs:541:        usage: None,
+src/repl/commands.rs:549:        usage: Some("<line>"),
+src/repl/commands.rs:557:        usage: None,
+[0m
+[0m$ [0msed -n '180,260p' src/lib.rs
+match args.len() {
+        1 => run_repl(),
+        2 => {
+            let cmd = &args[1];
+            match cmd.as_str() {
+                "help" | "--help" | "-h" => print_help(),
+                "version" | "--version" | "-v" => print_version(),
+                "test" => {
+                    if let Err(e) = run_test(None) {
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
+                }
+                "grammar" => print!("{}", textmate_grammar()),
+                "keywords" => {
+                    for keyword in Lexer::keywords() {
+                        println!("{}", keyword);
+                    }
+                }
+                // `rb bootstrap` with no output directory. It has to be named
+                // here, in the arm that treats an unknown name as a file to
+                // run: without this arm it fell through to the file-runner,
+                // tried to read `bootstrap` — a directory in a checkout — and
+                // exited 1 with `Is a directory`, which is the exact failure the
+                // command exists to remove. The `3 if` arm below handles the
+                // one-positional form; this is the same command with the
+                // output directory defaulted to `target/bootstrap`.
+                "bootstrap" => {
+                    if let Err(message) = bootstrap_args(&[]) {
+                        eprintln!("Error: {}", message);
+                        process::exit(1);
+                    }
+                }
+                _ => {
+                    if let Err(rendered) = run_file_with_diagnostic(cmd) {
+                        report(&rendered);
+                    }
+                }
+            }
+        }
+        // `rb bootstrap <out-dir>` — before the `3` arm, which would read the
+        // directory as a file to run. Bare `rb bootstrap` is the `bootstrap`
+        // arm in the `2` match above.
+        3 if args[1] == "bootstrap" => {
+            if let Err(message) = bootstrap_args(&args[2..]) {
+                eprintln!("Error: {}", message);
+                process::exit(1);
+            }
+        }
+        3 => {
+            let cmd = &args[1];
+            let path = &args[2];
+            match cmd.as_str() {
+                "test" => {
+                    if let Err(e) = run_test(Some(path)) {
+                        eprintln!("Error: {}", e);
+                        process::exit(1);
+                    }
+                }
+                "run" => {
+                    if let Err(rendered) = run_file_with_diagnostic(path) {
+                        report(&rendered);
+                    }
+                }
+                "compile" => {
+                    if let Err(message) = compile_command(path, None) {
+                        eprintln!("{}", message);
+                        process::exit(1);
+                    }
+                }
+                "dis" => {
+                    if let Err(message) = dis_command(path) {
+                        eprintln!("{}", message);
+                        process::exit(1);
+                    }
+                }
+                "vm" => {
+                    if let Err(message) = vm_command(path) {
+                        eprintln!("Error: {}", message);
+                        process::exit(1);
+                    }
+[0m
+[0m$ [0msed -n '80,120p' src/lib.rs && sed -n '130,160p' src/lib.rs
+.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Runs `path` and, when it fails, renders the source line and caret for the
+/// failure next to the message.
+fn run_file_with_diagnostic(path: &str) -> std::result::Result<(), String> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(e) => return Err(Error::Io(e.to_string()).to_string()),
+    };
+
+    run_source_in(&source, root_of(path)).map_err(|e| e.render(&source, Some(path)))
+}
+
+fn report(rendered: &str) -> ! {
+    eprintln!("Error: {}", rendered);
+    process::exit(1);
+}
+
+pub fn run_source(source: &str) -> Result<(), Error> {
+    run_source_in(source, Path::new("."))
+}
+
+/// The whole pipeline on `source`, resolved from `root`.
+///
+/// [`run_source`] is this against the working directory. `root` is the directory
+/// the program lives in, so a program given as text — a REPL line, a snippet in
+/// a test, a host embedding the interpreter — can still be resolved against the
+/// manifest that belongs to it rather than against wherever the process is.
+pub fn run_source_in(source: &str, root: &Path) -> Result<(), Error> {
+    logging::reset();
+    let tokens = Lexer::tokenize(source)?;
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze_in(&ast, root)?;
+
+    let (_vm, result) = interpreter::run_isolated_in(&ast, root);
+    result.map(|_| ())
+}
+
+}
+
+/// [`run_source_value`] against `root` — see [`run_source_in`].
+pub fn run_source_value_in(source: &str, root: &Path) -> Result<Value, Error> {
+    // A program starts from the documented defaults. The configuration is
+    // thread-local: this reset reaches the inline wasm path, and the interpreter
+    // resets again on the thread it actually runs the program on, so a native
+    // run cannot inherit an earlier program's threshold, destination or
+    // timestamp mode.
+    logging::reset();
+    let tokens = Lexer::tokenize(source)?;
+    let ast = parser::parse(tokens)?;
+    analyzer::analyze_in(&ast, root)?;
+
+    let (_vm, result) = interpreter::run_isolated_in(&ast, root);
+    result
+}
+
+pub fn run_repl() {
+    let mut repl = repl::Repl::new();
+    repl.run();
+}
+
+pub fn run_test(path: Option<&str>) -> Result<(), Error> {
+    let mut harness = testing::TestHarness::new();
+
+    match path {
+        Some(p) => {
+            harness.run_file(p)?;
+            // Report the failures and exit non-zero. Without this a failing
+            // `expect` printed only a dot/F and still exited 0.
+[0m
+[0m$ [0mls target/debug/rb 2>/dev/null; cargo build --bin rb 2>&1 | tail -5
+target/debug/rb
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 0.07s
+[0m
+[0m$ [0mtarget/debug/rb run bootstrap/compiler.rb --intern-selftest-type-error; echo "EXIT:$?"
+Error: RuntimeError: length requires a list or text
+  --> bootstrap/compiler.rb:2714:5
+2714 |     while intern_hash_i < length(raw)
+     |     ^
+EXIT:1
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -2151,15 +2151,10 @@
+         .parse::<i64>()
+         .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
+ }
+ 
+-fn intern_selftest_type_error() -> Result<(), String> {
+-    let run = run_intern_mode(&["--intern-selftest-type-error"]);
+-    if run.succeeded {
+-        Ok(())
+-    } else {
+-        Err(run.stderr)
+-    }
++fn intern_selftest_type_error() -> InternOutput {
++    run_intern_mode(&["--intern-selftest-type-error"])
+ }
+ 
+ #[test]
+ fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
+
+[0m
+[0m← [0mEdit phases/phase-074/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-074/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-074/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-074/REPORT.md
+@@ -99,9 +99,9 @@
+ 
+ ## Invariants touched
+ 
+ - None. No language syntax, `Value` variant, error kind, example, module or
+-  `.rb` file changed.
++  corpus `.rb` file changed (`bootstrap/compiler.rb` is the phase's target).
+ - The emitted bytes are unchanged because entries still enter `G_POOL` and
+   `G_INTERN` in first-use order. The fixed point `stage1.rbc == stage2.rbc` is
+   the proof.
+ 
+
+[0m
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -2703,10 +2703,10 @@
+     end
+     give back intern_result
+ end
+ 
+-// FNV-style over the name's bytes, reduced so every intermediate below the
+-// multiply is exact in an `f64`. The exact value does not matter; what matters
++// A polynomial rolling hash over the name's bytes, reduced so every
++// intermediate below the multiply is exact in an `f64`. The exact value does not matter; what matters
+ // is that the same bytes give the same bucket on every run, in both the
+ // tree-walker and the bytecode VM.
+ to intern_hash(raw)
+     set intern_hash_value to 0
+
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -2253,12 +2253,28 @@
+ }
+ 
+ #[test]
+ fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
++    let run = intern_selftest_type_error();
+     assert!(
+-        intern_selftest_type_error().is_err(),
++        !run.succeeded,
+         "the compiler interned a number as if it were a name"
+     );
++    assert!(
++        run.stderr.contains("length requires a list or text"),
++        "the failure was not the clean length error:\n{}",
++        run.stderr
++    );
++    assert!(
++        !run.stderr.contains("usage:"),
++        "the run fell through to a usage error instead of reaching the intern table:\n{}",
++        run.stderr
++    );
++    assert!(
++        !run.stderr.contains("panicked"),
++        "the run panicked instead of reporting a runtime error:\n{}",
++        run.stderr
++    );
+ }
+ 
+ #[test]
+ fn edge_name_heavy_fixture_is_byte_identical_in_both_stages() {
+
+[0m
+[0m← [0mEdit bootstrap/compiler.rb
+Index: /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
++++ /home/runner/work/rbops/rbops/redblue/bootstrap/compiler.rb
+@@ -2748,9 +2748,9 @@
+     end
+     set G_INTERN_BUCKETS to G_INTERN_BUCKETS_NEXT
+ end
+ 
+-// The direct tests in `tests/bootstrap_intern_test.rs` drive the table through
++// The direct tests in `tests/bootstrap_selfhost_test.rs` drive the table through
+ // this mode instead of hoping a source program happens to exercise one bucket.
+ // It runs only for `--intern-selftest`; a normal invocation takes the two-path
+ // branch in `main` and never reaches it.
+ to intern_selftest()
+
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 6.23s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tail -40
+test edge_abi_refuses_a_negative_length ... ok
+test edge_a_failure_keeps_the_output_written_before_it ... ok
+test edge_abi_rejects_bytes_that_are_not_utf8 ... ok
+test bytes_write_and_files_read_agree_on_where_the_bytes_went ... ok
+test edge_an_allocation_is_released_by_its_own_address_and_only_once ... ok
+test edge_an_allocation_past_the_source_limit_is_refused_before_anything_is_allocated ... ok
+test edge_bytes_that_are_not_text_say_the_same_thing_in_both_builds ... ok
+test edge_empty_and_whitespace_only_programs_produce_no_output ... ok
+test edge_an_allocation_stays_put_however_many_programs_follow_it ... ok
+test edge_print_is_immediate_and_say_flushes_at_the_end ... ok
+test edge_recursion_beyond_the_call_depth_is_a_clean_error_not_an_abort ... ok
+test edge_an_error_too_long_for_its_buffer_is_truncated_and_says_so ... ok
+test edge_the_in_memory_filesystem_answers_for_directories_too ... ok
+test edge_the_in_memory_filesystem_folds_dot_and_parent_segments_for_files ... ok
+test edge_the_in_memory_filesystem_folds_parent_segments_in_a_directory_listing ... ok
+test edge_the_in_memory_filesystem_folds_segments_around_spaced_and_non_ascii_names ... ok
+test edge_the_in_memory_filesystem_lists_a_dot_relative_directory ... ok
+test edge_the_in_memory_filesystem_lists_an_empty_current_directory ... ok
+test edge_the_in_memory_filesystem_lists_an_empty_root ... ok
+test edge_the_in_memory_filesystem_lists_directories_and_refuses_missing_ones ... ok
+test edge_reading_a_file_that_was_never_written_is_a_catchable_error ... ok
+test edge_the_in_memory_filesystem_lists_the_current_directory ... ok
+test edge_the_in_memory_filesystem_refuses_a_file_named_through_dot_segments_as_a_directory ... ok
+test edge_the_in_memory_filesystem_refuses_a_parent_segment_that_traverses_a_non_directory ... ok
+test edge_the_in_memory_filesystem_refuses_a_relative_path_above_the_root ... ok
+test edge_the_in_memory_filesystem_treats_a_backslash_as_a_filename_character ... ok
+test edge_say_output_is_bounded_while_it_is_still_buffered ... ok
+test edge_the_platform_builtins_still_answer_natively ... ok
+test edge_unicode_survives_the_boundary_intact ... ok
+test the_in_memory_filesystem_behaves_like_the_one_it_replaces ... ok
+test edge_output_past_the_playground_limit_is_reported_not_truncated ... ok
+test wasm_example_corpus_is_exactly_the_deterministic_examples ... ok
+test wasm_module_reports_its_version_and_keywords ... ok
+test files_reads_back_what_it_wrote_in_a_temp_dir ... ok
+test edge_the_output_is_copied_out_under_the_lock_rather_than_read_through_a_pointer ... ok
+test wasm_abi_round_trips_source_and_output ... ok
+test wasm_run_reproduces_the_native_output_of_every_example ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.05s
+[0m
+[0m$ [0mcargo test --all-targets > /tmp/opencode/phase074-test.log 2>&1; status=$?; grep -E "^test result:|error\[|error:" /tmp/opencode/phase074-test.log; echo "EXIT:$status"
+test result: ok. 581 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.46s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 427.54s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 568.95s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.34s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.77s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.52s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.86s
+test result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.02s
+test result: ok. 70 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 43 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.29s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.67s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.22s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s
+test result: ok. 94 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.11s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 62 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+EXIT:0
+[0m
+[0m$ [0mls ../rbops/verify.sh && ../rbops/verify.sh phase-074 > /tmp/opencode/phase074-verify.log 2>&1; status=$?; tail -30 /tmp/opencode/phase074-verify.log; echo "EXIT:$status"
+../rbops/verify.sh
+  [32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/Cli.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [31mFAIL[0m no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)
+          A suite of entirely passing tests does NOT satisfy this.
+          The check wants a test whose SUBJECT is a failure - a bad input
+          producing a clean error rather than a panic or a wrong value.
+          Rust:    let r = run_source(bad); assert!(r.is_err());
+          or:      #[should_panic] fn edge_...() { /* ... */ }
+          Redblue: try ... catch error ... end, asserting it was caught.
+  [32mPASS[0m test quota met: 5 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 5
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [32mPASS[0m reported test count (2748) matches actual (2748)
+
+[31m╔══════════════════════════════════════╗[0m
+[31m║ VERIFY FAIL — phase-074                ║[0m
+[31m║ 1 check(s) failed                    ║[0m
+[31m╚══════════════════════════════════════╝[0m
+EXIT:1
+[0m
+[0m$ [0mgrep -n "no test asserts a failure\|is_err\|should_panic" ../rbops/verify.sh | head -20
+75:      printf '          Rust:    let r = run_source(bad); assert!(r.is_err());\n'
+76:      printf '          or:      #[should_panic] fn edge_...() { /* ... */ }\n'
+431:# not errors. Requiring `is_err`/`should_panic` of them is a category error, and
+443:# Failure assertions per language. Rust has is_err/expect_err/should_panic;
+454:# surely as `is_err()` does. Same class as the #[test]-attribute fix (007) and
+465:  # a local helper rather than calling is_err() on a Result. Phase-048 blocked on
+472:    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|expect_refusal|assert_stdout_contains|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
+476:    bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
+[0m
+[0m$ [0msed -n '425,480p' ../rbops/verify.sh
+# The optional quote is the whole bug: a Redblue test name is a string literal,
+# so `test edge_x` never occurs, and the unquoted-only regex rejected 61 real
+# tests in phase-003 including correctly-named ones.
+EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test +"?)edge_')"
+# Some subsystems have no failure channel to assert on. A linter reports
+# problems as a diagnostics collection; a formatter and an LSP produce documents,
+# not errors. Requiring `is_err`/`should_panic` of them is a category error, and
+# it is not hypothetical: phase-015 (formatter) and phase-016 (linter) were both
+# blocked after burning every attempt on it, while phase-016's tests were
+# asserting failure correctly as `assert_eq!(warnings.len(), 1, ...)`.
+#
+# Such a phase declares `failure_assert: "not_applicable"` and the check is
+# SKIPPED, visibly — never silently passed, and never a global relaxation. The
+# reviewer still judges whether the tests can actually fail, and every
+# error-producing phase keeps the rule at full strength.
+FAILASSERT_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .failure_assert // "required"' "$PHASES" 2>/dev/null)" || FAILASSERT_MODE="required"
+[ -n "$FAILASSERT_MODE" ] || FAILASSERT_MODE="required"
+
+# Failure assertions per language. Rust has is_err/expect_err/should_panic;
+# Redblue has no exceptions and instead has `try ... catch error`, which was
+# missing here entirely — the one construct Redblue offers for asserting a fault.
+# Anchored to the line start so a test whose *data* mentions `catch error` cannot
+# buy a pass.
+#
+# Rust also has the `eval_err` idiom: a helper that evaluates a program
+# expecting an error, followed by `assert!(matches!(e, Error::...))`. Phase-037
+# blocked a 1200-green phase on this rule with 12 such assertions in the diff
+# and zero recognized strings — `let e = eval_err("random_choice([])");
+# assert!(matches!(e, Error::Runtime(_, _)))` asserts a failure is produced as
+# surely as `is_err()` does. Same class as the #[test]-attribute fix (007) and
+# the bilingual rules: the detector was narrower than the language's real
+# failure-asserting idioms. The reviewer remains the ceiling — a bare
+# `let _ = eval_err(x);` with no assertion is gaming, and it reads as gaming.
+if [ "$FAILASSERT_MODE" = "not_applicable" ]; then
+  # Skipped, and said out loud. A silent pass here would be indistinguishable
+  # from the rule being satisfied.
+  warn "failure-assertion rule NOT APPLICABLE to this phase (failure_assert: not_applicable) — the reviewer still judges whether the tests can fail"
+else
+  # Redblue's Error carries a label rather than a Result, so a test that proves
+  # a failure was produced reads `assert_eq!(label(&e), "RuntimeError")` through
+  # a local helper rather than calling is_err() on a Result. Phase-048 blocked on
+  # this with ~10 such assertions (every one documented as "failure asserted" in
+  # its REPORT) and zero recognized strings. Detecting the assertion is what
+  # matters, not which method spells it, so the pattern also accepts a helper
+  # call beside a spelled-out error label: a test cannot buy this by naming a
+  # label in prose, because the label must be quoted inside the matched line.
+  FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|expect_refusal|assert_stdout_contains|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
+  if [ "$FAILASSERT" -ge 1 ]; then
+    ok "failure-asserting test present: $FAILASSERT"
+  else
+    bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
+  fi
+fi
+
+TEST_POLICY_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .test_policy // "required"' "$PHASES" 2>/dev/null)" || TEST_POLICY_MODE="required"
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -2151,10 +2151,15 @@
+         .parse::<i64>()
+         .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
+ }
+ 
+-fn intern_selftest_type_error() -> InternOutput {
+-    run_intern_mode(&["--intern-selftest-type-error"])
++fn intern_selftest_type_error() -> Result<(), String> {
++    let run = run_intern_mode(&["--intern-selftest-type-error"]);
++    if run.succeeded {
++        Ok(())
++    } else {
++        Err(run.stderr)
++    }
+ }
+ 
+ #[test]
+ fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
+
+[0m
+[0m← [0mEdit tests/bootstrap_selfhost_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/bootstrap_selfhost_test.rs
+@@ -2258,27 +2258,28 @@
+ }
+ 
+ #[test]
+ fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
+-    let run = intern_selftest_type_error();
++    let result = intern_selftest_type_error();
+     assert!(
+-        !run.succeeded,
++        result.is_err(),
+         "the compiler interned a number as if it were a name"
+     );
++    let stderr = result.unwrap_err();
+     assert!(
+-        run.stderr.contains("length requires a list or text"),
++        stderr.contains("length requires a list or text"),
+         "the failure was not the clean length error:\n{}",
+-        run.stderr
++        stderr
+     );
+     assert!(
+-        !run.stderr.contains("usage:"),
++        !stderr.contains("usage:"),
+         "the run fell through to a usage error instead of reaching the intern table:\n{}",
+-        run.stderr
++        stderr
+     );
+     assert!(
+-        !run.stderr.contains("panicked"),
++        !stderr.contains("panicked"),
+         "the run panicked instead of reporting a runtime error:\n{}",
+-        run.stderr
++        stderr
+     );
+ }
+ 
+ #[test]
+
+[0m
+[0m$ [0mcargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo test --test bootstrap_selfhost_test edge_intern_refuses_a_name_that_is_not_a_byte_list 2>&1 | tail -12
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 4.83s
+[1m[92m     Running[0m tests/bootstrap_selfhost_test.rs (target/debug/deps/bootstrap_selfhost_test-6652d0dbbd9bc011)
+
+running 1 test
+test edge_intern_refuses_a_name_that_is_not_a_byte_list ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 27 filtered out; finished in 0.04s
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on package cache
+[1m[92m    Blocking[0m waiting for file lock on build directory
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 11.10s
+[0m
+[0m$ [0mcargo test --all-targets > /tmp/opencode/phase074-test2.log 2>&1; status=$?; grep -E "^test result:|error\[|error:" /tmp/opencode/phase074-test2.log | grep -v "ok\." ; echo "SUITES:$(grep -c '^test result:' /tmp/opencode/phase074-test2.log)"; grep -c 'test result: ok' /tmp/opencode/phase074-test2.log; echo "EXIT:$status"
+SUITES:85
+85
+EXIT:0
+[0m
+[0m$ [0m../rbops/verify.sh phase-074 > /tmp/opencode/phase074-verify2.log 2>&1; status=$?; tail -35 /tmp/opencode/phase074-verify2.log; echo "EXIT:$status"
+[1m== cargo fmt[0m
+  [32mPASS[0m cargo fmt --check
+
+[1m== cargo clippy[0m
+  [32mPASS[0m cargo clippy -D warnings
+
+[1m== cargo test[0m
+  [32mPASS[0m cargo test: 2748 passed, 0 failed
+
+[1m== doc tests[0m
+  [32mPASS[0m runs: examples/files.rb
+  [32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/Cli.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [32mPASS[0m failure-asserting test present: 1
+  [32mPASS[0m test quota met: 5 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 5
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [32mPASS[0m reported test count (2748) matches actual (2748)
+
+[32m╔══════════════════════════════════════╗[0m
+[32m║ VERIFY PASS — phase-074                ║[0m
+[32m╚══════════════════════════════════════╝[0m
+EXIT:0
+[0m
+[0m$ [0mgit diff --stat && git diff
+bootstrap/compiler.rb            | 206 ++++++++++++++++++++++++++++++---
+ tests/bootstrap_selfhost_test.rs | 241 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 432 insertions(+), 15 deletions(-)
+diff --git a/bootstrap/compiler.rb b/bootstrap/compiler.rb
+index c6fb4ca..593d6e0 100644
+--- a/bootstrap/compiler.rb
++++ b/bootstrap/compiler.rb
+@@ -45,11 +45,21 @@ constant NO_CONST to 4294967295
+ constant STATEMENT_MARKER to 4294967294
+ constant END_TRY_MARKER to 4294967295
+ 
++// The intern table's bucket count. A name is looked up in the bucket its hash
++// selects, so interning is proportional to the bucket and not to every name the
++// program has used. The count is a power of two so the modulo is cheap; 256
++// buckets keeps a self-compilation's thousand-odd names to a handful per bucket
++// while the table is still small enough to rebuild cheaply on an insertion.
++constant INTERN_BUCKETS to 256
++
+ // The fifth is the code generator's last accumulator, the sixth and seventh are
+ // the lexer's and the patcher's, and all seven are named for the same reason:
+ // a Redblue binding is program-wide, and `append` grows the list a name holds.
+ set G_POOL to []
+ set G_INTERN to []
++set G_INTERN_COUNT to 0
++set G_INTERN_BUCKETS to []
++set G_INTERN_BUCKETS_NEXT to []
+ set G_CODE to []
+ set G_JUMPS to []
+ set G_BLOCKS to []
+@@ -68,15 +78,31 @@ set G_PATCHED to []
+ to main()
+     set main_args to 0
+     set main_args to sys.argv()
+-    if length(main_args) is not 2 then
+-        refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
++    // The intern table's direct tests. A normal run has two paths and takes the
++    // branch below exactly as it did before these modes existed. The flag is
++    // kept in a name because `give back` inside an `if` leaves the `if`, not
++    // the function; returning here would only fall through to the usage check.
++    set main_self_test to no
++    if length(main_args) is 1 then
++        if main_args[0] is "--intern-selftest" then
++            intern_selftest()
++            set main_self_test to yes
++        end
++        if main_args[0] is "--intern-selftest-type-error" then
++            intern_selftest_type_error()
++            set main_self_test to yes
++        end
++    end
++    if main_self_test is no then
++        if length(main_args) is not 2 then
++            refuse(0, "usage: rb run bootstrap/compiler.rb <input.rb> <output.rbc>")
++        end
++        set main_source to read_source(main_args[0])
++        set main_tokens to lex(main_source)
++        set main_program to parse_program(main_tokens)
++        set main_chunk to compile_program(main_program)
++        bytes.write(main_args[1], encode(main_chunk))
+     end
+-
+-    set main_source to read_source(main_args[0])
+-    set main_tokens to lex(main_source)
+-    set main_program to parse_program(main_tokens)
+-    set main_chunk to compile_program(main_program)
+-    bytes.write(main_args[1], encode(main_chunk))
+     give back 0
+ end
+ 
+@@ -2485,12 +2511,14 @@ end
+ // So the five lists `ctx` carried are names here, and `append` grows them:
+ //
+ //   G_POOL     the constant pool, in order of first use
+-//   G_INTERN   the intern table: every name once, with its pool index
++//   G_INTERN   the intern table's entries: every name once, with its pool index
++//   G_INTERN_BUCKETS  the hash buckets, each a list of G_INTERN indexes
+ //   G_CODE     the instructions of the block being compiled
+ //   G_JUMPS    the patches that block's jumps still need
+ //   G_BLOCKS   the nested blocks that block has compiled
+ //
+-// `G_POOL` and `G_INTERN` belong to the whole program and are never saved. The
++// `G_POOL`, `G_INTERN` and `G_INTERN_BUCKETS` belong to the whole program and
++// are never saved. The
+ // other three belong to the block being compiled, so `compile_block` saves them
+ // and puts them back: a nested block is compiled *into* its parent's run while
+ // it is being built, and its own instructions are what the block record keeps.
+@@ -2641,14 +2669,23 @@ end
+ 
+ // The intern table. A name used a hundred times is one entry, so the pool is
+ // the same whichever way round the source used them.
++//
++// A lookup used to walk every entry, and a self-compilation walks the table for
++// every name it emits, so the cost was the number of names times the number of
++// entries. `intern_hash` names a bucket instead, and only that bucket's entries
++// are compared. The entries stay in `G_INTERN` in insertion order, so a new
++// name still takes the next pool index and the emitted bytes are unchanged.
+ to intern(raw)
+-    set intern_found to 0
+-    set intern_i to 0
++    intern_init()
++    set intern_bucket to intern_hash(raw) mod INTERN_BUCKETS
++    set intern_chain to G_INTERN_BUCKETS[intern_bucket]
+     set intern_found to -1
+     set intern_i to 0
+-    while intern_i < length(G_INTERN)
+-        if G_INTERN[intern_i].k is raw then
+-            set intern_found to intern_i
++    while intern_i < length(intern_chain)
++        if intern_found < 0 then
++            if G_INTERN[intern_chain[intern_i]].k is raw then
++                set intern_found to intern_chain[intern_i]
++            end
+         end
+         set intern_i to intern_i + 1
+     end
+@@ -2660,11 +2697,150 @@ to intern(raw)
+         set intern_index to length(G_POOL)
+         append("G_POOL", {t: 3, b: raw})
+         append("G_INTERN", {k: raw, n: intern_index})
++        set G_INTERN_COUNT to G_INTERN_COUNT + 1
++        intern_bucket_add(intern_bucket, length(G_INTERN) - 1)
+         set intern_result to intern_index
+     end
+     give back intern_result
+ end
+ 
++// A polynomial rolling hash over the name's bytes, reduced so every
++// intermediate below the multiply is exact in an `f64`. The exact value does not matter; what matters
++// is that the same bytes give the same bucket on every run, in both the
++// tree-walker and the bytecode VM.
++to intern_hash(raw)
++    set intern_hash_value to 0
++    set intern_hash_i to 0
++    while intern_hash_i < length(raw)
++        set intern_hash_value to (intern_hash_value * 31 + raw[intern_hash_i]) mod 2147483647
++        set intern_hash_i to intern_hash_i + 1
++    end
++    give back intern_hash_value
++end
++
++// The bucket array, built on the first lookup. Every bucket starts empty.
++to intern_init()
++    if length(G_INTERN_BUCKETS) is 0 then
++        set intern_init_i to 0
++        while intern_init_i < INTERN_BUCKETS
++            append("G_INTERN_BUCKETS", [])
++            set intern_init_i to intern_init_i + 1
++        end
++    end
++end
++
++// The index is added to one bucket. The bucket is rebuilt rather than changed
++// in place because Redblue has no index assignment, and the table is rebuilt
++// with it because a bucket is held by value. Rebuilding the table costs one
++// `append` per bucket, paid only when a name is new; a lookup still reads its
++// bucket directly.
++to intern_bucket_add(bucket, entry_index)
++    set intern_bucket_add_chain to push(G_INTERN_BUCKETS[bucket], entry_index)
++    set G_INTERN_BUCKETS_NEXT to []
++    set intern_bucket_add_i to 0
++    while intern_bucket_add_i < length(G_INTERN_BUCKETS)
++        if intern_bucket_add_i is bucket then
++            append("G_INTERN_BUCKETS_NEXT", intern_bucket_add_chain)
++        else
++            append("G_INTERN_BUCKETS_NEXT", G_INTERN_BUCKETS[intern_bucket_add_i])
++        end
++        set intern_bucket_add_i to intern_bucket_add_i + 1
++    end
++    set G_INTERN_BUCKETS to G_INTERN_BUCKETS_NEXT
++end
++
++// The direct tests in `tests/bootstrap_selfhost_test.rs` drive the table through
++// this mode instead of hoping a source program happens to exercise one bucket.
++// It runs only for `--intern-selftest`; a normal invocation takes the two-path
++// branch in `main` and never reaches it.
++to intern_selftest()
++    set intern_selftest_start to G_INTERN_COUNT
++
++    // One name, a thousand times: the table grows by one, not by a thousand.
++    set intern_selftest_repeated to bytes.from_text("repeated")
++    set intern_selftest_first to intern(intern_selftest_repeated)
++    set intern_selftest_i to 0
++    while intern_selftest_i < 1000
++        intern(intern_selftest_repeated)
++        set intern_selftest_i to intern_selftest_i + 1
++    end
++    say "repeat_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
++    intern(bytes.from_text("other"))
++    say "other_growth " + to_text(G_INTERN_COUNT - intern_selftest_start)
++
++    // The empty name is a name, not a missing one.
++    set intern_selftest_empty_start to G_INTERN_COUNT
++    set intern_selftest_empty_one to intern([])
++    set intern_selftest_empty_two to intern([])
++    say "empty_same " + intern_selftest_yes(intern_selftest_empty_one is intern_selftest_empty_two)
++    say "empty_growth " + to_text(G_INTERN_COUNT - intern_selftest_empty_start)
++
++    // A name far longer than a bucket count, and a variant that differs only in
++    // its last byte. A hash that truncated the name would give them one index.
++    set intern_selftest_long_a to []
++    set intern_selftest_long_b to []
++    set intern_selftest_i to 0
++    while intern_selftest_i < 10000
++        append("intern_selftest_long_a", 120)
++        append("intern_selftest_long_b", 120)
++        set intern_selftest_i to intern_selftest_i + 1
++    end
++    append("intern_selftest_long_b", 121)
++    set intern_selftest_long_start to G_INTERN_COUNT
++    set intern_selftest_long_one to intern(intern_selftest_long_a)
++    set intern_selftest_long_two to intern(intern_selftest_long_a)
++    set intern_selftest_long_three to intern(intern_selftest_long_b)
++    say "long_same " + intern_selftest_yes(intern_selftest_long_one is intern_selftest_long_two)
++    say "long_distinct " + intern_selftest_yes(intern_selftest_long_one is not intern_selftest_long_three)
++    say "long_growth " + to_text(G_INTERN_COUNT - intern_selftest_long_start)
++
++    // Two distinct names engineered to select the same bucket: keep the first
++    // candidate, then walk a sequence of distinct names until one hashes to its
++    // bucket. Both then have to be in the bucket at once and each has to answer
++    // with its own index.
++    set intern_selftest_a to bytes.from_text("collision-0")
++    set intern_selftest_a_bucket to intern_hash(intern_selftest_a) mod INTERN_BUCKETS
++    set intern_selftest_b to []
++    set intern_selftest_found to no
++    set intern_selftest_i to 1
++    while intern_selftest_i < 20000
++        if intern_selftest_found is no then
++            set intern_selftest_b to bytes.from_text("collision-" + to_text(intern_selftest_i))
++            if (intern_hash(intern_selftest_b) mod INTERN_BUCKETS) is intern_selftest_a_bucket then
++                set intern_selftest_found to yes
++            end
++        end
++        set intern_selftest_i to intern_selftest_i + 1
++    end
++    set intern_selftest_a_index to intern(intern_selftest_a)
++    set intern_selftest_b_index to intern(intern_selftest_b)
++    say "collision_found " + intern_selftest_yes(intern_selftest_found)
++    say "collision_distinct " + intern_selftest_yes(intern_selftest_a_index is not intern_selftest_b_index)
++    say "collision_bucket " + to_text(intern_hash(intern_selftest_a) mod INTERN_BUCKETS)
++    say "collision_a_index " + to_text(intern_selftest_a_index)
++    say "collision_b_index " + to_text(intern_selftest_b_index)
++    say "collision_a_lookup " + to_text(intern(intern_selftest_a))
++    say "collision_b_lookup " + to_text(intern(intern_selftest_b))
++    give back 0
++end
++
++// The same words the rest of this file prints for a yes/no.
++to intern_selftest_yes(flag)
++    set intern_selftest_yes_text to "no"
++    if flag is yes then
++        set intern_selftest_yes_text to "yes"
++    end
++    give back intern_selftest_yes_text
++end
++
++// A name that is not a byte list must fail at the table, not be accepted as
++// some other key. The test drives this through `main`, so the failure is the
++// compiler's own runtime error and not a panic.
++to intern_selftest_type_error()
++    intern(42)
++    give back 0
++end
++
+ // `Compiler::text`: intern a name and use it as an operand.
+ to emit_name(opcode, raw, aux, line)
+     emit(opcode, intern(raw), aux, line)
+diff --git a/tests/bootstrap_selfhost_test.rs b/tests/bootstrap_selfhost_test.rs
+index c5ad699..f8e2332 100644
+--- a/tests/bootstrap_selfhost_test.rs
++++ b/tests/bootstrap_selfhost_test.rs
+@@ -2100,3 +2100,244 @@ fn edge_a_while_loop_nested_in_another_patches_its_own_jump() {
+         assert_identical(name, source);
+     }
+ }
++
++// Phase 074: the compiler's intern table is internal to
++// `bootstrap/compiler.rb`, so the direct tests drive it through the compiler's
++// hidden `--intern-selftest` mode. That mode runs the same `intern` and
++// `intern_hash` the normal compile path runs; it only gives a test a way to
++// call them without a source file that happens to use every shape needed.
++//
++// The byte-equality test is the real gate: a hash table that answers a name
++// with the wrong index changes the constant pool, and the pool is part of the
++// bytes. `edge_name_heavy_fixture_is_byte_identical_in_both_stages` compiles a
++// program with many distinct names in both stages and requires the files to be
++// one file.
++
++struct InternOutput {
++    stdout: String,
++    stderr: String,
++    succeeded: bool,
++}
++
++fn run_intern_mode(args: &[&str]) -> InternOutput {
++    let output = Command::new(env!("CARGO_BIN_EXE_rb"))
++        .arg("run")
++        .arg(compiler())
++        .args(args)
++        .output()
++        .expect("the rb binary runs");
++    InternOutput {
++        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
++        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
++        succeeded: output.status.success(),
++    }
++}
++
++fn intern_selftest() -> InternOutput {
++    run_intern_mode(&["--intern-selftest"])
++}
++
++/// The value printed for `key`, which the self-test prints as `key value`.
++fn intern_report<'a>(stdout: &'a str, key: &str) -> &'a str {
++    let prefix = format!("{key} ");
++    stdout
++        .lines()
++        .find_map(|line| line.strip_prefix(&prefix))
++        .unwrap_or_else(|| panic!("the self-test printed no '{key}' line:\n{stdout}"))
++}
++
++fn intern_number(stdout: &str, key: &str) -> i64 {
++    intern_report(stdout, key)
++        .parse::<i64>()
++        .unwrap_or_else(|error| panic!("'{key}' is not an integer: {error}\n{stdout}"))
++}
++
++fn intern_selftest_type_error() -> Result<(), String> {
++    let run = run_intern_mode(&["--intern-selftest-type-error"]);
++    if run.succeeded {
++        Ok(())
++    } else {
++        Err(run.stderr)
++    }
++}
++
++#[test]
++fn edge_interning_the_same_name_1000_times_grows_the_table_once() {
++    let run = intern_selftest();
++    assert!(
++        run.succeeded,
++        "the intern self-test failed:\n{}",
++        run.stderr
++    );
++    assert_eq!(
++        intern_number(&run.stdout, "repeat_growth"),
++        1,
++        "1000 repetitions of one name grew the table by more than the one distinct name:\n{}",
++        run.stdout
++    );
++    assert_eq!(
++        intern_number(&run.stdout, "other_growth"),
++        2,
++        "a second distinct name did not grow the table to exactly two entries:\n{}",
++        run.stdout
++    );
++}
++
++#[test]
++fn edge_engineered_collision_resolves_each_name_to_its_own_index() {
++    let run = intern_selftest();
++    assert!(
++        run.succeeded,
++        "the intern self-test failed:\n{}",
++        run.stderr
++    );
++    assert_eq!(
++        intern_report(&run.stdout, "collision_found"),
++        "yes",
++        "the self-test failed to construct a collision:\n{}",
++        run.stdout
++    );
++    assert_eq!(
++        intern_report(&run.stdout, "collision_distinct"),
++        "yes",
++        "two colliding names were given the same index:\n{}",
++        run.stdout
++    );
++
++    // Each colliding name must still resolve to the index it was given, after
++    // the other one was added to the same bucket.
++    for name in ["collision_a", "collision_b"] {
++        let index = intern_number(&run.stdout, &format!("{name}_index"));
++        let lookup = intern_number(&run.stdout, &format!("{name}_lookup"));
++        assert_eq!(
++            lookup, index,
++            "{name} did not resolve to its own index after the collision:\n{}",
++            run.stdout
++        );
++    }
++}
++
++#[test]
++fn edge_empty_and_ten_kilobyte_names_are_interned_exactly() {
++    let run = intern_selftest();
++    assert!(
++        run.succeeded,
++        "the intern self-test failed:\n{}",
++        run.stderr
++    );
++    assert_eq!(
++        intern_report(&run.stdout, "empty_same"),
++        "yes",
++        "the empty name was not interned to one index:\n{}",
++        run.stdout
++    );
++    assert_eq!(
++        intern_number(&run.stdout, "empty_growth"),
++        1,
++        "the empty name grew the table by more than one:\n{}",
++        run.stdout
++    );
++    assert_eq!(
++        intern_report(&run.stdout, "long_same"),
++        "yes",
++        "the same 10KB name did not intern to one index:\n{}",
++        run.stdout
++    );
++    assert_eq!(
++        intern_report(&run.stdout, "long_distinct"),
++        "yes",
++        "a 10KB name that differs only in its last byte reused the first index, so the name was truncated:\n{}",
++        run.stdout
++    );
++    assert_eq!(
++        intern_number(&run.stdout, "long_growth"),
++        2,
++        "the two 10KB names did not grow the table to exactly two entries:\n{}",
++        run.stdout
++    );
++}
++
++#[test]
++fn edge_intern_refuses_a_name_that_is_not_a_byte_list() {
++    let result = intern_selftest_type_error();
++    assert!(
++        result.is_err(),
++        "the compiler interned a number as if it were a name"
++    );
++    let stderr = result.unwrap_err();
++    assert!(
++        stderr.contains("length requires a list or text"),
++        "the failure was not the clean length error:\n{}",
++        stderr
++    );
++    assert!(
++        !stderr.contains("usage:"),
++        "the run fell through to a usage error instead of reaching the intern table:\n{}",
++        stderr
++    );
++    assert!(
++        !stderr.contains("panicked"),
++        "the run panicked instead of reporting a runtime error:\n{}",
++        stderr
++    );
++}
++
++#[test]
++fn edge_name_heavy_fixture_is_byte_identical_in_both_stages() {
++    let mut source = String::new();
++    for index in 0..120 {
++        source.push_str(&format!("set name{index} to {index}\n"));
++    }
++    for index in 0..120 {
++        source.push_str(&format!("say name{index}\n"));
++    }
++    // One name emitted far more often than the others: the table must still
++    // hold it once and answer every occurrence with the same index. The
++    // statement count is kept well below the compiler's parser call-depth
++    // limit, since the contract here is byte equality rather than size.
++    for _ in 0..30 {
++        source.push_str("say name0\n");
++    }
++    // A name is bytes, so a non-ASCII name is one name and not one entry per
++    // byte. Both stages have to intern the same UTF-8 sequence.
++    for name in ["naïve", "日本語", "café"] {
++        source.push_str(&format!("set {name} to 1\nsay {name}\n"));
++    }
++
++    let expected = stage1("name-heavy", &source);
++    let actual = stage2("name-heavy", &source);
++    assert!(
++        actual.succeeded,
++        "stage 2 failed on the name-heavy fixture:\n{}",
++        actual.stderr
++    );
++    assert_eq!(
++        actual.bytes, expected,
++        "the name-heavy fixture is not byte-identical in both stages"
++    );
++
++    let decoded = redblue::Chunk::decode(&actual.bytes).expect("stage 2's file decodes");
++    let names: Vec<&str> = decoded
++        .constants
++        .iter()
++        .filter_map(|constant| match constant {
++            redblue::bytecode::Constant::Text(text) => Some(text.as_str()),
++            _ => None,
++        })
++        .collect();
++    for index in 0..120 {
++        let name = format!("name{index}");
++        assert_eq!(
++            names.iter().filter(|candidate| **candidate == name).count(),
++            1,
++            "'{name}' is not in the constant pool exactly once, so the intern table did not deduplicate it"
++        );
++    }
++    for name in ["naïve", "日本語", "café"] {
++        assert_eq!(
++            names.iter().filter(|candidate| **candidate == name).count(),
++            1,
++            "the UTF-8 name '{name}' is not in the constant pool exactly once"
++        );
++    }
++}
+[0m
+[0m$ [0mgit status --short && git check-ignore -v phases/phase-074/REPORT.md || true; sed -n '99,106p' phases/phase-074/REPORT.md
+M bootstrap/compiler.rb
+ M tests/bootstrap_selfhost_test.rs
+?? phases/phase-074/
+
+## Invariants touched
+
+- None. No language syntax, `Value` variant, error kind, example, module or
+  corpus `.rb` file changed (`bootstrap/compiler.rb` is the phase's target).
+- The emitted bytes are unchanged because entries still enter `G_POOL` and
+  `G_INTERN` in first-use order. The fixed point `stage1.rbc == stage2.rbc` is
+  the proof.
+[0m
+Fixed all four findings:
+
+- `edge_intern_refuses_a_name_that_is_not_a_byte_list` now asserts stderr contains `length requires a list or text` and excludes `usage:` and panic output, while retaining an `is_err()` assertion.
+- Corrected the test path reference to `tests/bootstrap_selfhost_test.rs`.
+- Reworded the REPORT invariant to acknowledge `bootstrap/compiler.rb`.
+- Relabeled the hash as polynomial rolling instead of FNV-style.
+
+All four gates pass: `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --all-targets` (2748 passed), and `verify.sh phase-074` (**VERIFY PASS**).
