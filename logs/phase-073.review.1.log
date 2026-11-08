@@ -2,20 +2,22 @@
 > reviewer · deepseek-v4.1-flash-free
 [0m
 [0m→ [0mRead tests/bench/mod.rs
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=1468][0m
 [0m→ [0mRead tests/bench/runner.rs
-[0m→ [0mRead tests/bench_test.rs
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead Cargo.toml
-[0m→ [0mRead BENCH.md
-[0m→ [0mRead tests/bench/mod.rs[90m [offset=1515][0m
-[0m✱ [0mGrep "GiveBack|Statement::Return"[90m in src · 31 matches[0m
-[0m✱ [0mGrep "give back|give_back|early return"[90m in tests · 100 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=914][0m
+[0m→ [0mRead tests/bench_test.rs[90m [limit=180][0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=1130, limit=350][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=900, limit=450][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=330, offset=1350][0m
+[0m✱ [0mGrep "fn edge_the_phase_under_review|653c3d34|8771dfa|DELIVERY_SUBJECT_PREFIXES|phase-073"[90m in tests/unreviewed_work_ack_test.rs · 12 matches[0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=1930, limit=140][0m
+[0m✱ [0mGrep "edge_a_hung_workload|run_with_budget|run_workload_with_env|HANG_WORKLOAD_NAME|edge_a_hung_child|timeout"[90m in tests/bench_test.rs · 41 matches[0m
+[0m→ [0mRead tests/bench_test.rs[90m [limit=160, offset=220][0m
 FINDINGS:
-1. [MAJOR] tests/bench_test.rs:265 — `edge_a_hung_child_process_is_killed_at_its_budget` gives the child only a 300 ms parent budget that must also cover process spawn, dynamic linking of the full `rb-bench` binary, and the child writing its `.started` marker. If startup is delayed (2724 tests run in parallel on 4 CPUs), the parent kills the child before `started_marker.is_file()` at tests/bench_test.rs:289 and the gate fails nondeterministically. It also mutates process-global environment (`std::env::set_var`/`remove_var` at :263/:270) while sibling tests spawn child processes in parallel, so the child environment depends on scheduling. Not verified by running (read-only session); traced from the 300 ms `recv_timeout` in tests/bench/mod.rs:418 to the marker assertion. Fix: pass the sentinel through the spawned child's environment explicitly (add an env hook to `measure_in_child` rather than using `set_var`), and use a substantially larger budget (or a start-marker handshake) so the test's premise does not depend on sub-300 ms process startup.
+1. [BLOCKER] tests/unreviewed_work_ack_test.rs:201 — The phase acknowledges its own delivery commit by pinning the SHA `653c3d34...`, but the pipeline re-creates the phase’s delivery commit every round. When the uncommitted changes are committed, `HEAD` gets a new SHA; `edge_the_phase_under_review_acknowledges_its_delivery_by_reviewed_sha_not_a_self_prefix` reads `HEAD` fresh at `:1958` and requires that SHA in `ACKNOWLEDGED` at `:1975`, while the fixed entry at `:201` is either stale or the new delivery commit is unacknowledged. The file itself documents this failure mode at `:70-79`: a SHA-pinned delivery commit goes stale when rebuilt. — Concrete fix: do not write the phase’s own delivery SHA into the working tree; have the pipeline append the final SHA after delivery, or acknowledge the phase-under-review delivery by a pipeline-owned rule rather than a SHA the phase writes. Remove the `653c...` entry and the `HEAD`-SHA assertion until the delivery SHA is stable. — VERIFIED: traced `:1958-1979` (fresh `git log -1 HEAD`, then `ACKNOWLEDGED.iter().any(|entry| *entry == sha)`) against the fixed SHA at `:201`, plus the stale check at `:987-992`.
 
-2. [MINOR] tests/bench_test.rs:1267 — `edge_single_workload_measurement_does_not_write_the_baseline` passes an injected output path, but the single-workload branch of `run_cli_with_path` (tests/bench/mod.rs:1228-1274) never reads `output`; it only prints a table. The assertions at tests/bench_test.rs:1277-1284 therefore cannot detect the failure they claim to guard: a regression that wrote `bench_md_path()` (cwd `BENCH.md`) on the single-workload path would still pass. The REPORT's claim that this test "proves the single-workload path never writes the baseline" is overstated. Fix: assert that `bench_md_path()` is untouched (e.g. run with a temp cwd or an `RB_BENCH_OUTPUT` override) in addition to the injected path.
+2. [MAJOR] tests/bench_test.rs:1419 — `edge_cli_named_workload_uses_its_default_size` never asserts the size actually used. It computes `expected` at `:1424` but only uses it in an assertion message at `:1428`; the assertions at `:1425-1437` check exit code and absence of writes. A regression where `run_cli` ignores `default_size` and runs size `0` for every workload would still pass this test. — Concrete fix: capture the emitted table (or expose the resolved `(name, size)` from the CLI path) and assert the rendered row contains `default_size(name)`, not merely that the command exited zero.
 
-3. [MINOR] tests/bench/mod.rs:427 — In the real production path a wrong answer can never surface as `BenchError::WrongAnswer`. The child's `measure_direct` checks the reference first (tests/bench/mod.rs:473), so on a mismatch `run_worker` prints `ERR` and returns 1 (tests/bench/mod.rs:528-531); the parent then sees non-success and converts it to `BenchError::Load` (tests/bench/mod.rs:427-432). `WrongAnswer` is only reachable through the `#[cfg(test)]` in-process `measure` used by `run_workload_with`, which is what `edge_a_wrong_answer_is_refused_instead_of_measured` exercises. The refusal still happens, but the documented distinct error variant and the "ERR line becomes a Load" parser branch (tests/bench/mod.rs:553-557) are dead on the shipped path. Fix: either have `measure_in_child` parse the child's `ERR` line into the correct variant (parse before the status check), or drop the claim/unit-test that the real path reports `WrongAnswer`.
+3. [MINOR] tests/bench/mod.rs:902 — `truncate` counts Unicode scalar values, not terminal display width, so a 20-character CJK answer occupies about 40 columns and breaks the aligned table. `tests/bench_test.rs:1211` reinforces the wrong model by calling 20 CJK characters the “full 20-character column width.” — Concrete fix: pad/truncate by display width (e.g. `unicode-width`) or explicitly document and test character-count truncation without claiming column alignment.
 
 REVIEW VERDICT: FINDINGS 3
