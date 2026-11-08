@@ -1,26 +1,24 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=2095, limit=260][0m
-[0m→ [0mRead bootstrap/compiler.rb[90m [offset=2660, limit=200][0m
-[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [limit=130, offset=1][0m
-[0m→ [0mRead bootstrap/compiler.rb[90m [limit=45, offset=75][0m
-[0m✱ [0mGrep ""push"|fn.*push|push\s*=>"[90m in src · 24 matches[0m
-[0m✱ [0mGrep "length requires a list or text"[90m in src · 3 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [limit=45, offset=4385][0m
-[0m✱ [0mGrep ""push"|push"[90m in src/bytecode · 100 matches[0m
-[0m✱ [0mGrep "fn (numeric_)?mod|"mod"|Mod\b|Opcode::Mod|% b|rem"[90m in src · 100 matches[0m
-[0m✱ [0mGrep "fn mod|modulo|remainder|rem_euclid"[90m in src · 83 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [limit=55, offset=300][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [offset=2625, limit=130][0m
+[0m✱ [0mGrep "intern\(|emit_name\(|G_INTERN|bytes.from_text"[90m 47 matches[0m
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=2280, limit=180][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=120, offset=190][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [limit=45, offset=3262][0m
+[0m✱ [0mGrep "fn (compiler_contents|scratch|stage1|stage2|assert_identical)\b"[90m in tests/bootstrap_selfhost_test.rs · 12 matches[0m
+[0m✱ [0mGrep "fn mod_|Modulo|Percent|fn push|append\("[90m in src/interpreter.rs · 37 matches[0m
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [limit=105, offset=28][0m
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [limit=30, offset=1200][0m
+[0m✱ [0mGrep "to (lex|parse_primary|parse_statement)|\.n to|n: |\{k:|\{t:"[90m in bootstrap/compiler.rb · 100 matches[0m
+[0m✱ [0mGrep "fn index|Text\(|Value::Text|as_bytes|chars\(\)"[90m in src/value.rs · 100 matches[0m
+[0m✱ [0mGrep "intern-selftest|G_INTERN_COUNT|hidden self-test|hidden `--intern"[90m in . · 0 matches[0m
+[0m✱ [0mGrep ""push"|fn push_value|fn .*push|push\("[90m in src/stdlib.rs · 100 matches[0m
+[0m→ [0mRead tests/bootstrap_ship_test.rs[90m [limit=110][0m
+[0m✱ [0mGrep "bootstrap/compiler\.rb|bootstrap/\*\.rb|read_dir.*bootstrap|intern_selftest"[90m in . · 41 matches[0m
+[0m→ [0mRead phases/phase-074/REPORT.md[90m [offset=88, limit=40][0m
 FINDINGS:
+1. [MINOR] tests/bootstrap_selfhost_test.rs:2300 — the distribution test claims bucket counts "notice that the lookup is not walking the whole table", but it only inspects buckets maintained at insertion time. If `intern` were reverted to a full `G_INTERN` scan while still calling `intern_bucket_add` on misses, `spread_growth`, `distinct_buckets`, `max_chain` and the ordinary-name checks would all still pass. The phase's central performance property therefore has no guard that can fail for a linear-lookup regression — add a counter of table comparisons (or a timing/work probe) and assert lookups stay near the bucket size, or drop the overclaim.
+2. [MINOR] phases/phase-074/REPORT.md:119 — the known-gaps entry still says "The hidden self-test route in `main` works around it with a flag", but that route no longer exists: there is no `--intern-selftest` string in any `.rb` file and `bootstrap/compiler.rb` ends with a plain `main()` (line 3306). The report contradicts its own "main ... untouched" description and the actual tree; remove or rewrite the sentence to describe the `bootstrap/intern_selftest.rb` fragment.
 
-1. [MAJOR] tests/bootstrap_selfhost_test.rs:2187 — The phase's actual new behaviour is that `intern_hash` selects one of 256 buckets, but no test pins distribution. `edge_engineered_collision` only proves a collision resolves; it never asserts that two ordinary names land in *different* buckets. The self-test even prints `collision_bucket` (bootstrap/compiler.rb:2819) and the Rust test never reads it. A degenerate `intern_hash` that returns a constant (every name in bucket 0) would satisfy every assertion here: `repeat_growth`/`other_growth`, `empty_*`, `long_*`, `collision_found`, distinct indexes, the byte-identical fixture, and the type-error test all depend only on dedup correctness, not on which bucket a name selects. So the exact performance regression this phase exists to prevent — falling back to an O(n) scan — cannot be detected by the suite. Fix: have `--intern-selftest` print the number of distinct non-empty buckets (and/or max chain length) after interning a few hundred names, and assert a lower bound; add an assertion that two ordinary names hash to different buckets.
-   - This is verified by inspection of the assertions and the selftest output keys; I did not run the suite.
-
-2. [MINOR] bootstrap/compiler.rb:2737 — `intern_bucket_add` rebuilds the entire 256-entry bucket array (and allocates a fresh 256-element list) for every newly seen name, so insertion remains O(INTERN_BUCKETS) per distinct name. The change only improves lookups. This is acceptable at 256 but is the cost the phase neither tests nor documents as a trade-off; combined with finding 1, an insertion regression is invisible.
-
-3. [MINOR] bootstrap/compiler.rb:2756 — ~90 lines of test-only `intern_selftest` machinery plus the hidden `--intern-selftest` and `--intern-selftest-type-error` modes are embedded in the compiler under test. The self-compilation fixed point now includes code that exists only for tests, and a lone-argument invocation silently runs a self-test and exits 0 instead of producing the existing usage error. This is scope beyond "hash the intern table"; the probe belongs in a separate `.rb` fixture the test runs.
-
-4. [MINOR] tests/bootstrap_selfhost_test.rs:2221 — Three separate tests (lines 2165, 2187, 2221) each spawn a fresh compiler process and re-run the *entire* `intern_selftest`, including the 1000-repeat loop, the 20,000-candidate collision search, and the 10 KB×10,000 append loop. The suite pays the full heavy self-test three times for overlapping data. Fix: run it once (shared result / one test asserting all keys) or split the modes.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 2

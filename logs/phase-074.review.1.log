@@ -1,31 +1,27 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead tests/bootstrap_selfhost_test.rs
-I'll inspect the change set, starting with the new tests and the modified compiler sections.
-[0m→ [0mRead bootstrap/compiler.rb[90m [offset=2650, limit=260][0m
-[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=1266, limit=500][0m
-[0m→ [0mRead bootstrap/compiler.rb[90m [offset=60, limit=70][0m
-[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=2050, limit=280][0m
-[0m✱ [0mGrep "G_INTERN|G_POOL|to compile_program"[90m in bootstrap/compiler.rb · 40 matches[0m
-[0m✱ [0mGlob "tests/bootstrap*_test.rs"[90m 2 matches[0m
-[0m✱ [0mGrep "emit_name\(|intern\("[90m in bootstrap/compiler.rb · 38 matches[0m
-[0m→ [0mRead bootstrap/compiler.rb[90m [offset=2520, limit=60][0m
+[0m→ [0mRead bootstrap/compiler.rb[90m [offset=2635, limit=120][0m
+[0m✱ [0mGrep "intern_selftest|--intern|INTERN_BUCKETS|intern_bucket_add|G_INTERN_COUNT"[90m in bootstrap/compiler.rb · 100 matches[0m
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=2360, limit=260][0m
+I'll inspect the actual compiler intern implementation, the hidden-mode claims, and the tail of the tests.
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=2103, limit=255][0m
 [0m✱ [0mGrep ""push"|\bpush\b"[90m in src · 100 matches[0m
-[0m✱ [0mGrep "push\("[90m in bootstrap/compiler.rb · 35 matches[0m
-[0m✱ [0mGrep "length requires|fn builtin_length|\"length\""[90m in src · 14 matches[0m
-[0m→ [0mRead src/value.rs[90m [offset=485, limit=30][0m
-[0m→ [0mRead phases/phase-074/REPORT.md[90m [offset=80, limit=40][0m
-[0m→ [0mRead src/runtime.rs[90m [offset=3150, limit=45][0m
-I've inspected the change set and traced the relevant paths. Findings below.
-
+Now the remaining new tests and whether `push` is a real builtin.
+[0m→ [0mRead bootstrap/compiler.rb[90m [offset=2478, limit=90][0m
+[0m✱ [0mGrep ""push"|push\("[90m in src/stdlib.rs · 100 matches[0m
+[0m✱ [0mGrep "G_INTERN|G_POOL"[90m in bootstrap/compiler.rb · 41 matches[0m
+Let me verify `push` exists and check the block save/restore comment region.
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=180, limit=110][0m
+[0m✱ [0mGrep "distinct_buckets|max_chain|spread_growth|ordinary_a_bucket|ordinary_b_bucket"[90m in tests/bootstrap_selfhost_test.rs · 0 matches[0m
+Checking the delivery-ack test change for gate weakening, and whether spread values ever get asserted.
+[0m✱ [0mGrep "length requires a list or text"[90m in src · 3 matches[0m
+Verifying the exact error string the failure test asserts, to check the gate claim is real.
+[0m✱ [0mGrep "fn stage1|fn stage2|fn scratch|fn compiler_contents"[90m in tests/bootstrap_selfhost_test.rs · 33 matches[0m
+One more check: whether the two stages actually run different engines (for the cross-engine hash claim).
+[0m→ [0mRead tests/bootstrap_selfhost_test.rs[90m [offset=80, limit=55][0m
 FINDINGS:
-1. [MAJOR] tests/bootstrap_selfhost_test.rs:2155-2166 — `edge_intern_refuses_a_name_that_is_not_a_byte_list` only checks that the child process exited non-zero. `intern_selftest_type_error()` returns `Ok(())` whenever `run.succeeded` is true; the test then asserts `.is_err()`. That same non-zero exit happens if the `--intern-selftest-type-error` handler in `main` (compiler.rb:91-94) is removed, because `main` falls through to `refuse(0, "usage: ...")` at compiler.rb:97-99, and it also happens on a panic. So the test passes for the two failure modes it is supposed to exclude (usage error, panic) and cannot detect removal of the mode it claims to drive. The underlying behaviour is in fact clean (`length` returns `Error::Runtime("length requires a list or text")` at src/runtime.rs:3181-3185), but that message is never asserted, so REPORT.md:83/88 ("clean runtime failure, not a panic … diagnostics path (`length requires a list or text`) is the failure test") is not pinned by any test. Concrete fix: assert the stderr contains `length requires a list or text`, and assert it does not contain `usage:` or a panic marker.
+1. [MAJOR] bootstrap/intern_selftest.rb:107 — The probe prints `distinct_buckets`, `max_chain`, `spread_growth`, `ordinary_a_bucket` and `ordinary_b_bucket`, but no Rust test ever reads any of those keys (grep over `tests/bootstrap_selfhost_test.rs` finds zero references; the five tests at lines 2208–2408 assert only repeat growth, the engineered collision, empty/10KB names, the type error, and stage1/stage2 byte equality). A degenerate `intern_hash` that always returns 0 would put every name in one bucket and still pass all five tests: `repeat_growth` stays 1, the collision is trivially found at `collision-1`, duplicate lookups still resolve within the single chain, and pool/emission order is unchanged. So the phase's central property — that the hash actually distributes names so lookups walk a bucket instead of the whole table — is unverified, and the comment at intern_selftest.rb:82-85 claiming those counts are what notices a linear scan is false. Fix: add assertions in the test suite such as `intern_number("distinct_buckets") >= 200`, `intern_number("max_chain") <= 5`, and `intern_report("ordinary_a_bucket") != intern_report("ordinary_b_bucket")`.
+2. [MINOR] bootstrap/compiler.rb:2683 — `G_INTERN_COUNT` is test-only instrumentation (declared at line 60, only ever read by `bootstrap/intern_selftest.rb`) left inside the shipped compiler, contradicting the stated goal that the compiler not carry test-only code and adding a global plus an increment to every new name. The probe could measure growth with `length(G_INTERN)` instead. Fix: remove `G_INTERN_COUNT` and its increment, and use `length(G_INTERN)` in the fragment.
 
-2. [MINOR] bootstrap/compiler.rb:2752 — the comment says the direct tests live in `tests/bootstrap_intern_test.rs`; no such file exists. The actual tests are in `tests/bootstrap_selfhost_test.rs` (glob shows only `bootstrap_selfhost_test.rs` and `bootstrap_ship_test.rs`). Update the reference so a maintainer can find the tests.
-
-3. [MINOR] phases/phase-074/REPORT.md:102-103 — the "Invariants touched" section claims "No language syntax, `Value` variant, error kind, example, module or `.rb` file changed", but the phase's primary change is to `bootstrap/compiler.rb`, which is a `.rb` file. Reword to "no corpus/example/module `.rb` file" so the report's invariant statement is not false on its face.
-
-4. [STYLE] bootstrap/compiler.rb:2707 — the comment calls the hash "FNV-style", but the implementation is a polynomial rolling hash (`v * 31 + byte mod 2147483647`), not FNV (offset basis plus multiply/XOR). The label will mislead anyone tuning or reimplementing it; call it a polynomial/rolling hash.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 2
