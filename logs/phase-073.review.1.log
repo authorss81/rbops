@@ -2,25 +2,20 @@
 > reviewer · deepseek-v4.1-flash-free
 [0m
 [0m→ [0mRead tests/bench/mod.rs
-[0m→ [0mRead tests/bench_test.rs
-[0m→ [0mRead BENCH.md
 [0m→ [0mRead tests/bench/runner.rs
+[0m→ [0mRead tests/bench_test.rs
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead src/interpreter.rs[90m [offset=2220, limit=90][0m
-[0m✱ [0mGrep "GiveBack|Return|return_value|fn execute_block|fn run_block"[90m in src/interpreter.rs · 63 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=1060, limit=90][0m
-[0m✱ [0mGrep "enum LoopControl|LoopControl::Return|Return\(Value|Some\(LoopControl"[90m in src/interpreter.rs · 7 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=520, limit=40][0m
-[0m✱ [0mGrep "run_block\(|execute_statements\(|fn call_function|fn call_user|loop_control"[90m in src/interpreter.rs · 43 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2520, limit=60][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=3090, limit=50][0m
+[0m→ [0mRead Cargo.toml
+[0m→ [0mRead BENCH.md
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=1515][0m
+[0m✱ [0mGrep "GiveBack|Statement::Return"[90m in src · 31 matches[0m
+[0m✱ [0mGrep "give back|give_back|early return"[90m in tests · 100 matches[0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=914][0m
 FINDINGS:
-1. [MAJOR] phases/phase-073/REPORT.md:84 — The gate summary claims `2708 tests, 4 rust / 4 edge / 4 failure-asserting`, but the only tests this resumed diff adds are the four at tests/bench_test.rs:1058-1161, and only `edge_check_size_supported_rejects_negative_and_unknown_names` (1114-1142) asserts a failure; the other three assert success or paths. The count also jumps 2699 -> 2708 while the diff adds four tests (2699+4=2703; the 5-test delta is unexplained, though it could be the `rb-bench` bin's five unit tests). Why it matters: the gate table is the phase's evidence that the gate passed; a summary that does not match the diff means the gate ran on a different tree or the report is inaccurate. Fix: re-run `cargo test --all-targets` and `../rbops/verify.sh phase-073` on this exact tree and paste the actual counts, or explain the 5-test delta. Not a BLOCKER only because I could not read `../rbops/verify.sh` to confirm its failure-asserting threshold. VERIFIED: read the four added test bodies and counted one failure-asserting test.
+1. [MAJOR] tests/bench_test.rs:265 — `edge_a_hung_child_process_is_killed_at_its_budget` gives the child only a 300 ms parent budget that must also cover process spawn, dynamic linking of the full `rb-bench` binary, and the child writing its `.started` marker. If startup is delayed (2724 tests run in parallel on 4 CPUs), the parent kills the child before `started_marker.is_file()` at tests/bench_test.rs:289 and the gate fails nondeterministically. It also mutates process-global environment (`std::env::set_var`/`remove_var` at :263/:270) while sibling tests spawn child processes in parallel, so the child environment depends on scheduling. Not verified by running (read-only session); traced from the 300 ms `recv_timeout` in tests/bench/mod.rs:418 to the marker assertion. Fix: pass the sentinel through the spawned child's environment explicitly (add an env hook to `measure_in_child` rather than using `set_var`), and use a substantially larger budget (or a start-marker handshake) so the test's premise does not depend on sub-300 ms process startup.
 
-2. [MINOR] phases/phase-073/REPORT.md:7-13 — The "What changed" line counts do not match the diff: `tests/bench/mod.rs` is a new 1147-line file, not `+349 −30`; `BENCH.md` is a new 15-line file, not `+8 −8`; `.gitignore` is `+4/−1`, not `+2 −1`; `tests/unreviewed_work_ack_test.rs` is `+10/−5`, not `+1`. Why it matters: this table is the phase's map of what it touched; wrong counts make scope verification harder. Fix: correct the table or label the counts as per-attempt.
+2. [MINOR] tests/bench_test.rs:1267 — `edge_single_workload_measurement_does_not_write_the_baseline` passes an injected output path, but the single-workload branch of `run_cli_with_path` (tests/bench/mod.rs:1228-1274) never reads `output`; it only prints a table. The assertions at tests/bench_test.rs:1277-1284 therefore cannot detect the failure they claim to guard: a regression that wrote `bench_md_path()` (cwd `BENCH.md`) on the single-workload path would still pass. The REPORT's claim that this test "proves the single-workload path never writes the baseline" is overstated. Fix: assert that `bench_md_path()` is untouched (e.g. run with a temp cwd or an `RB_BENCH_OUTPUT` override) in addition to the injected path.
 
-3. [MINOR] tests/bench/mod.rs:232-266 — `run_with_budget` spawns a worker and `recv_timeout`s it; on timeout the thread is detached and keeps running. The 60-second budget bounds the caller's wait, not the work, so a hung workload is a resource leak until process exit (the report documents this as a known gap). Fix: run the measurement in a child process and kill it, or add a cancellation hook.
+3. [MINOR] tests/bench/mod.rs:427 — In the real production path a wrong answer can never surface as `BenchError::WrongAnswer`. The child's `measure_direct` checks the reference first (tests/bench/mod.rs:473), so on a mismatch `run_worker` prints `ERR` and returns 1 (tests/bench/mod.rs:528-531); the parent then sees non-success and converts it to `BenchError::Load` (tests/bench/mod.rs:427-432). `WrongAnswer` is only reachable through the `#[cfg(test)]` in-process `measure` used by `run_workload_with`, which is what `edge_a_wrong_answer_is_refused_instead_of_measured` exercises. The refusal still happens, but the documented distinct error variant and the "ERR line becomes a Load" parser branch (tests/bench/mod.rs:553-557) are dead on the shipped path. Fix: either have `measure_in_child` parse the child's `ERR` line into the correct variant (parse before the status check), or drop the claim/unit-test that the real path reports `WrongAnswer`.
 
-4. [MINOR] tests/bench_test.rs:1059-1097 — `edge_table_truncates_long_answers_by_characters` only asserts that `"..."` appears and the full 60-character string is absent; it never asserts the truncated cell is the first 17 CJK characters plus `"..."`, so a truncation to one character plus `"..."` would also pass. Fix: assert the exact truncated answer and its 20-character length.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 3

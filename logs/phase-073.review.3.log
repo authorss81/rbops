@@ -1,24 +1,25 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead tests/bench/mod.rs
-[0m→ [0mRead tests/bench_test.rs
+[0m→ [0mRead tests/bench/mod.rs[90m [limit=600][0m
+I'll inspect the phase change set, focusing on the benchmark harness production code and its tests.
 [0m→ [0mRead tests/bench/runner.rs
-[0m→ [0mRead Cargo.toml
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=601, limit=650][0m
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=1251, limit=530][0m
+[0m→ [0mRead tests/bench_test.rs[90m [limit=700][0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=701, limit=700][0m
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m✱ [0mGrep "fn edge_|fn [a-z_]+\(\)|resume phase-0|DELIVERY_SUBJECT_PREFIXES|delivery_acknowledgements"[90m in tests/unreviewed_work_ack_test.rs · 100 matches[0m
-[0m✱ [0mGrep "resume phase-073|phase-073"[90m in tests/unreviewed_work_ack_test.rs · 3 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=910, limit=420][0m
-[0m✱ [0mGrep "fn .*delivery|phase-083|not_acknowledged|is_delivery_subject"[90m in tests/unreviewed_work_ack_test.rs · 27 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=1895, limit=130][0m
+[0m→ [0mRead BENCH.md
+[0m→ [0mRead .gitignore
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=914, limit=400][0m
 FINDINGS:
 
-1. [MAJOR] `tests/bench/mod.rs:658` — `parse_baseline_markdown` skips any pipe-line whose cell count is not exactly 4 *before* it checks whether the first cell names a known workload, so a corrupted known row like `| fibonacci | 20 | 6765 |` (missing the wall-time cell) is silently dropped. The function's own contract at `tests/bench/mod.rs:644-648` says "a corrupted baseline cannot compare as if it had fewer workloads", and `comparison_table` (`tests/bench/mod.rs:768-797`) then runs only the rows that survived and the CLI exits 0. A user pointing `rb-bench --compare` at a truncated/edited baseline gets a clean success that silently omits a workload. Fix: before the `cells.len() != 4 { continue; }`, check `cells.first()` against `workload_names()` and return an error when a known workload appears in a malformed row; add a test with a 3-cell and a 5-cell known-workload row.
+1. [MAJOR] tests/unreviewed_work_ack_test.rs:256 — This phase added `"resume phase-073:"` to `DELIVERY_SUBJECT_PREFIXES` (lines 254-273), the rule that makes the unreviewed-work audit treat any matching commit as acknowledged with no per-commit review. `scan` resolves those commits purely by subject (`is_delivery_subject`, lines 858-862; `delivery_acknowledgements`, lines 888-901) and never inspects their contents, so a benchmark phase has edited the gate that governs its own delivery commit to auto-clear it. That is self-acknowledgement and makes the audit unfalsifiable for this phase's delivery. Concrete fix: do not let a phase add its own prefix; require the acknowledgement to be a reviewed `ACKNOWLEDGED` entry, or add a test that a prefix for the phase under review cannot be introduced by that phase. What would settle it: whether rbops requires the phase itself to register its delivery prefix (in which case this is intended and should be documented as such) or whether the audit owner is supposed to do it. Checked by reading the prefix list and the subject-only matching path.
 
-2. [MAJOR] `tests/bench_test.rs:38` — the "records hardware" assertion is `text.to_lowercase().contains("hardware")`, but `render_markdown` always writes the prose sentence "The hardware line is best-effort; ...", which itself contains the word "hardware" (`tests/bench/mod.rs:448-449`). Deleting the entire `## Hardware` section and the CPU line from `BENCH.md` would still pass this test, so the checked-in baseline's hardware note is not actually pinned despite the REPORT claiming the test "requires ... the hardware note". The same weak check appears at `tests/bench_test.rs:470`. Fix: assert on `text.contains("## Hardware")` and `text.contains("CPU:")` from the checked-in file (the synthetic-render test at `tests/bench_test.rs:903` already shows how to pin the value).
+2. [MINOR] tests/bench/mod.rs:372 — When `worker_binary()` is `None`, `measure_in_worker_with_env` silently takes the `#[cfg(test)]` fallback (`run_with_budget`) and discards both `env` and `start_marker` (lines 375-379). The "real child, killed at its budget" guarantee therefore depends on a build-layout coincidence (`CARGO_BIN_EXE_rb-bench` or the sibling `rb-bench`), not on the code under test; under `cargo test --bin rb-bench` the hidden workload runs in-process and the marker assertions in `edge_child_measurement_accepts_an_explicit_environment` fail rather than prove the child path. Fix: in `cfg(test)`, return a hard `Load`/panic when the worker binary is absent for `run_workload_with_env`, so the test cannot silently fall back.
 
-3. [MAJOR] `tests/bench/mod.rs:773` — the new `--compare`/baseline refusal branches have no tests: the empty-baseline error (`mod.rs:773-778`), the missing/unreadable-baseline error (`mod.rs:769-770`), the wrong-arity error (`mod.rs:840-845`), and the negative-size baseline row (`mod.rs:677-682`) are all unreachable from the suite. `edge_cli_compare_reruns_every_baseline_row` (`tests/bench_test.rs:692`) only exercises the happy path. This is a new feature added in this round, so the refusal channels need their own fixtures (missing file, empty file, `["--compare"]`, `["--compare","a","b"]`, `| fibonacci | -1 | 0 | 1.000 ms |`).
+3. [MINOR] tests/bench/mod.rs:1179 — Duplicate detection only rejects an identical `(workload, size)` pair (lines 1179-1187). A baseline carrying `fibonacci` at two different sizes is accepted, and `comparison_table` (lines 1267-1278) only requires each workload name to appear once, so `--compare` re-runs both rows and renders two rows for one workload. This contradicts the REPORT's "duplicate rows refused" claim and the checked-in-baseline invariant (one row per workload at the default size) enforced elsewhere. Fix: refuse more than one row per workload in `parse_baseline_markdown`, or explicitly document multi-size baselines.
 
-4. [MINOR] `tests/bench/mod.rs:705` — `parse_baseline_markdown` stores `answer: cells[2].to_string()` without validating it, and `comparison_table` re-runs the workload but never compares the re-run answer against the baseline's recorded answer (`tests/bench/mod.rs:791-793`). A baseline whose answer column is wrong or empty still yields exit 0 and a comparison table, even though the file's header calls the column "verified answers". Fix either by comparing `measurement.answer.to_string()` to `row.answer` (and refusing on mismatch) or by documenting that answers in an externally supplied baseline are ignored; add a test with a hand-corrupted answer.
+4. [MINOR] tests/bench/mod.rs:566 — The hidden `--worker` path is user-reachable through `tests/bench/runner.rs:14-15` (`rb-bench --worker __hang <size>`), and `run_worker` sleeps `Duration::from_millis(size as u64)` with no cap and no budget (lines 563-570). `rb-bench --worker __hang 9223372036854775807` sleeps for roughly 292 million years. The flag is undocumented and test-only, but it is an unbounded resource path in a shipped binary. Fix: cap the hang size (e.g. refuse above a few seconds) or gate `--worker` behind an environment variable.
 
 REVIEW VERDICT: FINDINGS 4

@@ -3,26 +3,31 @@
 [0m
 [0m→ [0mRead tests/bench/mod.rs
 [0m→ [0mRead tests/bench/runner.rs
-[0m→ [0mRead tests/bench_test.rs
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=1498][0m
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead BENCH.md
-[0m→ [0mRead Cargo.toml
-[0m✱ [0mGrep "^\| concat \| 200 \| (ab){200} \| [0-9]+\.[0-9]{3} ms \|$"[90m in BENCH.md · 1 match[0m
-[0m→ [0mRead phases/phase-073/REPORT.md[90m [offset=70, limit=40][0m
-[0m✱ [0mGrep "BinaryOp::(Plus|Add)|Value::Text\([a-z]+\) \+"[90m in src/interpreter.rs · 7 matches[0m
-[0m→ [0mRead src/runtime.rs[90m [offset=180, limit=55][0m
+[0m✱ [0mGrep "fn (edge_a_size_past_the_maximum_is_refused_before_a_child_starts|edge_single_workload_measurement_does_not_write_the_baseline|edge_usage_names_every_workload_and_the_compare_mode|edge_correctness_gate_does_not_rewrite_the_checked_in_baseline|edge_a_hung_child_process_is_killed_at_its_budget|edge_cli_compare_refuses_a_baseline_missing_a_workload)"[90m in tests/bench_test.rs · 6 matches[0m
+[0m✱ [0mGrep "set_var|remove_var|RB_BENCH_HANG_SENTINEL|with_extension|start_marker|run_workload_with_env|std::env::set"[90m in tests/bench_test.rs · 42 matches[0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=240, limit=130][0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=1240, limit=160][0m
+[0m✱ [0mGrep "run_cli\(|RB_BENCH_OUTPUT|current_dir|set_current_dir|fn unique_temp_dir|fn run_cli_with_path"[90m in tests/bench_test.rs · 25 matches[0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=820, limit=120][0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=1, limit=120][0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=640, limit=190][0m
+[0m✱ [0mGrep "fn edge_size_limit_boundary_is_exact_per_workload|fn edge_fibonacci_is_capped_where_f64_is_exact|fn edge_the_size_limit_is_enforced_without_running_the_workload"[90m in tests/bench_test.rs · 3 matches[0m
+[0m→ [0mRead tests/bench_test.rs[90m [offset=420, limit=80][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2220, limit=90][0m
+[0m✱ [0mGrep "GiveBack|Return|return_value|early return|returned"[90m in src/interpreter.rs · 85 matches[0m
+[0m✱ [0mGrep "Text\(|enum Value|Rc<|Arc<"[90m in src/value.rs · 100 matches[0m
+[0m✱ [0mGrep "fn run_source_value|pub fn run_source"[90m in src/lib.rs · 5 matches[0m
+[0m→ [0mRead src/lib.rs[90m [offset=90, limit=75][0m
+[0m✱ [0mGrep "fn run_isolated|run_isolated_in|bytecode::|codegen"[90m in src/interpreter.rs · 63 matches[0m
 FINDINGS:
+1. [MAJOR] tests/bench_test.rs:432 — `edge_size_limit_boundary_is_exact_per_workload` runs every workload at its `max_size` inside the normal `cargo test --all-targets` gate: concat 100_000, lex 250_000, primes 10_000. Each call gets only the hard 60 s `DEFAULT_BUDGET` (tests/bench/mod.rs:31) and panics on `BudgetExceeded` (line 432-434). `concat` is O(n²) string copying (`Value::Text(format!("{}{}", a, b))` at src/runtime.rs:213) over 100k interpreter iterations, so the test's pass/fail depends on the gate machine's speed; a slower runner turns a correctness test into a spurious timeout failure. It also violates the phase's own separation that measurement stays outside the gate (Cargo.toml comment: "a measurement that writes `BENCH.md` must not run inside the test gate"). Fix: pin the maximum with `check_size_supported` (which does not run the workload, as `mod.rs`'s `edge_the_size_limit_is_enforced_without_running_the_workload` already does) and run one small, bounded size end-to-end. What would settle it: the measured wall time of this test on the gate machine; if it is a few seconds, downgrade.
 
-1. [MAJOR] tests/bench/mod.rs:411 — The production child-process timeout/kill branch (`Err(RecvTimeoutError::Timeout)` → `child.kill()`/`wait()`) has no test on either side. The only "hung workload" test, tests/bench_test.rs:243-248, calls `bench::run_with_budget`, which is `#[cfg(test)]` (tests/bench/mod.rs:240) and runs the closure in an in-process thread; it never reaches `measure_in_child`. So the claim in REPORT.md:104 that "production measurements run in a child process that is killed at the deadline" is unverified by the gate. — Fix: add a hidden worker workload (or a `--worker` hook) that sleeps, then a test that drives `run_workload` with a tiny budget and asserts `BudgetExceeded` and that no child survives. — VERIFIED: traced `edge_a_hung_workload_fails_loudly_at_its_budget` → `run_with_budget` at mod.rs:241-268; `measure_in_child` is only entered via `measure_in_worker` (mod.rs:318-337), which no test forces through a timeout.
+2. [MINOR] tests/bench_test.rs:297 — `edge_a_hung_child_process_is_killed_at_its_budget` asserts a wall-clock bound (`since_started < child_sleep`, 500 ms budget vs 1500 ms sleep) and then sleeps only 1400 ms before checking the finish marker (line 317), leaving a 400 ms margin. The parent's timeout and the watcher's 2 ms polling are both subject to scheduling delay, so a loaded gate machine can return after the child's own sleep or fail the marker check — the exact flake class the phase says it avoids ("timing assertions are flakes wearing a gate's clothes"). Fix: make the child sleep much longer (e.g. 10 s), assert only that the process was killed (no finish marker after the parent returned), and drop the tight elapsed comparison.
 
-2. [MAJOR] tests/bench/mod.rs:495-547 — The new worker protocol parser has many failure branches (`ERR` prefix, wrong field count, unreadable nanos, unreadable hex, unknown tag, non-UTF-8 text) with no tests. `parse_worker_output` is not `#[cfg(test)]`, but every integration test only exercises the happy `OK …` line emitted by a known workload. A regression in any branch silently becomes `BenchError::Load` or a mis-decoded answer. — Fix: unit-test `parse_worker_output` directly with each malformed/`ERR` line and a non-UTF-8 hex payload. — VERIFIED: read tests/bench_test.rs in full; no test calls `parse_worker_output` or supplies malformed worker output.
+3. [MINOR] tests/bench/mod.rs:1577 — `edge_child_measurement_accepts_an_explicit_environment` passes `&[]` for `env`, so it cannot fail if `measure_in_child` ignored its `env` argument entirely. The test name and the REPORT's claim ("accepts an explicit environment without mutating the process-global one") are not actually pinned by this test; the non-empty env path is only exercised incidentally by the hang test. Fix: pass a non-empty, observable environment entry through a hidden workload/marker and assert the child saw it (or drop the overclaiming test name/REPORT line).
 
-3. [MINOR] tests/bench/mod.rs:403-405 — On the `Ok(Err(error))` read-error branch `child.wait()` is called without `child.kill()`. If `read_to_string` fails while the child is still alive, `wait()` blocks indefinitely and the budget is bypassed. The fixed workloads emit ASCII, so this is hard to reach today, but it contradicts the "budget bounds the wait" promise. — Fix: `child.kill()` before `child.wait()` on every error branch.
+4. [MINOR] tests/bench_test.rs:352 — `edge_bench_md_path_is_the_working_directory` silently skips all of its assertions whenever `RB_BENCH_OUTPUT` is set (`if std::env::var_os("RB_BENCH_OUTPUT").is_none()`). A test that an ambient environment variable can make inert is the environment-coupling the phase claims to have fixed; the deterministic helper (`bench_md_path_from`) is already covered in `mod.rs`. Fix: delete this test and rely on the direct helper test, or drive the env with an injected accessor.
 
-4. [MINOR] tests/bench/mod.rs:23-31 — The `DEFAULT_BUDGET` doc comment still says the runner "enforces this itself with a worker thread and `recv_timeout`" and that "a timed-out worker is detached and may keep running", which is the pre-refactor behaviour. The code now kills a child at mod.rs:411-414 and REPORT.md:104 says so. — Fix: update the comment to match the child-process design.
-
-5. [MINOR] tests/bench/mod.rs:929-937 — `parse_baseline_markdown` silently skips any four-cell row whose first cell is unknown when the size cell is non-numeric, and `comparison_table` (mod.rs:1041-1046) only requires a non-empty baseline. A baseline missing a workload (or a row with a typo'd name and malformed size) therefore compares "as if it had fewer workloads", contradicting the doc at mod.rs:902-909. — Fix: after parsing, require exactly the four known workload names, or reject every four-cell row that does not name a known workload.
-
-6. [MAJOR] phases/phase-073/REPORT.md:87 — The gate count is internally inconsistent and appears not to come from a run. If the five `rb-bench` bin unit tests are in the preserved `HEAD` (as the sentence says), they were already counted in the reported 2699, so `2699 + 4 = 2703`, not 2708; if they were added by this run, they would account for ~86 lines of `tests/bench/mod.rs` that the report attributes only to the child-process move. Line 88 also reports verify counted "4 rust / 4 edge / 4 failure-asserting" while the four new tests include only one that asserts an error. — Fix: paste the actual `cargo test --all-targets` and `verify.sh` output, or correct the decomposition. — VERIFIED: cannot run tests read-only; this would be settled by `cargo test --all-targets -- --list | grep -c ': test$'` on `HEAD` and on the working tree.
-
-REVIEW VERDICT: FINDINGS 6
+REVIEW VERDICT: FINDINGS 4
