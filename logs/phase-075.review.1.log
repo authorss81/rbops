@@ -1,25 +1,26 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=197, limit=800][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1, limit=400][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=509, offset=401][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=82, offset=997][0m
-[0m✱ [0mGrep "Text\(|column|fn tokenize"[90m in src/lexer.rs · 100 matches[0m
-[0m✱ [0mGrep "pub const BUILTIN_NAMES|pub const MODULES|BUILTIN_NAMES:|MODULES:"[90m in src/stdlib.rs · 3 matches[0m
-[0m✱ [0mGrep "Text\(|struct Token|pub line|pub column"[90m 6 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [limit=70, offset=460][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=40, offset=150][0m
-[0m✱ [0mGrep "goto_definition|find_references|completions\(|analyze\("[90m 87 matches[0m
-[0m✱ [0mGrep "TokenKind::Has"[90m 1 match[0m
-[0m✱ [0mGrep ""has""[90m 6 matches[0m
-[0m✱ [0mGrep "fn parse_has"[90m 1 match[0m
-[0m→ [0mRead src/parser.rs[90m [limit=45, offset=1361][0m
+[0m✗ [0mInvalid Tool
+The arguments provided to the tool are invalid: Model tried to call unavailable tool 'bash'. Available tools: glob, grep, invalid, read.
+[0m
+[0m✱ [0mGrep "BUILTIN_NAMES|MODULES"[90m in src/stdlib.rs · 48 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=200, limit=1000][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=540, limit=420][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=960, limit=290][0m
+[0m✱ [0mGrep "Newline|fn tokenize|comment|'/'|line \+=|column"[90m in src/lexer.rs · 100 matches[0m
+[0m✱ [0mGrep "Newline"[90m in src/lexer.rs · 2 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [offset=430, limit=120][0m
+[0m✱ [0mGrep "if .*then|otherwise|else if|end"[90m in docs/GRAMMAR.md · 39 matches[0m
+[0m→ [0mRead docs/GRAMMAR.md[90m [offset=200, limit=120][0m
+[0m✱ [0mGrep "lru_cache"[90m in . · 100 matches[0m
 FINDINGS:
-1. [BLOCKER] src/lsp.rs:544 — `while`/`repeat`/`for`/`object`/`module` push `Frame::scoped` (opens_scope=true) but never push a matching scope, while `End`/`Until` pop a scope whenever `scopes.len() > 1`. Any loop or object nested in a function therefore pops the *function's* scope at its `end`, so every parameter/local declared before it becomes unresolvable afterwards: `goto_definition` returns `None` and `completions` omits them. For example, tracing `to show(x)` → function scope pushed (line 656); `while x` pushes a scoped frame (544) with no `scopes.push`; the loop's `End` (529-531) pops the function scope; the later `say x` then has no binding. Only `To` (656), `Literal` (671) and `Catch` (606) actually push scopes. The same missing push makes `for` loop variables (declared at 557) leak into the enclosing scope at top level. Fix: push a new `HashMap` for each scoped frame (before `declare` for `for`), or record whether a frame pushed a scope and pop only then — VERIFIED: traced lines 412-419 (`Frame::scoped` sets `opens_scope: true`), 544-547/579/593 (no `scopes.push`), and 529-531/537-539 (`scopes.pop()` guarded only by `scopes.len() > 1`); no test covers a loop/object inside a function.
+1. [BLOCKER] src/lsp.rs:734-741 — `decorated` ignores line/context: it treats *any* `to` whose immediately preceding token is the identifier `lru_cache` (or a `)` closing an `lru_cache(...)` call) as a decorated function declaration, even when `to` is a range operator. Valid source such as `set lru_cache to 3` followed by `for each i from lru_cache to limit` is accepted (`tests/stdlib_module_docs_test.rs:2172` asserts `lru_cache` is an ordinary variable), but here `is_declaration` becomes true at line 740-741, so `limit` is declared as a `Function` and a scoped `To` frame is pushed mid-loop. The loop's own `end` then pops the `To` frame instead of the `For` frame, leaking the loop variable and corrupting every later scope. `edge_range_with_a_call_lower_bound_does_not_push_a_function_frame` only covers `finish()` as the lower bound, not `lru_cache`. Fix: require the decorator and `to` to be on the same line and in declaration position (and restrict the identifier branch to a decorator, not any identifier named `lru_cache`). VERIFIED: traced token stream for `for each i from lru_cache to limit` — `last_significant` is the `lru_cache` identifier, line 736 returns true, line 741 makes `is_declaration` true because `limit` is an identifier, and line 613-618 then pops the wrong frame at the loop's `end`.
 
-2. [MAJOR] tests/tooling_grammar_test.rs:862 — the REPORT's edge matrix claims `malformed_input` is covered, but `malformed_positions_are_clean_errors_not_panics` only exercises bad positions; no test sends malformed *source* through the new `analyze` error path (src/lsp.rs:493). A regression that turns a `Lexer::tokenize` error into a panic, or into a silent success, would ship untested. Fix: add a case asserting `goto_definition`/`find_references`/`completions` return `Err` (not panic) for e.g. `say "unterminated`, and correct the matrix.
+2. [MAJOR] src/lsp.rs:724-791 / 613-619 — A parameterless function literal with an explicit `end` (valid per `docs/GRAMMAR.md:548-552`: `to give back 42 end`) pushes no frame: the `To` branch only pushes when a name follows or when the next token is `(`, and `give` lexes as the `GiveBack` keyword. The literal's own `end` is then consumed by the unconditional `frames.pop()` in the `End` arm, closing the *enclosing* function/loop/object scope early. E.g. inside `to outer() ... set f to to give back 42 end ... say x ... end`, `say x` is analyzed outside `outer`, so goto/reference answers are wrong. The REPORT's "known gap" only says the literal gets no scope of its own; it does not disclose that its `end` steals the enclosing frame. Fix: push a `Literal` frame for `to <keyword> ...` with `closes_at_newline`/`end` handling, or make `End` pop only a frame whose kind can close there. VERIFIED: traced `set f to to give back 42 end` — line 740-741 fails (no identifier after `to`), line 767-769 fails (`GiveBack` is not `LeftParen`), then line 613-614 pops the enclosing `To` frame.
 
-3. [MINOR] phases/phase-075/REPORT.md:9 — the summary claims "11 navigation tests (8 `edge_*`)", but the table below lists only 7 `edge_*` navigation tests (`edge_goto_definition_on_builtin…`, `edge_find_references_on_imported…`, `edge_empty_source…`, `edge_goto_definition_counts_unicode…`, `edge_completions_at_eof…`, `edge_completions_inside_string…`, `edge_navigation_handles…`). The report miscounts its own coverage; fix the number.
+3. [MINOR] tests/tooling_grammar_test.rs:916-918 — the "quickly" benchmark asserts only `elapsed < Duration::from_secs(30)`, while `phases/phase-075/REPORT.md` states the 5000-line navigation answers "under one second". The test therefore cannot catch an order-of-magnitude regression against the documented gate. Fix: assert the claimed bound (or lower it to a defensible value like 1–2 s) and keep the report in sync.
 
-REVIEW VERDICT: FINDINGS 3
+4. [MINOR] src/lsp.rs:782-789 / 602-612 — a single-line parenthesised literal at EOF with no trailing newline never closes: `closes_at_newline` is set, but the pop only happens on a `Newline` token, and EOF is not treated as a line end. `completions` at that EOF position still lists the literal's parameters as in scope after the expression has ended. Fix: when analysis reaches `Eof`, pop any `closes_at_newline` frames for the final line, or treat the `Eof` token like a newline for those frames.
+
+REVIEW VERDICT: FINDINGS 4
