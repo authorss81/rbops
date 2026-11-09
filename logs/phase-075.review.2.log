@@ -1,0 +1,29 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=190, limit=900][0m
+[0m✱ [0mGrep "BUILTIN_NAMES|MODULES"[90m in src/stdlib.rs · 48 matches[0m
+[0m✱ [0mGrep "fn (goto_definition|find_references|completions|edge_|navigation_)"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
+[0m✱ [0mGrep "fn |goto_definition|find_references|completions"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=700][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=700, limit=300][0m
+[0m✱ [0mGrep "\bhas\b|\bmodule\b|\bcatch\b|\buntil\b"[90m in docs · 100 matches[0m
+[0m✱ [0mGrep ""has"|"module"|"catch"|"until"|"to"|"constant"|Has|Module"[90m in src/lexer.rs · 100 matches[0m
+[0m→ [0mRead docs/GRAMMAR.md[90m [offset=100, limit=270][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=180][0m
+FINDINGS:
+1. [BLOCKER] src/lsp.rs:542 — `else if` pushes a second `If` frame but the single `end` pops only one (src/lsp.rs:527), desyncing the frame/scope stack. `else` is its own token (src/lexer.rs:28-31), so `if … else if … end` leaves a stale `If`; the enclosing function's `end` then pops that stale frame instead of its `To` frame, so the function scope/parameters leak out and goto/references/completions resolve names wrongly — the exact leak `edge_loop_and_object_scopes_do_not_pop_the_enclosing_function_scope` tries to guard against for loops/objects. — VERIFIED: traced the token/frame path: `TokenKind::If => frames.push(Frame::block(FrameKind::If))` at :542 for both `if` tokens, `TokenKind::End` pops exactly one frame at :527-533, and `Else` has no pop. — Fix: on `If`, check whether the previous significant token is `Else` (and do not push a new frame), or make `end` balance the `else if` chain; add an `else if` navigation test inside a function.
+
+2. [MAJOR] src/lsp.rs:747 — multiple assignment only declares the first name: `set a, b to 1, 2` declares `a` from `tokens[index+1]`, leaving `b` unresolved, so goto-definition on `b` returns `None` and completion never offers it. Grammar allows `set identifier { ',' identifier } to …` (docs/GRAMMAR.md:197). — Fix: after declaring index+1, walk comma-separated identifiers until `to`, declaring each; add a test.
+
+3. [MAJOR] src/lsp.rs:818 — `declare_params` declares every `Identifier` between the parentheses, including type expressions and `of`, so `to total(items of list)` binds `of` and `list` (and `to f(x: number)` binds `number`) as `Parameter`s (grammar: docs/GRAMMAR.md:300-301; `number`/`list`/`of` are ordinary identifiers in src/lexer.rs:23-71). This pollutes completion and lets a parameter shadow a real builtin/type name in the body. — Fix: parse the parameter grammar (name, then optionally `:`/`of` type) and skip type tokens; add a typed/`of` parameter navigation test.
+
+4. [MAJOR] src/lsp.rs:617 — the catch binder is the wrong identifier: `catch error e` and `catch error of Runtime e` declare `error` (or nothing useful) instead of binding `e`, because the code unconditionally declares `tokens[index+1]` and only special-cases the literal `"of"`. Grammar: `catch [identifier [identifier] [ 'of' failure_kind [identifier] ]]` and the binder is the name after `error`/kind (docs/GRAMMAR.md:327-358). — Fix: parse the handler shape and bind the trailing identifier; add goto/references tests for plain and typed catch binders.
+
+5. [MAJOR] src/lsp.rs:641-648 — the `decorated` check treats a `to` preceded by `)` as a function declaration, so a numeric range whose lower bound is parenthesised or a call (`for each i from f(n) to finish`) pushes a scoped `To` frame that is never closed at the loop's `end`; the loop's `end` pops the bogus frame/scope instead, and the loop variable leaks past the loop. — Fix: treat `to` as a declaration only when it is first on its line (or the explicit `lru_cache` decorator), not on `RightParen`; add a range-with-call-lower-bound test.
+
+6. [MAJOR] src/lsp.rs:759 — `has` is both the property-declaration keyword and the membership operator (`has_op` in docs/GRAMMAR.md:128, `property_decl` at :311), but the walker unconditionally declares the identifier after every `has` as a `Variable` in the current scope. In an expression such as `if functions has abs then`, this creates a phantom binding that shadows the builtin/module name for the rest of the scope, corrupting goto, references and completion (`is_builtin_name` is then never consulted). — Fix: only bind `has <name>` when `has` begins a declaration (e.g., first significant token on the line inside an object body); add a navigation test with the membership operator.
+
+7. [MINOR] tests/tooling_grammar_test.rs:857 — `edge_navigation_handles_five_thousand_lines_quickly` asserts `elapsed < Duration::from_secs(1)`, a wall-clock threshold that can flake on a loaded CI runner (the same concern the suite raises for env-coupled tests). — Fix: assert deterministic behaviour (e.g., output correctness / a work bound) or use a much looser timeout.
+
+REVIEW VERDICT: FINDINGS 7

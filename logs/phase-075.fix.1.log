@@ -1,0 +1,1902 @@
+[0m
+> build · deepseek-v4.1-flash-free
+[0m
+[0m$ [0mgit status && git log --oneline -5 && ls phases/phase-075/
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   src/lib.rs
+	modified:   src/lsp.rs
+	modified:   tests/tooling_grammar_test.rs
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	phases/phase-075/
+
+no changes added to commit (use "git add" and/or "git commit -a")
+e54a690 rbops: phase-074 (2026-11-08T22:07:55Z)
+3e71f3d resume phase-074: adopt preserved work
+71ce4f8 rbops: phase-073 (2026-11-08T13:05:41Z)
+cba845c resume phase-073: adopt preserved work
+18ef4b7 docs: resolve permission fatigue in phase 152 and document limitations 7-9
+REPORT.md
+[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=380, limit=300][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=680, limit=400][0m
+[0m→ [0mRead phases/phase-075/REPORT.md
+[0m
+[0m$ [0mgrep -n "navigation\|malformed\|edge_\|goto_definition\|find_references\|completions" tests/tooling_grammar_test.rs
+11:    completions, completions_json, diagnostics, diagnostics_json, find_references,
+12:    find_references_json, goto_definition, goto_definition_json, keyword_pattern, textmate_grammar,
+546:fn edge_empty_source_produces_no_diagnostics() {
+560:fn edge_diagnostic_columns_count_characters_not_bytes() {
+585:fn edge_escape_json_escapes_quotes_backslashes_controls_and_unicode() {
+633:fn edge_diagnostic_json_escapes_a_message_containing_quotes_and_newlines() {
+661:fn goto_definition_on_variable_use_returns_declaration_span() {
+664:    let found = goto_definition(source, 2, 5)
+677:fn edge_goto_definition_on_builtin_resolves_to_registry_not_file_span() {
+680:    let found = goto_definition(source, 1, 5)
+694:fn find_references_distinguishes_shadowed_bindings() {
+704:    let outer: Vec<(usize, usize)> = find_references(source, 1, 5)
+709:    let inner: Vec<(usize, usize)> = find_references(source, 3, 9)
+728:fn edge_find_references_on_imported_module_spans_the_import() {
+731:    let definition = goto_definition(source, 2, 5)
+741:    let references: Vec<(usize, usize)> = find_references(source, 2, 5)
+755:fn edge_empty_source_answers_without_failing() {
+759:        goto_definition(source, 1, 1).expect("the empty file has one position"),
+764:        find_references(source, 1, 1)
+770:    let offered = completions(source, 1, 1).expect("the empty file has one position");
+780:fn edge_goto_definition_counts_unicode_names_as_characters() {
+783:    let found = goto_definition(source, 2, 5)
+800:fn edge_completions_at_eof_without_trailing_newline_include_keywords_builtins_and_scope() {
+803:    let offered = completions(source, 1, 15).expect("the end-of-file position is valid");
+814:fn edge_completions_inside_string_literal_are_empty() {
+817:    let offered = completions(source, 1, 7).expect("the position is inside the file");
+826:fn edge_navigation_handles_five_thousand_lines_quickly() {
+840:    let definition = goto_definition(&source, last_line, last_column)
+843:    let references = find_references(&source, last_line, last_column).expect("valid position");
+844:    let offered = completions(&source, last_line, eof_column).expect("valid position");
+858:        "navigation over 5000 lines must answer in under a second, took {elapsed:?}"
+863:fn malformed_positions_are_clean_errors_not_panics() {
+868:            goto_definition(source, line, column).is_err(),
+869:            "goto_definition must reject {line}:{column} with an error"
+872:            find_references(source, line, column).is_err(),
+873:            "find_references must reject {line}:{column} with an error"
+876:            completions(source, line, column).is_err(),
+877:            "completions must reject {line}:{column} with an error"
+883:fn navigation_json_extends_the_line_column_shape() {
+887:        serde_json::from_str(&goto_definition_json(source, 2, 5).expect("valid position"))
+894:        serde_json::from_str(&find_references_json(source, 1, 5).expect("valid position"))
+900:        serde_json::from_str(&completions_json(source, 2, 6).expect("valid position"))
+[0m
+[0m$ [0mgit diff src/lib.rs src/lsp.rs | head -100
+diff --git a/src/lib.rs b/src/lib.rs
+index 1ad478e..ed36780 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -38,8 +38,9 @@ use testing::reporter::Reporter;
+ pub use error::{Error, Span};
+ pub use failure::{value_of as failure_value, FailureKind};
+ pub use lsp::{
+-    diagnostics, diagnostics_json, diagnostics_to_json, textmate_grammar, Diagnostic, Severity,
+-    GRAMMAR_PATH, LANGUAGE_CONFIG_PATH,
++    completions, completions_json, diagnostics, diagnostics_json, diagnostics_to_json,
++    find_references, find_references_json, goto_definition, goto_definition_json, textmate_grammar,
++    Definition, DefinitionKind, Diagnostic, Location, Severity, GRAMMAR_PATH, LANGUAGE_CONFIG_PATH,
+ };
+ // `FunctionValue` is re-exported because it is the payload of the public
+ // `Value::Function` variant: a caller that matches that variant has to be able
+diff --git a/src/lsp.rs b/src/lsp.rs
+index fa9d347..46b4dbb 100644
+--- a/src/lsp.rs
++++ b/src/lsp.rs
+@@ -16,8 +16,11 @@
+ //! [`crate::Span`]: an editor drawing a caret under the reported column lines up
+ //! even when the line holds multi-byte characters.
+ 
++use std::collections::{HashMap, HashSet};
++
+ use crate::error::Error;
+-use crate::lexer::KEYWORDS;
++use crate::lexer::{Lexer, Token, TokenKind, KEYWORDS};
++use crate::stdlib::{BUILTIN_NAMES, MODULES};
+ 
+ /// Where the generated grammar is checked in. Nothing has to be built to make
+ /// the grammar valid: the file is plain JSON, and this constant names it.
+@@ -194,6 +197,787 @@ pub fn diagnostics_to_json(found: &[Diagnostic]) -> String {
+     format!("[{}]", entries.join(","))
+ }
+ 
++/// A span a navigation answer points at. Lines and columns are 1-based
++/// characters, the same positions [`Diagnostic`] reports, so an editor can draw
++/// the same caret under either.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Location {
++    pub line: usize,
++    pub column: usize,
++    pub end_line: usize,
++    pub end_column: usize,
++}
++
++impl Location {
++    fn of_name(token: &Token, name: &str) -> Self {
++        let width = name.chars().count().max(1);
++        Self {
++            line: token.line,
++            column: token.column,
++            end_line: token.line,
++            end_column: token.column + width - 1,
++        }
++    }
++
++    fn to_json(self) -> String {
++        format!(
++            "{{\"line\":{},\"column\":{},\"end_line\":{},\"end_column\":{}}}",
++            self.line, self.column, self.end_line, self.end_column,
++        )
++    }
++}
++
++/// What a goto-definition answer resolved to.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum DefinitionKind {
++    Variable,
++    Constant,
++    Parameter,
++    Function,
++    Import,
++    LoopVariable,
++    Object,
++    Module,
++    Catch,
++    Builtin,
++}
++
++impl DefinitionKind {
++    /// The kind's name, as the JSON answer spells it.
++    pub fn as_str(&self) -> &'static str {
++        match self {
++            DefinitionKind::Variable => "variable",
++            DefinitionKind::Constant => "constant",
++            DefinitionKind::Parameter => "parameter",
++            DefinitionKind::Function => "function",
++            DefinitionKind::Import => "import",
++            DefinitionKind::LoopVariable => "loop",
++            DefinitionKind::Object => "object",
++            DefinitionKind::Module => "module",
++            DefinitionKind::Catch => "catch",
++            DefinitionKind::Builtin => "builtin",
++        }
++    }
++}
++
+[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=650, limit=270][0m
+[0m
+[0m← [0mEdit src/lsp.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lsp.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+@@ -540,12 +540,19 @@
+     }
+ }
+ TokenKind::If => frames.push(Frame::block(FrameKind::If)),
+ TokenKind::Unless => frames.push(Frame::block(FrameKind::Unless)),
+-TokenKind::While => frames.push(Frame::scoped(FrameKind::While)),
+-TokenKind::Repeat => frames.push(Frame::scoped(FrameKind::Repeat)),
++TokenKind::While => {
++    frames.push(Frame::scoped(FrameKind::While));
++    scopes.push(HashMap::new());
++}
++TokenKind::Repeat => {
++    frames.push(Frame::scoped(FrameKind::Repeat));
++    scopes.push(HashMap::new());
++}
+ TokenKind::For => {
+     frames.push(Frame::scoped(FrameKind::For));
++    scopes.push(HashMap::new());
+     let mut cursor = index + 1;
+     if matches!(
+         tokens.get(cursor).map(|token| &token.kind),
+         Some(TokenKind::Each)
+
+[0m
+[0m✗ [0mEdit src/lsp.rs failed
+[91m[1mError: [0mNo changes to apply: oldString and newString are identical.
+[0m→ [0mRead src/lsp.rs[90m [limit=30, offset=542][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=36, offset=573][0m
+[0m
+[0m← [0mEdit src/lsp.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lsp.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+@@ -583,8 +583,9 @@
+         );
+         mark_declaration(&mut token_binding, &mut declarations, index + 1, binding);
+     }
+     frames.push(Frame::scoped(FrameKind::Object));
++    scopes.push(HashMap::new());
+ }
+ TokenKind::Module => {
+     if let Some(name) = tokens.get(index + 1).and_then(name_of) {
+         let location = Location::of_name(&tokens[index + 1], name);
+
+[0m
+[0m← [0mEdit src/lsp.rs
+Index: /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/src/lsp.rs
++++ /home/runner/work/rbops/rbops/redblue/src/lsp.rs
+@@ -598,8 +598,9 @@
+         );
+         mark_declaration(&mut token_binding, &mut declarations, index + 1, binding);
+     }
+     frames.push(Frame::scoped(FrameKind::Module));
++    scopes.push(HashMap::new());
+ }
+ TokenKind::Test => frames.push(Frame::block(FrameKind::Test)),
+ TokenKind::Try => frames.push(Frame::block(FrameKind::Try)),
+ TokenKind::Catch => {
+
+[0m
+[0m→ [0mRead src/lsp.rs[90m [limit=32, offset=573][0m
+[0m
+[0m$ [0mgrep -n "Frame::scoped\|scopes.push\|scopes.pop" src/lsp.rs
+523:                        scopes.pop();
+530:                        scopes.pop();
+538:                        scopes.pop();
+545:                frames.push(Frame::scoped(FrameKind::While));
+546:                scopes.push(HashMap::new());
+549:                frames.push(Frame::scoped(FrameKind::Repeat));
+550:                scopes.push(HashMap::new());
+553:                frames.push(Frame::scoped(FrameKind::For));
+554:                scopes.push(HashMap::new());
+586:                frames.push(Frame::scoped(FrameKind::Object));
+587:                scopes.push(HashMap::new());
+601:                frames.push(Frame::scoped(FrameKind::Module));
+602:                scopes.push(HashMap::new());
+615:                    scopes.push(HashMap::new());
+664:                    frames.push(Frame::scoped(FrameKind::To));
+665:                    scopes.push(HashMap::new());
+678:                    let mut frame = Frame::scoped(FrameKind::Literal);
+680:                    scopes.push(HashMap::new());
+[0m
+[0m$ [0mgrep -n "unterminated\|Unterminated\|string" src/lexer.rs | head -40
+311:                return Err(self.unterminated(span));
+333:                    None => return Err(self.unterminated(span)),
+359:                    "Unicode escape needs four hex digits, such as \"\\u00e9\"".to_string(),
+379:    /// The failure for a string that ran to the end of input without closing.
+382:    /// a string broken across lines is several lines and not one: the reader has
+383:    /// to see the whole runaway string, not only the quote that opened it.
+384:    fn unterminated(&self, span: Span) -> Error {
+386:        Error::Lexer("Unterminated string".to_string(), span)
+652:        assert_eq!(tokens[1].kind, TokenKind::Text("Hello, World!".to_string()));
+[0m
+[0m← [0mEdit tests/tooling_grammar_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
+@@ -879,8 +879,26 @@
+     }
+ }
+ 
+ #[test]
++fn edge_malformed_source_returns_errors_not_panics() {
++    let source = "say \"unterminated";
++
++    assert!(
++        goto_definition(source, 1, 1).is_err(),
++        "goto_definition must surface a lexer error as Err, not panic or succeed"
++    );
++    assert!(
++        find_references(source, 1, 1).is_err(),
++        "find_references must surface a lexer error as Err, not panic or succeed"
++    );
++    assert!(
++        completions(source, 1, 1).is_err(),
++        "completions must surface a lexer error as Err, not panic or succeed"
++    );
++}
++
++#[test]
+ fn navigation_json_extends_the_line_column_shape() {
+     let source = "set x to 1\nsay x\n";
+ 
+     let definition: serde_json::Value =
+
+[0m
+[0m$ [0mgrep -rn "while .*end\|repeat\|for each\|for .* in\|object " tests/*.rs src/parser.rs | head -40
+tests/agent_permissions_test.rs:109:/// - `doom_loop` is opencode's repeated-call guard. It defaults to `ask`, and
+tests/agent_permissions_test.rs:111:///   denied outright: the guard blocks the repeated call instead of waiting
+tests/agent_permissions_test.rs:156:/// action or an object with exactly these fifteen properties — re-measured
+tests/agent_permissions_test.rs:158:/// `PermissionConfig` is an `anyOf` of a bare action and an object with these
+tests/agent_permissions_test.rs:210:/// either a bare action or an object of pattern → action. These five are typed
+tests/agent_permissions_test.rs:211:/// as the action alone, so an object of patterns is not a value opencode can
+tests/agent_permissions_test.rs:375:/// (`"deny"`), and an object of pattern → action (`{"**": "deny"}`). The bare
+tests/agent_permissions_test.rs:377:/// an object is the same rule as the bare one only when every pattern in it
+tests/agent_permissions_test.rs:385:/// {"**": "allow"}` sits above the agent's own rules. Reading that object as
+tests/agent_permissions_test.rs:387:/// passes a suite that says it may not, so a narrow object is refused here
+tests/agent_permissions_test.rs:390:/// A mixed object is not one action either — it denies some patterns and
+tests/agent_permissions_test.rs:399:                    "takes a bare action: opencode's schema types `{key}` as one, and an object \
+tests/agent_permissions_test.rs:404:            for (pattern, value) in patterns {
+tests/agent_permissions_test.rs:416:                            "the patterns disagree: {previous:?} and {value:?} — a mixed object is \
+tests/agent_permissions_test.rs:423:                .ok_or_else(|| "an empty object grants nothing and is not an action".to_string())?;
+tests/agent_permissions_test.rs:430:                    "the patterns {names:?} do not cover every path: an object of patterns is the \
+tests/agent_permissions_test.rs:442:/// Assert one agent holds `action` for every tool in [`TOOLS`].
+tests/agent_permissions_test.rs:452:        .ok_or_else(|| format!("`agent.{name}.permission` must be an object keyed by tool name"))?;
+tests/agent_permissions_test.rs:453:    for tool in TOOLS {
+tests/agent_permissions_test.rs:526:    for (tool, value) in permissions {
+tests/agent_permissions_test.rs:571:/// "Deny" here means the bare action, or the object form of it that covers
+tests/agent_permissions_test.rs:586:    for tool in REVIEWER_DENIED {
+tests/agent_permissions_test.rs:630:    for (tool, value) in permissions {
+tests/agent_permissions_test.rs:660:    for name in agents.keys() {
+tests/agent_permissions_test.rs:687:    for (name, agent) in agents {
+tests/agent_permissions_test.rs:691:        for key in agent.keys() {
+tests/agent_permissions_test.rs:737:    for key in root.keys() {
+tests/agent_permissions_test.rs:755:            "`agent` must be an object keyed by agent name, found {}",
+tests/agent_permissions_test.rs:828:    for relative in [
+tests/agent_permissions_test.rs:856:        .expect("`agent` must be an object keyed by agent name")
+tests/agent_permissions_test.rs:865:    for tool in REVIEWER_DENIED {
+tests/agent_permissions_test.rs:885:        .expect("`agent` must be an object keyed by agent name")
+tests/agent_permissions_test.rs:887:    for (name, action) in [("reviewer", "deny"), ("verifier", "allow")] {
+tests/agent_permissions_test.rs:893:        for tool in TOOLS {
+tests/agent_permissions_test.rs:915:        .expect("`agent` must be an object keyed by agent name")
+tests/agent_permissions_test.rs:917:    for name in ["reviewer", "verifier"] {
+tests/agent_permissions_test.rs:958:        .expect("`agent` must be an object keyed by agent name")
+tests/agent_permissions_test.rs:997:/// the check is repeatable by anyone: naming the schema in the file is what
+tests/agent_permissions_test.rs:1030:    for name in ["build", "auditor"] {
+tests/agent_permissions_test.rs:1079:    for (label, text) in [
+[0m
+[0m$ [0mgrep -rn "while\|repeat\|for each\|for .* to \|object \|module " SPEC.md docs/GRAMMAR.md | head -50
+SPEC.md:29:Redblue is a general-purpose programming language designed for readability. Its syntax is based on natural English sentences, making code self-documenting and accessible to beginners while remaining powerful enough for professional software development.
+SPEC.md:73:| Loops | for, each, in, from, times, while, repeat, until |
+SPEC.md:459:for each item in items
+SPEC.md:467:for each i from 1 to 10
+SPEC.md:472:for each i from 0 to 100 by 5
+SPEC.md:477:for each i from 5 to 1 by -1
+SPEC.md:485:The step decides the direction. A positive step counts up while the counter is
+SPEC.md:486:at or below `to`; a negative one counts down while it is at or above it. An
+SPEC.md:497:repeat 10 times
+SPEC.md:505:while x > 0
+SPEC.md:513:repeat
+SPEC.md:521:for each item in items
+SPEC.md:528:for each i from 1 to 100
+SPEC.md:544:while it runs, because the turn it stopped has not ended until it has. Each block
+SPEC.md:546:finished one at a time, so a `finally` written inside one of them runs while that
+SPEC.md:552:leaves that loop. A module body is in it for the same reason an `object` body is:
+SPEC.md:553:the declaration runs where it is written, so a `break` in the module body around a
+SPEC.md:554:loop is a `break` in that loop — and the module is then left declaring nothing,
+SPEC.md:559:for each name in names
+SPEC.md:688:object Person
+SPEC.md:722:object Person
+SPEC.md:739:object Employee extends Person
+SPEC.md:751:A declaration is both the type and its prototype: `object Person ... end` binds
+SPEC.md:770:| The chain is acyclic by construction | `object A extends A` is a one-object cycle and is reported as one; a two-object cycle cannot be written, because `A` is already declared when `B` is and re-declaring a name is refused. |
+SPEC.md:774:A method writes to the object it was called on through `this`
+SPEC.md:784:object is not guessed at: a missing method and a non-object receiver are each
+SPEC.md:790:object Circle
+SPEC.md:807:module MathUtils
+SPEC.md:837:replace. It exists so a module can give its functions one shared value —
+SPEC.md:868:importing the same module again is a no-op rather than a second binding of the
+SPEC.md:939:| `Io` | the host's filesystem and environment: a file that is not there, a path that cannot be read, a module that cannot be loaded |
+SPEC.md:1055:there is nothing for a `catch` written around this `try` to handle, and the
+SPEC.md:1060:for each name in ["ada", "bob", "cleo"]
+SPEC.md:1139:RuntimeError: Maximum call depth of 1000 reached while calling 'endless'
+SPEC.md:1198:console.log("Hello")             // `say` under its module spelling
+SPEC.md:1204:`say` and `print` are keywords rather than module functions, so there is no
+SPEC.md:1205:`console.say` and no `console.print`: a module has the functions that are spelled
+SPEC.md:1207:module spelling of `say` and answers `nothing`, so `say console.log("x")` prints
+SPEC.md:1220:module function, so there is no `console.input` — the same rule as for `say` and
+SPEC.md:1317:error. Both dotted spellings are module members, so both are written
+SPEC.md:1358:These six are spelled as module members only — `text.wrap`, `text.diff` and the rest — so a
+SPEC.md:1424:`PI` and `E` are globals, not module members: a module has functions, so
+SPEC.md:1464:The module spells its members `decimal.from_text(text)`,
+SPEC.md:1468:multiplication and remainder are exact while the result fits; a result that
+SPEC.md:1583:above. A builtin that cannot answer is not a module member — the alternative is a
+SPEC.md:1588:under its module spelling, as § text writes it for a text.
+SPEC.md:1771:key it has not seen — zero for a counter this module made — rather than
+SPEC.md:1782:and a program that wants a different value for each key writes it with
+SPEC.md:1785:Both records refuse a hand-written `counts` or `entries` list that repeats a
+SPEC.md:1786:key. Otherwise `collections.count` would answer one copy while
+[0m
+[0m$ [0msed -n '450,535p;680,830p' SPEC.md
+```redblue
+unless is_valid
+    say "Invalid!"
+end
+```
+
+### For Loop (Iteration)
+
+```redblue
+for each item in items
+    say item
+end
+```
+
+### For Loop (Range)
+
+```redblue
+for each i from 1 to 10
+    say i
+end
+
+// With step
+for each i from 0 to 100 by 5
+    say i
+end
+
+// A negative step counts down
+for each i from 5 to 1 by -1
+    say i
+end
+```
+
+Both ends are inclusive: `from 3 to 3` visits 3 once, and a range whose step can
+never reach its end — `from 5 to 1` — visits nothing at all.
+
+The step decides the direction. A positive step counts up while the counter is
+at or below `to`; a negative one counts down while it is at or above it. An
+omitted step is `1`. A zero step never moves the counter, so the loop is endless
+and is stopped by the same iteration limit every other loop obeys.
+
+`from`, `to` and `by` must all be numbers. A bound that is not one is a
+`RuntimeError` naming the argument and the type it was given, not a loop that
+quietly runs zero times.
+
+### Repeat Loop
+
+```redblue
+repeat 10 times
+    say "Hello"
+end
+```
+
+### While Loop
+
+```redblue
+while x > 0
+    set x to x - 1
+end
+```
+
+### Repeat Until
+
+```redblue
+repeat
+    set x to x + 1
+until x > 10
+```
+
+### Break and Skip
+
+```redblue
+for each item in items
+    if item is nothing
+        skip
+    end
+    process item
+end
+
+for each i from 1 to 100
+    if i is 50
+        break
+    end
+    say i
+end
+```
+
+
+---
+
+## Objects
+
+### Declaration
+
+```redblue
+object Person
+    has name
+    has age
+    has email default nothing
+    
+    to introduce()
+        say "I'm {this.name}"
+    end
+    
+    to can email(message)
+        // email implementation
+    end
+end
+```
+
+### Instantiation
+
+Not implemented. There is no `new`: the word is an ordinary identifier, and
+`new Person` reads as two identifiers in a row and is a parser error. A
+declaration is its own prototype, so a program writes to the declaration where
+it would otherwise construct one — see "Lookup order and shadowing".
+
+```redblue
+set Person.name to "Alice"
+set Person.age to 30
+```
+
+### Constructor
+
+A `to create` method is a constructor written on the declaration itself, and is
+called as one. `this` is the prototype, so `give back this` hands back the
+declaration rather than a fresh copy — see "Lookup order and shadowing".
+
+```redblue
+object Person
+    has name
+    has age
+    
+    to create(person_name, person_age)
+        set this.name to person_name
+        set this.age to person_age
+        give back this
+    end
+end
+
+set person to Person.create("Alice", 30)
+```
+
+### Inheritance
+
+```redblue
+object Employee extends Person
+    has salary
+    has department
+    
+    to get_bonus()
+        give back this.salary * 0.1
+    end
+end
+```
+
+### Lookup order and shadowing
+
+A declaration is both the type and its prototype: `object Person ... end` binds
+the name `Person` to a record of the fields the declaration resolves to, so
+`type_of(Person)` is `"record"` and `Person` is the value a method sees as
+`this`.
+
+Lookup order, for both fields and methods, is **nearest declaration first**: the
+child's own `has` fields and `to can` methods, then the parent's, then the
+grandparent's, and so on. The first declaration of a name in that order wins
+and the further ones are not copied in, so a child field or method **shadows**
+its parent's rather than merging with it. `Employee.role()` is the child's
+`role`, and `Person.role()` is still the parent's. A field and a method of one
+name are separate: `Employee.name` is the field, `Employee.name()` is the
+method.
+
+Four rules follow from that order:
+
+| Rule | Why |
+|---|---|
+| The parent must be declared before the child | The chain is walked once, at declaration. An undeclared parent is an error, not an empty base. |
+| The chain is acyclic by construction | `object A extends A` is a one-object cycle and is reported as one; a two-object cycle cannot be written, because `A` is already declared when `B` is and re-declaring a name is refused. |
+| `has` twice keeps the later default | One field, one default, in the position of the first mention. |
+| A write is a write to that prototype | `set Person.name to "Ada"` changes the record `Person` names. A child declared afterwards still starts from the *declared* defaults, not from those writes. |
+
+A method writes to the object it was called on through `this`
+(`set this.name to name`) and hands the result back with `give back this`, which
+is the constructor SPEC.md § Constructor is written as. The write does not
+escape to the declaration by itself: a record is a value, so a method that
+mutates `this` and returns nothing leaves the prototype as it was.
+
+A call is a method call when the receiver names a declared object, and a module
+function (`receiver_function`, as `files.read` is) when it does not. `this` is
+bound by a method call and by nothing else, so reaching for it in free code is
+an error rather than an empty record. A method on a receiver that names no
+object is not guessed at: a missing method and a non-object receiver are each
+their own error.
+
+### Properties
+
+```redblue
+object Circle
+    has radius
+    has color default "white"
+    
+    to area()
+        give back PI * this.radius * this.radius
+    end
+end
+```
+
+---
+
+## Modules
+
+### Declaration
+
+```redblue
+module MathUtils
+    constant PI to 3.14159
+    
+    to circle_area(radius)
+        give back PI * radius * radius
+    end
+    
+    export all
+end
+```
+
+### Import
+
+```redblue
+import MathUtils
+
+set area to MathUtils.circle_area(5)
+```
+
+### Import with Alias
+
+```redblue
+import MathUtils as M
+[0m
+[0m← [0mEdit tests/tooling_grammar_test.rs
+Index: /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
++++ /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs
+@@ -859,8 +859,64 @@
+     );
+ }
+ 
+ #[test]
++fn edge_loop_and_object_scopes_do_not_pop_the_enclosing_function_scope() {
++    let source = concat!(
++        "to show(x)\n",
++        "    while x > 0\n",
++        "        say x\n",
++        "    end\n",
++        "    object Person\n",
++        "        has name\n",
++        "    end\n",
++        "    say x\n",
++        "end\n",
++        "say x\n",
++    );
++
++    let after_blocks = goto_definition(source, 8, 9)
++        .expect("a position inside the file is valid")
++        .expect("the parameter is still in scope after the loop and object close");
++    assert_eq!(
++        (after_blocks.line, after_blocks.column, after_blocks.kind.as_str()),
++        (1, 9, "parameter"),
++        "a loop or object `end` must close its own scope, not the function's"
++    );
++
++    assert_eq!(
++        goto_definition(source, 10, 5).expect("a position inside the file is valid"),
++        None,
++        "the parameter must not leak past the function's own `end`"
++    );
++}
++
++#[test]
++fn edge_for_loop_variable_does_not_leak_into_the_enclosing_scope() {
++    let source = concat!(
++        "for each item in items\n",
++        "    say item\n",
++        "end\n",
++        "say item\n",
++    );
++
++    let inside = goto_definition(source, 2, 9)
++        .expect("a position inside the file is valid")
++        .expect("the loop variable is in scope inside the loop body");
++    assert_eq!(
++        (inside.line, inside.column, inside.kind.as_str()),
++        (1, 10, "loop"),
++        "the body's `item` must resolve to the loop variable"
++    );
++
++    assert_eq!(
++        goto_definition(source, 4, 5).expect("a position inside the file is valid"),
++        None,
++        "the loop variable must not leak past the loop's `end`"
++    );
++}
++
++#[test]
+ fn malformed_positions_are_clean_errors_not_panics() {
+     let source = "set x to 1\n";
+ 
+     for (line, column) in [(0, 1), (1, 0), (1, 99), (99, 1)] {
+
+[0m
+[0m← [0mEdit phases/phase-075/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+@@ -5,9 +5,9 @@
+ | File | Lines | What |
+ |---|---|---|
+ | src/lsp.rs | +785 −1 | `Location`, `Definition`, `DefinitionKind`; token-level lexical scope walk; `goto_definition`, `find_references`, `completions` and their JSON forms; greedy string-literal context check |
+ | src/lib.rs | +3 −2 | re-export the new navigation surface |
+-| tests/tooling_grammar_test.rs | +261 −2 | 11 navigation tests (8 `edge_*`) including shadowing, builtins, imports, Unicode, malformed positions and the 5000-line benchmark |
++| tests/tooling_grammar_test.rs | +324 −2 | 13 navigation tests (9 `edge_*`) including shadowing, builtins, imports, Unicode, malformed source and positions, nested loop/object scopes and the 5000-line benchmark |
+ 
+ No server loop or transport was added: the phase asks for pure functions over source text, and the existing `diagnostics_json` shape is extended per capability.
+ 
+ ## Tests added
+
+[0m
+[0m← [0mEdit phases/phase-075/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+@@ -22,9 +22,12 @@
+ | edge_goto_definition_counts_unicode_names_as_characters | Unicode (character columns) |
+ | edge_completions_at_eof_without_trailing_newline_include_keywords_builtins_and_scope | boundary: EOF with no trailing newline |
+ | edge_completions_inside_string_literal_are_empty | context awareness: inside text |
+ | edge_navigation_handles_five_thousand_lines_quickly | resource: 5000 lines, all three under one second |
++| edge_loop_and_object_scopes_do_not_pop_the_enclosing_function_scope | nesting: a loop/object `end` closes only its own scope |
++| edge_for_loop_variable_does_not_leak_into_the_enclosing_scope | nesting: a loop variable is scoped to the loop body |
+ | malformed_positions_are_clean_errors_not_panics | out of bounds / malformed position; asserts `is_err()` |
++| edge_malformed_source_returns_errors_not_panics | malformed source: all three surface a lexer error as `Err` |
+ | navigation_json_extends_the_line_column_shape | JSON `{line, column, ...}` contract for all three |
+ 
+ ### Mandatory edge-case matrix
+ 
+
+[0m
+[0m← [0mEdit phases/phase-075/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+@@ -39,9 +39,9 @@
+ | out_of_bounds | covered by `malformed_positions_are_clean_errors_not_panics` (line 0, line past EOF, column 0, column past line) |
+ | type_mismatch | N/A: navigation consumes source text and positions only, never values |
+ | numeric_boundary | N/A: no arithmetic or numeric values are evaluated |
+ | unicode | covered by `edge_goto_definition_counts_unicode_names_as_characters` (span is four characters, not five bytes) |
+-| nesting_recursion | covered by the shadowing test (function scope nested in top-level scope) |
++| nesting_recursion | covered by the shadowing test (function scope nested in top-level scope) and by the loop/object-in-function tests (each block closes only its own scope) |
+ | duplicate_missing_keys | N/A: no records/maps are navigated; repeated `set` in one scope reuses that binding |
+ | malformed_input | covered for positions; malformed source returns a clean `Err` because `Lexer::tokenize` refuses it rather than panicking |
+ | resource_limit | covered by the 5000-line benchmark assertion |
+ 
+
+[0m
+[0m← [0mEdit phases/phase-075/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+@@ -41,9 +41,9 @@
+ | numeric_boundary | N/A: no arithmetic or numeric values are evaluated |
+ | unicode | covered by `edge_goto_definition_counts_unicode_names_as_characters` (span is four characters, not five bytes) |
+ | nesting_recursion | covered by the shadowing test (function scope nested in top-level scope) and by the loop/object-in-function tests (each block closes only its own scope) |
+ | duplicate_missing_keys | N/A: no records/maps are navigated; repeated `set` in one scope reuses that binding |
+-| malformed_input | covered for positions; malformed source returns a clean `Err` because `Lexer::tokenize` refuses it rather than panicking |
++| malformed_input | covered by `edge_malformed_source_returns_errors_not_panics` (unterminated string surfaces `Err` from all three) and by `malformed_positions_are_clean_errors_not_panics` |
+ | resource_limit | covered by the 5000-line benchmark assertion |
+ 
+ ## Gates
+ 
+
+[0m
+[0m$ [0mls .. && ls ../rbops 2>/dev/null | head && find .. -maxdepth 3 -name verify.sh 2>/dev/null
+AGENTS.md
+DEFERRED-PHASES.md
+LICENSE
+README.md
+logs
+opencode.json
+phases
+rbops
+redblue
+agents
+baseline.json
+dispatch.sh
+gen-prompts.sh
+phases.json
+progress_watchdog.sh
+setup-deploy-key.ps1
+smoke.sh
+verify.sh
+../rbops/verify.sh
+[0m
+[0m$ [0mcargo fmt --all -- --check
+Diff in /home/runner/work/rbops/rbops/redblue/tests/tooling_grammar_test.rs:878:
+         .expect("a position inside the file is valid")
+         .expect("the parameter is still in scope after the loop and object close");
+     assert_eq!(
+-        (after_blocks.line, after_blocks.column, after_blocks.kind.as_str()),
++        (
++            after_blocks.line,
++            after_blocks.column,
++            after_blocks.kind.as_str()
++        ),
+         (1, 9, "parameter"),
+         "a loop or object `end` must close its own scope, not the function's"
+     );
+[0m
+[0m$ [0mcargo fmt --all && cargo fmt --all -- --check
+(no output)
+[0m
+[0m$ [0mcargo clippy --all-targets -- -D warnings
+[1m[92m   Compiling[0m redblue v0.2.0 (/home/runner/work/rbops/rbops/redblue)
+[1m[92m    Finished[0m `dev` profile [unoptimized] target(s) in 7.57s
+[0m
+[0m$ [0mcargo test --all-targets 2>&1 | tail -40
+(no output)
+
+<shell_metadata>
+shell tool terminated command after exceeding timeout 900000 ms. If this command is expected to take longer and is not waiting for interactive input, retry with a larger timeout value in milliseconds.
+</shell_metadata>
+[0m
+[0m$ [0mcargo test --test tooling_grammar_test 2>&1 | tail -50
+[1m[92m    Finished[0m `test` profile [unoptimized] target(s) in 0.08s
+[1m[92m     Running[0m tests/tooling_grammar_test.rs (target/debug/deps/tooling_grammar_test-ff70a3215eac8bbc)
+
+running 32 tests
+test diagnostics_json_is_a_well_formed_array_of_located_entries ... ok
+test diagnostics_surface_a_spanned_lexer_error ... ok
+test diagnostics_report_linter_findings_as_warnings ... ok
+test diagnostics_lint_the_ast_they_already_parsed ... ok
+test diagnostics_surface_a_spanned_parser_error ... ok
+test diagnostics_surface_a_spanned_analyzer_error ... ok
+test edge_completions_inside_string_literal_are_empty ... ok
+test edge_diagnostic_columns_count_characters_not_bytes ... ok
+test edge_diagnostic_json_escapes_a_message_containing_quotes_and_newlines ... ok
+test edge_empty_source_produces_no_diagnostics ... ok
+test edge_completions_at_eof_without_trailing_newline_include_keywords_builtins_and_scope ... ok
+test edge_escape_json_escapes_quotes_backslashes_controls_and_unicode ... ok
+test edge_empty_source_answers_without_failing ... ok
+test edge_find_references_on_imported_module_spans_the_import ... ok
+test edge_goto_definition_on_builtin_resolves_to_registry_not_file_span ... ok
+test edge_for_loop_variable_does_not_leak_into_the_enclosing_scope ... ok
+test edge_goto_definition_counts_unicode_names_as_characters ... ok
+test edge_malformed_source_returns_errors_not_panics ... ok
+test edge_loop_and_object_scopes_do_not_pop_the_enclosing_function_scope ... ok
+test every_listed_keyword_lexes_as_a_keyword_not_an_identifier ... ok
+test find_references_distinguishes_shadowed_bindings ... ok
+test goto_definition_on_variable_use_returns_declaration_span ... ok
+test grammar_highlights_the_comment_marker_the_lexer_accepts ... ok
+test malformed_positions_are_clean_errors_not_panics ... ok
+test grammar_orders_strings_before_comments_and_comments_before_operators ... ok
+test shipped_grammar_file_is_valid_json_with_a_redblue_scope ... ok
+test shipped_grammar_file_matches_the_generator ... ok
+test shipped_language_configuration_uses_the_lexers_comment_marker ... ok
+test navigation_json_extends_the_line_column_shape ... ok
+test grammar_covers_the_lexer_keyword_set ... ok
+test unused_variable_warnings_come_out_in_a_stable_name_order ... ok
+test edge_navigation_handles_five_thousand_lines_quickly ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+[0m
+[0m$ [0mcat ../rbops/verify.sh
+#!/usr/bin/env bash
+# =============================================================================
+# rbops/verify.sh — the ONLY authority on whether phase work is real.
+#
+# Exit 0  = phase may be marked .done
+# Exit 1  = gate failed, phase must be retried
+#
+# Design rule: this script must be UNTRUSTWORTHY-PROOF against the agent.
+# The implementer agent cannot edit this file (see AGENTS.md hard rule 1) and
+# the token it runs under has no `workflows` scope, so a push that modifies
+# .github/ is rejected by GitHub itself. Two independent locks.
+# =============================================================================
+set -uo pipefail
+
+PHASE="${1:?usage: verify.sh <phase-id>}"
+
+# Resolve every path BEFORE changing directory, and normalise away any `..`.
+# The gate runs against the project checkout (redblue/) while the manifest,
+# baseline and report live in the pipeline repo. A relative path resolved after
+# `cd` silently points at a file that does not exist there, and the gate then
+# fails on its very first check having verified nothing.
+abspath() {
+  local p="$1"
+  if [ -e "$p" ]; then (cd "$(dirname "$p")" && printf '%s/%s\n' "$(pwd)" "$(basename "$p")")
+  else printf '%s\n' "$p"; fi
+}
+
+# `cd && pwd` normalises away any `..`. RBOPS_ROOT is overridable so the gate can
+# be exercised against a fixture pipeline root, not only this checkout.
+RBOPS_ROOT="${RBOPS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PHASES="$(abspath "${RBOPS_PHASES:-$RBOPS_ROOT/rbops/phases.json}")"
+BASELINE="$(abspath "${RBOPS_BASELINE:-$RBOPS_ROOT/rbops/baseline.json}")"
+PROJECT_DIR="$(abspath "${RBOPS_PROJECT_DIR:-.}")"
+REPORT="$RBOPS_ROOT/phases/$PHASE/REPORT.md"
+
+# Preconditions, checked before we touch the project.
+[ -f "$PHASES" ]                                    || { echo "FATAL: no manifest at $PHASES" >&2; exit 1; }
+[ -f "$BASELINE" ]                                  || { echo "FATAL: no baseline at $BASELINE" >&2; exit 1; }
+[ -d "$RBOPS_ROOT/phases/$PHASE" ]                  || { echo "FATAL: $RBOPS_ROOT/phases/$PHASE does not exist" >&2; exit 1; }
+cd "$PROJECT_DIR" || { echo "FATAL: cannot enter project dir $PROJECT_DIR" >&2; exit 1; }
+[ -f Cargo.toml ] || { echo "FATAL: no Cargo.toml in $PROJECT_DIR — is RBOPS_PROJECT_DIR correct?" >&2; exit 1; }
+
+# Honour $JQ so a native Linux jq can be substituted when testing outside CI.
+# A Windows jq.exe under WSL emits CRLF and breaks every id and count.
+JQ="${JQ:-jq}"
+BASE_REF="${RBOPS_BASE_REF:-HEAD}"
+
+FAIL=0
+step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33mWARN\033[0m %s\n' "$*"; }
+# Every failure passes through here, so this is the one place a remedy can be
+# attached to a check that does not know how to fix itself.
+#
+# Phase-092, 088 and 113 all failed the same two checks and burned three
+# attempts each. The message said the rule and not the remedy, and a rule an
+# agent cannot act on is not a gate - it is a wall. The retry note is supposed to
+# close that gap, but a note is written by a human who has to notice, and three
+# of these ran before anyone did.
+#
+# remedy_for prints the first line of advice for a message, keyed on a substring
+# of it. It is a lookup rather than a per-check argument so that adding a check
+# means adding a remedy rather than remembering to thread one through, and so
+# the text lives in exactly one place and cannot drift from what it explains.
+#
+# When nothing matches, nothing is printed: a wrong remedy would send an agent
+# chasing a problem it does not have, which is worse than the bare verdict it
+# replaces.
+remedy_for() {
+  case "$1" in
+    *"failure is produced"*)
+      printf '          A suite of entirely passing tests does NOT satisfy this.\n'
+      printf '          The check wants a test whose SUBJECT is a failure - a bad input\n'
+      printf '          producing a clean error rather than a panic or a wrong value.\n'
+      printf '          Rust:    let r = run_source(bad); assert!(r.is_err());\n'
+      printf '          or:      #[should_panic] fn edge_...() { /* ... */ }\n'
+      printf '          Redblue: try ... catch error ... end, asserting it was caught.\n'
+      ;;
+    *"REPORT.md missing"*)
+      printf '          Writing REPORT.md is the whole fix; the code may already be right.\n'
+      printf '          It needs sections: What changed / Tests added / Gates /\n'
+      printf '          Known gaps, with real evidence rows. Report counts you observed.\n'
+      ;;
+    *"edge"*"test"*|*"no test named"*)
+      printf '          At least one test must be named edge_* (fn edge_foo, or test "edge_foo").\n'
+      printf '          The happy path alone is not a test.\n'
+      ;;
+    *"quota"*)
+      printf '          AGENTS.md 3.3: at least 3 new #[test] (or 2 Redblue test blocks).\n'
+      printf '          The count floor catches "no verification at all"; see it there.\n'
+      ;;
+    *"must_touch"*|*"no implementation change"*)
+      printf '          must_touch names the areas the change must land in. At least one\n'
+      printf '          changed file must fall under one of them, or this check fails on\n'
+      printf '          exactly that. Editing only tests, or only docs, does not satisfy it.\n'
+      ;;
+    *"documentation block"*|*"bucket"*)
+      printf '          A ```redblue block moved or was added, so tests/doc_blocks_runs.txt\n'
+      printf '          still points at the old line. Update the registry entry to the new\n'
+      printf '          line of the opening fence, or classify the block in\n'
+      printf '          doc_blocks_fragments.txt / doc_blocks_known_fail.txt.\n'
+      ;;
+    *"README"*)
+      printf '          README names a corpus count that has drifted. Count corpus/*.rb and\n'
+      printf '          update the number in the same commit that adds or removes a program.\n'
+      ;;
+    *"clippy"*|*"fmt"*)
+      printf '          Fix the reported diagnostic and re-run; do not widen the lint bound\n'
+      printf '          and do not reformat files outside this phase.\n'
+      ;;
+  esac
+}
+
+bad()  {
+  printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1))
+  remedy_for "$*"
+}
+
+# =============================================================================
+# RBOPS_PREFLIGHT=1 — the cheap half of the gate.
+#
+# Everything here is a question about a DIFF or a DOCUMENT. Nothing here needs a
+# build, a test run, or an example to execute. So it can be asked BEFORE the
+# agent is dispatched, against whatever the phase inherits (its recovery branch,
+# its WIP checkpoint, or nothing yet).
+#
+# Why this exists, in numbers: phases 037 and 048 each burned three ~5-hour runs
+# and 24 agent-hours total, and both were correct work refused by a DETECTOR —
+# first `eval_err`, then `label()`, neither of which the failure-assert regex
+# recognised. The agent cannot fix that; only the gate can. Asking the same
+# questions seconds earlier, before the model call, turns a 5-hour failure into
+# a 5-second one.
+#
+# This mode deliberately does NOT reimplement any check. It runs the same
+# functions below, so preflight and the real gate cannot drift into disagreeing
+# about what a diff means. It only skips the expensive sections (3 and 4), and
+# says so in its own verdict line, so a skipped section is never a silent pass.
+# =============================================================================
+PREFLIGHT="${RBOPS_PREFLIGHT:-0}"
+preflight_skip() {
+  [ "$PREFLIGHT" = "1" ] || return 1
+  printf '\n\033[1m== %s\033[0m\n' "$*"
+  printf '  \033[33mSKIP\033[0m %s — needs a build; preflight does not build\n' "$*"
+  return 0
+}
+
+# --- 0. integrity: is the phase even declared? ------------------------------
+step "manifest"
+if command -v "$JQ" >/dev/null 2>&1; then
+  if "$JQ" -e --arg p "$PHASE" '.phases[] | select(.id==$p)' "$PHASES" >/dev/null 2>&1; then
+    ok "phase $PHASE is declared in $PHASES"
+  else
+    bad "phase $PHASE is NOT declared in $PHASES — an undeclared phase cannot pass"
+  fi
+  # dependencies must be .done. Anchored to the pipeline root: this script cd's
+  # into the project, so a relative phases/ path would resolve inside redblue/
+  # and every satisfied dependency would read as missing — which is exactly how
+  # a good phase-002 attempt once failed its own gate.
+  while read -r dep; do
+    [ -n "$dep" ] || continue
+    if [ -f "$RBOPS_ROOT/phases/${dep}/.done" ]; then ok "dep ${dep} done"
+    else bad "dep ${dep} not done"; fi
+  done < <("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .depends_on[]?' "$PHASES" 2>/dev/null)
+else
+  bad "jq not available — cannot validate manifest"
+fi
+
+# --- 1. report exists and is not a stub -------------------------------------
+step "report"
+if [ -f "$REPORT" ]; then
+  ok "$REPORT exists"
+  # every required section must be present AND non-trivially filled
+  for sec in "What changed" "Tests added" "Gates" "Known gaps"; do
+    if grep -qF "$sec" "$REPORT"; then ok "section: $sec"
+    else bad "report missing section: $sec"; fi
+  done
+  # The evidence table must contain at least one real data row: a markdown row
+  # that names a path. A header-only or placeholder table is a stub.
+  if awk '
+    /^##[[:space:]]+What changed/ { insec=1; next }
+    /^##[[:space:]]/           { insec=0 }
+    insec && /^\|/ && /\// && !/^\|[[:space:]]*-+/ && !/^\|[[:space:]]*File[[:space:]]*\|/ { found=1 }
+    END { exit(found ? 0 : 1) }
+  ' "$REPORT"; then ok "report has at least one real evidence row"
+  else bad "report evidence table is a stub — needs a row naming an actual file"; fi
+  # a report claiming a green gate it cannot have run
+  if grep -qiE 'cargo test *\| *(pass|green)' "$REPORT" && ! grep -qE '[1-9][0-9]* passed' "$REPORT"; then
+    bad "report claims cargo test passed but records no passing count"
+  fi
+else
+  # Under preflight a missing report is EXPECTED, not a defect: preflight runs
+  # BEFORE the agent, so it is judging a tree nobody has written a report into
+  # yet. Failing it there would refuse every retry of every phase, which is the
+  # opposite of what an early warning is for. The report is still required by the
+  # full gate, which runs after the agent. A report that EXISTS is checked in
+  # full even under preflight — only its absence is tolerated.
+  if [ "$PREFLIGHT" = "1" ]; then
+    warn "no REPORT.md yet — expected under preflight (the agent has not run); the full gate requires one"
+  else
+    bad "$REPORT missing — a phase without a report cannot pass"
+  fi
+fi
+
+# --- 2. diff hygiene ---------------------------------------------------------
+step "diff hygiene"
+
+# STAGE NEW FILES, then diff. `git diff <base>` compares the base tree to the
+# working tree for TRACKED paths only — a brand-new file the agent wrote is
+# untracked, and untracked files are invisible to it. Writing a new test file is
+# the single most natural thing a phase does, and the gate was scoring those
+# phases as if no test existed: phase-007 wrote 355 lines and 16 #[test]
+# functions in tests/numeric_edge_test.rs and the gate reported "0 rust".
+#
+# `git add -N` (intent-to-add), deliberately NOT `git add -A`: it records the
+# path in the index with no content, so the file becomes visible to the diff,
+# while modifications to already-tracked files stay unstaged. That matters
+# because `git checkout -- <path>` restores from the INDEX, so staging
+# tracked edits would silently break every restore-from-HEAD in the pipeline.
+git add -N . >/dev/null 2>&1 || true
+
+CHANGED="$(git diff --name-only "$BASE_REF" 2>/dev/null)"
+if [ -z "$CHANGED" ]; then
+  # An empty diff means two different things. Under the full gate it means the
+  # phase changed nothing, which is a failure — and correctly so. Under
+  # PREFLIGHT it usually means the phase is on its FIRST attempt and has not
+  # written anything yet: there is nothing to judge, not something to reject.
+  # Failing it there would defer every new phase before the agent ever ran.
+  if [ "$PREFLIGHT" = "1" ]; then
+    printf '\n\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT NOTHING TO JUDGE — %s ║\033[0m\n' "$PHASE"
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 4
+  fi
+  bad "no changed files detected against $BASE_REF"
+fi
+
+# 2a. forbidden paths (the lock that makes this gate trustworthy)
+while read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    .github/workflows/*|rbops/*|.opencode/agent/*)
+      bad "forbidden path touched: $f" ;;
+  esac
+done <<< "$CHANGED"
+ok "forbidden-path scan done"
+
+# 2b. forbidden diff patterns = gate weakening.
+#
+# The attribute must be at the START of an added line, which is how Rust
+# attributes actually appear. Matching `#[ignore]` anywhere in the line
+# produced a false positive: a test that asserts the linter rejects
+# `#[ignore]` contains that token inside a string literal, and the gate
+# blocked a phase for containing the word it was testing against.
+if git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null \
+  | grep -nE '^\+[[:space:]]*(#\[ignore|#\[allow\((clippy|dead_code)|//[[:space:]]*skip\b)' \
+  | sed -n '1,20p'; then
+  # NOTE: `| head -20` here would be a verdict-inverting bug, not a display
+  # choice. head exits after 20 lines; with 21+ matches grep dies on SIGPIPE
+  # (141), pipefail propagates it, and the `else` below reports a phase with
+  # twenty-one violations as clean. sed consumes the whole stream instead.
+  bad "gate-weakening construct added (#[ignore], // skip, allow(clippy::...)) — see AGENTS.md rule 2"
+else
+  ok "no gate-weakening constructs added"
+fi
+
+# 2b2. scratch and probe files must not land in the diff. phase-020 left
+# tests/zz_probe.rs — a debugging scratch file — in the tree, and the gate only
+# caught it incidentally via formatting. A formatted scratch file would have
+# shipped.
+#
+# The comment here used to claim the patterns were "prefixes and junk
+# extensions, not substrings", and the code said otherwise: `[^/]*probe[^/]*`
+# was a substring match, so ANY filename containing "probe" was refused.
+# Preflight caught it on its first real use — a legitimate
+# `tests/preflight_probe.rs` was rejected as scratch, which is exactly the
+# failure this rule exists to prevent, inverted. It is now anchored to the
+# conventions that mean "scratch" and nothing else: the `zz_` prefix phase-020
+# actually used, a `_scratch` suffix, and junk extensions. `probe_stub.rs`,
+# `resumed_probe.rs` and `preflight_probe.rs` are real test files and pass;
+# `zz_probe.rs`, `foo_scratch.rs` and `x.tmp` do not.
+_scratch="$(printf '%s\n' "$CHANGED" | grep -iE '(^|/)zz_[^/]*$|(^|/)[^/]*_scratch\.[^/]*$|\.(tmp|bak|orig|swp)$|~$' || true)"
+if [ -n "$_scratch" ]; then
+  bad "scratch/probe files in the diff — remove them, they are not phase work: $(printf '%s' "$_scratch" | tr '\n' ' ' | head -c 300)"
+else
+  ok "no scratch files"
+fi
+
+# 2c. minimum substance
+# NOTE ON QUOTING: these read `"$JQ"`, never `'"$JQ"'`. The latter is a
+# single-quoted string CONTAINING the literal characters "$JQ" — bash does not
+# expand it, so the command ran as a program named `"$JQ"`, failed, and the
+# `|| echo N` fallback silently supplied the default. Every one of these reads
+# had been dead since the gate was written: min_changed_lines and BOTH test
+# quota floors came from the fallback, not the manifest. They matched by luck.
+# A wrong fallback also hid the failure completely, so each now warns.
+MIN_LINES="$("$JQ" -r '.gate.min_changed_lines' "$PHASES" 2>/dev/null)" || MIN_LINES=""
+if [ -z "$MIN_LINES" ]; then warn "could not read .gate.min_changed_lines from the manifest; using 5"; MIN_LINES=5; fi
+ADDED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$1} END{print s+0}')"
+DELETED="$(git diff --numstat "$BASE_REF" 2>/dev/null | awk '{s+=$2} END{print s+0}')"
+if [ "$ADDED" -ge "$MIN_LINES" ]; then ok "diff substance: +${ADDED} -${DELETED} (min +${MIN_LINES})"
+else bad "diff too small: +${ADDED} (min +${MIN_LINES})"; fi
+
+# 2d. must_touch: the phase must IMPLEMENT, not only test.
+#
+# Every other rule here measures verification. None of them measures ambition, so
+# the cheapest way to pass was to write tests for behaviour that already existed
+# and touch no implementation at all. Phase-004 did exactly that: its goal was
+# preserving insertion order in src/value.rs and it landed 19 lines of src/ and
+# 532 of tests. A gate that cannot tell the difference will happily keep buying
+# that.
+#
+# This is a FLOOR, not a judgement of substance — one line under src/ satisfies
+# it. Judging whether the change is big enough, correct, or complete is the
+# reviewer's job (AGENTS.md 5). What it removes is the tests-only escape hatch.
+#
+# It is per-phase and opt-in: a phase whose real work IS tests (phase-020, the
+# differential harness) declares tests/, and a phase with no must_touch is not
+# constrained at all. Several acceptable areas may be listed; touching ANY one
+# satisfies the phase, because which of them is correct depends on the finding.
+MUST_TOUCH="$("$JQ" -r --arg p "$PHASE" '[.phases[] | select(.id==$p) | (.must_touch // [])[]] | join(" ")' "$PHASES" 2>/dev/null)" || MUST_TOUCH=""
+if [ -n "${MUST_TOUCH// /}" ]; then
+  _hit=""
+  for _pat in $MUST_TOUCH; do
+    if printf '%s\n' "$CHANGED" | grep -q "^$_pat"; then _hit="$_pat"; break; fi
+  done
+  if [ -n "$_hit" ]; then
+    ok "implementation touched ${_hit} (must_touch: ${MUST_TOUCH})"
+  else
+    bad "no implementation change — must_touch requires a change under one of: ${MUST_TOUCH} — see AGENTS.md 3.5"
+  fi
+else
+  ok "no must_touch declared (nothing to enforce)"
+fi
+
+# --- 3. the four gates -------------------------------------------------------
+if preflight_skip "cargo fmt"; then
+  :
+else
+step "cargo fmt"
+if cargo fmt --all -- --check >/tmp/fmt.log 2>&1; then ok "cargo fmt --check"
+else bad "cargo fmt --check"; tail -20 /tmp/fmt.log; fi
+
+step "cargo clippy"
+if cargo clippy --all-targets -- -D warnings >/tmp/clippy.log 2>&1; then
+  ok "cargo clippy -D warnings"
+else
+  bad "cargo clippy"; grep -E '^(error|warning)' /tmp/clippy.log | sed -n '1,20p'
+fi
+
+step "cargo test"
+if cargo test --all-targets >/tmp/test.log 2>&1; then
+  PASSED="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  FAILED="$(grep -oE '[0-9]+ failed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  if [ "${PASSED:-0}" -gt 0 ]; then ok "cargo test: ${PASSED} passed, ${FAILED:-0} failed"
+  else bad "cargo test reported 0 passing tests — a suite that cannot fail is not a suite"; fi
+else
+  bad "cargo test"; grep -E 'FAILED|panicked|failures:' /tmp/test.log | sed -n '1,20p'
+fi
+
+step "doc tests"
+cargo test --doc >/tmp/doctest.log 2>&1 || { bad "cargo test --doc"; tail -15 /tmp/doctest.log; }
+fi
+
+# --- 4. examples still run (the language's spec-by-example) ------------------
+if preflight_skip "examples"; then
+  :
+else
+# Do not hide why the build failed: an unbuilt binary used to surface as the
+# useless "rb binary not built".
+if ! cargo build >/tmp/build.log 2>&1; then
+  bad "cargo build"; tail -20 /tmp/build.log
+fi
+RB="./target/debug/rb"
+if [ -x "$RB" ]; then
+  for ex in examples/*.rb modules/*.rb; do
+    [ -f "$ex" ] || continue
+    if timeout 60 "$RB" run "$ex" >/dev/null 2>&1; then
+      ok "runs: $ex"
+      continue
+    fi
+    detail="$(timeout 60 "$RB" run "$ex" 2>&1 | tail -1)"
+    # Was this failure already known at bootstrap time?
+    known="$("$JQ" -r --arg p "$ex" \
+              '.unparseable[]? | select(.path == $p) | .path' "$BASELINE" 2>/dev/null | head -1)"
+    if [ -n "$known" ]; then
+      # Rule 1: touching a baselined file revokes the exemption. A phase cannot
+      # edit a broken file and keep calling it "pre-existing".
+      if printf '%s\n' "$CHANGED" | grep -qxF -- "$ex"; then
+        bad "example still fails AND this phase touched it (baseline revoked): $ex — $detail"
+      else
+        warn "pre-existing failure, baselined, not touched by this phase: $ex — $detail"
+      fi
+    else
+      bad "example fails: $ex — $detail"
+    fi
+  done
+  ok "example sweep done"
+else
+  bad "rb binary missing at $RB after a successful build — check [[bin]] name in Cargo.toml"
+fi
+fi
+
+# --- 5. test policy: edge cases and failure assertions are mandatory ---------
+step "test policy"
+# The quota is disjunctive, matching AGENTS.md 3.3: a phase qualifies with
+# >=3 Rust tests OR >=2 Redblue tests. This is deliberately a low floor, not a
+# target — it catches "no verification at all", and sufficiency beyond it is
+# the reviewer's call. A high count once failed a good 5-test phase.
+MIN_RS="$("$JQ" -r '.test_policy.min_rust_tests' "$PHASES" 2>/dev/null)" || MIN_RS=""
+if [ -z "$MIN_RS" ]; then warn "could not read .test_policy.min_rust_tests; using 3"; MIN_RS=3; fi
+MIN_RB="$("$JQ" -r '.test_policy.min_redblue_tests' "$PHASES" 2>/dev/null)" || MIN_RB=""
+if [ -z "$MIN_RB" ]; then warn "could not read .test_policy.min_redblue_tests; using 2"; MIN_RB=2; fi
+# Count the `#[test]` ATTRIBUTE, not a name prefix. Requiring `fn test_`/`fn
+# edge_` meant a test named `modulo_by_zero_is_a_runtime_error` — perfectly
+# clear, perfectly real — did not count toward the quota. phase-007 wrote 16
+# #[test] functions and the quota read 0 because only the 6 edge_-prefixed ones
+# matched. The prefix belongs to the edge_-naming rule below, which enforces it
+# deliberately; the quota should be counting tests.
+NEW_TESTS="$(git diff -U0 "$BASE_REF" -- '*.rs' 2>/dev/null | grep -cE '^\+\s*#\[test\]' )"
+NEW_RB="$(git diff -U0 "$BASE_REF" -- '*.rb' 2>/dev/null | grep -cE '^\+\s*test ' )"
+# Both idioms must be recognised, in BOTH target languages. The quota above is
+# disjunctive (Rust OR Redblue), so these two rules have to be too — otherwise a
+# Redblue-only phase can satisfy the quota and still be told it proved nothing.
+#   Rust:    fn edge_empty_list()          Redblue:  test "edge_empty list"
+# The optional quote is the whole bug: a Redblue test name is a string literal,
+# so `test edge_x` never occurs, and the unquoted-only regex rejected 61 real
+# tests in phase-003 including correctly-named ones.
+EDGE="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null | grep -cE '^\+.*(fn |test +"?)edge_')"
+# Some subsystems have no failure channel to assert on. A linter reports
+# problems as a diagnostics collection; a formatter and an LSP produce documents,
+# not errors. Requiring `is_err`/`should_panic` of them is a category error, and
+# it is not hypothetical: phase-015 (formatter) and phase-016 (linter) were both
+# blocked after burning every attempt on it, while phase-016's tests were
+# asserting failure correctly as `assert_eq!(warnings.len(), 1, ...)`.
+#
+# Such a phase declares `failure_assert: "not_applicable"` and the check is
+# SKIPPED, visibly — never silently passed, and never a global relaxation. The
+# reviewer still judges whether the tests can actually fail, and every
+# error-producing phase keeps the rule at full strength.
+FAILASSERT_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .failure_assert // "required"' "$PHASES" 2>/dev/null)" || FAILASSERT_MODE="required"
+[ -n "$FAILASSERT_MODE" ] || FAILASSERT_MODE="required"
+
+# Failure assertions per language. Rust has is_err/expect_err/should_panic;
+# Redblue has no exceptions and instead has `try ... catch error`, which was
+# missing here entirely — the one construct Redblue offers for asserting a fault.
+# Anchored to the line start so a test whose *data* mentions `catch error` cannot
+# buy a pass.
+#
+# Rust also has the `eval_err` idiom: a helper that evaluates a program
+# expecting an error, followed by `assert!(matches!(e, Error::...))`. Phase-037
+# blocked a 1200-green phase on this rule with 12 such assertions in the diff
+# and zero recognized strings — `let e = eval_err("random_choice([])");
+# assert!(matches!(e, Error::Runtime(_, _)))` asserts a failure is produced as
+# surely as `is_err()` does. Same class as the #[test]-attribute fix (007) and
+# the bilingual rules: the detector was narrower than the language's real
+# failure-asserting idioms. The reviewer remains the ceiling — a bare
+# `let _ = eval_err(x);` with no assertion is gaming, and it reads as gaming.
+if [ "$FAILASSERT_MODE" = "not_applicable" ]; then
+  # Skipped, and said out loud. A silent pass here would be indistinguishable
+  # from the rule being satisfied.
+  warn "failure-assertion rule NOT APPLICABLE to this phase (failure_assert: not_applicable) — the reviewer still judges whether the tests can fail"
+else
+  # Redblue's Error carries a label rather than a Result, so a test that proves
+  # a failure was produced reads `assert_eq!(label(&e), "RuntimeError")` through
+  # a local helper rather than calling is_err() on a Result. Phase-048 blocked on
+  # this with ~10 such assertions (every one documented as "failure asserted" in
+  # its REPORT) and zero recognized strings. Detecting the assertion is what
+  # matters, not which method spells it, so the pattern also accepts a helper
+  # call beside a spelled-out error label: a test cannot buy this by naming a
+  # label in prose, because the label must be quoted inside the matched line.
+  FAILASSERT="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+    | grep -cE '^\+.*(is_err|expect_err|should_panic|eval_err|assert_throws|expect_refusal|assert_stdout_contains|label\(.*\)\s*[,)]|label\(.*==)|Error::(Lexer|Parser|Analyzer|Runtime|Io)|expect .* to fail|^\+[[:space:]]*catch[[:space:]]+error')"
+  if [ "$FAILASSERT" -ge 1 ]; then
+    ok "failure-asserting test present: $FAILASSERT"
+  else
+    bad "no test asserts a failure is produced — mandatory (Rust: is_err()/should_panic; Redblue: try ... catch error)"
+  fi
+fi
+
+TEST_POLICY_MODE="$("$JQ" -r --arg p "$PHASE" '.phases[] | select(.id==$p) | .test_policy // "required"' "$PHASES" 2>/dev/null)" || TEST_POLICY_MODE="required"
+[ -n "$TEST_POLICY_MODE" ] || TEST_POLICY_MODE="required"
+if [ "$TEST_POLICY_MODE" = "not_applicable" ]; then
+  warn "test quota and edge_* rule NOT APPLICABLE to this phase (test_policy: not_applicable) — the reviewer still judges documentation and substance"
+else
+  if [ "$NEW_TESTS" -ge "$MIN_RS" ] || [ "$NEW_RB" -ge "$MIN_RB" ]; then
+    ok "test quota met: ${NEW_TESTS} rust / ${NEW_RB} redblue (need ${MIN_RS} or ${MIN_RB})"
+  else
+    bad "test quota not met: ${NEW_TESTS} rust (need ${MIN_RS}) and ${NEW_RB} redblue (need ${MIN_RB}) — see AGENTS.md 3.3"
+  fi
+  [ "$EDGE" -ge 1 ] && ok "edge case test present: $EDGE" \
+    || bad "no test named edge_* — mandatory (Rust: fn edge_foo(); Redblue: test \"edge_foo\")"
+fi
+
+# Same precision rule as the construct scan above: the token must begin the
+# line. A test fixture that embeds `#[ignore]` as data is not a skipped test.
+SKIPDELTA="$(git diff -U0 "$BASE_REF" -- '*.rs' '*.rb' 2>/dev/null \
+  | grep -cE '^\+[[:space:]]*(#\[ignore|//[[:space:]]*skip\b)')"
+[ "$SKIPDELTA" -eq 0 ] && ok "no newly skipped tests" || bad "$SKIPDELTA newly skipped/ignored tests"
+
+# --- 6. self-consistency: does the report match reality? --------------------
+step "report honesty"
+if [ -f "$REPORT" ] && [ -f /tmp/test.log ]; then
+  REAL="$(grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print s+0}')"
+  CLAIM="$(grep -oE '[0-9]+ passed' "$REPORT" | head -1 | awk '{print $1}')"
+  if [ -n "${CLAIM:-}" ]; then
+    # Asymmetric by design. The threat model is FABRICATION: claiming green
+    # that was never earned. A claim ABOVE reality (+2 tolerance for reruns)
+    # fails the phase. A claim BELOW reality is sloppiness in prose, not a lie
+    # that ships bad code — the gate itself measured the real number, so warn
+    # and move on. This distinction once blocked a phase with 59 green tests
+    # over a "0 passing" typo.
+    if [ "$CLAIM" -gt $((REAL + 2)) ]; then
+      bad "report claims $CLAIM passing, actual run has $REAL — over-claiming is fabrication"
+    elif [ "$CLAIM" -lt $((REAL - 2)) ]; then
+      warn "report claims $CLAIM passing, actual run has $REAL — under-claimed, fix the number"
+      ok "reported test count ($CLAIM) does not exceed actual ($REAL)"
+    else
+      ok "reported test count ($CLAIM) matches actual ($REAL)"
+    fi
+  fi
+fi
+
+# --- verdict -----------------------------------------------------------------
+printf '\n'
+if [ "$PREFLIGHT" = "1" ]; then
+  # A preflight PASS is NOT a gate pass, and the exit code says so: 0 means "no
+  # defect found in the cheap half", never "this phase may be marked .done". The
+  # caller (dispatch.sh cmd_run) still runs the full gate after the agent. A
+  # distinct exit code makes it impossible for a preflight to be mistaken for
+  # the real thing by a caller that does not read this banner.
+  if [ "$FAIL" -eq 0 ]; then
+    printf '\033[33m╔══════════════════════════════════════╗\033[0m\n'
+    printf '\033[33m║ PREFLIGHT CLEAN — %-19s ║\033[0m\n' "$PHASE"
+    printf '\033[33m║ diff-based checks only; no build run ║\033[0m\n'
+    printf '\033[33m╚══════════════════════════════════════╝\033[0m\n'
+    exit 0
+  fi
+  printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[31m║ PREFLIGHT FAIL   — %-19s ║\033[0m\n' "$PHASE"
+  printf '\033[31m║ %d diff-based check(s) failed         ║\033[0m\n' "$FAIL"
+  printf '\033[31m╚══════════════════════════════════════╝\033[0m\n'
+  exit 3
+fi
+if [ "$FAIL" -eq 0 ]; then
+  printf '\033[32m╔══════════════════════════════════════╗\033[0m\n'
+  printf '\033[32m║ VERIFY PASS — %-24s ║\033[0m\n' "$PHASE"
+  printf '\033[32m╚══════════════════════════════════════╝\033[0m\n'
+  exit 0
+fi
+printf '\033[31m╔══════════════════════════════════════╗\033[0m\n'
+printf '\033[31m║ VERIFY FAIL — %-24s ║\033[0m\n' "$PHASE"
+printf '\033[31m║ %d check(s) failed                    ║\033[0m\n' "$FAIL"
+printf '\033[31m╚══════════════════════════════════════╝\033[0m\n'
+exit 1
+[0m
+[0m$ [0mls tests | wc -l && ls tests | head -60 && grep -rln "sleep\|Instant::now\|timeout\|network" tests/*.rs | head
+104
+agent_permissions_test.rs
+assertions_test.rs
+bench
+bench_test.rs
+bootstrap_selfhost_test.rs
+bootstrap_ship_test.rs
+bytecode_test.rs
+bytecode_vm_test.rs
+call_depth_test.rs
+catch_binding_test.rs
+checkpoint_ancestry_ack.txt
+checkpoint_ancestry_test.rs
+closure_capture_test.rs
+collections_test.rs
+common
+comparison_lex_test.rs
+comparison_words_test.rs
+constant_test.rs
+data_formats_test.rs
+debug_watch_test.rs
+debugger_test.rs
+diagnostics_test.rs
+differential_test.rs
+discovery_test.rs
+doc_blocks_fragments.txt
+doc_blocks_known_fail.txt
+doc_blocks_runs.txt
+doc_blocks_test.rs
+encoding_hashing_test.rs
+expect_test.rs
+failure_channel_test.rs
+for_range_test.rs
+formatter_test.rs
+function_literal_test.rs
+handout_claims_test.rs
+index_bounds_test.rs
+index_words_test.rs
+integration_test.rb
+interpolation_test.rs
+keyword_reservation_test.rs
+lexer_robustness_test.rs
+libraries_policy_test.rs
+linter_test.rs
+list_append_test.rs
+list_push_test.rs
+loop_bounds_test.rs
+loop_control_test.rs
+loop_instruction_test.rs
+manifest_test.rs
+matrix_test.rs
+memory_model_test.rs
+method_map_test.rs
+might_fail_test.rs
+mod_in_test.rs
+module_system_test.rs
+numeric_edge_test.rs
+object_model_test.rs
+parser_hardening_test.rs
+phase_088_scanner_test.rs
+phase_088_value_contract_test.rs
+tests/bench_test.rs
+tests/checkpoint_ancestry_test.rs
+tests/debugger_test.rs
+tests/doc_blocks_test.rs
+tests/formatter_test.rs
+tests/keyword_reservation_test.rs
+tests/list_append_test.rs
+tests/parser_hardening_test.rs
+tests/regex_module_test.rs
+tests/repl_printing_test.rs
+[0m
+[0m$ [0mnohup cargo test --all-targets > /tmp/test.log 2>&1 & echo $! > /tmp/test.pid; sleep 60; tail -5 /tmp/test.log; echo "---"; ps -p $(cat /tmp/test.pid) -o pid,etime,cmd 2>/dev/null || echo done
+test edge_the_bytecode_vm_reports_a_bad_invocation_as_a_failure ... ok
+test edge_the_self_compilation_still_obeys_the_step_budget ... ok
+test edge_stage3_refuses_every_malformed_corpus_program ... ok
+test edge_the_two_engines_run_a_branching_program_the_same ... ok
+test edge_name_heavy_fixture_is_byte_identical_in_both_stages ... ok
+---
+    PID     ELAPSED CMD
+ 175804       01:00 /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --all-targets
+[0m
+[0m$ [0msleep 240; tail -8 /tmp/test.log; echo "---"; ps -p $(cat /tmp/test.pid) -o pid,etime,cmd 2>/dev/null || echo done
+test stage2_is_byte_identical_for_each_statement_kind ... ok
+test edge_stage3_is_byte_identical_on_every_corpus_program has been running for over 60 seconds
+test edge_the_self_hosted_compiler_compiles_itself_byte_identically has been running for over 60 seconds
+test edge_three_consecutive_self_compilations_are_byte_identical has been running for over 60 seconds
+test stage2_is_byte_identical_on_its_corpus_families has been running for over 60 seconds
+test edge_stage3_is_byte_identical_on_every_corpus_program ... ok
+test stage2_is_byte_identical_on_the_examples_and_the_modules ... ok
+test stage2_is_byte_identical_on_its_corpus_families ... ok
+---
+    PID     ELAPSED CMD
+ 175804       05:02 /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --all-targets
+[0m
+[0m$ [0msleep 420; tail -8 /tmp/test.log; echo "---"; ps -p $(cat /tmp/test.pid) -o pid,etime,cmd 2>/dev/null || echo done
+test edge_a_frontend_refusal_keeps_its_kind_and_position ... ok
+test edge_a_missing_empty_or_silent_compiler_is_refused_rather_than_shipped ... ok
+test edge_bare_rb_bootstrap_is_the_command_and_not_a_file_to_run ... ok
+test edge_the_release_command_exits_non_zero_on_what_it_cannot_ship ... ok
+test edge_a_rollback_that_is_not_the_fixed_point_writes_nothing has been running for over 60 seconds
+test edge_a_stage_two_that_is_not_the_fixed_point_is_refused_and_ships_nothing has been running for over 60 seconds
+test edge_concurrent_stage_two_runs_keep_their_own_paths has been running for over 60 seconds
+test edge_the_release_is_built_by_the_self_hosted_compiler has been running for over 60 seconds
+---
+    PID     ELAPSED CMD
+ 175804       12:04 /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --all-targets
+[0m
+[0m$ [0msleep 480; tail -12 /tmp/test.log; echo "---"; ps -p $(cat /tmp/test.pid) -o pid,etime,cmd 2>/dev/null || echo done
+2
+1
+2
+2
+6
+6
+3
+2
+3
+2
+found
+found
+---
+    PID     ELAPSED CMD
+ 175804       20:06 /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test --all-targets
+[0m
+[0m$ [0msleep 480; tail -20 /tmp/test.log; echo "---"; ps -p $(cat /tmp/test.pid) -o pid,etime,cmd 2>/dev/null || echo done
+test edge_the_in_memory_filesystem_lists_the_current_directory ... ok
+test edge_the_in_memory_filesystem_refuses_a_file_named_through_dot_segments_as_a_directory ... ok
+test edge_the_in_memory_filesystem_refuses_a_parent_segment_that_traverses_a_non_directory ... ok
+test edge_the_in_memory_filesystem_refuses_a_relative_path_above_the_root ... ok
+test edge_the_in_memory_filesystem_treats_a_backslash_as_a_filename_character ... ok
+test edge_say_output_is_bounded_while_it_is_still_buffered ... ok
+test edge_an_error_too_long_for_its_buffer_is_truncated_and_says_so ... ok
+test edge_the_platform_builtins_still_answer_natively ... ok
+test edge_unicode_survives_the_boundary_intact ... ok
+test the_in_memory_filesystem_behaves_like_the_one_it_replaces ... ok
+test edge_output_past_the_playground_limit_is_reported_not_truncated ... ok
+test wasm_example_corpus_is_exactly_the_deterministic_examples ... ok
+test wasm_module_reports_its_version_and_keywords ... ok
+test files_reads_back_what_it_wrote_in_a_temp_dir ... ok
+test wasm_run_reproduces_the_native_output_of_every_example ... ok
+test edge_the_output_is_copied_out_under_the_lock_rather_than_read_through_a_pointer ... ok
+test wasm_abi_round_trips_source_and_output ... ok
+
+test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.71s
+
+---
+    PID     ELAPSED CMD
+done
+[0m
+[0m$ [0mgrep -c "test result: ok" /tmp/test.log; grep -E "test result: FAILED|failures:|panicked" /tmp/test.log | head; grep -oE '[0-9]+ passed' /tmp/test.log | awk '{s+=$1} END{print "passed total:", s}'; grep -oE '[0-9]+ failed' /tmp/test.log | awk '{s+=$1} END{print "failed total:", s}'
+85
+passed total: 2763
+failed total: 0
+[0m
+[0m← [0mEdit phases/phase-075/REPORT.md
+Index: /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+===================================================================
+--- /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
++++ /home/runner/work/rbops/rbops/redblue/phases/phase-075/REPORT.md
+@@ -50,9 +50,9 @@
+ | Gate | Result |
+ |---|---|
+ | cargo fmt --all -- --check | pass |
+ | cargo clippy --all-targets -- -D warnings | pass |
+-| cargo test --all-targets | 2760 passed, 0 failed, 0 ignored |
++| cargo test --all-targets | 2763 passed, 0 failed, 0 ignored |
+ | ../rbops/verify.sh "phase-075" | pass |
+ 
+ ## Invariants touched
+ 
+
+[0m
+[0m$ [0mpwd; ls -d phases ../phases 2>/dev/null; ls phases/phase-075 2>/dev/null; ls ../phases/phase-075 2>/dev/null; git status --short | head -20
+/home/runner/work/rbops/rbops/redblue
+../phases
+phases
+REPORT.md
+PROMPT.md
+REPORT.md
+ M src/lib.rs
+ M src/lsp.rs
+ M tests/tooling_grammar_test.rs
+?? phases/phase-075/
+[0m
+[0m$ [0mecho "=== redblue/phases ==="; sed -n '1,15p' phases/phase-075/REPORT.md; echo "=== parent/phases ==="; sed -n '1,15p' ../phases/phase-075/REPORT.md; echo "=== diff ==="; diff phases/phase-075/REPORT.md ../phases/phase-075/REPORT.md | head -40
+=== redblue/phases ===
+# Phase 075 — Teach the language server navigation: goto-definition, references, completion
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| src/lsp.rs | +785 −1 | `Location`, `Definition`, `DefinitionKind`; token-level lexical scope walk; `goto_definition`, `find_references`, `completions` and their JSON forms; greedy string-literal context check |
+| src/lib.rs | +3 −2 | re-export the new navigation surface |
+| tests/tooling_grammar_test.rs | +324 −2 | 13 navigation tests (9 `edge_*`) including shadowing, builtins, imports, Unicode, malformed source and positions, nested loop/object scopes and the 5000-line benchmark |
+
+No server loop or transport was added: the phase asks for pure functions over source text, and the existing `diagnostics_json` shape is extended per capability.
+
+## Tests added
+
+| Test | Edge class covered |
+=== parent/phases ===
+# Phase 075 — Teach the language server navigation: goto-definition, references, completion
+
+## What changed
+
+| File | Lines | What |
+|---|---|---|
+| src/lsp.rs | +785 −1 | `Location`, `Definition`, `DefinitionKind`; token-level lexical scope walk; `goto_definition`, `find_references`, `completions` and their JSON forms; greedy string-literal context check |
+| src/lib.rs | +3 −2 | re-export the new navigation surface |
+| tests/tooling_grammar_test.rs | +261 −2 | 11 navigation tests (8 `edge_*`) including shadowing, builtins, imports, Unicode, malformed positions and the 5000-line benchmark |
+
+No server loop or transport was added: the phase asks for pure functions over source text, and the existing `diagnostics_json` shape is extended per capability.
+
+## Tests added
+
+| Test | Edge class covered |
+=== diff ===
+9c9
+< | tests/tooling_grammar_test.rs | +324 −2 | 13 navigation tests (9 `edge_*`) including shadowing, builtins, imports, Unicode, malformed source and positions, nested loop/object scopes and the 5000-line benchmark |
+---
+> | tests/tooling_grammar_test.rs | +261 −2 | 11 navigation tests (8 `edge_*`) including shadowing, builtins, imports, Unicode, malformed positions and the 5000-line benchmark |
+26,27d25
+< | edge_loop_and_object_scopes_do_not_pop_the_enclosing_function_scope | nesting: a loop/object `end` closes only its own scope |
+< | edge_for_loop_variable_does_not_leak_into_the_enclosing_scope | nesting: a loop variable is scoped to the loop body |
+29d26
+< | edge_malformed_source_returns_errors_not_panics | malformed source: all three surface a lexer error as `Err` |
+43c40
+< | nesting_recursion | covered by the shadowing test (function scope nested in top-level scope) and by the loop/object-in-function tests (each block closes only its own scope) |
+---
+> | nesting_recursion | covered by the shadowing test (function scope nested in top-level scope) |
+45c42
+< | malformed_input | covered by `edge_malformed_source_returns_errors_not_panics` (unterminated string surfaces `Err` from all three) and by `malformed_positions_are_clean_errors_not_panics` |
+---
+> | malformed_input | covered for positions; malformed source returns a clean `Err` because `Lexer::tokenize` refuses it rather than panicking |
+54c51
+< | cargo test --all-targets | 2763 passed, 0 failed, 0 ignored |
+---
+> | cargo test --all-targets | 2760 passed, 0 failed, 0 ignored |
+[0m
+[0m$ [0mgit -C .. rev-parse --show-toplevel 2>/dev/null; git -C ../.. rev-parse --show-toplevel 2>/dev/null; git -C .. status --short 2>/dev/null | head; ls -la ../phases/phase-075/
+/home/runner/work/rbops/rbops
+?? logs/phase-075.checkpoint.log
+?? logs/phase-075.fix.1.log
+?? logs/phase-075.log
+?? logs/phase-075.review.1.log
+?? phases/phase-075/.base
+?? phases/phase-075/REPORT.md
+total 32
+drwxr-xr-x   2 runner runner 4096 Nov  9 01:21 .
+drwxr-xr-x 128 runner runner 4096 Nov  8 22:08 ..
+-rw-r--r--   1 runner runner   41 Nov  8 22:09 .base
+-rw-r--r--   1 runner runner   46 Nov  9 01:21 .seen_findings
+-rw-r--r--   1 runner runner 5660 Nov  8 22:08 PROMPT.md
+-rw-r--r--   1 runner runner 4149 Nov  9 00:53 REPORT.md
+[0m
+[0m$ [0mgit rev-parse --show-toplevel; ls -la .git | head; ls -la ../.git | head
+/home/runner/work/rbops/rbops/redblue
+total 272
+drwxr-xr-x  7 runner runner   4096 Nov  9 02:06 .
+drwxr-xr-x 15 runner runner   4096 Nov  9 01:59 ..
+-rw-r--r--  1 runner runner  63867 Nov  8 22:37 FETCH_HEAD
+-rw-r--r--  1 runner runner     21 Nov  8 22:08 HEAD
+-rw-r--r--  1 runner runner     41 Nov  8 22:14 ORIG_HEAD
+-rw-r--r--  1 runner runner    333 Nov  8 22:08 config
+-rwxr-xr-x  1 runner runner     73 Nov  8 22:08 description
+drwxr-xr-x  2 runner runner   4096 Nov  8 22:08 hooks
+-rw-r--r--  1 runner runner 108237 Nov  9 02:05 index
+total 160
+drwxr-xr-x 7 runner runner   4096 Nov  9 02:06 .
+drwxr-xr-x 8 runner runner   4096 Nov  8 22:08 ..
+-rw-r--r-- 1 runner runner     95 Nov  8 22:08 FETCH_HEAD
+-rw-r--r-- 1 runner runner     21 Nov  8 22:08 HEAD
+-rw-r--r-- 1 runner runner    861 Nov  8 22:08 config
+-rw-r--r-- 1 runner runner     83 Nov  8 22:08 config.worktree
+-rwxr-xr-x 1 runner runner     73 Nov  8 22:08 description
+drwxr-xr-x 2 runner runner   4096 Nov  8 22:08 hooks
+-rw-r--r-- 1 runner runner 110170 Nov  9 02:06 index
+[0m
+[0m$ [0mcp phases/phase-075/REPORT.md ../phases/phase-075/REPORT.md && diff phases/phase-075/REPORT.md ../phases/phase-075/REPORT.md && echo synced
+synced
+[0m
+[0m$ [0m../rbops/verify.sh "phase-075" 2>&1 | tail -120
+[1m== manifest[0m
+  [32mPASS[0m phase phase-075 is declared in /home/runner/work/rbops/rbops/rbops/phases.json
+  [32mPASS[0m dep phase-074 done
+
+[1m== report[0m
+  [32mPASS[0m /home/runner/work/rbops/rbops/phases/phase-075/REPORT.md exists
+  [32mPASS[0m section: What changed
+  [32mPASS[0m section: Tests added
+  [32mPASS[0m section: Gates
+  [32mPASS[0m section: Known gaps
+  [32mPASS[0m report has at least one real evidence row
+
+[1m== diff hygiene[0m
+  [32mPASS[0m forbidden-path scan done
+  [32mPASS[0m no gate-weakening constructs added
+  [32mPASS[0m no scratch files
+  [32mPASS[0m diff substance: +1201 -5 (min +5)
+  [32mPASS[0m implementation touched src/ (must_touch: src/)
+
+[1m== cargo fmt[0m
+  [32mPASS[0m cargo fmt --check
+
+[1m== cargo clippy[0m
+  [32mPASS[0m cargo clippy -D warnings
+
+[1m== cargo test[0m
+  [32mPASS[0m cargo test: 2763 passed, 0 failed
+
+[1m== doc tests[0m
+  [32mPASS[0m runs: examples/files.rb
+  [32mPASS[0m runs: examples/fizzbuzz.rb
+  [32mPASS[0m runs: examples/formats.rb
+  [32mPASS[0m runs: examples/hello.rb
+  [32mPASS[0m runs: examples/random.rb
+  [32mPASS[0m runs: examples/test_arithmetic.rb
+  [32mPASS[0m runs: examples/time.rb
+  [32mPASS[0m runs: modules/Cli.rb
+  [32mPASS[0m runs: modules/MathUtils.rb
+  [32mPASS[0m runs: modules/SuiteKit.rb
+  [32mPASS[0m example sweep done
+
+[1m== test policy[0m
+  [32mPASS[0m failure-asserting test present: 6
+  [32mPASS[0m test quota met: 14 rust / 0 redblue (need 3 or 2)
+  [32mPASS[0m edge case test present: 10
+  [32mPASS[0m no newly skipped tests
+
+[1m== report honesty[0m
+  [32mPASS[0m reported test count (2763) matches actual (2763)
+
+[32m╔══════════════════════════════════════╗[0m
+[32m║ VERIFY PASS — phase-075                ║[0m
+[32m╚══════════════════════════════════════╝[0m
+[0m
+[0m$ [0mgit diff --numstat && git status --short
+3	2	src/lib.rs
+794	1	src/lsp.rs
+339	2	tests/tooling_grammar_test.rs
+ M src/lib.rs
+ M src/lsp.rs
+ M tests/tooling_grammar_test.rs
+?? phases/phase-075/
+[0m
+[0m$ [0mcd /home/runner/work/rbops/rbops && python3 - <<'PY'
+from pathlib import Path
+for p in [Path("phases/phase-075/REPORT.md"), Path("redblue/phases/phase-075/REPORT.md")]:
+    t = p.read_text()
+    t = t.replace("| src/lsp.rs | +785 −1 |", "| src/lsp.rs | +794 −1 |")
+    t = t.replace("| tests/tooling_grammar_test.rs | +324 −2 |", "| tests/tooling_grammar_test.rs | +339 −2 |")
+    p.write_text(t)
+print("done")
+PY
+diff phases/phase-075/REPORT.md redblue/phases/phase-075/REPORT.md && grep -n "src/lsp.rs\|tooling_grammar_test.rs |" phases/phase-075/REPORT.md
+done
+7:| src/lsp.rs | +794 −1 | `Location`, `Definition`, `DefinitionKind`; token-level lexical scope walk; `goto_definition`, `find_references`, `completions` and their JSON forms; greedy string-literal context check |
+9:| tests/tooling_grammar_test.rs | +339 −2 | 13 navigation tests (9 `edge_*`) including shadowing, builtins, imports, Unicode, malformed source and positions, nested loop/object scopes and the 5000-line benchmark |
+[0m
+[0m$ [0mgit diff src/lsp.rs | sed -n '1,200p' | grep -n "^+" | tail -80
+121:+    }
+122:+
+123:+    fn to_json(&self) -> String {
+124:+        format!(
+125:+            concat!(
+126:+                "{{\"line\":{},\"column\":{},\"end_line\":{},\"end_column\":{},",
+127:+                "\"kind\":{},\"name\":{}}}"
+128:+            ),
+129:+            self.line,
+130:+            self.column,
+131:+            self.end_line,
+132:+            self.end_column,
+133:+            escape_json(self.kind.as_str()),
+134:+            escape_json(&self.name),
+135:+        )
+136:+    }
+137:+}
+138:+
+139:+/// The source positions of one file, in characters, for translating editor
+140:+/// positions to token offsets and back.
+141:+struct SourceMap {
+142:+    chars: Vec<char>,
+143:+    line_starts: Vec<usize>,
+144:+}
+145:+
+146:+impl SourceMap {
+147:+    fn new(source: &str) -> Self {
+148:+        let chars: Vec<char> = source.chars().collect();
+149:+        let mut line_starts = vec![0];
+150:+        for (index, c) in chars.iter().enumerate() {
+151:+            if *c == '\n' {
+152:+                line_starts.push(index + 1);
+153:+            }
+154:+        }
+155:+        Self { chars, line_starts }
+156:+    }
+157:+
+158:+    fn offset(&self, line: usize, column: usize) -> usize {
+159:+        let start = self
+160:+            .line_starts
+161:+            .get(line.saturating_sub(1))
+162:+            .copied()
+163:+            .unwrap_or(self.chars.len());
+164:+        start.saturating_add(column.saturating_sub(1))
+165:+    }
+166:+
+167:+    /// The source offset of a 1-based line and column, refusing positions no
+168:+    /// editor could have sent: line or column zero, a line past the file, or a
+169:+    /// column past the end of its line.
+170:+    fn validate(&self, line: usize, column: usize) -> Result<usize, String> {
+171:+        if line == 0 {
+172:+            return Err("line 0 is not a source position: lines are 1-based".to_string());
+173:+        }
+174:+        if column == 0 {
+175:+            return Err("column 0 is not a source position: columns are 1-based".to_string());
+176:+        }
+177:+        if line > self.line_starts.len() {
+178:+            return Err(format!("line {line} is past the end of the file"));
+179:+        }
+180:+
+181:+        let start = self.line_starts[line - 1];
+182:+        let mut end = start;
+183:+        while end < self.chars.len() && self.chars[end] != '\n' {
+184:+            end += 1;
+185:+        }
+186:+        if column > end - start + 1 {
+187:+            return Err(format!("column {column} is past the end of line {line}"));
+188:+        }
+189:+
+190:+        Ok(start + column - 1)
+191:+    }
+192:+}
+193:+
+194:+#[derive(Debug, Clone)]
+195:+struct Binding {
+196:+    name: String,
+197:+    location: Location,
+198:+    kind: DefinitionKind,
+199:+}
+200:+
+[0m
+[0m$ [0mgrep -n "13 navigation\|edge_loop\|edge_for_loop\|edge_malformed_source\|nesting_recursion\|malformed_input\|2763\|+794\|+339" ../phases/phase-075/REPORT.md
+7:| src/lsp.rs | +794 −1 | `Location`, `Definition`, `DefinitionKind`; token-level lexical scope walk; `goto_definition`, `find_references`, `completions` and their JSON forms; greedy string-literal context check |
+9:| tests/tooling_grammar_test.rs | +339 −2 | 13 navigation tests (9 `edge_*`) including shadowing, builtins, imports, Unicode, malformed source and positions, nested loop/object scopes and the 5000-line benchmark |
+26:| edge_loop_and_object_scopes_do_not_pop_the_enclosing_function_scope | nesting: a loop/object `end` closes only its own scope |
+27:| edge_for_loop_variable_does_not_leak_into_the_enclosing_scope | nesting: a loop variable is scoped to the loop body |
+29:| edge_malformed_source_returns_errors_not_panics | malformed source: all three surface a lexer error as `Err` |
+43:| nesting_recursion | covered by the shadowing test (function scope nested in top-level scope) and by the loop/object-in-function tests (each block closes only its own scope) |
+45:| malformed_input | covered by `edge_malformed_source_returns_errors_not_panics` (unterminated string surfaces `Err` from all three) and by `malformed_positions_are_clean_errors_not_panics` |
+54:| cargo test --all-targets | 2763 passed, 0 failed, 0 ignored |
+[0m
+Fixed all findings:
+
+1. **BLOCKER** `src/lsp.rs` — `while`/`repeat`/`for`/`object`/`module` now push a scope matching their `opens_scope` frame, so their `end`/`until` closes only their own scope. `for` pushes before declaring the loop variable, so it no longer leaks. Added regression tests for loop/object-in-function and top-level `for` variable leakage.
+2. **MAJOR** — Added `edge_malformed_source_returns_errors_not_panics`, asserting all three APIs return `Err` for `say "unterminated`; updated the edge matrix.
+3. **MINOR** — Corrected the report counts to 13 navigation tests / 9 `edge_*`, added the new rows, and updated the test total to 2763.
+
+Gates:
+- `cargo fmt --all -- --check` — pass
+- `cargo clippy --all-targets -- -D warnings` — pass
+- `cargo test --all-targets` — 2763 passed, 0 failed, 0 ignored
+- `../rbops/verify.sh "phase-075"` — VERIFY PASS
