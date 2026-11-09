@@ -1,27 +1,20 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=190, limit=900][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1, limit=120][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=220, offset=1089][0m
-[0m✱ [0mGrep "fn (edge_|goto_|find_|completions|navigation_|malformed_)"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
-[0m✱ [0mGrep "^fn |^#\[test\]|goto_definition|find_references|completions|\[ignore\]"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=120, offset=1060][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=420, offset=320][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=572, offset=740][0m
-[0m✱ [0mGrep "resume phase-075|resume phase-0|DELIVERY|subject"[90m 100 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=160, offset=1][0m
-[0m✱ [0mGrep ""give"|"back"|give|Give"[90m 10 matches[0m
-[0m✱ [0mGrep "give back|GiveBack|TokenKind::Give"[90m in src · 57 matches[0m
-[0m→ [0mRead src/parser.rs[90m [limit=110, offset=1395][0m
+[0m✱ [0mGrep "unwrap\(|expect\(|panic!|unreachable!|todo!|unimplemented!|\[[a-z_]+\]|as usize|as u|\.\."[90m in src/lsp.rs · 100 matches[0m
+[0m✱ [0mGrep "pub fn goto_definition|pub fn find_references|pub fn completions|fn resolve|fn context|fn ident_at|fn token_at"[90m in src/lsp.rs · 24 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1180, limit=340][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=800, limit=380][0m
+[0m✱ [0mGrep "edge_builtin_references|goto_definition|member_names|type_names|edge_assignment_to|edge_object_member|error carries|enormous"[90m in tests · 52 matches[0m
+[0m✱ [0mGrep "TokenKind::Text|TokenKind::Dot|fn tokenize|column:"[90m in src · 10 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1400, limit=240][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=480, limit=60][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1140, limit=90][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=700, limit=160][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead src/lsp.rs[90m [offset=700, limit=104][0m
 FINDINGS:
+1. [MAJOR] src/lsp.rs:1506 — CR-only line endings are not handled: `inside_comment` terminates a `//` comment only at `'\n'`, and `SourceMap::new` (same file) records only `'\n'` as a line start, while the lexer explicitly treats `'\r'` as a newline (src/lexer.rs:482-488). A file using classic-Mac `\r` endings therefore has every navigation call reject lines >1 as past EOF (or, on line 1, map columns across the whole file), and completions anywhere after a `//` are wrongly empty because the comment scan runs to EOF. — Add `'\r'`/CRLF handling to both the line-start builder and the comment terminator, and add a CR/CRLF navigation test. VERIFIED: traced both branches in source (not executed).
+2. [MAJOR] src/lsp.rs:1355 — `goto_definition` falls back to a builtin whenever the identifier text matches `BUILTIN_NAMES`/`MODULES`, without consulting `member_names`. For `say holder.abs`, `abs` is recorded as a member access (line 1149) and is not the global builtin, yet goto answers `DefinitionKind::Builtin` at 0:0. `find_references` was fixed to exclude these (line 1397), so the two navigation APIs now disagree on the same token. — Guard the builtin fallback with `!member_names.contains(&index)` (note the test at line 1170 intentionally pins type-name `list` → builtin, so do not extend the guard to `type_names` without updating that test) and add a goto test on `holder.abs`.
 
-1. [MAJOR] src/lsp.rs:892-895 — `set` inside a nested block always creates a fresh binding in the current scope, while the interpreter's `set_var` writes through to an enclosing binding (the report itself admits this at `phases/phase-075/REPORT.md` "Known gaps"). For the common accumulator form `set x to 0` … `while … set x to x - 1 … end`, the analyzer declares a new inner `x` *before* resolving the RHS `x`, so `goto_definition` on the RHS points at the inner `set` line instead of the real outer declaration, and `find_references` on the outer `x` misses both the write and its read. This is not lexical shadowing — Redblue has no inner-declaration form here — so the navigation answer is simply wrong. Fix: in the `Set`/`Constant` handler, look up the name across `scopes` first and reuse that binding (marking the token as a reference); only call `declare` when no enclosing binding exists. VERIFIED: traced token order — `declare` at src/lsp.rs:894 runs before the RHS identifier is resolved at src/lsp.rs:931-936, so the RHS resolves to the binding just created.
-
-2. [MAJOR] src/lsp.rs:829-832 — a one-line function literal is left open until the end of its source line (`frame.closes_at_newline = Some(token.line)`), but the parser ends the literal at the statement boundary *within* that line (`while self.span().line == open_line && self.can_begin_statement()` at src/parser.rs:1463). For valid source like `say f(to (x) give back x, x)`, the trailing `x` argument is still inside the literal's scope in the analyzer, so `goto_definition`/`find_references` resolve it to the literal's parameter instead of the outer `x`. Fix: close the literal scope at the token where the parsed body ends (the first `,`/`)`/`]`/`}` that cannot begin a statement), matching `parser::can_begin_statement`, rather than at the newline; or derive the close offset from the parsed `Expr::FunctionLiteral` span. Add a test with a reference after the literal on the same line. VERIFIED: traced the parser (src/parser.rs:1455-1469) and analyzer (src/lsp.rs:809-836) paths.
-
-3. [MINOR] src/lsp.rs:1189 — `inside_comment` returns true only for `offset < end`, where `end` is the newline index. A cursor exactly at the end of a comment line (and, for an unterminated comment at EOF, a cursor at EOF where `offset == len`) is therefore reported as *outside* the comment, and `completions` returns the whole keyword/builtin/scope list inside the comment. Not covered by `edge_completions_inside_line_comment_are_empty`, which only probes mid-comment. Fix: treat the terminating position as inside (`offset <= end` with the newline/EOF case handled explicitly) and add an end-of-comment / unterminated-comment boundary test.
-
-4. [MINOR] tests/tooling_grammar_test.rs:930-933 — the 5000-line benchmark's wall-clock bound was relaxed from one second to two (`elapsed < Duration::from_secs(2)`), which is the "threshold lowered" gate-weakening class and remains environment-dependent: a loaded CI runner can exceed it, and a genuine complexity regression could hide under the wider bound. The operation is linear, so assert a scaling property (e.g. 10 kB vs 50 kB ratio) or keep a tighter bound with a warm-up rather than doubling the tolerance.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 2

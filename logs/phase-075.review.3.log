@@ -1,32 +1,21 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=197, limit=700][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=897, limit=420][0m
-[0m✱ [0mGrep "fn (edge_|goto_|find_|malformed_|navigation_)"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=190, limit=700][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=890, limit=700][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=200, limit=120][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=190, offset=1][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=110, offset=340][0m
+[0m✱ [0mGrep "fn (edge_|goto_|find_references|completions|navigation|malformed)"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
 [0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m✱ [0mGrep "effective_navigation|fn .*navigation|fn edge_|fn goto_definition|fn find_references|fn completions|fn malformed_positions"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=460, offset=560][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=390, offset=1019][0m
-[0m✱ [0mGrep "goto_definition|find_references|completions\("[90m 79 matches[0m
-[0m✱ [0mGrep "hoist|forward|before (its|the) definition|defined later|declare.*later"[90m 29 matches[0m
-[0m✱ [0mGrep "object|has |\.name|property"[90m 25 matches[0m
-[0m→ [0mRead docs/GRAMMAR.md[90m [limit=80, offset=120][0m
-[0m→ [0mRead docs/GRAMMAR.md[90m [limit=40, offset=630][0m
-[0m✱ [0mGrep "TokenKind::Object|parse_type|ObjectType|type_expression"[90m 6 matches[0m
-[0m→ [0mRead src/parser.rs[90m [limit=70, offset=470][0m
-[0m→ [0mRead src/parser.rs[90m [limit=60, offset=1465][0m
-[0m✱ [0mGrep "type annotation|parse_parameter|parse_params|Colon =>|TokenKind::Colon|object type|Invalid type|unknown type"[90m 1 match[0m
+[0m→ [0mRead src/lexer.rs[90m [limit=222, offset=450][0m
+[0m✱ [0mGrep "^(fn |pub fn |#\[test\])|edge_"[90m in tests · 100 matches[0m
+[0m✱ [0mGrep "BUILTIN_NAMES|pub const MODULES|const BUILTIN"[90m in src/stdlib.rs · 22 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=420, offset=1380][0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=80, offset=2082][0m
 FINDINGS:
+1. [MAJOR] src/lsp.rs:800 — New frame/scope arms for `Unless`, `While`, `Repeat`/`Until`, `Module`, `Test` and `Try` (also src/lsp.rs:810, src/lsp.rs:874, src/lsp.rs:896, src/lsp.rs:897) ship without a single navigation test. An unbalanced `Frame`/scope in any of them silently corrupts every later `goto_definition`/`find_references`/`completions` answer at that point in the file (the scope never pops, or an inner `end` pops the wrong frame). The REPORT's "nesting_recursion" row only names `for`, object and function scopes, so this is a new branch with no test on either side. Fix: add `unless`/`while`/`repeat…until`/`module`/`test`/`try…catch` fixtures asserting a binding declared in the block does not leak past its terminator and that goto still resolves after it. (Read at src/lsp.rs:800-928; not executed, read-only.)
+2. [MAJOR] tests/tooling_grammar_test.rs:978 — `navigation_sample(lines: usize) -> Duration` plus `edge_navigation_handles_five_thousand_lines_quickly` (tests/tooling_grammar_test.rs:1018) make a wall-clock assertion. The REPORT describes it as comparing 1000 vs 5000 lines and "asserts linear scaling", which is a timing comparison; on a loaded/slow CI runner the ratio is nondeterministic and can fail a green gate intermittently (hunt list #4). The "resource_limit" matrix row is claimed covered by this, but a timing ratio is not a resource bound. Fix: assert a deterministic property (e.g., count `Lexer::tokenize`/scope operations, or a generous absolute ceiling such as no more than N seconds) instead of a ratio between two wall-clock samples. I did not read the assertion body (tool budget), so this is unverified beyond the REPORT's own description of it.
+3. [MINOR] tests/tooling_grammar_test.rs:1577 — `edge_builtin_references_exclude_member_and_type_names` calls `list` a builtin ("say list" ... "not a use of the builtin"), but `list` is not in `BUILTIN_NAMES` (src/stdlib.rs:2082-2161 lists `to_list`/`list_map`, not `list`). The test therefore exercises the *unresolved-name* path, not a real builtin, so the asserted claim about builtin references is misleading; the real builtin-with-type-collision case remains untested. Fix: use an actual member of `BUILTIN_NAMES` spelled identically to a type name (or change the wording and add a genuine builtin fixture).
 
-1. [MAJOR] src/lsp.rs:1037 — Type annotations are advanced over but never marked as non-references; the outer token loop at src/lsp.rs:981 then resolves every identifier consumed by `skip_type_expression` as an ordinary name. With `set number to 5` followed by `to scale(value: number)`, goto-definition on the annotation `number` returns the variable `number`, and `find_references` from that variable includes the annotation. The only type test (`edge_typed_and_of_parameters_do_not_declare_their_type_names`, tests/tooling_grammar_test.rs:1152) uses unbound `number` and the builtin `list`, so it cannot detect the collision. Fix: record the identifiers skipped by `skip_type_expression` (src/lsp.rs:952 and :1043) in a set the resolution arm ignores, and add a test where the type name shadows a real binding.
-
-2. [MAJOR] src/lsp.rs:967 — `has name` declares the field in the object's nested scope (pushed at src/lsp.rs:753), and `End` pops that scope (src/lsp.rs:686-691), so a property access outside the object never resolves. `docs/GRAMMAR.md:652` uses exactly `set Person.name to "Bob"`; the token `name` there is looked up in the root scope and `goto_definition` returns `None`, while `find_references` on `has name` omits it. No test exercises a property use (the only `has` test, tests/tooling_grammar_test.rs:1246, asserts the membership negative). Fix: resolve a name following `.` against its receiver's object binding, or keep field bindings reachable, and add a `this.name` / `Person.name` navigation test.
-
-3. [MAJOR] src/lsp.rs:981 — Resolution is single-pass and forward-only: `token_binding` is assigned from scopes built so far, so a use written before its declaration is left `None`. `goto_definition` (src/lsp.rs:1084-1093) therefore returns no definition for a call/use that appears earlier in the file, and `find_references` (src/lsp.rs:1119-1133) excludes those earlier uses from the declaration's answer. This is only correct if Redblue forbids forward references; if a function may be called before its `to ... end`, the navigation answer is wrong. A test declaring a function below its first use would settle it; none exists.
-
-4. [MINOR] src/lsp.rs:880 — `import network as net` declares `network` as an `Import` first (the `Identifier` arm), then declares `net` in the `As` arm at src/lsp.rs:897. Navigation therefore treats the pre-alias name as a bound import even though only the alias is presumably usable; no test covers the aliased import shape. Verify against the interpreter's import binding and, if only the alias is bound, do not `declare` the original name when an `as` follows.
-
-5. [MINOR] src/lsp.rs:1201 — The string/comment context boundaries are inconsistent: `inside_text` requires `offset > start`, and `inside_comment` scans only while `index < offset` (src/lsp.rs:1220), so a completion request on the opening quote or on the first `/` of `//` offers code completions, while the test matrix claims end-of-comment boundaries are handled and the newline after a comment is treated as inside (src/lsp.rs:1239). This is a small editor-convention gap, not a panic; either document the exclusive start or include the delimiter character.
-
-REVIEW VERDICT: FINDINGS 5
+REVIEW VERDICT: FINDINGS 3
