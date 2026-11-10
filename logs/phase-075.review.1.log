@@ -1,27 +1,26 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=400, limit=500][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=900, limit=500][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=340, offset=1400][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=150, offset=1950][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=130, offset=190][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=200, offset=200][0m
-[0m✱ [0mGrep "new |object |this\.|\.name|\.greet"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
-[0m✱ [0mGrep "new [A-Z]|is a new|object instance|create"[90m in docs/GRAMMAR.md · 11 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [limit=180, offset=320][0m
-[0m✱ [0mGrep "fn (goto_definition|find_references|completions|edge_object|edge_navigation_handles_cr|edge_completions_at_the)"[90m in tests/tooling_grammar_test.rs · 23 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=210, offset=1745][0m
-[0m✱ [0mGrep "fn edge_test_block_keeps|fn edge_try_catch_scope|fn edge_else_if|fn edge_assignment_to_inside|fn edge_unless_scope"[90m in tests/tooling_grammar_test.rs · 5 matches[0m
-[0m✱ [0mGrep "assert!\(true|is_ok\(\)|#\[ignore\]|todo!|unimplemented!"[90m in tests/tooling_grammar_test.rs · 69 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=120, offset=1255][0m
-[0m✱ [0mGrep "Unless|UnlessStatement|unless|push_scope|begin_scope|new_scope|scopes\.push"[90m in src/interpreter.rs · 88 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=40, offset=2100][0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=25, offset=1738][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=190, limit=750][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=200, limit=110][0m
+I'll inspect the main implementation and tests. Let me start reading the changed files.
+[0m→ [0mRead src/lsp.rs[90m [limit=600, offset=940][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=130, offset=310][0m
+[0m✱ [0mGrep "Newline|'\\r'|'\\n'"[90m in src/lexer.rs · 100 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [limit=290, offset=1540][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=231, offset=440][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=230, offset=1050][0m
+[0m✱ [0mGrep "run_block|Statement::Unless|Statement::Test"[90m in src · 36 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=220, offset=1280][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=70, offset=1085][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=45, offset=2100][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [limit=30, offset=328][0m
+[0m→ [0mRead src/bytecode/codegen.rs[90m [limit=25, offset=710][0m
 FINDINGS:
+1. [MAJOR] src/lsp.rs:1237 — The `TokenKind::Set | TokenKind::Constant` arm applies `set`'s write-through lookup to `constant` as well: `let existing = scopes.iter().rev().find_map(|scope| scope.get(name).copied());` then reuses that binding. A `constant` declared in an inner scope (loop/function/catch) where the spelling already exists in an enclosing scope is therefore never declared locally; goto/references answer the outer `set` binding and report kind `variable`, not `constant`. The comment above only justifies write-through for `set`. Fix: restrict the enclosing-scope reuse to `TokenKind::Set`; for `Constant`, always declare in the current scope. Not verified against the interpreter: settle by running `set x to 1` then `while ... constant x to 2 ... end` and checking whether the inner use is a new constant or the outer variable.
 
-1. [MAJOR] tests/tooling_grammar_test.rs:1301 — the only test covering the new `Test` frame does not actually test the claim in its own message. The final assertion checks `goto_definition(source, 9, 5)` on `item`, which is a `for each` variable whose `For` scope is already popped at line 5's `end` (src/lsp.rs:835-841 pops only `opens_scope`/`catch_scope` frames). It would pass even if a declaration written directly in the `test` body leaked. `src/lsp.rs:963` pushes `Frame::block(FrameKind::Test)` with `opens_scope: false`, so a plain `set local to 1` in a test body is declared in the enclosing scope and survives the test's `end`. If `test` bodies are meant to be scoped (the analyzer pushes a scope for `Test` at src/analyzer.rs:471/488), navigation is wrong here. Add a fixture with a direct `set local` in the test body and assert it is `None` after `end`; if the runtime does isolate test bodies, give the `Test` frame `Frame::scoped`. VERIFIED: read src/lsp.rs:835-841, src/lsp.rs:963 and tests/tooling_grammar_test.rs:1262-1306; the assertion at 1301-1305 cannot observe a Test-frame leak.
+2. [MAJOR] src/lsp.rs:1022 — `Catch` pushes a scope and sets `catch_scope = true` on the `Try` frame, and nothing pops it until the `end` at src/lsp.rs:892-898. The interpreter has a distinct `finally_body` (src/interpreter.rs:2510), so a `try ... catch ... finally ... end` analyzes the `finally` body inside the catch binder's scope: the catch binder remains visible in `finally`, and declarations written in `finally` are popped with the catch scope instead of staying in the enclosing scope. Fix: detect the finally clause (or the first token after the catch body) and pop the catch scope there rather than only at `End`. Settle by checking the parser keyword for finally and running a fixture where `finally` reads the catch binder and declares a name used after `end`.
 
-2. [MINOR] src/lsp.rs:515 — `declare_fresh` inserts with `scope.entry(name).or_insert(id)`, so plain-name resolution keeps the first binding while `object_fields`/`object_methods` keep the last. Combined with the plain lookup at src/lsp.rs:1271-1274, a bare call to a method that shares its spelling with an earlier-declared field resolves to the field, even though `member_binding` (src/lsp.rs:739-748) resolves the same spelling to the method when called through a receiver. E.g. `object R / has b default 1 / to can b() ... end / to can a() give back b() end` resolves `b()` to the field. Concrete fix: when the identifier is followed by `LeftParen`, prefer a `DefinitionKind::Function` binding from the visible scope (mirroring `member_binding`'s call rule). VERIFIED: traced src/lsp.rs:499-518, 739-748 and 1271-1274.
+3. [MAJOR] src/lsp.rs:1020 — Modeling a `test` body as sharing the enclosing scope means every top-level `test` block now writes into the same scope: a name declared in one `test` resolves in a later `test`. The test harness extracts each body independently (src/testing/harness.rs:94) and is expected to isolate tests, so navigation can disagree with what `rb test` sees. The uncommitted change also rewrote the prior tests that asserted test-body isolation instead of supplementing them, so nothing pins the new model. Fix: keep `test` bodies out of the file-level scope (or scope them per test) unless the harness provably runs all bodies in one shared environment. Settle by running two tests where one declares `x` and the other reads it under `rb test`.
 
-REVIEW VERDICT: FINDINGS 2
+REVIEW VERDICT: FINDINGS 3

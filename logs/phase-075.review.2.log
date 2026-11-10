@@ -1,24 +1,33 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "fn (collect|analyze|goto_definition|find_references|completions|declare|declare_fresh|scope_function_binding|member_binding|visible_names)"[90m 13 matches[0m
-[0m✱ [0mGrep "fn edge_|fn goto_definition|fn find_references|fn completions|fn navigation_|fn malformed_"[90m 58 matches[0m
-I'll start by inspecting the core navigation implementation and the tests.
-[0m→ [0mRead src/lsp.rs[90m [offset=825, limit=340][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1380, limit=280][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=216, offset=1165][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=132, offset=1660][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=200, offset=1970][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=140, offset=190][0m
-[0m✱ [0mGrep "Newline|'\\r'|c == '\\n'|is_whitespace"[90m 8 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=120, offset=1255][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=40, offset=470][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=62, offset=1834][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=2000][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=2000][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1369, limit=700][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1559, limit=900][0m
+[0m✱ [0mGrep "default|To can|Can|Has|Constant"[90m in src · 17 matches[0m
+[0m✱ [0mGrep "Unless|run_block|run_catch_body|run_finally_body|run_isolated|push_scope|current_scope"[90m in src · 100 matches[0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=340, limit=60][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2090, limit=45][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2470, limit=50][0m
+[0m✱ [0mGrep "fn run_source|analyze\(|AnalyzerError|Unknown variable"[90m in src · 44 matches[0m
+[0m→ [0mRead src/lib.rs[90m [limit=80, offset=90][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=160, offset=180][0m
+[0m✱ [0mGrep "Newline|'\\r'|'\\n'|skip_comment|skip_whitespace"[90m in src · 15 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [limit=45, offset=466][0m
+[0m→ [0mRead src/analyzer.rs[90m [limit=90, offset=60][0m
+[0m→ [0mRead src/analyzer.rs[90m [limit=55, offset=240][0m
+[0m→ [0mRead src/analyzer.rs[90m [limit=65, offset=140][0m
+[0m→ [0mRead src/analyzer.rs[90m [limit=150, offset=400][0m
+[0m→ [0mRead src/analyzer.rs[90m [limit=45, offset=550][0m
+[0m→ [0mRead src/testing/harness.rs[90m [limit=45, offset=190][0m
 FINDINGS:
-1. [MAJOR] src/lsp.rs:1566 — `find_references` computes `target = analysis.token_binding[index]` and, when it is `None`, matches every unresolved token of that spelling that is not a member/type name; it never checks whether the *requested* token itself is a member or type name. So `find_references("set holder to 1\nsay holder.abs\nsay abs(-1)\n", 2, 12)` on the member `abs` returns the unrelated plain builtin use at `(3,5)` (target is `None`, `(2,12)` is filtered out by `member_names`, `(3,5)` is not), instead of returning nothing / only itself. Same for a type name queried directly. The only test, `tests/tooling_grammar_test.rs:1836`, queries `(3,5)` (the plain use) rather than `(2,12)` (the member), so it never exposes this. — Fix: if `target.is_none() && (analysis.member_names.contains(&index) || analysis.type_names.contains(&index))`, answer empty (or just the requested location) instead of scanning all same-spelled unresolved names. — Traced through the exact branch at 1558-1576.
+1. [BLOCKER] src/lsp.rs:916-921 — `If`/`Unless` use `Frame::block`, so a function/import/object declared in their body stays in the enclosing scope, but the analyzer pushes and pops a scope for these bodies (`src/analyzer.rs:349-364`) and declares functions there (`src/analyzer.rs:429-439`). The new test `edge_unless_body_keeps_the_enclosing_scope_like_the_interpreter` (`tests/tooling_grammar_test.rs:1087-1129`) pins a program the compiler rejects: `to helper` inside `unless` is popped, so `say helper` after `end` is `Unknown variable 'helper'`. The report's "verified" `set leaked` experiment proved only that `set` writes through to program scope (`src/analyzer.rs:140-157`), not that every declaration in an `unless` body survives. — Fix: model non-`set`/non-`constant` declarations with the analyzer's scope push/pop, or fix the analyzer; replace this fixture with a compiler-valid one and add a negative test. — VERIFIED: traced `src/lib.rs:114-118` (analyzer runs before the VM), `src/analyzer.rs:359-364` and `src/analyzer.rs:429-439` (function declared in pushed scope then popped), versus `src/lsp.rs:921` (block frame opens no scope).
 
-2. [MAJOR] src/lsp.rs:1528 — `goto_definition` guards builtin resolution with `!analysis.member_names.contains(&index)` but omits the analogous `!analysis.type_names.contains(&index)`. A type annotation that happens to spell a builtin, e.g. `to total(items of abs)` (the type name is marked in `type_names` by `skip_type_expression`), resolves to `DefinitionKind::Builtin` even though `find_references` in the same file correctly treats it as a type name. `tests/tooling_grammar_test.rs:1859` only asserts the plain `abs` still resolves; no test asks goto of the type-name position. — Fix: add `&& !analysis.type_names.contains(&index)` to the guard.
+2. [BLOCKER] src/lsp.rs:1263-1285 — a `set` whose name is bound in no live scope is declared in the *current* scope, but the analyzer and VM bind that first assignment in the program scope (`src/analyzer.rs:140-157`: "to the program's own scope otherwise"). Thus `to f() set g to 1 end say g` is valid and `g` resolves after `end` at runtime, while navigation answers `None` after the function. The new test `edge_unless_nested_in_a_function_does_not_leak_out_of_the_function` (`tests/tooling_grammar_test.rs:1481-1507`) asserts exactly the wrong result and will fail if its fixture is run through `run_source`/the analyzer. — Fix: when no existing binding is found, declare `set` in scope id `0` (the program scope), as `declare_assigned` does, and add a test for a first assignment inside a function/loop. — VERIFIED: traced `src/analyzer.rs:140-157` and `src/lsp.rs:1271-1285`; the current-scope `declare` at `src/lsp.rs:1275` is popped with the function frame.
 
-3. [MINOR] tests/tooling_grammar_test.rs:2026 — the field/method same-name test only covers the field-declared-first order. `declare_fresh` (src/lsp.rs:499) inserts with `scope.entry(name).or_insert(id)`, so when the method is declared *before* `has name`, the plain-name entry stays the method and a bare field read resolves to the method, the opposite of `member_binding`'s "bare member prefers the field" rule. This reverse ordering is a new branch with no test on either side; add a fixture with `to can name()` above `has name` and pin the bare-use expectation.
+3. [MAJOR] src/lsp.rs:1248-1285 — `constant` is always declared in the current scope, but the analyzer declares every constant in the program scope (`src/analyzer.rs:159-167`: "The VM binds a constant to a global whatever scope the declaration is written in"). The new test `edge_constant_in_an_inner_scope_shadows_the_enclosing_variable` (`tests/tooling_grammar_test.rs:1403-1433`) asserts a local shadowing that neither the analyzer nor the VM implements, so it is a wrong oracle rather than a regression test. — Fix: declare constants in the program/root scope (or change the analyzer and VM first, with tests), and rewrite this test to pin the real behavior. — VERIFIED: by reading `src/analyzer.rs:159-167` and the `scopes.last_mut()` declare path in `src/lsp.rs:1254-1285`.
 
-REVIEW VERDICT: FINDINGS 3
+4. [MAJOR] src/lsp.rs:1203-1210 — every `import` is declared into `scopes[..1]` (the root scope), regardless of where it is written. The analyzer declares imports into the scope containing the statement (`src/analyzer.rs:498-549`), so an `import` inside a function or loop leaks out of its block in navigation and `goto_definition` after the block resolves a name the analyzer rejects. There is no test for a nested import, only the top-level `edge_find_references_on_imported_module_spans_the_import`. — Fix: declare imports in the current scope (`scope_ids.last()`), as the analyzer does, and add a nested-import fixture.
+
+REVIEW VERDICT: FINDINGS 4
