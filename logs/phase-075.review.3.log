@@ -1,21 +1,22 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=190, limit=700][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=890, limit=700][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=200, limit=120][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=190, offset=1][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=110, offset=340][0m
-[0m✱ [0mGrep "fn (edge_|goto_|find_references|completions|navigation|malformed)"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead src/lexer.rs[90m [limit=222, offset=450][0m
-[0m✱ [0mGrep "^(fn |pub fn |#\[test\])|edge_"[90m in tests · 100 matches[0m
-[0m✱ [0mGrep "BUILTIN_NAMES|pub const MODULES|const BUILTIN"[90m in src/stdlib.rs · 22 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=420, offset=1380][0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=80, offset=2082][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=2000][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=2000][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=220, limit=90][0m
+[0m→ [0mRead src/lib.rs[90m [offset=1, limit=80][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1372, limit=2000][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1548, limit=2000][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=310, limit=180][0m
+[0m✱ [0mGrep "Default|default"[90m 7 matches[0m
+[0m✱ [0mGrep "TokenKind::Default|Default"[90m 0 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [offset=484, limit=70][0m
+[0m✱ [0mGrep "fn parse_parameters|parse_parameter|LeftParen.*param|parameters"[90m 4 matches[0m
+[0m✱ [0mGrep "declare_assigned|fn set_var|run_block|run_catch_body|run_finally_body|constant"[90m in src · 100 matches[0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=140, limit=45][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [offset=1448, limit=50][0m
 FINDINGS:
-1. [MAJOR] src/lsp.rs:800 — New frame/scope arms for `Unless`, `While`, `Repeat`/`Until`, `Module`, `Test` and `Try` (also src/lsp.rs:810, src/lsp.rs:874, src/lsp.rs:896, src/lsp.rs:897) ship without a single navigation test. An unbalanced `Frame`/scope in any of them silently corrupts every later `goto_definition`/`find_references`/`completions` answer at that point in the file (the scope never pops, or an inner `end` pops the wrong frame). The REPORT's "nesting_recursion" row only names `for`, object and function scopes, so this is a new branch with no test on either side. Fix: add `unless`/`while`/`repeat…until`/`module`/`test`/`try…catch` fixtures asserting a binding declared in the block does not leak past its terminator and that goto still resolves after it. (Read at src/lsp.rs:800-928; not executed, read-only.)
-2. [MAJOR] tests/tooling_grammar_test.rs:978 — `navigation_sample(lines: usize) -> Duration` plus `edge_navigation_handles_five_thousand_lines_quickly` (tests/tooling_grammar_test.rs:1018) make a wall-clock assertion. The REPORT describes it as comparing 1000 vs 5000 lines and "asserts linear scaling", which is a timing comparison; on a loaded/slow CI runner the ratio is nondeterministic and can fail a green gate intermittently (hunt list #4). The "resource_limit" matrix row is claimed covered by this, but a timing ratio is not a resource bound. Fix: assert a deterministic property (e.g., count `Lexer::tokenize`/scope operations, or a generous absolute ceiling such as no more than N seconds) instead of a ratio between two wall-clock samples. I did not read the assertion body (tool budget), so this is unverified beyond the REPORT's own description of it.
-3. [MINOR] tests/tooling_grammar_test.rs:1577 — `edge_builtin_references_exclude_member_and_type_names` calls `list` a builtin ("say list" ... "not a use of the builtin"), but `list` is not in `BUILTIN_NAMES` (src/stdlib.rs:2082-2161 lists `to_list`/`list_map`, not `list`). The test therefore exercises the *unresolved-name* path, not a real builtin, so the asserted claim about builtin references is misleading; the real builtin-with-type-collision case remains untested. Fix: use an actual member of `BUILTIN_NAMES` spelled identically to a type name (or change the wording and add a genuine builtin fixture).
+1. [BLOCKER] src/lsp.rs:1356 — A first `set` inside a `module` body is declared in the file/program scope, not the module scope — `module M ... set local to 1 ... end` then `say local` navigates as if `local` leaked out, while the VM keeps it module-local — track open module scopes and use the innermost module body as the program scope for `set`, mirroring the existing `test_scopes` handling, and add a module/`set` fixture — VERIFIED: traced src/lsp.rs:1356-1360, where only `test_scopes` is consulted before defaulting to `scopes[..1]`/scope `0`, against src/bytecode/vm.rs:1461-1465, where `set_var` writes a new name into `self.locals.last_mut()` when `module_depth > 0`.
+2. [MAJOR] src/lsp.rs:1133 — `catch_binder_index` only marks the binder (`problem`); the contextual words `error`, `of`, and the failure kind (`Runtime`) remain ordinary identifiers and are resolved by the identifier branch at src/lsp.rs:1431 — a user variable named `error` or `Runtime` gets spurious goto/reference hits from the catch header, and a failure kind spelled like a builtin/module is counted as a use — mark the handler word, `of`, and the failure kind in a non-name/type set (as `skip_type_expression` does for parameter types), with a typed-catch fixture. The same gap exists at src/lsp.rs:1404 for `has name default ...`, where `default` is lexed as an identifier and is never marked as a syntax word; it should be excluded from name resolution too.
 
-REVIEW VERDICT: FINDINGS 3
+REVIEW VERDICT: FINDINGS 2

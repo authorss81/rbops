@@ -1,33 +1,25 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [limit=2000][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=2000][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1369, limit=700][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1559, limit=900][0m
-[0m✱ [0mGrep "default|To can|Can|Has|Constant"[90m in src · 17 matches[0m
-[0m✱ [0mGrep "Unless|run_block|run_catch_body|run_finally_body|run_isolated|push_scope|current_scope"[90m in src · 100 matches[0m
-[0m→ [0mRead src/analyzer.rs[90m [offset=340, limit=60][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2090, limit=45][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2470, limit=50][0m
-[0m✱ [0mGrep "fn run_source|analyze\(|AnalyzerError|Unknown variable"[90m in src · 44 matches[0m
-[0m→ [0mRead src/lib.rs[90m [limit=80, offset=90][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=160, offset=180][0m
-[0m✱ [0mGrep "Newline|'\\r'|'\\n'|skip_comment|skip_whitespace"[90m in src · 15 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [limit=45, offset=466][0m
-[0m→ [0mRead src/analyzer.rs[90m [limit=90, offset=60][0m
-[0m→ [0mRead src/analyzer.rs[90m [limit=55, offset=240][0m
-[0m→ [0mRead src/analyzer.rs[90m [limit=65, offset=140][0m
-[0m→ [0mRead src/analyzer.rs[90m [limit=150, offset=400][0m
-[0m→ [0mRead src/analyzer.rs[90m [limit=45, offset=550][0m
-[0m→ [0mRead src/testing/harness.rs[90m [limit=45, offset=190][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=220, limit=70][0m
+[0m✱ [0mGrep "fn completions|fn completions_json|visible_names|fn find_references|sort|dedup"[90m in src/lsp.rs · 100 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1350, limit=260][0m
+[0m✱ [0mGrep "visible_names|visible:|struct Analysis|fn analyze|fn completions|BUILTIN_NAMES|MODULES|sort"[90m in src/lsp.rs · 100 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1608, limit=300][0m
+[0m✱ [0mGrep "fn is_builtin_name|fn is_member_access|fn call_follows|fn scope_plain_binding|fn scope_function_binding|fn member_binding|fn analyze"[90m in src/lsp.rs · 21 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=440, limit=120][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=700, limit=260][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=959, limit=392][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=330, limit=120][0m
+[0m✱ [0mGrep "Newline|'\\r'|'\\n'|fn next_token|fn tokenize"[90m in src/lexer.rs · 100 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [offset=490, limit=181][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=455, limit=42][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1560, limit=360][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=2380, limit=181][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=560, limit=142][0m
 FINDINGS:
-1. [BLOCKER] src/lsp.rs:916-921 — `If`/`Unless` use `Frame::block`, so a function/import/object declared in their body stays in the enclosing scope, but the analyzer pushes and pops a scope for these bodies (`src/analyzer.rs:349-364`) and declares functions there (`src/analyzer.rs:429-439`). The new test `edge_unless_body_keeps_the_enclosing_scope_like_the_interpreter` (`tests/tooling_grammar_test.rs:1087-1129`) pins a program the compiler rejects: `to helper` inside `unless` is popped, so `say helper` after `end` is `Unknown variable 'helper'`. The report's "verified" `set leaked` experiment proved only that `set` writes through to program scope (`src/analyzer.rs:140-157`), not that every declaration in an `unless` body survives. — Fix: model non-`set`/non-`constant` declarations with the analyzer's scope push/pop, or fix the analyzer; replace this fixture with a compiler-valid one and add a negative test. — VERIFIED: traced `src/lib.rs:114-118` (analyzer runs before the VM), `src/analyzer.rs:359-364` and `src/analyzer.rs:429-439` (function declared in pushed scope then popped), versus `src/lsp.rs:921` (block frame opens no scope).
+1. [MAJOR] src/lsp.rs:1327 — A `constant` declared after a same-named binding in the program scope resolves to the *earlier* binding, not to its own declaration. The `Constant` branch deliberately clears `existing` (src/lsp.rs:1315-1317) and then calls `declare` for the program scope, but `declare` returns early on any name already in that map: `let scope = scopes.last_mut()...; if let Some(existing) = scope.get(name) { return *existing; }` (src/lsp.rs:479-481). So for `set x to 1` followed by `constant x to 2` in a loop, `mark_declaration` records the variable's id, and goto on the `constant x` token returns the `set x` span with kind `variable`. The earlier committed fixture asserted the opposite behaviour (`edge_constant_in_an_inner_scope_shadows_the_enclosing_variable`, "its references do not join the outer `set`"); the uncommitted report renames/rewords it to `edge_constant_in_an_inner_scope_is_a_program_binding` instead of keeping the shadowing assertion — i.e. the test was changed to fit the code rather than the code fixed. Fix: declare constants with `declare_fresh` (or only reuse an existing binding whose kind is also `Constant`), and restore a test with an outer `set x` and an inner `constant x` asserting distinct bindings and references. — VERIFIED: traced src/lsp.rs:1315-1336 → `declare` at src/lsp.rs:479-481, which returns the existing program-scope binding; `mark_declaration` then stores it for the constant's own name token.
 
-2. [BLOCKER] src/lsp.rs:1263-1285 — a `set` whose name is bound in no live scope is declared in the *current* scope, but the analyzer and VM bind that first assignment in the program scope (`src/analyzer.rs:140-157`: "to the program's own scope otherwise"). Thus `to f() set g to 1 end say g` is valid and `g` resolves after `end` at runtime, while navigation answers `None` after the function. The new test `edge_unless_nested_in_a_function_does_not_leak_out_of_the_function` (`tests/tooling_grammar_test.rs:1481-1507`) asserts exactly the wrong result and will fail if its fixture is run through `run_source`/the analyzer. — Fix: when no existing binding is found, declare `set` in scope id `0` (the program scope), as `declare_assigned` does, and add a test for a first assignment inside a function/loop. — VERIFIED: traced `src/analyzer.rs:140-157` and `src/lsp.rs:1271-1285`; the current-scope `declare` at `src/lsp.rs:1275` is popped with the function frame.
+2. [MAJOR] src/lsp.rs:1239 — The `Import` walker declares every identifier it sees on the import line before it looks for an alias, so `import network as net` declares **both** `network` (src/lsp.rs:1239-1257) and `net` (src/lsp.rs:1258-1279). If the runtime/analyzer binds only the alias (the AGENTS.md example says `import files, network as net` then uses `net.get(...)`), navigation and completion offer a nonexistent `network` binding, and goto on the module token points at a binding the program does not have. Fix: buffer the module name and only declare it when no `as`/`to` alias follows, or drop the pre-alias declaration when an alias is found. Settle by checking `src/analyzer.rs`/`src/interpreter.rs` import handling or running `import files as f` then `say files`. — VERIFIED: traced the loop in src/lsp.rs:1236-1282: `Identifier` is declared immediately at cursor, then `As` advances and declares the alias as a second binding.
 
-3. [MAJOR] src/lsp.rs:1248-1285 — `constant` is always declared in the current scope, but the analyzer declares every constant in the program scope (`src/analyzer.rs:159-167`: "The VM binds a constant to a global whatever scope the declaration is written in"). The new test `edge_constant_in_an_inner_scope_shadows_the_enclosing_variable` (`tests/tooling_grammar_test.rs:1403-1433`) asserts a local shadowing that neither the analyzer nor the VM implements, so it is a wrong oracle rather than a regression test. — Fix: declare constants in the program/root scope (or change the analyzer and VM first, with tests), and rewrite this test to pin the real behavior. — VERIFIED: by reading `src/analyzer.rs:159-167` and the `scopes.last_mut()` declare path in `src/lsp.rs:1254-1285`.
-
-4. [MAJOR] src/lsp.rs:1203-1210 — every `import` is declared into `scopes[..1]` (the root scope), regardless of where it is written. The analyzer declares imports into the scope containing the statement (`src/analyzer.rs:498-549`), so an `import` inside a function or loop leaks out of its block in navigation and `goto_definition` after the block resolves a name the analyzer rejects. There is no test for a nested import, only the top-level `edge_find_references_on_imported_module_spans_the_import`. — Fix: declare imports in the current scope (`scope_ids.last()`), as the analyzer does, and add a nested-import fixture.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 2
