@@ -1,29 +1,27 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=190, limit=520][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=710, limit=780][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=700, limit=780][0m
-[0m✱ [0mGrep "fn message|fn display|line|column"[90m in src/error.rs · 100 matches[0m
-[0m✱ [0mGrep "Dot|TokenKind::Text|pub const BUILTIN_NAMES|pub const MODULES|fn tokenize"[90m in src · 19 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [offset=460, limit=140][0m
-[0m→ [0mRead src/error.rs[90m [offset=1, limit=120][0m
-[0m→ [0mRead src/error.rs[90m [offset=120, limit=130][0m
-[0m✱ [0mGrep "pub const KEYWORDS|=> TokenKind::|^\s*\(""[90m in src/lexer.rs · 100 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [offset=150, limit=310][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=599, limit=70][0m
-[0m✱ [0mGrep "KEYWORDS\s*[:=]|KEYWORDS"[90m in src · 15 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [offset=1, limit=150][0m
-[0m✱ [0mGrep "then\s+(set|say|give|return|print)\b.*\bend\b"[90m in . · 9 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=400, limit=500][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=900, limit=500][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=340, offset=1400][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=150, offset=1950][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=130, offset=190][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=200, offset=200][0m
+[0m✱ [0mGrep "new |object |this\.|\.name|\.greet"[90m in tests/tooling_grammar_test.rs · 100 matches[0m
+[0m✱ [0mGrep "new [A-Z]|is a new|object instance|create"[90m in docs/GRAMMAR.md · 11 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [limit=180, offset=320][0m
+[0m✱ [0mGrep "fn (goto_definition|find_references|completions|edge_object|edge_navigation_handles_cr|edge_completions_at_the)"[90m in tests/tooling_grammar_test.rs · 23 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=210, offset=1745][0m
+[0m✱ [0mGrep "fn edge_test_block_keeps|fn edge_try_catch_scope|fn edge_else_if|fn edge_assignment_to_inside|fn edge_unless_scope"[90m in tests/tooling_grammar_test.rs · 5 matches[0m
+[0m✱ [0mGrep "assert!\(true|is_ok\(\)|#\[ignore\]|todo!|unimplemented!"[90m in tests/tooling_grammar_test.rs · 69 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=120, offset=1255][0m
+[0m✱ [0mGrep "Unless|UnlessStatement|unless|push_scope|begin_scope|new_scope|scopes\.push"[90m in src/interpreter.rs · 88 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=40, offset=2100][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=25, offset=1738][0m
 FINDINGS:
-1. [BLOCKER] src/lsp.rs:957 — The `to` of a plain assignment is misread as a function-literal opener. After `Set` declares a name, the `Set` arm does not consume the following `to` (lines 1049-1094), so the main loop visits it; `is_declaration` is false (lines 918-919), and because `Set` is not in `ends_expression` (597-610) the `else if` at 957-959 pushes a scoped `FrameKind::Literal` plus a scope (960-994). That spurious frame has `closes_at_token` at the line end and then steals the next inline `end` at 744-749 instead of the intended enclosing frame. Repro: `to f(limit)` / `    if limit is 1 then set flag to yes end` / `    say limit` / `end` / `say limit` — the literal frame is popped by the inline `end`, so the `If` frame survives, the function's `end` pops that `If`, and the function scope is never popped; `goto_definition(source, 5, 5)` then wrongly resolves the post-function `limit` to the parameter at line 1 (same failure shape the `else-if` test guards against, but that fixture has no `set`). Concrete fix: treat a `to` whose preceding significant token is `Set`/`Constant` as the assignment operator, not a literal opener (e.g. add those kinds to the `ends_expression` check at 957-958 or track assignment context). VERIFIED: traced the token path at lines 918-919, 957-994, 744-749 against the lexer's valid one-line block form (`if x then say "a" end`, src/parser.rs:3436); not executed because read-only.
 
-2. [MAJOR] src/lsp.rs:1127 — Object-field navigation only resolves during the first pass, using `token_binding[index - 2]` as the receiver; if the receiver is declared later, `token_binding` is still `None` there. The deferred pass that exists precisely for uses before declarations (1163-1193) explicitly skips `member_names` (1176), so a forward reference like `say p.name` above `object p ... has name ... end` never binds `name`: `goto_definition` returns `None` and `find_references` on the `has` field omit the use. There is also no test in tests/tooling_grammar_test.rs exercising `obj.field`/`this.field` navigation at all, so this whole branch is unpinned. Fix: resolve `member_names` in the deferred pass after receivers are resolved (and `object_fields` is populated), and add a member-access test both for forward and ordinary references.
+1. [MAJOR] tests/tooling_grammar_test.rs:1301 — the only test covering the new `Test` frame does not actually test the claim in its own message. The final assertion checks `goto_definition(source, 9, 5)` on `item`, which is a `for each` variable whose `For` scope is already popped at line 5's `end` (src/lsp.rs:835-841 pops only `opens_scope`/`catch_scope` frames). It would pass even if a declaration written directly in the `test` body leaked. `src/lsp.rs:963` pushes `Frame::block(FrameKind::Test)` with `opens_scope: false`, so a plain `set local to 1` in a test body is declared in the enclosing scope and survives the test's `end`. If `test` bodies are meant to be scoped (the analyzer pushes a scope for `Test` at src/analyzer.rs:471/488), navigation is wrong here. Add a fixture with a direct `set local` in the test body and assert it is `None` after `end`; if the runtime does isolate test bodies, give the `Test` frame `Frame::scoped`. VERIFIED: read src/lsp.rs:835-841, src/lsp.rs:963 and tests/tooling_grammar_test.rs:1262-1306; the assertion at 1301-1305 cannot observe a Test-frame leak.
 
-3. [MINOR] src/lsp.rs:709 — `analyze` maps lexer failures with `error.message()`, discarding the `Span`; `Error::message()` returns only the text (src/error.rs:172-186). All three navigation entry points therefore return a bare `String` such as `"Unterminated string"` with no line/column, so an editor cannot point at the malformed source. `edge_malformed_source_returns_errors_not_panics` only asserts `is_err()`, so this loss is untested. Fix: include `error.span()`/the full position in the returned message or return a structured error.
+2. [MINOR] src/lsp.rs:515 — `declare_fresh` inserts with `scope.entry(name).or_insert(id)`, so plain-name resolution keeps the first binding while `object_fields`/`object_methods` keep the last. Combined with the plain lookup at src/lsp.rs:1271-1274, a bare call to a method that shares its spelling with an earlier-declared field resolves to the field, even though `member_binding` (src/lsp.rs:739-748) resolves the same spelling to the method when called through a receiver. E.g. `object R / has b default 1 / to can b() ... end / to can a() give back b() end` resolves `b()` to the field. Concrete fix: when the identifier is followed by `LeftParen`, prefer a `DefinitionKind::Function` binding from the visible scope (mirroring `member_binding`'s call rule). VERIFIED: traced src/lsp.rs:499-518, 739-748 and 1271-1274.
 
-4. [MINOR] src/lsp.rs:1416 — Off-by-one at the delimiter itself: `inside_text` returns `offset > start && offset <= cursor`, so a caret exactly on the opening quote (`offset == start`) is treated as code, and `inside_comment` loops `while index < offset` (1435) so it never inspects a `//` that begins exactly at `offset` (1454); completions are offered while the cursor sits on the string quote or the first `/` of a comment. Fix: use `offset >= start` for the quote and scan up to `index <= offset` for the comment.
-
-5. [MINOR] src/lsp.rs:1342 — For a builtin (target `None`), `find_references` matches every same-named token whose `token_binding` is `None` (`analysis.token_binding[candidate].is_none()`, 1342-1345), which includes unresolved member accesses (`x.abs`) and type-annotation names (`items of length`) recorded as `member_names`/`type_names`. So references for a builtin name include occurrences that are not uses of that builtin. Fix: exclude `member_names` and `type_names` candidates from the unresolved-name branch.
-
-REVIEW VERDICT: FINDINGS 5
+REVIEW VERDICT: FINDINGS 2

@@ -1,20 +1,24 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "unwrap\(|expect\(|panic!|unreachable!|todo!|unimplemented!|\[[a-z_]+\]|as usize|as u|\.\."[90m in src/lsp.rs · 100 matches[0m
-[0m✱ [0mGrep "pub fn goto_definition|pub fn find_references|pub fn completions|fn resolve|fn context|fn ident_at|fn token_at"[90m in src/lsp.rs · 24 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1180, limit=340][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=800, limit=380][0m
-[0m✱ [0mGrep "edge_builtin_references|goto_definition|member_names|type_names|edge_assignment_to|edge_object_member|error carries|enormous"[90m in tests · 52 matches[0m
-[0m✱ [0mGrep "TokenKind::Text|TokenKind::Dot|fn tokenize|column:"[90m in src · 10 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1400, limit=240][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=480, limit=60][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1140, limit=90][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=700, limit=160][0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead src/lsp.rs[90m [offset=700, limit=104][0m
+[0m✱ [0mGrep "fn (collect|analyze|goto_definition|find_references|completions|declare|declare_fresh|scope_function_binding|member_binding|visible_names)"[90m 13 matches[0m
+[0m✱ [0mGrep "fn edge_|fn goto_definition|fn find_references|fn completions|fn navigation_|fn malformed_"[90m 58 matches[0m
+I'll start by inspecting the core navigation implementation and the tests.
+[0m→ [0mRead src/lsp.rs[90m [offset=825, limit=340][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1380, limit=280][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=216, offset=1165][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=132, offset=1660][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=200, offset=1970][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=140, offset=190][0m
+[0m✱ [0mGrep "Newline|'\\r'|c == '\\n'|is_whitespace"[90m 8 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=120, offset=1255][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=40, offset=470][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=62, offset=1834][0m
 FINDINGS:
-1. [MAJOR] src/lsp.rs:1506 — CR-only line endings are not handled: `inside_comment` terminates a `//` comment only at `'\n'`, and `SourceMap::new` (same file) records only `'\n'` as a line start, while the lexer explicitly treats `'\r'` as a newline (src/lexer.rs:482-488). A file using classic-Mac `\r` endings therefore has every navigation call reject lines >1 as past EOF (or, on line 1, map columns across the whole file), and completions anywhere after a `//` are wrongly empty because the comment scan runs to EOF. — Add `'\r'`/CRLF handling to both the line-start builder and the comment terminator, and add a CR/CRLF navigation test. VERIFIED: traced both branches in source (not executed).
-2. [MAJOR] src/lsp.rs:1355 — `goto_definition` falls back to a builtin whenever the identifier text matches `BUILTIN_NAMES`/`MODULES`, without consulting `member_names`. For `say holder.abs`, `abs` is recorded as a member access (line 1149) and is not the global builtin, yet goto answers `DefinitionKind::Builtin` at 0:0. `find_references` was fixed to exclude these (line 1397), so the two navigation APIs now disagree on the same token. — Guard the builtin fallback with `!member_names.contains(&index)` (note the test at line 1170 intentionally pins type-name `list` → builtin, so do not extend the guard to `type_names` without updating that test) and add a goto test on `holder.abs`.
+1. [MAJOR] src/lsp.rs:1566 — `find_references` computes `target = analysis.token_binding[index]` and, when it is `None`, matches every unresolved token of that spelling that is not a member/type name; it never checks whether the *requested* token itself is a member or type name. So `find_references("set holder to 1\nsay holder.abs\nsay abs(-1)\n", 2, 12)` on the member `abs` returns the unrelated plain builtin use at `(3,5)` (target is `None`, `(2,12)` is filtered out by `member_names`, `(3,5)` is not), instead of returning nothing / only itself. Same for a type name queried directly. The only test, `tests/tooling_grammar_test.rs:1836`, queries `(3,5)` (the plain use) rather than `(2,12)` (the member), so it never exposes this. — Fix: if `target.is_none() && (analysis.member_names.contains(&index) || analysis.type_names.contains(&index))`, answer empty (or just the requested location) instead of scanning all same-spelled unresolved names. — Traced through the exact branch at 1558-1576.
 
-REVIEW VERDICT: FINDINGS 2
+2. [MAJOR] src/lsp.rs:1528 — `goto_definition` guards builtin resolution with `!analysis.member_names.contains(&index)` but omits the analogous `!analysis.type_names.contains(&index)`. A type annotation that happens to spell a builtin, e.g. `to total(items of abs)` (the type name is marked in `type_names` by `skip_type_expression`), resolves to `DefinitionKind::Builtin` even though `find_references` in the same file correctly treats it as a type name. `tests/tooling_grammar_test.rs:1859` only asserts the plain `abs` still resolves; no test asks goto of the type-name position. — Fix: add `&& !analysis.type_names.contains(&index)` to the guard.
+
+3. [MINOR] tests/tooling_grammar_test.rs:2026 — the field/method same-name test only covers the field-declared-first order. `declare_fresh` (src/lsp.rs:499) inserts with `scope.entry(name).or_insert(id)`, so when the method is declared *before* `has name`, the plain-name entry stays the method and a bare field read resolves to the method, the opposite of `member_binding`'s "bare member prefers the field" rule. This reverse ordering is a new branch with no test on either side; add a fixture with `to can name()` above `has name` and pin the bare-use expectation.
+
+REVIEW VERDICT: FINDINGS 3
