@@ -1,25 +1,28 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
+[0m✱ [0mGrep "^\s*(pub )?fn |^\s*fn |struct |enum "[90m 67 matches[0m
 [0m→ [0mRead src/lexer.rs[90m [offset=220, limit=70][0m
-[0m✱ [0mGrep "fn completions|fn completions_json|visible_names|fn find_references|sort|dedup"[90m in src/lsp.rs · 100 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1350, limit=260][0m
-[0m✱ [0mGrep "visible_names|visible:|struct Analysis|fn analyze|fn completions|BUILTIN_NAMES|MODULES|sort"[90m in src/lsp.rs · 100 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1608, limit=300][0m
-[0m✱ [0mGrep "fn is_builtin_name|fn is_member_access|fn call_follows|fn scope_plain_binding|fn scope_function_binding|fn member_binding|fn analyze"[90m in src/lsp.rs · 21 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=440, limit=120][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=700, limit=260][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=959, limit=392][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=330, limit=120][0m
-[0m✱ [0mGrep "Newline|'\\r'|'\\n'|fn next_token|fn tokenize"[90m in src/lexer.rs · 100 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [offset=490, limit=181][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=455, limit=42][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=1560, limit=360][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=2380, limit=181][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=560, limit=142][0m
-FINDINGS:
-1. [MAJOR] src/lsp.rs:1327 — A `constant` declared after a same-named binding in the program scope resolves to the *earlier* binding, not to its own declaration. The `Constant` branch deliberately clears `existing` (src/lsp.rs:1315-1317) and then calls `declare` for the program scope, but `declare` returns early on any name already in that map: `let scope = scopes.last_mut()...; if let Some(existing) = scope.get(name) { return *existing; }` (src/lsp.rs:479-481). So for `set x to 1` followed by `constant x to 2` in a loop, `mark_declaration` records the variable's id, and goto on the `constant x` token returns the `set x` span with kind `variable`. The earlier committed fixture asserted the opposite behaviour (`edge_constant_in_an_inner_scope_shadows_the_enclosing_variable`, "its references do not join the outer `set`"); the uncommitted report renames/rewords it to `edge_constant_in_an_inner_scope_is_a_program_binding` instead of keeping the shadowing assertion — i.e. the test was changed to fit the code rather than the code fixed. Fix: declare constants with `declare_fresh` (or only reuse an existing binding whose kind is also `Constant`), and restore a test with an outer `set x` and an inner `constant x` asserting distinct bindings and references. — VERIFIED: traced src/lsp.rs:1315-1336 → `declare` at src/lsp.rs:479-481, which returns the existing program-scope binding; `mark_declaration` then stores it for the constant's own name token.
+I'll start by mapping the new navigation code and the lexer change.
+[0m→ [0mRead src/lsp.rs[90m [offset=927, limit=470][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1397, limit=560][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=319, limit=450][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=360, limit=160][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=768, limit=160][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=204, limit=115][0m
+[0m✱ [0mGrep "#\[ignore\]|is_ok\(\)|is_err\(\)|todo!|FIXME|TODO|unwrap_or|assert!\(true|assert_eq!\([^,]+, [^,]+\)\s*;?\s*$"[90m 65 matches[0m
+[0m✱ [0mGrep "resume phase-075|subject|phase-07|delivery|fn .*ack|assert"[90m 100 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=2380, limit=410][0m
+[0m✱ [0mGrep "then .*else|else .*$|if .* then"[90m 41 matches[0m
+[0m✱ [0mGrep "then|one.line|inline"[90m 18 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=130, limit=75][0m
+[0m✱ [0mGrep "builtin|Builtin|shadow|cannot assign|already defined|redeclar"[90m 11 matches[0m
+[0m→ [0mRead src/analyzer.rs[90m [offset=180, limit=70][0m
+I've inspected the new navigation logic and cross-checked it against the analyzer. One verified correctness defect in the deferred-resolution pass, plus one test-correctness concern.
 
-2. [MAJOR] src/lsp.rs:1239 — The `Import` walker declares every identifier it sees on the import line before it looks for an alias, so `import network as net` declares **both** `network` (src/lsp.rs:1239-1257) and `net` (src/lsp.rs:1258-1279). If the runtime/analyzer binds only the alias (the AGENTS.md example says `import files, network as net` then uses `net.get(...)`), navigation and completion offer a nonexistent `network` binding, and goto on the module token points at a binding the program does not have. Fix: buffer the module name and only declare it when no `as`/`to` alias follows, or drop the pre-alias declaration when an alias is found. Settle by checking `src/analyzer.rs`/`src/interpreter.rs` import handling or running `import files as f` then `say files`. — VERIFIED: traced the loop in src/lsp.rs:1236-1282: `Identifier` is declared immediately at cursor, then `As` advances and declares the alias as a second binding.
+FINDINGS:
+1. [MAJOR] src/lsp.rs:1582 — The source-order "deferred pass" rebinds an earlier *builtin* use to a user declaration that appears later. For `say abs\nset abs to 1\n`, the walk leaves the `abs` on line 1 unresolved (no scope entry yet, `src/lsp.rs:1526-1544`), which is correct: `analyzer.rs:216-220` says a builtin answers until the program "claims the name", and `first-set`/function declarations do not pre-claim it (only `constant`/`import` do, `analyzer.rs:223-229`). The deferred pass then sees `token_binding[index]==None`, walks `scope_decls` and assigns the line-2 `set abs` binding (`src/lsp.rs:1600-1613`), so `goto_definition(source,1,5)` answers the variable at 2:5 instead of `DefinitionKind::Builtin`, and `find_references` joins the builtin use to the variable. This contradicts the phase's stated "follows the analyzer and runtime" rule. Fix: in the deferred pass, when `is_builtin_name(name)`, only bind to a declaration that precedes the use or is a `Constant`/`Import`; otherwise leave the token unbound so the builtin fallback runs. VERIFIED: traced the exact path — walk leaves line-1 `abs` at `token_binding=None` (loop at 1527-1543 finds no scope entry), then 1582-1616 unconditionally re-resolves it via `scope_decls` to the line-2 `set` binding; no test pins the builtin-shadowed-by-later-`set` case.
+
+2. [MINOR] tests/tooling_grammar_test.rs:2504 — This test asserts that a bare `name` read inside a method body (`give back name`) resolves to the object's `has name` field, and `src/lsp.rs:1540` implements that by leaving object-scope field entries visible through the method's parent scope. Field access elsewhere in the suite is written `this.name` (e.g. line 2398), so if the analyzer does not bind object fields as bare lexical names inside method bodies, this test pins navigation behaviour the language rejects ("navigation models the analyzer" is the phase's claim). I could not run the analyzer to confirm, so this is deliberately marked MINOR. What would settle it: analyze/run the fixture `object Row\n  has name default "field"\n  to can name()\n    give back name\n  end\nend` and check whether `name` is an `Unknown variable` error; if it is, change the fixture/navigation to use `this.name` and drop the bare-field preference.
 
 REVIEW VERDICT: FINDINGS 2
