@@ -1,28 +1,25 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "^\s*(pub )?fn |^\s*fn |struct |enum "[90m 67 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [offset=220, limit=70][0m
-I'll start by mapping the new navigation code and the lexer change.
-[0m→ [0mRead src/lsp.rs[90m [offset=927, limit=470][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1397, limit=560][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=319, limit=450][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=360, limit=160][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=768, limit=160][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=204, limit=115][0m
-[0m✱ [0mGrep "#\[ignore\]|is_ok\(\)|is_err\(\)|todo!|FIXME|TODO|unwrap_or|assert!\(true|assert_eq!\([^,]+, [^,]+\)\s*;?\s*$"[90m 65 matches[0m
-[0m✱ [0mGrep "resume phase-075|subject|phase-07|delivery|fn .*ack|assert"[90m 100 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=2380, limit=410][0m
-[0m✱ [0mGrep "then .*else|else .*$|if .* then"[90m 41 matches[0m
-[0m✱ [0mGrep "then|one.line|inline"[90m 18 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=130, limit=75][0m
-[0m✱ [0mGrep "builtin|Builtin|shadow|cannot assign|already defined|redeclar"[90m 11 matches[0m
-[0m→ [0mRead src/analyzer.rs[90m [offset=180, limit=70][0m
-I've inspected the new navigation logic and cross-checked it against the analyzer. One verified correctness defect in the deferred-resolution pass, plus one test-correctness concern.
-
+[0m✱ [0mGrep "extends|object_parents|nearest_object_member|member_binding"[90m in src/lsp.rs · 66 matches[0m
+I'll inspect the new inheritance code and its runtime counterpart.
+[0m✱ [0mGrep "extends|declare_object|object_parents|fn.*object"[90m in src/interpreter.rs · 87 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=2930, limit=110][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=820, limit=110][0m
+Let me read the runtime object declaration and the LSP inheritance handling.
+[0m→ [0mRead src/lsp.rs[90m [limit=80, offset=1560][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=90, offset=1740][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=240, offset=2867][0m
+[0m✱ [0mGrep "TokenKind::Object|TokenKind::Extends|TokenKind::Has|TokenKind::Method|TokenKind::To"[90m in src/lsp.rs · 44 matches[0m
+[0m✱ [0mGrep "fn visible_names|fn find_references|fn goto_definition|fn completions|syntax_names|DefinitionKind::Object"[90m in src/lsp.rs · 20 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [limit=80, offset=1160][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=70, offset=1640][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=55, offset=225][0m
+One tool call left; verifying the lexer CR change precisely.
 FINDINGS:
-1. [MAJOR] src/lsp.rs:1582 — The source-order "deferred pass" rebinds an earlier *builtin* use to a user declaration that appears later. For `say abs\nset abs to 1\n`, the walk leaves the `abs` on line 1 unresolved (no scope entry yet, `src/lsp.rs:1526-1544`), which is correct: `analyzer.rs:216-220` says a builtin answers until the program "claims the name", and `first-set`/function declarations do not pre-claim it (only `constant`/`import` do, `analyzer.rs:223-229`). The deferred pass then sees `token_binding[index]==None`, walks `scope_decls` and assigns the line-2 `set abs` binding (`src/lsp.rs:1600-1613`), so `goto_definition(source,1,5)` answers the variable at 2:5 instead of `DefinitionKind::Builtin`, and `find_references` joins the builtin use to the variable. This contradicts the phase's stated "follows the analyzer and runtime" rule. Fix: in the deferred pass, when `is_builtin_name(name)`, only bind to a declaration that precedes the use or is a `Constant`/`Import`; otherwise leave the token unbound so the builtin fallback runs. VERIFIED: traced the exact path — walk leaves line-1 `abs` at `token_binding=None` (loop at 1527-1543 finds no scope entry), then 1582-1616 unconditionally re-resolves it via `scope_decls` to the line-2 `set` binding; no test pins the builtin-shadowed-by-later-`set` case.
 
-2. [MINOR] tests/tooling_grammar_test.rs:2504 — This test asserts that a bare `name` read inside a method body (`give back name`) resolves to the object's `has name` field, and `src/lsp.rs:1540` implements that by leaving object-scope field entries visible through the method's parent scope. Field access elsewhere in the suite is written `this.name` (e.g. line 2398), so if the analyzer does not bind object fields as bare lexical names inside method bodies, this test pins navigation behaviour the language rejects ("navigation models the analyzer" is the phase's claim). I could not run the analyzer to confirm, so this is deliberately marked MINOR. What would settle it: analyze/run the fixture `object Row\n  has name default "field"\n  to can name()\n    give back name\n  end\nend` and check whether `name` is an `Unknown variable` error; if it is, change the fixture/navigation to use `this.name` and drop the bare-field preference.
+1. [MAJOR] src/lsp.rs:1712-1739 — the `extends` edge is attached from **source order**, not from whether the parent object is actually declared (and in scope) when the child's `object` statement executes. The guard only checks `bindings[parent].location < bindings[child].location` and `kind == Object`; it never checks that the parent binding is visible at the child token. So `to make()` / `object Person ... end` / `end` followed by a top-level `object Employee extends Person` attaches a parent edge even though the runtime (`declare_object`, src/interpreter.rs:2993-3007) looks the parent up in `context.objects` at declaration time and would report `Object 'Employee' extends 'Person', which is not declared` because `make` was never called. Navigation then resolves `Employee.age` to a field the program can never reach. The same applies to a parent declared inside a not-taken `if`/`unless` branch. — Fix: only attach the edge when the parent binding is in an enclosing scope of the child and was declared in straight-line code before the child (or explicitly document/handle the dynamic case); add a fixture with a parent inside an uncalled function/untaken branch. — VERIFIED: traced both paths; the LSP condition at src/lsp.rs:1724-1737 compares only declaration `Location`s while the runtime lookup at src/interpreter.rs:3002-3006 requires the parent to already be in `context.objects`.
+
+2. [MAJOR] src/lsp.rs:1573-1576 — `this` is bound to the **lexically enclosing object frame**, so an inherited method that reads an overridden field navigates to the ancestor's declaration. With `object Person` / `has age default 1` / `to can describe()` / `give back this.age` / `end` / `end`, `object Child extends Person` / `has age default 2` / `end`, `Child.describe()` runs `this.age` against the Child record (the runtime copies child entries first, src/interpreter.rs:3013-3015, so `this` sees the child's `age`), but goto on that `this.age` resolves to `Person.age` because the frame's object is `Person`. This is exactly the inheritance case the new feature claims to model. — Fix: when resolving `this` inside a method that may be inherited, prefer the nearest override on the runtime receiver (or at minimum don't claim the ancestor's field is the read's binding); add a fixture for an inherited method reading a field the child overrides. — VERIFIED: traced `this_objects`/frame binding at src/lsp.rs:1575 plus the runtime copy order at src/interpreter.rs:3013-3015; would be fully settled by running `Child.describe()` and confirming `this` is the receiver record rather than the lexical type.
 
 REVIEW VERDICT: FINDINGS 2

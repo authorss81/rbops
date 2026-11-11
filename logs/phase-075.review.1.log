@@ -1,23 +1,27 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lexer.rs[90m [offset=190, limit=130][0m
-[0m✱ [0mGrep "syntax_names|TokenKind::Set|program_position|fn analyze|struct Analysis"[90m in src/lsp.rs · 36 matches[0m
-[0m✱ [0mGrep "TokenKind::Newline|'\\r'|'\\n'|fn next_token|fn tokenize|fn lex"[90m in src/lexer.rs · 100 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1350, limit=290][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=460, limit=60][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=300, limit=180][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1640, limit=210][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=200, offset=1849][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=70, offset=1150][0m
-[0m✱ [0mGrep "BUILTIN_NAMES|MODULES"[90m in src/stdlib.rs · 48 matches[0m
-[0m✱ [0mGrep "fn name_of|fn catch_syntax_indices|fn is_builtin_name|fn name_of_kind"[90m in src/lsp.rs · 4 matches[0m
-[0m→ [0mRead src/stdlib.rs[90m [limit=130, offset=2082][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=780, limit=160][0m
+[0m→ [0mRead src/lexer.rs[90m [offset=225, limit=70][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1000, limit=260][0m
+I'll inspect the key changed code paths, starting with the inheritance navigation and lexer CR handling.
+[0m→ [0mRead src/lsp.rs[90m [limit=280, offset=1560][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=130, offset=95][0m
+[0m→ [0mRead src/lexer.rs[90m [limit=140, offset=330][0m
+[0m✱ [0mGrep "fn declare\(|fn declare_member\(|fn name_of\(|fn visible_names\("[90m in src/lsp.rs · 10 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [limit=202, offset=469][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=170, offset=472][0m
+[0m✱ [0mGrep "pub fn goto_definition|pub fn find_references|pub fn completions|fn references_of|analyze\(source"[90m in src/lsp.rs · 10 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=220, offset=2867][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=150, offset=1840][0m
+[0m✱ [0mGrep "Extends|extends"[90m in src · 54 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=70, offset=2975][0m
 FINDINGS:
-1. [BLOCKER] phases/phase-075/REPORT.md:168 — the gate table claims `cargo clippy --all-targets -- -D warnings` and `cargo test --all-targets` pass, but the committed tree cannot compile: the uncommitted diff's pre-image at src/lsp.rs:1415 is `let program_position = if kind == DefinitionKind::Set {`, and `DefinitionKind` declares no `Set` variant; the same diff adds the missing `syntax_names` field to the `Analysis { ... }` initializer at src/lsp.rs:1662, so the committed initializer omitted a required field. Either is a hard rustc error, so the recorded gate result is impossible. — VERIFIED: traced the HEAD pre-image in the uncommitted diff against the current enum at src/lsp.rs:243-256 (Variable/Constant/Parameter/Function/Import/LoopVariable/Object/Module/Catch/Builtin, no `Set`) and the current initializer at src/lsp.rs:1656-1664; the working-tree edit repairs exactly those two lines but the report still asserts a green gate for the broken revision. Fix: commit the repair, re-run the full gate on that commit, and replace the gate-table claim with the measured result; do not describe the broken revision as green.
 
-2. [MAJOR] src/lsp.rs:1819-1823 — `find_references` excludes `member_names` and `type_names` from the unresolved-name branch but omits `syntax_names`, while `goto_definition` explicitly excludes all three at src/lsp.rs:1763-1767. A contextual word recorded in `syntax_names` (e.g. a catch failure kind or field `default`, inserted at src/lsp.rs:1184-1187/1491) that also matches a builtin spelling will therefore be reported as a reference to that builtin while goto on the same token answers `None`, so the two capabilities disagree. — VERIFIED by line-level trace: the guard at 1800-1804 returns early only on `member_names || type_names || !is_builtin_name`, and the candidate match at 1819-1823 checks `token_binding.is_none() && !member_names && !type_names`, never `syntax_names`; no existing test covers a syntax word colliding with a builtin name. Fix: add `syntax_names` to both the early-return guard and the candidate match, mirroring lines 1764-1766.
+1. [MAJOR] src/lsp.rs:1726 — A parent declared *after* its child is resolved as a valid `extends` target, diverging from the runtime. Trace: `pending_parents` records `(child, index+3)` at src/lsp.rs:1191-1200; the deferred pass attaches any binding the later name got at src/lsp.rs:1722-1730; `nearest_object_member`/`member_binding` (src/lsp.rs:836-881) then resolves inherited members. But `Interpreter::declare_object` resolves the chain at declaration time and errors for an undeclared parent: `"Object '{name}' extends '{current}', which is not declared"` (src/interpreter.rs:3002-3006). So `goto_definition`/`find_references` answer on `object Employee extends Person` / `object Person` written below, while `rb run` refuses to execute that program — and the report justifies this as matching the runtime. Fix: attach only parents already in scope at the `object` token (drop `pending_parents`), or explicitly document forward-parent leniency as a deliberate divergence and remove the "runtime agrees" claim. VERIFIED: traced the pending-parent → deferred-attach path and quoted src/interpreter.rs:3002-3006.
 
-3. [MINOR] phases/phase-075/REPORT.md:176-180 — the report admits the pipeline's copy still carries 2817 tests and that the gate prints an under-claim warning, yet the phase is presented as green. The report-honesty gate is therefore satisfied by a stale copy while the working copy claims 2821, so the shipped record and the measured tree disagree. Fix: sync `$RBOPS_ROOT/phases/phase-075/REPORT.md` with the measured count and make the gate run against the same copy the report describes.
+2. [MINOR] tests/tooling_grammar_test.rs:3019 — `edge_extends_cycle_does_not_hang_member_navigation` is not a runnable program: `object A extends B` with `B` declared below is rejected by the interpreter (`... which is not declared`, src/interpreter.rs:3004) before any chain walk, so it does not pin a reachable cycle; it only exercises the LSP's defensive `seen` guard on an invalid forward reference. Missing tests: a valid parent-above-child multi-level chain (`Child` → `Parent` → `GrandParent` field) and a fixture pinning the chosen forward-parent behaviour. Fix: add those, and keep the cycle fixture only if forward resolution is intentionally kept.
+
+3. [MINOR] phases/phase-075/REPORT.md:225 (Gates section) — The report claims `verify.sh pass` but admits the report-honesty step measured a stale harvested copy holding the previous 2825 count and only WARNed; the corrected 2831 report is the uncommitted in-tree copy. The gate therefore did not validate the count it ships, so "pass" is not evidence the report matches the suite. Fix: re-harvest the corrected report and re-run `verify.sh` so the honesty step measures 2831, or state in the gate definition that an under-claim WARN is acceptable.
 
 REVIEW VERDICT: FINDINGS 3
