@@ -1,22 +1,26 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "declare_function_binding|declare_replacing_function|scope_plain_binding|runtime_scopes|pushes_runtime_scope|fn declare_binding|fn declare_constant_binding"[90m 21 matches[0m
-[0m✱ [0mGrep "edge_function_declaration_shadows_an_earlier_variable|edge_later_set_shadows_an_earlier_function|edge_set_inside_a_function_shadows_an_outer_function_locally|edge_set_inside_a_branch_shadows_a_function_in_the_runtime_frame|edge_function_variable_shadowing_rejects_a_position_past_the_line"[90m 5 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=540, limit=180][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1420, limit=320][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=3150, limit=300][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=130, offset=1020][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=210, offset=1740][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=110, offset=430][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=260, offset=1150][0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m✱ [0mGrep "pub fn completions|fn completion|sort|dedup|visible"[90m 21 matches[0m
+[0m✱ [0mGrep "MODULE_MEMBERS|fn is_module"[90m in src/stdlib.rs · 26 matches[0m
+[0m✱ [0mGrep "fn member_completions|fn completions|fn analyze|this_objects|object_fields"[90m in src/lsp.rs · 34 matches[0m
+[0m✱ [0mGlob "tests/tooling_grammar_test.rs"[90m 1 match[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2255, limit=145][0m
+[0m→ [0mRead src/stdlib.rs[90m [offset=80, limit=70][0m
+[0m✱ [0mGrep "Import|module|is_module"[90m in src/lsp.rs · 100 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=3634, limit=130][0m
+[0m✱ [0mGrep "TokenKind::Import|fn name_of|al?ias|DefinitionKind"[90m in src/lsp.rs · 100 matches[0m
+[0m✱ [0mGrep "TokenKind::Import"[90m in src/lsp.rs · 7 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1620, limit=120][0m
+[0m✱ [0mGrep "completions.*(alias|as )|import files as|import .* as .*\n.*\."[90m in tests/tooling_grammar_test.rs · 0 matches[0m
+[0m✱ [0mGrep "import files as|import json as|net\.|J\.|completions\(.*as"[90m in tests · 16 matches[0m
+[0m✱ [0mGrep "fn validate|fn offset|struct SourceMap|impl SourceMap"[90m in src/lsp.rs · 6 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=319, limit=70][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1212, limit=90][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1970, limit=120][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1860, limit=115][0m
 FINDINGS:
-1. [MAJOR] src/lsp.rs:1645 — A `set` reuses any existing non-`Function` binding, including a `constant`: the filter is `existing.filter(|&binding| bindings[binding].kind != DefinitionKind::Function)`, so `constant x` followed by `set x to ...` binds the `set` name to the *constant* declaration instead of starting a new variable binding (no `mark_declaration`, no new reference set). This contradicts the report's stated invariant in the uncommitted REPORT diff ("a later `set`, `constant` or `to` replaces a binding of another kind") and the runtime, which refuses assignment to a constant entirely; goto on `set x` returns the `constant x` span and references merge the immutable constant with the attempted assignment. Fix: exclude `DefinitionKind::Constant` (and any other non-reusable kind) from the reuse filter, route it through `declare_replacing_function`/a fresh binding, and add a `constant` → `set` test mirroring `edge_constant_after_a_same_named_set_is_its_own_binding`. VERIFIED: traced lines 1637–1648; `existing` is `Some(constant)` and the `kind != Function` filter passes it through unchanged.
+1. [MAJOR] src/lsp.rs:2359-2364 — member completion cannot resolve an aliased module. For `import files as f`, the walk declares `f` as `DefinitionKind::Import` (src/lsp.rs:1655-1673), but `member_completions` takes `name_of(receiver_token)` → `"f"`, then requires `is_module("f")`; that is false, so it returns `None` and `completions` falls through to the ordinary lexical answer (keywords/builtins/modules), contradicting the stated rule that a member slot must not offer language keywords. The only module test uses the unaliased spelling (`import files`, tests/tooling_grammar_test.rs:3733), so the alias path is unpinned. — Fix: record alias→module (like the runtime's `module_aliases`) during the `Import` walk and look up `MODULE_MEMBERS` by the resolved module name, not the alias spelling. — VERIFIED: traced the exact path; lines 2360-2364 gate on `is_module(name)` where `name` is the alias text.
 
-2. [MAJOR] src/lsp.rs:1047 — `scope_function_binding` scans `binding_scopes` with `find` and returns *any* same-scope `Function` binding with the name, ignoring declaration order. After `to f(); set f to 1`, the scope entry is the replacement `Variable`, so a later `f()` call falls into this scan and is attributed to the shadowed-out function. The report itself states the runtime raises `RuntimeError: Unknown function 'f'` for such a call, yet navigation links it into the old function's reference set; `edge_later_set_shadows_an_earlier_function` tests only `say f`, never `say f()`, so the gap is unpinned. Fix: when the scope's current entry for the name is a non-function (the shadowing declaration), do not fall back to an earlier function; add a call-after-shadowing fixture. VERIFIED: traced call resolution at lines 1790–1802 into the linear scan at 1047–1056.
+2. [MAJOR] src/lsp.rs:2278-2284 — member completion never reaches its "complete walk" for an object declared after the caret. The prefix analysis (`analyze(source, Some(offset))`) stops at line 1271-1274 and skips the deferred pass entirely (`if stop.is_none()` at line 1900), so for `Person.` written above `object Person`, `analysis.token_binding[receiver]` is `None` at line 2333, `receiver_object` is `None`, and `member_completions(&analysis, …)` returns `None`. The subsequent full analysis at 2281 is only attempted when the *prefix* call already returned `Some`, so it is dead for this case. Goto/references explicitly support forward object member access (`edge_object_member_access_navigates_a_forward_reference`), and the report claims the member list is order-independent, so this is an inconsistent gap. — Fix: when the caret is syntactically in an identifier-member slot, consult the full analysis even if the prefix pass could not bind the receiver (or bind forward object names before the slot check). — VERIFIED: traced the `stop` break at 1269-1274, the `stop.is_none()` guard at 1900, and the `token_binding[receiver]` filter at 2333-2335.
 
-3. [MINOR] src/lsp.rs:1074 — `scope_plain_binding` returns the scope entry (`if bindings[first].lexical { return Some(first) }`), and `declare_fresh` makes a method the scope entry when no earlier same-name plain binding exists (line 528, `scope.entry(name).or_insert(id)`). Consequently a bare non-call read of a method's own name inside the object body resolves to the method declaration, while the analyzer treats a bare method/field name as an unknown variable (the report's own repro `to can name()` / `give back name` reports `Unknown variable 'name'`). The existing object-field test uses a differently named method, so this shape is untested. Fix: keep method bindings out of the plain-name lookup (or mark them call-only) so only a real lexical variable/function answers a bare read; add a `to can name()`/`give back name` navigation test. Not run — traced; a fixture asserting the opposite would settle it.
-
-REVIEW VERDICT: FINDINGS 3
+REVIEW VERDICT: FINDINGS 2
