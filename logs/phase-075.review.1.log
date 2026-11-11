@@ -1,27 +1,22 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=780, limit=160][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=225, limit=70][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1000, limit=260][0m
-I'll inspect the key changed code paths, starting with the inheritance navigation and lexer CR handling.
-[0m→ [0mRead src/lsp.rs[90m [limit=280, offset=1560][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=130, offset=95][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=140, offset=330][0m
-[0m✱ [0mGrep "fn declare\(|fn declare_member\(|fn name_of\(|fn visible_names\("[90m in src/lsp.rs · 10 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [limit=202, offset=469][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=170, offset=472][0m
-[0m✱ [0mGrep "pub fn goto_definition|pub fn find_references|pub fn completions|fn references_of|analyze\(source"[90m in src/lsp.rs · 10 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=220, offset=2867][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=150, offset=1840][0m
-[0m✱ [0mGrep "Extends|extends"[90m in src · 54 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=70, offset=2975][0m
+[0m✱ [0mGrep "declare_function_binding|declare_replacing_function|scope_plain_binding|runtime_scopes|pushes_runtime_scope|fn declare_binding|fn declare_constant_binding"[90m 21 matches[0m
+[0m✱ [0mGrep "edge_function_declaration_shadows_an_earlier_variable|edge_later_set_shadows_an_earlier_function|edge_set_inside_a_function_shadows_an_outer_function_locally|edge_set_inside_a_branch_shadows_a_function_in_the_runtime_frame|edge_function_variable_shadowing_rejects_a_position_past_the_line"[90m 5 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=540, limit=180][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1420, limit=320][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=3150, limit=300][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=130, offset=1020][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=210, offset=1740][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=110, offset=430][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=260, offset=1150][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m✱ [0mGrep "pub fn completions|fn completion|sort|dedup|visible"[90m 21 matches[0m
 FINDINGS:
+1. [MAJOR] src/lsp.rs:1645 — A `set` reuses any existing non-`Function` binding, including a `constant`: the filter is `existing.filter(|&binding| bindings[binding].kind != DefinitionKind::Function)`, so `constant x` followed by `set x to ...` binds the `set` name to the *constant* declaration instead of starting a new variable binding (no `mark_declaration`, no new reference set). This contradicts the report's stated invariant in the uncommitted REPORT diff ("a later `set`, `constant` or `to` replaces a binding of another kind") and the runtime, which refuses assignment to a constant entirely; goto on `set x` returns the `constant x` span and references merge the immutable constant with the attempted assignment. Fix: exclude `DefinitionKind::Constant` (and any other non-reusable kind) from the reuse filter, route it through `declare_replacing_function`/a fresh binding, and add a `constant` → `set` test mirroring `edge_constant_after_a_same_named_set_is_its_own_binding`. VERIFIED: traced lines 1637–1648; `existing` is `Some(constant)` and the `kind != Function` filter passes it through unchanged.
 
-1. [MAJOR] src/lsp.rs:1726 — A parent declared *after* its child is resolved as a valid `extends` target, diverging from the runtime. Trace: `pending_parents` records `(child, index+3)` at src/lsp.rs:1191-1200; the deferred pass attaches any binding the later name got at src/lsp.rs:1722-1730; `nearest_object_member`/`member_binding` (src/lsp.rs:836-881) then resolves inherited members. But `Interpreter::declare_object` resolves the chain at declaration time and errors for an undeclared parent: `"Object '{name}' extends '{current}', which is not declared"` (src/interpreter.rs:3002-3006). So `goto_definition`/`find_references` answer on `object Employee extends Person` / `object Person` written below, while `rb run` refuses to execute that program — and the report justifies this as matching the runtime. Fix: attach only parents already in scope at the `object` token (drop `pending_parents`), or explicitly document forward-parent leniency as a deliberate divergence and remove the "runtime agrees" claim. VERIFIED: traced the pending-parent → deferred-attach path and quoted src/interpreter.rs:3002-3006.
+2. [MAJOR] src/lsp.rs:1047 — `scope_function_binding` scans `binding_scopes` with `find` and returns *any* same-scope `Function` binding with the name, ignoring declaration order. After `to f(); set f to 1`, the scope entry is the replacement `Variable`, so a later `f()` call falls into this scan and is attributed to the shadowed-out function. The report itself states the runtime raises `RuntimeError: Unknown function 'f'` for such a call, yet navigation links it into the old function's reference set; `edge_later_set_shadows_an_earlier_function` tests only `say f`, never `say f()`, so the gap is unpinned. Fix: when the scope's current entry for the name is a non-function (the shadowing declaration), do not fall back to an earlier function; add a call-after-shadowing fixture. VERIFIED: traced call resolution at lines 1790–1802 into the linear scan at 1047–1056.
 
-2. [MINOR] tests/tooling_grammar_test.rs:3019 — `edge_extends_cycle_does_not_hang_member_navigation` is not a runnable program: `object A extends B` with `B` declared below is rejected by the interpreter (`... which is not declared`, src/interpreter.rs:3004) before any chain walk, so it does not pin a reachable cycle; it only exercises the LSP's defensive `seen` guard on an invalid forward reference. Missing tests: a valid parent-above-child multi-level chain (`Child` → `Parent` → `GrandParent` field) and a fixture pinning the chosen forward-parent behaviour. Fix: add those, and keep the cycle fixture only if forward resolution is intentionally kept.
-
-3. [MINOR] phases/phase-075/REPORT.md:225 (Gates section) — The report claims `verify.sh pass` but admits the report-honesty step measured a stale harvested copy holding the previous 2825 count and only WARNed; the corrected 2831 report is the uncommitted in-tree copy. The gate therefore did not validate the count it ships, so "pass" is not evidence the report matches the suite. Fix: re-harvest the corrected report and re-run `verify.sh` so the honesty step measures 2831, or state in the gate definition that an under-claim WARN is acceptable.
+3. [MINOR] src/lsp.rs:1074 — `scope_plain_binding` returns the scope entry (`if bindings[first].lexical { return Some(first) }`), and `declare_fresh` makes a method the scope entry when no earlier same-name plain binding exists (line 528, `scope.entry(name).or_insert(id)`). Consequently a bare non-call read of a method's own name inside the object body resolves to the method declaration, while the analyzer treats a bare method/field name as an unknown variable (the report's own repro `to can name()` / `give back name` reports `Unknown variable 'name'`). The existing object-field test uses a differently named method, so this shape is untested. Fix: keep method bindings out of the plain-name lookup (or mark them call-only) so only a real lexical variable/function answers a bare read; add a `to can name()`/`give back name` navigation test. Not run — traced; a fixture asserting the opposite would settle it.
 
 REVIEW VERDICT: FINDINGS 3

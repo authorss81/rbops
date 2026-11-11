@@ -1,25 +1,21 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "extends|object_parents|nearest_object_member|member_binding"[90m in src/lsp.rs · 66 matches[0m
-I'll inspect the new inheritance code and its runtime counterpart.
-[0m✱ [0mGrep "extends|declare_object|object_parents|fn.*object"[90m in src/interpreter.rs · 87 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=2930, limit=110][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=820, limit=110][0m
-Let me read the runtime object declaration and the LSP inheritance handling.
-[0m→ [0mRead src/lsp.rs[90m [limit=80, offset=1560][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=90, offset=1740][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=240, offset=2867][0m
-[0m✱ [0mGrep "TokenKind::Object|TokenKind::Extends|TokenKind::Has|TokenKind::Method|TokenKind::To"[90m in src/lsp.rs · 44 matches[0m
-[0m✱ [0mGrep "fn visible_names|fn find_references|fn goto_definition|fn completions|syntax_names|DefinitionKind::Object"[90m in src/lsp.rs · 20 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [limit=80, offset=1160][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=70, offset=1640][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=55, offset=225][0m
-One tool call left; verifying the lexer CR change precisely.
+[0m✱ [0mGrep "fn (goto_definition|find_references|completions|scope_plain_binding|declare|declare_fresh|declare_member|declare_constant_binding|member_binding|resolve|walk|analyze)\b"[90m in src/lsp.rs · 21 matches[0m
+[0m✱ [0mGrep "call_only|lexical|syntax_names|scope_plain_binding|first_set|program_scope"[90m in src/lsp.rs · 62 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=380, limit=340][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=900, limit=330][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=430, offset=1230][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=400, offset=1660][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=220, offset=2050][0m
+[0m✱ [0mGrep "fn (edge_function_declaration_shadows_an_earlier_variable|edge_later_set_shadows_an_earlier_function|edge_set_inside_a_function_shadows_an_outer_function_locally|edge_set_inside_a_branch_shadows_a_function_in_the_runtime_frame|edge_function_variable_shadowing_rejects_a_position_past_the_line|edge_set_after_a_same_named_constant_is_its_own_binding|edge_call_after_a_set_shadowing_a_function_does_not_resolve|edge_method_name_is_not_a_bare_lexical_name)"[90m in tests/tooling_grammar_test.rs · 8 matches[0m
+[0m✱ [0mGrep "fn (set_var|declare_assigned|assign)"[90m in src/interpreter.rs · 4 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=290, offset=3260][0m
+[0m→ [0mRead src/interpreter.rs[90m [limit=55, offset=1870][0m
+[0m→ [0mRead src/bytecode/vm.rs[90m [limit=80, offset=1440][0m
 FINDINGS:
+1. [MAJOR] src/lsp.rs:1690-1708 (insert at src/lsp.rs:663) — `declare_replacing_binding` writes the replacing variable only into the runtime frame (`scopes[scope_position]`) and never updates the current block scope, so a `set` that shadows a function/object/module declared in the *same* branch body leaves the block's old entry in place. Traced: `if yes then / to f() end / set f to 1 / say f / end` — `to f` lands in the branch scope (declare_function_binding, src/lsp.rs:632), the `set` sees it as non-reusable and inserts the variable into the program scope, then the lookup at src/lsp.rs:1833-1850 hits the branch's stale function entry first and answers the function. The added test only covers a top-level function shadowed from a branch, so this order is untested. Fix: when the runtime frame is not the current scope, also overwrite/remove the name in `scopes.last_mut()`; add `edge_set_shadows_a_function_declared_in_the_same_branch`.
+2. [MAJOR] phases/phase-075/REPORT.md:273 — the gate table claims `cargo test --all-targets` reported 2843 passed, but the committed report pinned 2832 and the same uncommitted table lists exactly 8 new tests (five in `+237`, three in `+371`), so 2832 + 8 = 2840, not 2843. Either three added tests are unlisted or the count is stale/fabricated, which is exactly the gate-honesty value `verify.sh` is supposed to read. Fix: re-run and record the real count, or name the three missing tests.
+3. [MINOR] src/lsp.rs:1082-1089 — `scope_function_binding` accepts any function binding with `id > first` in the same scope without checking it is declared before the use token, so `to f() end / set f to 1 / say f() / to f() end` resolves the middle call to the *later* function even though the slot holds the variable there. No test covers the set-before-later-function-with-a-call-between order; decide whether forward resolution is intended and either bound the search by source position or document the hoisting rule and pin it with a test. Not verified by execution.
 
-1. [MAJOR] src/lsp.rs:1712-1739 — the `extends` edge is attached from **source order**, not from whether the parent object is actually declared (and in scope) when the child's `object` statement executes. The guard only checks `bindings[parent].location < bindings[child].location` and `kind == Object`; it never checks that the parent binding is visible at the child token. So `to make()` / `object Person ... end` / `end` followed by a top-level `object Employee extends Person` attaches a parent edge even though the runtime (`declare_object`, src/interpreter.rs:2993-3007) looks the parent up in `context.objects` at declaration time and would report `Object 'Employee' extends 'Person', which is not declared` because `make` was never called. Navigation then resolves `Employee.age` to a field the program can never reach. The same applies to a parent declared inside a not-taken `if`/`unless` branch. — Fix: only attach the edge when the parent binding is in an enclosing scope of the child and was declared in straight-line code before the child (or explicitly document/handle the dynamic case); add a fixture with a parent inside an uncalled function/untaken branch. — VERIFIED: traced both paths; the LSP condition at src/lsp.rs:1724-1737 compares only declaration `Location`s while the runtime lookup at src/interpreter.rs:3002-3006 requires the parent to already be in `context.objects`.
-
-2. [MAJOR] src/lsp.rs:1573-1576 — `this` is bound to the **lexically enclosing object frame**, so an inherited method that reads an overridden field navigates to the ancestor's declaration. With `object Person` / `has age default 1` / `to can describe()` / `give back this.age` / `end` / `end`, `object Child extends Person` / `has age default 2` / `end`, `Child.describe()` runs `this.age` against the Child record (the runtime copies child entries first, src/interpreter.rs:3013-3015, so `this` sees the child's `age`), but goto on that `this.age` resolves to `Person.age` because the frame's object is `Person`. This is exactly the inheritance case the new feature claims to model. — Fix: when resolving `this` inside a method that may be inherited, prefer the nearest override on the runtime receiver (or at minimum don't claim the ancestor's field is the read's binding); add a fixture for an inherited method reading a field the child overrides. — VERIFIED: traced `this_objects`/frame binding at src/lsp.rs:1575 plus the runtime copy order at src/interpreter.rs:3013-3015; would be fully settled by running `Child.describe()` and confirming `this` is the receiver record rather than the lexical type.
-
-REVIEW VERDICT: FINDINGS 2
+REVIEW VERDICT: FINDINGS 3
