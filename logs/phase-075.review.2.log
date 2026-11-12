@@ -1,28 +1,23 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "is_complete_expression|unmatched_opens"[90m 6 matches[0m
-[0m✱ [0mGrep "fn (interpolation_at|interpolation_candidate|interpolation_completions|interpolation_member_completions|matching_close|text_literal_at|decode_text_literal|inside_text)"[90m 8 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=2692, limit=280][0m
-[0m→ [0mRead src/parser.rs[90m [offset=2930, limit=100][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=130, offset=2972][0m
+[0m✱ [0mGrep "fn (goto_definition_in_interpolation|interpolation_source_at|interpolation_view|line_column|original_location|find_references|merge|inside_text|name_token_at)"[90m 10 matches[0m
+[0m✱ [0mGrep "edge_(goto_definition_inside_an_interpolation|find_references_inside_an_interpolation|navigation_inside_escaped|interpolated_use_prefers|find_references_from_the_declaration)"[90m 6 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2360, limit=460][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=4460, limit=230][0m
+[0m✱ [0mGrep "struct TextLiteral|impl TextLiteral|fn caret_index|fn text_literal_at|fn interpolation_at|fn inside_nested_text|sources|fn text_literal_token|fn matching_close|fn unmatched_opens"[90m 15 matches[0m
+[0m✱ [0mGrep "pub(crate) fn (is_complete_expression|unmatched_opens)|fn is_complete_expression|fn unmatched_opens"[90m 2 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [limit=275, offset=3000][0m
 [0m→ [0mRead src/parser.rs[90m [limit=70, offset=3130][0m
-[0m✱ [0mGrep "fn visible|visible:|fn member_slot|fn member_completions"[90m 5 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [limit=130, offset=2470][0m
-[0m✱ [0mGrep "interpolation"[90m 14 matches[0m
-[0m→ [0mRead src/parser.rs[90m [limit=115, offset=3018][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=175, offset=945][0m
-[0m✱ [0mGrep "'u'|from_u32|to_digit|escape|\\\\n"[90m 17 matches[0m
-[0m✱ [0mGrep "fn analyze|fn validate|struct SourceMap|fn offset|syntax_names"[90m 14 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [limit=70, offset=1261][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=55, offset=320][0m
-[0m→ [0mRead src/lexer.rs[90m [limit=65, offset=310][0m
+[0m✱ [0mGrep "struct Location|impl Location|fn of_name|fn offset\(|fn validate\(|struct SourceMap|fn inside_text|fn inside_comment"[90m 8 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [limit=160, offset=3275][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=190, offset=200][0m
+[0m✱ [0mGrep "fn read_interpolated|fn interpolated_parts|is_complete_expression|read_interpolation"[90m 4 matches[0m
+[0m→ [0mRead src/parser.rs[90m [limit=125, offset=2940][0m
 FINDINGS:
 
-1. [MAJOR] src/lsp.rs:2508-2513 (with `interpolation_candidate` at src/lsp.rs:2829-2847) — the "member slot is still completion even when the expression after the dot is not written yet" fallback never checks that the brace pair could ever become an interpolation. `interpolation_candidate` accepts *any* balanced pair containing the caret, so a pair the parser will permanently keep as text (because its contents can never re-parse as one expression) still gets member completion. Concretely, for `object Person / has name default "Ada" / end` plus `say "{ \"a\": Person. }"`, `interpolation_at` correctly returns `None` (the inner is not an expression), but `interpolation_candidate` returns the pair, `interpolation_member_completions` re-analyzes `say  "a": Person. `, `member_slot` binds the receiver `Person` to the object, and the user is offered `name` inside a string the parser treats as JSON text. This contradicts the report's own invariant that "a pair is interpolation only when its contents re-parse as one complete expression." The new test `edge_completions_inside_balanced_braces_that_are_not_an_expression_are_empty` (tests/tooling_grammar_test.rs:1020) does not cover a dot, so it never exercises the candidate branch. Fix: gate the candidate branch on the inner (with the partial member name treated as a completed identifier, or via `is_complete_expression`) being a valid interpolation, and add a JSON+receiver-dot fixture. Not run; traced the path through lines 2496–2513, 2829–2847, 2904–2906.
+1. [MAJOR] src/lsp.rs:2539-2548 — `interpolations_in` calls `matching_close` (src/lsp.rs:3130-3143) for **every** balanced `{`, and `matching_close` itself restarts a forward scan from that open; for a literal of nested braces (`"{{{{…}}}}"`) this is O(n²), and each candidate additionally runs `is_complete_expression` (lex + parse of the inner text). This is exactly the quadratic pattern the parser avoids by advancing past a matched pair (`index = scan + 1`, src/parser.rs:2999; its comment at 2943-2946 claims the walk is linear). Worse, `references_globally` invokes `interpolations_in` for every Text token on every `find_references` query (src/lsp.rs:2648-2652) and then re-runs `analyze` over the whole file once per interpolation (src/lsp.rs:2653-2655), so a file with M interpolations costs O(M·file_size), and a large/pathological literal can hang the language server. Fix: pair braces in one linear stack pass and skip a matched span the way the parser does; skip literals whose decoded text cannot contain the queried name; and cap or memoize the per-literal analyses instead of re-analyzing the file for every pair. VERIFIED: traced `interpolations_in` → `matching_close` per open and the per-interpolation `analyze` loop; the parser counterpart's linear `index = scan + 1` advance confirms the LSP path is the quadratic one.
 
-2. [MAJOR] src/lsp.rs:2496-2502 / src/lsp.rs:2917-2930 — a caret inside a *nested* text literal within a complete interpolation is treated as code. The dispatch finds the outer text token, `interpolation_at` confirms its inner text (`uppercase("hi")`) is one complete expression, and then `interpolation_completions` unconditionally offers scope names/builtins. But a caret inside the inner `"hi"` is inside a string literal and must yield nothing, exactly like `edge_completions_inside_string_literal_are_empty`. Repro: `say "x {uppercase(\"hi\")}"` with the caret on `hi` offers `greeting`/`uppercase`-style names. Fix: when the caret lies inside a quoted region of the decoded interpolation body, return an empty list. No test covers a nested literal inside a pair. Not run; traced lines 2494–2502 and 2869–2871.
+2. [MINOR] tests/tooling_grammar_test.rs:4496-4510 — every new interpolation-reference test projects the result to `(line, column)` and never asserts `end_line`/`end_column`, so the new end-mapping branch in `InterpolationSource::original_location` (src/lsp.rs:2429-2438, the `literal.sources`/suffix path) is never checked. The goto test's `end_column` at tests/tooling_grammar_test.rs:4482-4491 is the declaration in the prefix (identity mapping), and the escaped-brace test at 4564-4573 also only checks starts, so a wrong end span for an interpolated use would pass the suite. Also, `find_references` on a **builtin inside** an interpolation (`find_references_in_interpolation` with `target == None`, src/lsp.rs:2743-2752 → `references_globally` with `declaration == None`) has no test at all; only goto has a builtin-in-interpolation test (tests/tooling_grammar_test.rs:4513-4529). Add assertions on `end_column` for `"message: {greeting}"` (and a use that ends the expression / follows an escaped brace), plus a `find_references(source, 1, 8)` case for `say "{abs(-3)}"`.
 
-3. [MINOR] src/lsp.rs:2487-2488 — the `completions` doc comment still says "Inside a string literal no code can be written, so the answer is empty", which is now false for interpolations; it will mislead the next reader about the new branch. Update it to describe the interpolation exception.
-
-REVIEW VERDICT: FINDINGS 3
+REVIEW VERDICT: FINDINGS 2

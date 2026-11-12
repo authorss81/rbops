@@ -1,32 +1,24 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=2400, limit=420][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=2760, limit=180][0m
-[0m✱ [0mGrep "interpolation|\{.*expr|Text\("[90m in src · 100 matches[0m
-[0m✗ [0mGrep "interpolat|StringInterp|Substitution|\\{" failed[90m in .[0m
-[91m[1mError: [0mrg: regex parse error:
-    (?:interpolat|StringInterp|Substitution|\\{)
-                                               ^
-error: repetition quantifier expects a valid decimal
-[0m✱ [0mGrep "InterpolatedText|interpolat|split_interpolation|\{"[90m in src · 100 matches[0m
-[0m✱ [0mGrep "InterpolatedText"[90m in src · 10 matches[0m
-[0m→ [0mRead src/parser.rs[90m [offset=2880, limit=130][0m
-[0m✱ [0mGrep "Text|interpolat|\{"[90m in src · 100 matches[0m
-[0m→ [0mRead src/lexer.rs[90m [offset=305, limit=90][0m
-[0m→ [0mRead src/parser.rs[90m [offset=3009, limit=80][0m
-[0m✱ [0mGrep "interpolation|Interpolated|\{greeting\}|\\u007B|json|JSON"[90m in tests · 100 matches[0m
-[0m✱ [0mGrep "interpolation|\{.*\}|substitution"[90m in . · 37 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=900, limit=130][0m
-[0m✱ [0mGrep "const KEYWORDS|\("this"|This =>"[90m in src · 2 matches[0m
+[0m✱ [0mGrep "struct TextLiteral|fn text_literal_at|fn interpolation_at|struct Interpolation|struct SourceMap|fn caret_index|fn new\(source|fn builtin\(|struct Definition|fn original_definition|fn line_column|fn validate"[90m in src/lsp.rs · 22 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2380, limit=300][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=260, limit=160][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2860, limit=260][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=4470, limit=180][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m✱ [0mGrep "fn inside_text|fn name_token_at|impl Location|fn of_name|fn inside_comment"[90m in src/lsp.rs · 5 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=205, limit=60][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2350, limit=40][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=3145, limit=60][0m
+[0m✱ [0mGrep "fn is_complete_expression|fn unmatched_opens"[90m in src/parser.rs · 2 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=3119, limit=28][0m
 FINDINGS:
 
-1. [MAJOR] src/lsp.rs:2704 — `interpolation_inner_start` treats *any* balanced `{…}` inside a string literal as an interpolation, but the parser only does so when the contents re-parse as one complete expression (`src/parser.rs:2936-2941`, `src/parser.rs:3068-3072`). So completion now offers scope names/builtins inside plain text that the parser deliberately keeps as text, e.g. the SPEC's own `json.parse("{ \"name\": \"Alice\" }")` (`SPEC.md:1610`): the braces are balanced, the caret inside them is "inside text", yet `completions` returns `interpolation_completions`. This contradicts the documented contract at `src/lsp.rs:2486` ("Inside a string literal no code can be written, so the answer is empty") and the existing `edge_completions_inside_string_literal_are_empty` intent. — Fix: gate on the parser's actual validity rule (reuse `interpolated_parts`/`read_interpolated`, or require the inner slice to lex/parse as one expression) instead of brace balance alone. — VERIFIED: traced `completions` → `text_start_at` → `interpolation_inner_start` (brace counter only) against `Parser::interpolated_parts`, which pushes a literal `{` and answers `Expr::Text` when `read_interpolated` returns `None`; the JSON example's inner text ` "name": "Alice" ` leaves `inner.current() != Eof`, so it is text to the parser but interpolation to the LSP.
+1. [BLOCKER] src/lsp.rs:2555 — `find_references` only enters interpolation handling when the queried offset itself is inside a text literal. Queried from the declaration side (the normal "find all references" action), it falls through to `references_for`, which walks `analysis.tokens`; the whole `"…{greeting}…"` literal is one `TokenKind::Text` token there, so the interpolated use is invisible. The phase claims "find-references now look inside a `{…}` text interpolation", but a use inside the interpolation is only found when the query starts inside it: `find_references("set greeting to \"hi\"\nsay \"message: {greeting}\"\n", 1, 5)` returns only `(1,5)`, omitting `(2,16)`. New tests only query from inside the literal (`tests/tooling_grammar_test.rs:4496`, `:4564`), so the asymmetry is unpinned. Fix: after collecting references in the non-text path, resolve each text literal's interpolations and merge the mapped locations (or make reference collection globally interpolation-aware), and add a declaration-side test. — VERIFIED: traced `find_references` (src/lsp.rs:2550–2563): `inside_text` guards only the query offset, then the non-text branch calls `references_for` (src/lsp.rs:2565), whose loop at src/lsp.rs:2583 iterates `analysis.tokens`; `text_literal_at`/`decode_text_literal` (src/lsp.rs:2884, 2897) exist precisely because the lexer emits the whole literal as one token.
 
-2. [MAJOR] src/lsp.rs:2755 — `EXPRESSION_KEYWORDS` omits `this`, so inside a method the SPEC example `say "I'm {this.name}"` (`SPEC.md:694`) cannot be completed: `this` is a keyword, not a lexical binding, builtin, module, or constant, so it is absent from `analysis.visible` and from the hard-coded list. The feature claims completion inside interpolation but offers an expression that is legal per the spec incompletely. — Fix: include `this` (and verify the list against `is_expression_start`) in the expression keyword set.
+2. [MAJOR] phases/phase-075/REPORT.md:401 — the gate table now claims `cargo test --all-targets | 2883 passed`, and the prose at :404 says this is "the previous full-gate count plus the six resumed-run interpolation-navigation fixtures". The previous line in the same diff is 2875, and the uncommitted test diff adds exactly six `#[test]` functions (tests/tooling_grammar_test.rs:4474–4611), so the derivable count is 2875 + 6 = 2881, not 2883. The reported number therefore cannot be reconciled with the stated delta, which is the pattern the fake-completion check exists to catch. Fix: re-run the full gate and report the harvested number, or correct the prose and table together; do not hand-edit the count. — VERIFIED: arithmetic over the uncommitted REPORT diff and the six new test functions at tests/tooling_grammar_test.rs:4475, 4496, 4513, 4533, 4551, 4577.
 
-3. [MINOR] src/lsp.rs:2493 — the interpolation branch returns `interpolation_completions` before `member_slot` is consulted, so a member slot written inside an interpolation (`"{person.}"`, `"{this.}"`, `"{files.}"`) falls back to a flat lexical list instead of the object/module members the same slot offers outside text. This makes the new capability unable to complete the most common interpolated expressions from the spec (`{this.name}`, `{problem.message}`). — Fix: when the caret is in an interpolation, still run member-slot detection over the interpolation's decoded inner text and answer `member_completions` there.
+3. [MINOR] phases/phase-075/REPORT.md:415 — the "Known gaps" bullet understates the limitation: it says only "a reference set does not include names written inside a second interpolation of the same text literal", but the implementation also omits interpolated uses from every other text literal in the file, and (per finding 1) omits them entirely when references are queried from an outer declaration. Fix: state the real limitation or implement global interpolation reference collection.
 
-4. [MINOR] src/lsp.rs:2710 — the raw-character scan skips only two chars for every backslash, so a `\u007B` / `\u007D` escape (decoded to `{`/`}` by `Lexer::read_text`, `src/lexer.rs:331` + `read_unicode_escape`) is invisible to `interpolation_inner_start`: `say "\u007Bname}"` is an interpolation to the parser but plain text to completion, and the reverse can mis-pair braces. — Fix: scan the decoded literal (with an offset map) or special-case the `\uXXXX` escape so the LSP's brace view matches the parser's decoded view.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 3
