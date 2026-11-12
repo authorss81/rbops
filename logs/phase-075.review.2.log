@@ -1,30 +1,24 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "member_slot|member_completions|MODULE_MEMBERS|module_aliases|is_module"[90m in src/lsp.rs · 72 matches[0m
-[0m✱ [0mGrep "MODULE_MEMBERS|pub fn is_module|pub static MODULE"[90m in src/stdlib.rs · 26 matches[0m
-I'll inspect the new member-completion code and its tests.
-[0m→ [0mRead src/lsp.rs[90m [offset=2260, limit=220][0m
-[0m✱ [0mGrep "edge_completions_after_an_object_dot|edge_completions_after_this_dot|edge_completions_after_a_child_object_dot|edge_completions_after_a_module_dot|edge_member_completion_rejects"[90m in tests/tooling_grammar_test.rs · 6 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=3630, limit=190][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=80, limit=70][0m
-[0m✱ [0mGrep "object_fields|object_methods|object_parents|this_objects|fn name_of|fn offset|fn validate"[90m in src/lsp.rs · 36 matches[0m
-[0m✱ [0mGrep "fn offset|fn validate|struct SourceMap"[90m in src/lsp.rs · 5 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=315, limit=75][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1790, limit=100][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=2010, limit=80][0m
-[0m✱ [0mGrep "'\\r'|'\\n'|line \+=","[90m in src/lexer.rs · 100 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1628, limit=80][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=230, limit=60][0m
-[0m→ [0mRead src/lexer.rs[90m [offset=470, limit=50][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1890, limit=125][0m
-[0m→ [0mRead src/bytecode/vm.rs[90m [offset=4040, limit=65][0m
-[0m→ [0mRead src/interpreter.rs[90m [offset=1280, limit=45][0m
-[0m→ [0mRead src/stdlib.rs[90m [offset=275, limit=180][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=2479, limit=118][0m
+[0m✱ [0mGrep "declared_module_functions|module_name_bindings|module_functions|member_binding|declare_module_binding"[90m 16 matches[0m
+[0m✱ [0mGrep "edge_same_named_module|edge_module_member_shadowed|edge_bare_module_member_read|edge_goto_definition_on_a_declared_module_member|edge_find_references_on_a_declared_module_member|edge_declared_module_member_navigation"[90m 8 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1270, limit=180][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1600, limit=240][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2160, limit=120][0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=3900, limit=270][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=430, limit=140][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1080, limit=120][0m
+[0m✱ [0mGrep "module_scopes|module_aliases|declared_module_members|module_functions"[90m 26 matches[0m
+[0m✱ [0mGrep "fn declare_module|module_aliases|has no function|Module '|exports"[90m 13 matches[0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1560, limit=120][0m
+[0m✱ [0mGrep "fn module_declared_names|fn module_exports|fn declare_member"[90m 4 matches[0m
+[0m→ [0mRead src/parser.rs[90m [offset=330, limit=70][0m
+[0m→ [0mRead src/interpreter.rs[90m [offset=1535, limit=28][0m
 FINDINGS:
-1. [MAJOR] src/lsp.rs:2401-2414 — Member completion only recognises an object or a **stdlib** module; `name_of(receiver)`, `is_module(module)`, and the `MODULE_MEMBERS` lookup have no path for a program-declared `module … end` or a file-imported module. `import MathUtils` / `module text … end` therefore makes `MathUtils.` (the canonical example in AGENTS.md) return `None` from `member_completions` and `Ok(vec![])` from `completions`, even though `interpreter::module_member_values` can enumerate those members. The report's "Known gaps" only mentions interpolation, not this. — Fix: record declared-module members during the walk (analogous to `object_methods`) and consult that table before bailing; add a `module text … end` / file-import completion test. — Traced: `module_namespace` is true only when `is_module(module)` is true (std::stdlib `MODULES`), and the fallback arms at 2410-2414 return an empty slice for every other module.
 
-2. [MAJOR] src/lsp.rs:2395-2403 — `module_aliases` is one flat `HashMap<String, String>` (declared at src/lsp.rs:1240, filled at 1663/1689) with no scope information, but `member_completions` consults it whenever `token_binding[receiver]` is `None`. An alias declared in a function/branch (`to f()\n    import files as g\nend\ng.`) keeps `g → files` after the block, so completion after the out-of-scope `g.` offers `files` members even though the analyzer reports `Unknown variable 'g'`. This contradicts the phase's own `edge_nested_import_stays_in_its_block` scoping claim for navigation. — Fix: store the alias on the import binding/scope (or require an in-scope `DefinitionKind::Import` binding before consulting the alias map), and add a test for an alias used after its enclosing block ends. — Traced: the use outside the function has `token_binding[receiver] == None`, and the `None => is_module(module)` arm resolves the leaked alias.
+1. [BLOCKER] src/lsp.rs:1803 — A module member replaced by a `set`/`constant` inside a nested block is not dropped from the published-function table. The guard is `frames.last().and_then(|frame| frame.module)`, and `Frame::scoped` sets `module: None` (src/lsp.rs:454); an `if`/`unless`/loop frame is pushed above the module frame (e.g. src/lsp.rs:1399), so `if yes then / set f to 2 / end` inside a module never reaches the removal at src/lsp.rs:1811-1813. The deferred pass at src/lsp.rs:2211-2216 then still maps `M.f()` to the original `to f`. At runtime a block `set` writes through to the innermost module frame (the report's own model, and `declare_member` at src/interpreter.rs:1544-1550 reads that module-scope value), so `M.f` is the replacement value while navigation answers the stale function declaration. Concrete fix: resolve the owning module by walking `runtime_scopes`/the frame stack rather than only `frames.last()`, and remove the function entry whenever the `set`/`constant` targets the module's runtime scope. Existing coverage only pins a top-level `set`/`constant` (tests/tooling_grammar_test.rs:4077, :4103); no test covers the nested-block replacement. — VERIFIED: traced the frame path: `Frame::scoped` leaves `module: None` (src/lsp.rs:454), `If` pushes a scoped frame (src/lsp.rs:1399), and src/lsp.rs:1803 reads only `frames.last()`, so the removal at :1811 cannot fire for a branch `set`.
+
+2. [MAJOR] src/lsp.rs:1376 — The round-1 fix keys `declared_module_functions` by binding, but alias resolution still goes through a name-keyed table: `module_name_bindings.insert(name.clone(), module)` is overwritten on every same-named module close, and the deferred pass resolves an `Import` receiver via `module_aliases` → source name → `module_name_bindings` (src/lsp.rs:2206-2208). For a first module, a following `import M as A`, and a later second `module M`, `A.f()` is resolved against the *last* module's table, not the first module the import actually named. The new same-named test only exercises bare `M.f()` (tests/tooling_grammar_test.rs:4039) and never an alias, so the stated invariant "two same-named declarations cannot overwrite each other" is not actually held for aliases. Concrete fix: record the module binding at the `import`/`as` site (alias → module binding) instead of looking the source name up in a global last-wins map. (Caveat: the interpreter refuses a second `module` of the same name at src/interpreter.rs:1567-1571, so this is navigation over source the runtime would reject; it is still an internal contradiction with the keying fix.)
 
 REVIEW VERDICT: FINDINGS 2
