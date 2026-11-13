@@ -1,0 +1,21 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m✱ [0mGrep "run_all_tests|run_tests_in|run_test\(|find_test_files|find_project_root"[90m 63 matches[0m
+[0m→ [0mRead src/lib.rs[90m [offset=140, limit=280][0m
+[0m✱ [0mGlob "tests/**/*.rb"[90m 16 matches[0m
+[0m→ [0mRead src/testing/mod.rs[90m [limit=140][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=398, limit=420][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=1, limit=120][0m
+[0m✱ [0mGrep "MANIFEST_FILE|fn parse|parse_manifest|find_manifest|manifest_path|fn name|is_module_name"[90m in src/manifest.rs · 100 matches[0m
+[0m✱ [0mGrep "CARGO_BIN_EXE|Command::new|redblue::project|project::|redblue\.manifest"[90m in . · 100 matches[0m
+[0m→ [0mRead src/manifest.rs[90m [offset=640, limit=150][0m
+[0m→ [0mRead src/vfs.rs[90m [offset=60, limit=90][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=120, limit=280][0m
+[0m→ [0mRead src/manifest.rs[90m [offset=190, limit=180][0m
+FINDINGS:
+1. [MAJOR] tests/discovery_test.rs:416-423 — `outside_scratch` uses `std::env::temp_dir()` and the comment at tests/discovery_test.rs:413-415 admits the correctness of `edge_rb_test_outside_a_project_names_rb_new` (tests/discovery_test.rs:655-669) depends on "the system temp directory has no such ancestor". `find_project_root` walks every ancestor to `/`, so a developer/CI setting `TMPDIR=$PWD/target/tmp` (or any location inside the checkout) makes the "outside a project" scratch directory discover the checkout's new `redblue.manifest`; `rb test` then runs the whole checkout suite and exits 0, so the test's `!ran.status.success()` fails. It also writes under the system temp dir without cleanup, contradicting the existing `scratch_dir` convention documented at tests/discovery_test.rs:9-11. Concrete fix: do not depend on TMPDIR; drive `find_project_root`/`rb test` with an injectable start path, or assert `find_project_root(&dir).is_none()` and choose/skip another base, and remove the directory at the end. (Traced, not run.)
+2. [MAJOR] src/testing/mod.rs:89-103 — the round-1 change added two new error paths (non-`NotFound` `read_dir` failure and per-entry `Err`), but neither is exercised anywhere in tests/discovery_test.rs; the only directory-behaviour test (tests/discovery_test.rs:106-117) covers the empty and `NotFound` cases, which still return `Ok(vec![])`. A regression back to silently swallowing errors would pass the suite, and the REPORT's claim that this fix is tested is not supported. Missing test: `edge_discovery_unreadable_directory_is_an_error` — calling `find_test_files` on a path that is a regular file deterministically reaches the `Err(error) => return Err(...)` arm (`NotADirectory`, not `NotFound`) and pins the new contract; a nested-entry error test would cover src/testing/mod.rs:100-103.
+3. [MINOR] src/lib.rs:181 — the discovered root is a `PathBuf`, but it is converted with `to_string_lossy()` before being handed to `run_tests_in(&str)`. A project under a directory containing non-UTF-8 bytes is found by `find_project_root` yet the lossy replacement makes `find_test_files` look in a different path, producing "No Redblue test files" instead of running the suite. Fix: make `run_tests_in`/`find_test_files` take `impl AsRef<Path>` (or `&Path`) and keep the `PathBuf` end-to-end rather than round-tripping through `String`.
+
+REVIEW VERDICT: FINDINGS 3

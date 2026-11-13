@@ -1,0 +1,29 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/project.rs
+[0m→ [0mRead src/testing/mod.rs
+[0m→ [0mRead src/manifest.rs
+[0m→ [0mRead src/lib.rs[90m [offset=140, limit=220][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=390, limit=300][0m
+[0m✱ [0mGrep "fn add_error|fn report|failed|run_tests_in|run_all_tests|run_test\(None\)"[90m in src/testing · 26 matches[0m
+[0m✱ [0mGlob "**/redblue.manifest"[90m 0 matches[0m
+[0m✱ [0mGrep "run_test\(|run_all_tests|run_tests_in|find_project_root|create_project|check_manifest"[90m in . · 20 matches[0m
+[0m→ [0mRead src/testing/harness.rs[90m [offset=100, limit=150][0m
+[0m✱ [0mGrep "rb new|rb test|project root|redblue\.manifest|redblue project"[90m in . · 100 matches[0m
+[0m→ [0mRead README.md[90m [limit=40, offset=110][0m
+[0m→ [0mRead ROADMAP.md[90m [limit=40, offset=425][0m
+FINDINGS:
+1. [MAJOR] src/lib.rs:173 — bare `rb test` now requires a `redblue.manifest` ancestor, but the redblue checkout ships none (`glob **/redblue.manifest` returned no files), so running `rb test` from the checkout root now exits 1 with "No Redblue project found here" instead of running `tests/`. This contradicts README.md:129 ("Run tests: rb test") and ROADMAP.md:446 ("Run all tests"), and leaves the repository's own `.rb` suite unreachable through the CLI. Fix: ship a root `redblue.manifest`, or fall back to `tests/` when the CWD itself contains one. VERIFIED: traced `find_project_root` (src/project.rs:48-55) to `/`, then the `ok_or_else` error at src/lib.rs:173-178; no manifest exists in the checkout.
+
+2. [MAJOR] src/testing/mod.rs:81 — `collect_test_files` swallows `read_dir` errors (`if let Ok(entries)`), and `run_test(None)` prints the counts and only exits non-zero when `failed > 0` (src/lib.rs:181-187). A discovered project whose `tests/` directory is missing, unreadable, or empty therefore prints `Tests run: 0 / Passed: 0 / Failed: 0` and exits 0 — exactly the "silent success that ran nothing" the outside-a-project path was changed to eliminate. Fix: make `find_test_files`/`run_tests_in` return an error (or `run_test` fail) when the tests directory cannot be read or collects zero files, and add the missing test.
+
+3. [MINOR] src/project.rs:36-55 — the doc says a directory outside any project "answers `None` rather than borrowing an unrelated manifest from above it", but the loop walks every ancestor to `/`, so it does borrow any manifest found above. It also mishandles relative paths containing `..`: `PathBuf::pop` on `/a/b/..` yields `/a/b`, walking the wrong direction. Fix: clean/canonicalize the start path and correct the doc comment.
+
+4. [MINOR] tests/discovery_test.rs:572 — `edge_rb_test_outside_a_project_names_rb_new` uses a scratch dir inside the checkout (`target/tmp/project-test/outside`), so it is only "outside a project" until any ancestor (repo root, CI checkout location) gains a `redblue.manifest`; discovery will then find that root and the test fails. Fix: place the scratch outside the repository (system temp) or assert isolation explicitly.
+
+5. [MINOR] src/project.rs:146 — `check_project_name` duplicates `manifest::check_module_name` (src/manifest.rs:346) with its own message. The two validators can drift, making `rb new` accept or refuse a name that phase-044's manifest parser disagrees on. Fix: expose and reuse one validator from `manifest`.
+
+6. [MINOR] src/project.rs:74-91 — two new branches are untested: `root` existing but not being a directory (the `!root.is_dir()` refusal), and an existing *empty* directory being accepted. The REPORT's boundary row claims coverage but no test exercises either branch. Add both tests (a file named after the project, and a pre-created empty directory).
+
+REVIEW VERDICT: FINDINGS 6
