@@ -1,29 +1,23 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1760, limit=180][0m
-[0m→ [0mRead tests/bench/mod.rs[90m [offset=380, limit=80][0m
-[0m→ [0mRead phases/phase-088/scan.rs[90m [offset=490, limit=50][0m
-[0m✱ [0mGrep "member_assignment"[90m in tests/tooling_grammar_test.rs · 4 matches[0m
-[0m✱ [0mGrep "fn set_reuses_binding|fn pushes_runtime_scope|member_binding|fn declare_constant_binding"[90m in src/lsp.rs · 9 matches[0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=190, offset=4775][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=90, offset=2010][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=80, offset=1090][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=100, offset=2230][0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=80, offset=1][0m
-[0m✱ [0mGrep "delivery_phase|phase_under_review|refuse|phase-075|self"[90m in tests/unreviewed_work_ack_test.rs · 100 matches[0m
-[0m✱ [0mGrep "delivery_phase\(|fn edge_.*delivery|fn edge_the_phase_under_review"[90m 7 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=130, offset=1940][0m
-[0m✱ [0mGrep "set [A-Za-z_]+\.[A-Za-z_]+ to"[90m in . · 52 matches[0m
+[0m→ [0mRead src/lexer.rs[90m [limit=80][0m
+[0m→ [0mRead phases/phase-088/scan.rs[90m [offset=500, limit=45][0m
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=380, limit=120][0m
+[0m✱ [0mGrep "'\\r'|\\r|carriage|CR"[90m in src/lexer.rs · 81 matches[0m
+[0m✱ [0mGrep "unwrap\(\)|expect\(|panic!|unreachable!|todo!|unimplemented!|\[[a-z_]+\]|\.unwrap_or|\bas usize\b|\bas u32\b"[90m in src/lsp.rs · 100 matches[0m
+[0m→ [0mRead src/parser.rs[90m [offset=1, limit=40][0m
+[0m✱ [0mGrep "pub fn (goto_definition|find_references|completions)|fn (member_binding|module_value|published|analyze|resolve_member|scope_plain_binding)"[90m in src/lsp.rs · 9 matches[0m
+[0m✱ [0mGrep "Constant|constant|published|module_value|module_functions|ModuleValue|module_values"[90m in src/lsp.rs · 56 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1880, limit=210][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2400, limit=175][0m
+[0m✱ [0mGrep "#\[ignore\]|fn edge_.*\(\) *\{ *\}|is_ok\(\)|is_err\(\)|return;|todo!|unimplemented!"[90m in tests/tooling_grammar_test.rs · 45 matches[0m
+[0m✱ [0mGrep "module_values|module_functions|module_member_writes|declared_module_values|declared_module_functions"[90m in src/lsp.rs · 16 matches[0m
+[0m→ [0mRead tests/module_system_test.rs[90m [offset=1, limit=60][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1420, limit=360][0m
 FINDINGS:
+1. [MAJOR] src/lsp.rs:1717 — A `to` declared anywhere beneath a module’s body is attributed to the module with `frames.last().and_then(|frame| frame.module)`, but nested block frames are opened via `Frame::scoped(FrameKind::If)` at src/lsp.rs:1481 (and similarly for `unless`/loops) and are never given that module binding. The runtime only publishes a module’s *top-level* `to` items (a `to` inside an `if` is not a `module` body item), so either (a) if block frames do inherit `module`, a nested function is wrongly recorded as a published member at src/lsp.rs:1746-1748, and it additionally removes a same-named published value at src/lsp.rs:1755-1756; or (b) if they do not inherit it, the round-3 claim that a nested-branch `set` navigates cannot hold (see finding 2). Either way the module-owner resolution for `to` is wrong; it must require the declaration frame to be the `Module` frame itself rather than `frames.last()`. Settle it by checking `Frame::scoped`’s `module` initializer and running a fixture with `module M / if ... then to f() ... end / export all / end` followed by `M.f()` — the function must not resolve. VERIFIED: traced the exact path (src/lsp.rs:1717 → 1746-1757, frame opened at src/lsp.rs:1481 with no `.module` assignment, unlike src/lsp.rs:1609).
 
-1. [MAJOR] `src/lsp.rs:1833` — the new `break` on a following `.` skips the module-function bookkeeping at `src/lsp.rs:1858-1860`, so a member write to a declared module (`set M.f to 1`) leaves `declared_module_functions` holding the replaced key. The deferred pass at `src/lsp.rs:2262-2266` then still resolves the written member and any later `M.f()`/`M.f` to the stale `to f` declaration even though the runtime replaced the member value. The comment added here explicitly claims the receiver may be "an object or a module", but the code and the four new tests only exercise objects (`tests/tooling_grammar_test.rs:4786-4932`); there is no module-member-write test at all. — Add a module receiver to the member-write fixtures and, when the receiver resolves to a `Module`/`Import` binding, remove the written member from that module's published-function table. — VERIFIED: traced `break` at line 1837 → skipped `functions.remove(name)` at 1859 → module fallback at 2265 re-binds the member to the old declaration.
+2. [MAJOR] src/lsp.rs:1449-1454 — Publication of module `set` values is filtered against `members`, which comes from `module_declared`; `module_declared` is only appended when `top_module = frames.last().and_then(|frame| frame.module)` is `Some` (src/lsp.rs:1930,1940-1945). But the value binding itself is recorded using the `runtime_module` walk (`frames.iter().rev().find(pushes_runtime_scope)`, src/lsp.rs:1935-1939,1955-1963). For a `set` inside an `if`/`unless`/loop in a module body these two notions disagree: the value lands in `module_values`, yet the name is absent from `module_declared`, so `declared_module_values` drops it at module close and `Module.name` answers `None`. This is exactly the nested-branch case the round-3 report says it fixed; the same split also makes the published-function removal at src/lsp.rs:1955 and the value replacement at src/lsp.rs:1755 resolve different owners. Fix: derive the owning module once (the innermost runtime frame for `set` values/writes) and use that same owner when appending to `module_declared`, so the publication filter and the value table agree. Settle it by running the added nested-branch `set` fixture and asserting a bare `M.f` resolves, plus a module `constant`-after-`set` fixture. VERIFIED: traced src/lsp.rs:1930/1940-1945 against the `runtime_module` used at src/lsp.rs:1935-1939 and the filter at src/lsp.rs:1449-1454.
 
-2. [MAJOR] `phases/phase-075/REPORT.md:414` — the gate line claims `cargo test --all-targets` reports `2893 passed, 0 failed`, but the report's own narrative says the four new member-write tests were added on top of the previously harvested total `2887` (`2887 + 4 = 2891`), and `phases/phase-075/FINDINGS.md` admits two tests (`edge_child_measurement_accepts_an_explicit_environment` and a bench child-measurement case) were *failing* the gate before this round. If those two tests were failing, the earlier committed claim of `2887 passed, 0 failed` and `clippy ... pass` was false; if they were passing, the extra `+2` in `2893` is unexplained. Either way the current gate number cannot be reconciled with the report. — Re-run the gate and paste the actual per-target summary, or reconcile the arithmetic and state which tests moved from failed to passed. — VERIFIED: arithmetic from the two report files; I did not run the suite.
-
-3. [MINOR] `tests/bench/mod.rs:408` and `phases/phase-088/scan.rs:524` — this phase changes a benchmark harness and another phase's scanner, which are outside the claimed LSP-navigation scope. AGENTS.md's out-of-scope protocol says to record such findings as `[OPEN]` for the owner phase, not to modify the owner phase's files; `docs/OUT_OF_SCOPE_FINDINGS_LEDGER.md:85` instead records them as `[RESOLVED by phase-075]`. The scan change is semantically equivalent and the bench change is defensible gate maintenance, but both edits and the "resolved" ledger status are scope/protocol drift. — Keep the repairs if needed for a green gate, but mark the ledger rows `[OPEN]`/`[RESOLVED — verify in owner phase]` and call the scope exception out in the phase report rather than silently owning it.
-
-4. [MINOR] `tests/bench/mod.rs:430` — `profile` is taken as the first component after the Cargo target directory, so under a cross-target build (`cargo test --target <triple> ...`, path `target/<triple>/debug/deps/...`) the candidate becomes `target/<triple>/rb-bench` instead of `target/<triple>/debug/rb-bench` and the worker lookup fails again. The change trades the original failure for a target-triple-specific one. — Skip an optional triple component (or match a known profile component such as `debug`/`release`) before joining the binary name, and add a fixture for the `<triple>/<profile>` layout.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 2
