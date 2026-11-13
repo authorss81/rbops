@@ -1,26 +1,22 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "call_follows|module_values|declared_module_values|top_module"[90m in src/lsp.rs · 15 matches[0m
-[0m✱ [0mGrep "edge_goto_definition_on_a_declared_module_value|edge_find_references_on_a_declared_module_value|edge_declared_module_value_navigation_respects_export|edge_a_module_function_after_a_value_replaces|edge_module_value_navigation_rejects"[90m in tests/tooling_grammar_test.rs · 5 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1130, limit=60][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1300, limit=180][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=1900, limit=170][0m
-[0m→ [0mRead src/lsp.rs[90m [offset=2380, limit=70][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=170, offset=5190][0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs
-[0m→ [0mRead src/lsp.rs[90m [limit=70, offset=1710][0m
-[0m✱ [0mGrep "declare_module|module_members|export"[90m in src · 100 matches[0m
-[0m✱ [0mGrep "fn declare_module|Module \{|module.*exports|exports.*module"[90m in src/interpreter.rs · 40 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=125, offset=1560][0m
-[0m→ [0mRead src/analyzer.rs[90m [limit=60, offset=550][0m
-[0m✱ [0mGrep "fn declare_member|fn set_var|fn set_constant|fn assign|fn set_variable"[90m in src/interpreter.rs · 6 matches[0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=25, offset=1540][0m
-[0m→ [0mRead src/interpreter.rs[90m [limit=70, offset=1868][0m
+[0m✱ [0mGrep "standard_module_of|standard_module_member|module_member_references|import_module_bindings|module_aliases|declared_module_members|fn module_has_member"[90m in src · 60 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=5460, limit=160][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1255, limit=80][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1880, limit=80][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=2400, limit=90][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=240, limit=70][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=120, offset=3095][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=80, offset=3215][0m
+[0m✱ [0mGrep "member_names\.insert|member_names:|fn name_of|fn analyze\("[90m in src/lsp.rs · 8 matches[0m
+[0m→ [0mRead src/stdlib.rs[90m [limit=40, offset=275][0m
+[0m✱ [0mGrep "fn interpolations_view|fn interpolation_source_at|fn interpolations_in|member_names\.insert|fn analyze"[90m in src/lsp.rs · 19 matches[0m
+[0m→ [0mRead src/lsp.rs[90m [limit=125, offset=2880][0m
 FINDINGS:
 
-1. [MAJOR] src/lsp.rs:2044 — module-value recording is gated on `top_module` from `frames.last().and_then(|frame| frame.module)` (`src/lsp.rs:1930`). Inside an `if`/`loop` in a module body the top frame is the block frame (module `None`), so a replacing `set` is never added to `module_values`, even though the same walk has already deleted the same-named published function (`src/lsp.rs:1944-1953`, which deliberately walks to the innermost runtime frame because the write reaches the module scope) and the new binding is placed in the module's scope by `program_position = test_scopes.last().max(module_scopes.last())` (`src/lsp.rs:2009-2013`). Concretely, `module M / to f() give back 1 end / if yes then set f to 2 end / export all / end / say M.f` publishes `M.f` at runtime (`interpreter.rs:1544-1549` reads the module's local scopes, and `export all` still sees the top-level `to f`), but `goto_definition`/`find_references` on `M.f` answer `None`/empty. VERIFIED: traced the read lines and the runtime `declare_member`/`set_var` (interpreter.rs:1544-1549, 1881-1889); no test covers the nested-block replacement. Fix: derive the owning module for `module_values` from the innermost runtime frame, exactly as the function-removal code at 1944-1953 does, and add a fixture.
+1. [BLOCKER] src/lsp.rs:1288 — Standard-module canonicalisation resolves an import alias through the flat, name-keyed `module_aliases` map instead of the receiver's own binding, so two imports that reuse an alias in different scopes corrupt each other. `import files as f` at top level plus `import json as f` inside a function/branch leaves `module_aliases["f"] == "json"` (`src/lsp.rs:1940` unconditionally inserts by spelling); the top-level `f.read("x")` then canonicalises to `json`, `module_has_member("json","read")` is false, and goto/references answer nothing (and `f.parse` can falsely resolve to `json.parse`). This contradicts the delta's claim that "an import alias canonicalises to the module it named". Fix: record alias→source per import binding (extend `import_module_bindings` to also carry stdlib sources, or key the alias map by binding) and have `standard_module_of` use that instead of the name-keyed table; add a test with the same alias imported as two different modules in two scopes. VERIFIED: traced `src/lsp.rs:1940` (`module_aliases.insert(name.to_string(), source)`) and `src/lsp.rs:1288-1292` (`.get(receiver_name)`), with the receiver binding (`DefinitionKind::Import`) never mapped to its actual source.
 
-2. [MAJOR] src/lsp.rs:2014-2015 — the `constant` branch sets `program_position` from `test_scopes` only (ignoring `module_scopes`), so a `constant` written inside a `module` body is bound in the file's program scope; nevertheless line 2044 records it in `module_values` as a published member, and the new test `edge_goto_definition_on_a_declared_module_value_resolves_to_its_declaration` (`tests/tooling_grammar_test.rs:5218-5225`) asserts `Counter.label` resolves. The runtime reads a module member only out of the module's local scopes (`interpreter.rs:1544-1549`), and this file's own comment (`src/lsp.rs:1962-1964`) and the REPORT state the VM binds a constant to a global regardless of block. If that is accurate, the runtime never publishes `Counter.label`, so the test pins navigation to a phantom member. VERIFIED only as a trace of the LSP model; settle by running `module M; constant label to "n"; export all; end; say M.label` through `rb`. If it errors, stop recording module `constant`s as published values (or bind module constants in the module scope so navigation and runtime agree); if it succeeds, add a runtime/golden test proving the member exists.
+2. [MAJOR] src/lsp.rs:1298 — `standard_module_of` rejects a standard module whenever `declared_module_members.contains_key(module)` is true, but that map is built during the whole-file token walk and keyed only by bare name (`src/lsp.rs:1506` `declared_module_members.insert(name, members)`), ignoring source order and frame/scope. A program that uses `files.read(...)` before a later `module files … end`, or declares a same-named module inside a function/branch that may never run, loses stdlib member navigation for those earlier/other-scope uses even though the standard module is the one in force at that point. Fix: gate the program-module shadow on declaration position and the runtime frame path (as `module_member_writes` already does), or key it by the resolved module binding rather than the name. What would settle it: a test declaring `module text` (or `files`) inside a branch/function and navigating a stdlib member use elsewhere/earlier.
 
 REVIEW VERDICT: FINDINGS 2
