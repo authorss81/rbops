@@ -1,23 +1,29 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "fn (goto_definition_in_interpolation|interpolation_source_at|interpolation_view|line_column|original_location|find_references|merge|inside_text|name_token_at)"[90m 10 matches[0m
-[0m✱ [0mGrep "edge_(goto_definition_inside_an_interpolation|find_references_inside_an_interpolation|navigation_inside_escaped|interpolated_use_prefers|find_references_from_the_declaration)"[90m 6 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [offset=2360, limit=460][0m
-[0m→ [0mRead tests/tooling_grammar_test.rs[90m [offset=4460, limit=230][0m
-[0m✱ [0mGrep "struct TextLiteral|impl TextLiteral|fn caret_index|fn text_literal_at|fn interpolation_at|fn inside_nested_text|sources|fn text_literal_token|fn matching_close|fn unmatched_opens"[90m 15 matches[0m
-[0m✱ [0mGrep "pub(crate) fn (is_complete_expression|unmatched_opens)|fn is_complete_expression|fn unmatched_opens"[90m 2 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [limit=275, offset=3000][0m
-[0m→ [0mRead src/parser.rs[90m [limit=70, offset=3130][0m
-[0m✱ [0mGrep "struct Location|impl Location|fn of_name|fn offset\(|fn validate\(|struct SourceMap|fn inside_text|fn inside_comment"[90m 8 matches[0m
-[0m→ [0mRead src/lsp.rs[90m [limit=160, offset=3275][0m
-[0m→ [0mRead src/lsp.rs[90m [limit=190, offset=200][0m
-[0m✱ [0mGrep "fn read_interpolated|fn interpolated_parts|is_complete_expression|read_interpolation"[90m 4 matches[0m
-[0m→ [0mRead src/parser.rs[90m [limit=125, offset=2940][0m
+[0m→ [0mRead src/lsp.rs[90m [offset=1760, limit=180][0m
+[0m→ [0mRead tests/bench/mod.rs[90m [offset=380, limit=80][0m
+[0m→ [0mRead phases/phase-088/scan.rs[90m [offset=490, limit=50][0m
+[0m✱ [0mGrep "member_assignment"[90m in tests/tooling_grammar_test.rs · 4 matches[0m
+[0m✱ [0mGrep "fn set_reuses_binding|fn pushes_runtime_scope|member_binding|fn declare_constant_binding"[90m in src/lsp.rs · 9 matches[0m
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=190, offset=4775][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=90, offset=2010][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=80, offset=1090][0m
+[0m→ [0mRead src/lsp.rs[90m [limit=100, offset=2230][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead tests/tooling_grammar_test.rs[90m [limit=80, offset=1][0m
+[0m✱ [0mGrep "delivery_phase|phase_under_review|refuse|phase-075|self"[90m in tests/unreviewed_work_ack_test.rs · 100 matches[0m
+[0m✱ [0mGrep "delivery_phase\(|fn edge_.*delivery|fn edge_the_phase_under_review"[90m 7 matches[0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=130, offset=1940][0m
+[0m✱ [0mGrep "set [A-Za-z_]+\.[A-Za-z_]+ to"[90m in . · 52 matches[0m
 FINDINGS:
 
-1. [MAJOR] src/lsp.rs:2539-2548 — `interpolations_in` calls `matching_close` (src/lsp.rs:3130-3143) for **every** balanced `{`, and `matching_close` itself restarts a forward scan from that open; for a literal of nested braces (`"{{{{…}}}}"`) this is O(n²), and each candidate additionally runs `is_complete_expression` (lex + parse of the inner text). This is exactly the quadratic pattern the parser avoids by advancing past a matched pair (`index = scan + 1`, src/parser.rs:2999; its comment at 2943-2946 claims the walk is linear). Worse, `references_globally` invokes `interpolations_in` for every Text token on every `find_references` query (src/lsp.rs:2648-2652) and then re-runs `analyze` over the whole file once per interpolation (src/lsp.rs:2653-2655), so a file with M interpolations costs O(M·file_size), and a large/pathological literal can hang the language server. Fix: pair braces in one linear stack pass and skip a matched span the way the parser does; skip literals whose decoded text cannot contain the queried name; and cap or memoize the per-literal analyses instead of re-analyzing the file for every pair. VERIFIED: traced `interpolations_in` → `matching_close` per open and the per-interpolation `analyze` loop; the parser counterpart's linear `index = scan + 1` advance confirms the LSP path is the quadratic one.
+1. [MAJOR] `src/lsp.rs:1833` — the new `break` on a following `.` skips the module-function bookkeeping at `src/lsp.rs:1858-1860`, so a member write to a declared module (`set M.f to 1`) leaves `declared_module_functions` holding the replaced key. The deferred pass at `src/lsp.rs:2262-2266` then still resolves the written member and any later `M.f()`/`M.f` to the stale `to f` declaration even though the runtime replaced the member value. The comment added here explicitly claims the receiver may be "an object or a module", but the code and the four new tests only exercise objects (`tests/tooling_grammar_test.rs:4786-4932`); there is no module-member-write test at all. — Add a module receiver to the member-write fixtures and, when the receiver resolves to a `Module`/`Import` binding, remove the written member from that module's published-function table. — VERIFIED: traced `break` at line 1837 → skipped `functions.remove(name)` at 1859 → module fallback at 2265 re-binds the member to the old declaration.
 
-2. [MINOR] tests/tooling_grammar_test.rs:4496-4510 — every new interpolation-reference test projects the result to `(line, column)` and never asserts `end_line`/`end_column`, so the new end-mapping branch in `InterpolationSource::original_location` (src/lsp.rs:2429-2438, the `literal.sources`/suffix path) is never checked. The goto test's `end_column` at tests/tooling_grammar_test.rs:4482-4491 is the declaration in the prefix (identity mapping), and the escaped-brace test at 4564-4573 also only checks starts, so a wrong end span for an interpolated use would pass the suite. Also, `find_references` on a **builtin inside** an interpolation (`find_references_in_interpolation` with `target == None`, src/lsp.rs:2743-2752 → `references_globally` with `declaration == None`) has no test at all; only goto has a builtin-in-interpolation test (tests/tooling_grammar_test.rs:4513-4529). Add assertions on `end_column` for `"message: {greeting}"` (and a use that ends the expression / follows an escaped brace), plus a `find_references(source, 1, 8)` case for `say "{abs(-3)}"`.
+2. [MAJOR] `phases/phase-075/REPORT.md:414` — the gate line claims `cargo test --all-targets` reports `2893 passed, 0 failed`, but the report's own narrative says the four new member-write tests were added on top of the previously harvested total `2887` (`2887 + 4 = 2891`), and `phases/phase-075/FINDINGS.md` admits two tests (`edge_child_measurement_accepts_an_explicit_environment` and a bench child-measurement case) were *failing* the gate before this round. If those two tests were failing, the earlier committed claim of `2887 passed, 0 failed` and `clippy ... pass` was false; if they were passing, the extra `+2` in `2893` is unexplained. Either way the current gate number cannot be reconciled with the report. — Re-run the gate and paste the actual per-target summary, or reconcile the arithmetic and state which tests moved from failed to passed. — VERIFIED: arithmetic from the two report files; I did not run the suite.
 
-REVIEW VERDICT: FINDINGS 2
+3. [MINOR] `tests/bench/mod.rs:408` and `phases/phase-088/scan.rs:524` — this phase changes a benchmark harness and another phase's scanner, which are outside the claimed LSP-navigation scope. AGENTS.md's out-of-scope protocol says to record such findings as `[OPEN]` for the owner phase, not to modify the owner phase's files; `docs/OUT_OF_SCOPE_FINDINGS_LEDGER.md:85` instead records them as `[RESOLVED by phase-075]`. The scan change is semantically equivalent and the bench change is defensible gate maintenance, but both edits and the "resolved" ledger status are scope/protocol drift. — Keep the repairs if needed for a green gate, but mark the ledger rows `[OPEN]`/`[RESOLVED — verify in owner phase]` and call the scope exception out in the phase report rather than silently owning it.
+
+4. [MINOR] `tests/bench/mod.rs:430` — `profile` is taken as the first component after the Cargo target directory, so under a cross-target build (`cargo test --target <triple> ...`, path `target/<triple>/debug/deps/...`) the candidate becomes `target/<triple>/rb-bench` instead of `target/<triple>/debug/rb-bench` and the worker lookup fails again. The change trades the original failure for a target-triple-specific one. — Skip an optional triple component (or match a known profile component such as `debug`/`release`) before joining the binary name, and add a fixture for the `<triple>/<profile>` layout.
+
+REVIEW VERDICT: FINDINGS 4
