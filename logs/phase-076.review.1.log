@@ -1,23 +1,24 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
+[0m→ [0mRead src/project.rs
 [0m→ [0mRead src/testing/mod.rs
 [0m→ [0mRead src/testing/harness.rs
-[0m→ [0mRead src/project.rs
+[0m→ [0mRead src/lib.rs[90m [offset=130, limit=220][0m
 [0m→ [0mRead src/testing/reporter.rs
-[0m→ [0mRead src/lib.rs[90m [offset=140, limit=180][0m
-[0m→ [0mRead tests/discovery_test.rs[90m [limit=130][0m
-[0m✱ [0mGrep "#\[ignore\]|unwrap_or_default|assert!\(true|is_ok\(\)\)|// skip|allow\(clippy"[90m in tests/discovery_test.rs · 36 matches[0m
-[0m→ [0mRead tests/discovery_test.rs[90m [offset=560, limit=420][0m
-[0m→ [0mRead tests/discovery_test.rs[90m [offset=980, limit=349][0m
+[0m✱ [0mGrep "fn edge_check_manifest|fn edge_project_root_ignores|fn edge_rb_test_reports_the_failing_test|fn edge_rb_test_that_only_skips|fn edge_rb_test_with_a_path_that_defines_no_tests|fn edge_discovery_refuses_a_symlinked_root"[90m in tests/discovery_test.rs · 10 matches[0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=1600, limit=140][0m
+[0m✱ [0mGrep "symlink|#\[test\]"[90m in tests/discovery_test.rs · 100 matches[0m
+[0m✱ [0mGrep "295[0-9]|296[0-9]|test_count|EXPECTED_TEST|TOTAL_TESTS"[90m in . · 3 matches[0m
+[0m✱ [0mGrep "is_file\(\)|MANIFEST_FILE|fn find_project_root|fn check_manifest"[90m in src · 20 matches[0m
 [0m→ [0mRead tests/redblue_suite_test.rs
+[0m→ [0mRead src/manifest.rs[90m [offset=600, limit=90][0m
 FINDINGS:
-1. [BLOCKER] src/lib.rs:212 — The zero-execution guard checks `results.total`, but `TestResults::add_skip` increments `total` (src/testing/mod.rs:188-191), and `run_source` treats any `// skip` line as a skip (src/testing/harness.rs:48-56). A `tests/main_test.rb` containing only `// skip\n...` therefore yields `total=1, passed=0, failed=0`, `reject_zero_test_run` sees `total != 0`, and bare `rb test` prints `Tests run: 1 / Passed: 0 / Failed: 0` and exits 0 having executed no test. This is exactly the "zero-execution is not a passing suite" invariant the phase claims to enforce, and `edge_rb_test_that_defines_no_tests_fails` only covers comment-only/empty files, not skip-only. Fix: reject when `passed + failed == 0` (or when `passed == 0 && failed == 0` regardless of `skipped`), and add a skip-only test. - VERIFIED: traced the path — `add_skip` at src/testing/mod.rs:190 does `self.total += 1`; the guard at src/lib.rs:158-166 rejects only `total == 0`; harness.rs:54 calls `add_skip()` for a `// skip` line.
 
-2. [MAJOR] src/testing/harness.rs:93 — A whole-file lex/parse error is recorded only when `declares_test_block(source)` is true (any line starting with `test `). A file with a real syntax error but no literal `test ` line (e.g. `say "hi"\nthis is not redblue\n`) parses with `Err`, the error is dropped, `run_file` returns `Ok`, and `rb test <file>` then fails with `No tests were defined in '<file>'` (src/lib.rs:176) — hiding the actual syntax error the user needs. The new parse-failure test only uses a file whose first line is `test "broken"`, so it does not exercise this branch. Fix: record the parse error unconditionally (it is already a located `Error`), or at least when the file is non-empty, and add a test with a non-`test`-prefixed syntax error.
+1. [MAJOR] phases/phase-076/REPORT.md:171 — The gate row now claims `cargo test --all-targets | 2962 passed`, but the committed report at HEAD recorded `2956`, and the only test additions in this uncommitted round are four `#[test]` functions (`tests/discovery_test.rs:1622`, `:1648`, `:1676`, `:1693`). `2956 + 4 = 2960`, not `2962`, and the uncommitted diff touches no other test-bearing file (the `src/project.rs` changes add no tests). Two of the claimed passes are unaccounted for, which is the signature of a gate row edited without re-running the suite. - Fix: re-run `cargo test --all-targets` after the round-8 edits and record the number actually printed (or state the previous `2956` was stale and why). - This is arithmetic from the diff, not a test run, so it is not marked VERIFIED.
 
-3. [MINOR] src/testing/mod.rs:94 — The doc states "Directory symlinks are never followed", but `collect_test_files` opens the caller-supplied root with `std::fs::read_dir(dir)` (line 117), which follows a symlink for the top-level `dir`; only entries below it are checked with `DirEntry::file_type`. A project whose `tests/` is a symlink is therefore walked, and `rb test` runs tests from outside the project, contradicting both this doc and the REPORT's "walk descends only into real directories" claim. Fix: `symlink_metadata` the root before `read_dir` (and skip/refuse a symlinked root), or correct the documentation.
+2. [MAJOR] src/project.rs:55 — `find_project_root` calls `has_manifest`, and `has_manifest` (`src/project.rs:71`) returns false for a symlinked `redblue.manifest`; the walk then pops to the parent, so a directory whose nearest manifest is a symlink is silently skipped and `rb test` (`src/lib.rs:199-205`) runs an *ancestor* project's suite instead of erroring. `check_manifest`'s new symlink refusal (`src/project.rs:229-234`) is therefore unreachable through the only production caller, and the user gets tests from the wrong project rather than the clean "symbolic link" refusal the round-8 report says is delivered. - Fix: when a directory contains an entry named `MANIFEST_FILE` (regular, symlink, or other), stop there and let `check_manifest` classify it, or make `has_manifest`/discovery distinguish "no manifest" from "unusable manifest". - Would be settled by a test that runs `rb test` in a directory whose manifest is a symlink and asserts a non-zero symlink error rather than the ancestor's test output.
 
-4. [MINOR] phases/phase-076/REPORT.md:129 — The gate row claims `2950 passed` after round 4, but the uncommitted diff adds exactly three `#[test]` functions (all in `tests/discovery_test.rs`) on top of the committed `2945`, which is 2948. The reported number cannot be reconciled with the change set as given; rerun `cargo test --all-targets` and paste the actual count (or state what accounts for the extra two).
+3. [MINOR] tests/discovery_test.rs:1634 — `edge_project_root_ignores_a_symlinked_manifest` asserts only `found != Some(canonical(fake))`. A `has_manifest` that always returned false (discovery completely broken) also passes, because the scratch dir lives under the checkout, whose own regular `redblue.manifest` is an ancestor that can never equal `fake`. The test pins the specific "followed this link" regression but cannot fail on a broader discovery failure. - Fix: additionally assert that `find_project_root` of a sibling fixture holding a *regular* manifest returns that sibling (or assert the symlinked fixture resolves to the checkout root explicitly).
 
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 3
