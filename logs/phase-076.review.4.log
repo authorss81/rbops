@@ -1,0 +1,25 @@
+[0m
+> reviewer · deepseek-v4.1-flash-free
+[0m
+[0m→ [0mRead src/project.rs
+[0m→ [0mRead src/testing/mod.rs
+[0m→ [0mRead src/testing/harness.rs
+I'll inspect the core changed files first.
+[0m→ [0mRead src/lib.rs[90m [offset=140, limit=180][0m
+[0m→ [0mRead tests/discovery_test.rs
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=1490, limit=300][0m
+[0m✱ [0mGrep "#\[ignore\]|// skip|allow\(clippy|println!\(\"SKIP"[90m in tests/discovery_test.rs · 8 matches[0m
+[0m→ [0mRead tests/redblue_suite_test.rs[90m [offset=90, limit=80][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [limit=60][0m
+[0m→ [0mRead tests/redblue_suite_test.rs[90m [limit=90][0m
+[0m→ [0mRead tests/redblue_suite_test.rs[90m [offset=170, limit=90][0m
+[0m→ [0mRead src/lib.rs[90m [limit=110, offset=319][0m
+[0m✱ [0mGrep "fn parse\b|pub fn parse\(|struct Manifest|MANIFEST_FILE|pub fn parse_manifest"[90m in src/manifest.rs · 23 matches[0m
+[0m✱ [0mGrep "run_test\(None\)|run_all_tests\(\)|args\(\["test"\]\)|"test"\]"[90m in . · 16 matches[0m
+[0m✱ [0mGrep "version|^name"[90m in Cargo.toml · 100 matches[0m
+FINDINGS:
+1. [BLOCKER] src/testing/harness.rs:95 — A whole-file lex/parse error is silently discarded for any file that also contains a marker-style test/bench, so a syntax error outside the marker body never fails the run and `rb test` can exit 0 having executed a passing marker test. The condition is `if declares_test_block(source) || !uses_marker_tests(source) { self.add_source_error(&e); }`: for `// test "a"\nexpect 1 to be 1\n// end\nset x to (\n`, `declares_test_block` is false and `uses_marker_tests` is true (harness.rs:309-327 look only for marker prefixes), so the tokenizer/parser error is dropped. `run_single_test` then scans only up to `// end` (harness.rs:120-131), reports a pass, and `reject_zero_test_run` sees `passed == 1` and lets the process exit 0. A project can therefore hide a real syntax error behind one passing marker test, the exact "silently succeeds" class this phase is meant to close. — Fix: record the whole-file error whenever its span line is not inside a marker test/bench body (or always record it and de-duplicate per-body errors by file/line/message), instead of suppressing it for every marker-containing file. — VERIFIED: traced the exact path and quoted the guard at harness.rs:95, the marker predicates at harness.rs:316-327, and the early-return at harness.rs:98; the stray line is never visited by the marker scan because `run_single_test` stops at `// end` (harness.rs:120-127).
+
+2. [MINOR] src/testing/mod.rs:184 — Directory symlinks are skipped, but a symlinked `.rb` **file** is still collected and executed: `entry.file_type()` reports the link (not `is_dir`), then `path.extension() == Some("rb")` is true and the link path is pushed into the run list, so `tests/escape.rb -> /somewhere/outside.rb` runs a suite from outside the project. The doc comment at src/testing/mod.rs:101-106 only promises directory symlinks are not followed, leaving the same traversal class the round-4/5 symlink work was closing open for files, with no test covering it. — Fix: only push regular files (`file_type.is_file()`) or resolve the link and require its canonical target to stay under `dir`; add a test with a `.rb` symlink pointing outside. — Not run; traced `collect_test_files` at src/testing/mod.rs:184-188.
+
+REVIEW VERDICT: FINDINGS 2

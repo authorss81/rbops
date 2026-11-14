@@ -1,25 +1,26 @@
 [0m
 > reviewer · deepseek-v4.1-flash-free
 [0m
-[0m✱ [0mGrep "fn report|process::exit|fn add_fail|failed"[90m in src/testing/reporter.rs · 23 matches[0m
-[0m→ [0mRead src/lib.rs[90m [offset=150, limit=80][0m
-[0m→ [0mRead src/testing/mod.rs[90m [offset=1, limit=140][0m
-[0m→ [0mRead src/project.rs[90m [offset=1, limit=200][0m
-[0m→ [0mRead src/testing/mod.rs[90m [offset=137, limit=80][0m
-[0m→ [0mRead src/testing/harness.rs[90m [offset=1, limit=180][0m
-[0m✱ [0mGrep "resume phase-076|DELIVERY_SUBJECT|delivery subject|DELIVERY_S"[90m in tests/unreviewed_work_ack_test.rs · 13 matches[0m
-[0m✱ [0mGrep "fn add_error|fn results|fn execute_test_code|declares_test_block"[90m in src/testing/harness.rs · 6 matches[0m
-[0m→ [0mRead tests/unreviewed_work_ack_test.rs[90m [offset=240, limit=80][0m
-[0m→ [0mRead src/testing/reporter.rs[90m [offset=55, limit=70][0m
-[0m✱ [0mGrep "^fn (edge_|rb_new|find_test|edge_discovery)"[90m in tests/discovery_test.rs · 100 matches[0m
-[0m→ [0mRead src/testing/harness.rs[90m [offset=236, limit=38][0m
+[0m→ [0mRead src/project.rs
+[0m→ [0mRead src/testing/mod.rs
+[0m→ [0mRead src/testing/harness.rs
+[0m→ [0mRead src/testing/reporter.rs
+[0m✱ [0mGrep "fn edge_rb_test_outside_a_project|fn scratch|temp_dir|target/tmp|fn project_dir|fn run_rb|redblue.manifest"[90m in . · 15 matches[0m
+[0m→ [0mRead src/lib.rs[90m [offset=140, limit=180][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=545, limit=100][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=840, limit=60][0m
+[0m→ [0mRead tests/unreviewed_work_ack_test.rs
+[0m→ [0mRead tests/redblue_suite_test.rs
+[0m✱ [0mGrep "find_project_root|run_all_tests|No Redblue project|run_tests_in|find_test_files"[90m in . · 51 matches[0m
+[0m✱ [0mGrep ""test"\]|\[\"test\"\]|args\(\[\"test"[90m in tests · 10 matches[0m
+[0m✱ [0mGrep "CARGO_PKG_VERSION|0\.2\.0|redblue\.manifest|MANIFEST_FILE"[90m in . · 54 matches[0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=1120, limit=120][0m
+[0m→ [0mRead src/manifest.rs[90m [offset=700, limit=90][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=160, limit=60][0m
+[0m→ [0mRead tests/discovery_test.rs[90m [offset=1330, limit=96][0m
 FINDINGS:
-1. [BLOCKER] src/lib.rs:189-198 — bare `rb test` exits 0 after running zero tests — the guard at line 182 only rejects "no `.rb` files"; a `tests/` directory holding one comment-only or empty `.rb` file passes it, `run_tests_in` then finds no `test` blocks, `results.total == 0` and `results.failed == 0`, so the `if results.failed > 0` branch is skipped and `run_test` returns `Ok(())`. A CI gate can go green having executed nothing. — Reject a zero-test run: after `run_tests_in`, if `results.total == 0` return `Err(Error::Io("No tests were defined in '<dir>'"))` (or have `run_tests_in` distinguish "files found but zero tests"). — VERIFIED: traced src/lib.rs:182 (file-count guard) → src/testing/mod.rs:59-67 (no blocks means no `add_pass`/`add_fail`) → src/lib.rs:193-202 (zero failed skips reporter and returns `Ok`), so the process exits 0.
+1. [MAJOR] src/testing/mod.rs:119 — the new symlink-root guard calls `symlink_metadata(dir)` on the caller-supplied path verbatim, but `run_all_tests()` at src/testing/mod.rs:53 passes the literal string `"tests/"` with a trailing separator. On Linux a trailing slash forces path resolution through the final symlink, so `lstat`/`symlink_metadata("tests/")` reports the *target* directory, not the link — the check at line 120 (`metadata.file_type().is_symlink()`) never fires and `read_dir` at line 139 then follows the link. The comment and REPORT claim "The caller-supplied root is refused when it is itself a link", but the one production caller that hands in a directory path always supplies it with a trailing slash, and `edge_discovery_refuses_a_symlinked_root` (tests/discovery_test.rs:1415) only exercises `find_test_files(root)` without a trailing slash, so the guarded path is untested. Fix: normalise trailing separators before inspecting (e.g. trim `/` from the `Path`/use its `components`, or check `dir` and `dir` with separators stripped), and add a test calling `find_test_files("tests/")` against a symlink. I traced the path but could not run it (read-only session); please confirm with that test — the coverage gap is certain even if the lstat behaviour differs.
+2. [MINOR] src/lib.rs:160 — `reject_zero_test_run` now fires on `passed + failed == 0`, but reports `No tests were defined in '<dir>'`. That message is inaccurate for the case the round-5 change exists to catch (a suite whose only markers are skips: `total == 1, skipped == 1`), where tests *were* defined and *were* skipped, not "not defined". A reader gets the wrong remediation. Fix: distinguish the two states, e.g. when `results.total > 0 && skipped == total` say `No tests were run (N skipped)`; keep "defined" only for the truly empty case.
+3. [MINOR] src/testing/harness.rs:194 — `run_benchmark` discards the outcome (`let _ = self.execute_test_code(&bench_code);`), so a benchmark body that fails to lex/parse/run is silently treated as successful and nothing is added to `passed`/`failed`. With the new zero-execution guard this now surfaces as `rb test bench.rb` exiting non-zero with `No tests were defined`, masking the real syntax/runtime error in the benchmark instead of reporting it. Not introduced by this phase, but the guard makes the masking reachable and there is no test for a benchmark-only file. Fix: record the benchmark failure (or at least propagate the error) rather than dropping it, and name it in the zero-run message.
 
-2. [MAJOR] src/testing/harness.rs:242-250 — a whole-file lex/parse failure loses both the file name and the line — `run_file` sets `source_name` (harness.rs:73) precisely so failures name the file, and `run_test_blocks` calls `self.add_error(e.to_string())` (harness.rs:94) on a parse error, but `add_error` hardcodes `file: "unknown"` and `line: None`. A project test file that fails to parse is reported as `Location: unknown` with no line, and the `Error`'s span is discarded by `to_string()`. — Use `self.source_name.clone()` and preserve the error's span/line. — Not covered: `edge_rb_test_with_a_path_names_the_file_in_failure_output` uses an assertion failure, not a parse failure, so this path is untested.
-
-3. [MAJOR] src/testing/mod.rs:127-128 — `collect_test_files` still recurses with no depth bound — the symlink fix stops cycles, but a genuinely deep real directory tree under `tests/` recurses until the process overflows its stack, which is the same unbounded-resource class the phase claims to have closed. The REPORT's "resource_limit" row only cites the symlink-cycle test and does not bound depth. — Pass a depth counter with a limit (or walk iteratively with an explicit stack) and add a test for a too-deep tree.
-
-4. [MINOR] src/project.rs:121-141 — a failed scaffold write poisons its own target — `create_dir_all` for `src/` and `tests/` succeeds before the three `write` calls, so if any write fails (permissions, disk full) the directories remain with no manifest; a retry then hits `root.exists() && is_dir` with non-empty entries and is refused as "already exists and is not empty". A transient failure permanently blocks `rb new <name>` in that directory. — Stage the layout in a temporary directory and rename into place, or remove the directories created by this call on error.
-
-REVIEW VERDICT: FINDINGS 4
+REVIEW VERDICT: FINDINGS 3
